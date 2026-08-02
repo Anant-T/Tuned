@@ -4,7 +4,7 @@ The bridge is one-way: you edit here, push to GitHub, and the Kaggle
 notebook pulls. Model weights never live in this package.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 def where_am_i():
