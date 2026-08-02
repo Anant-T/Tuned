@@ -30,9 +30,20 @@ Model weights and datasets stay out of git (see `.gitignore`) - they belong in
 Bump `__version__` in `src/tuned/__init__.py`, push, then re-run cells 1 and 2.
 The printed `tuned_version` should match what you pushed.
 
+## Two constraints that bite
+
+**Target Python 3.12.** Kaggle runs 3.12.13 (verified). Code in `src/` that uses
+newer syntax will import locally and fail there.
+
+**Only `src/` crosses the bridge.** The Kaggle notebook is a detached copy made
+at import time - edits to `notebooks/kaggle_bootstrap.ipynb` here do *not* reach
+it. Keep the bootstrap cell thin; put real logic in `src/`, which is pulled fresh
+every run.
+
 ## Free-tier limits worth knowing
 
 - ~30 GPU-hours/week, reset weekly
+- Verified accelerator: `GPU T4 x2` = 2x Tesla T4, 15360 MiB each
 - 12h max per session (9h on TPU); an idle notebook is killed after 20 min
 - `/kaggle/working` persists during the session and caps at 20 GB
 - `/kaggle/temp` is scratch and is discarded when the session ends
