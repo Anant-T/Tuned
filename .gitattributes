@@ -1,0 +1,3 @@
+# This code runs on Kaggle (Linux). Keep LF in the repo regardless of local OS.
+* text=auto eol=lf
+*.ipynb text eol=lf

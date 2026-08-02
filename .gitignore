@@ -1,0 +1,28 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# --- Never commit model weights ---
+# These belong in /kaggle/working and come back via the notebook Output tab.
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.onnx
+
+# --- Never commit datasets or run artifacts ---
+data/
+checkpoints/
+outputs/
+runs/
+wandb/
+
+# --- Secrets ---
+kaggle.json
+.env
