@@ -1,0 +1,16 @@
+[project]
+name = "tuned"
+description = "Code that runs locally and on Kaggle's free GPU."
+requires-python = ">=3.12,<3.13"  # Kaggle runs 3.12.13; do not widen without checking
+dynamic = ["version"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Single source of truth for the version - bumping __init__.py is enough.
+[tool.hatch.version]
+path = "src/tuned/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tuned"]

@@ -17,6 +17,19 @@ Model weights and datasets stay out of git (see `.gitignore`) - they belong in
 | `src/tuned/` | Importable package. Kaggle puts `src/` on `sys.path`. |
 | `notebooks/kaggle_bootstrap.ipynb` | Import this into Kaggle once. |
 
+## Local setup (once)
+
+Matches Kaggle's interpreter exactly, so imports that work here work there.
+
+```powershell
+uv venv                      # reads .python-version -> CPython 3.12.13
+.venv\Scripts\Activate.ps1
+uv pip install -e .          # makes `import tuned` work without sys.path hacks
+```
+
+The version lives in one place: `__version__` in `src/tuned/__init__.py`.
+Hatchling reads it from there, so bumping that line is the whole release process.
+
 ## Kaggle setup (once)
 
 1. [kaggle.com/code](https://www.kaggle.com/code) -> **New Notebook**
