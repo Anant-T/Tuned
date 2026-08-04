@@ -10,6 +10,14 @@ import yaml
 class ModelCfg:
     repo: str
     revision: str | None
+    instruction_part: str
+    response_part: str
+
+
+@dataclass
+class DataCfg:
+    think_open: str
+    think_close: str
 
 
 @dataclass
@@ -17,7 +25,7 @@ class LoraCfg:
     r: int
     alpha: int
     dropout: float
-    target_modules: list[str]
+    target_modules: list[str] | str  # list of module names, or a regex string
 
 
 @dataclass
@@ -49,6 +57,7 @@ class HubCfg:
 @dataclass
 class Config:
     model: ModelCfg
+    data: DataCfg
     lora: LoraCfg
     train: TrainCfg
     hub: HubCfg
@@ -58,6 +67,7 @@ def load_config(path: str | Path, *, allow_unpinned: bool = False) -> Config:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     cfg = Config(
         model=ModelCfg(**raw["model"]),
+        data=DataCfg(**raw["data"]),
         lora=LoraCfg(**raw["lora"]),
         train=TrainCfg(
             smoke=RunCfg(**raw["train"].pop("smoke")),

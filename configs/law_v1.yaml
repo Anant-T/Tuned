@@ -1,12 +1,23 @@
 model:
-  repo: unsloth/gemma-4-31B-it-unsloth-bnb-4bit
-  revision: 8e256fc6d63003fc0ca8c91b976e6dcc38433385
+  repo: unsloth/Ministral-3-14B-Reasoning-2512-unsloth-bnb-4bit
+  revision: ec1befbd41647354531b2e09bd036cd1dc94b076
+  # Completion-masking markers, verified against this revision's chat_template.jinja:
+  # user turns render as [INST]...[/INST], the assistant reply follows [/INST].
+  instruction_part: '[INST]'
+  response_part: '[/INST]'
+
+data:
+  # Ministral Reasoning's native scaffold; the smoke builder wraps traces in these.
+  think_open: '[THINK]'
+  think_close: '[/THINK]'
 
 lora:
   r: 32
   alpha: 32
   dropout: 0.0
-  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  # Regex, not a list: scoped to language_model so the vision tower never gets
+  # LoRA modules (works around unsloth#5677 LoRA-save failure). Single quotes required.
+  target_modules: 'language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)'
 
 train:
   seed: 3407
