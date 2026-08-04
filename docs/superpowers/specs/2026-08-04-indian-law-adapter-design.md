@@ -61,14 +61,16 @@ Chunking: structure-preserving, ~2,048 tokens per chunk (research-optimal for le
 | gpt-oss-120b | Cerebras free tier | Volume generation + second judge |
 | Gemma 4 31B (self) | OpenRouter `:free` | Drafting/format volume (self-distillation is license-clean — Apache 2.0, verified) |
 
-Throughput plan: batched generation (~10 examples/request), multiple providers in parallel (OpenRouter free: 50 req/day, or 1,000/day/model after a one-time $10 credit purchase — recommended, user's choice; plus Groq/Cerebras free tiers). Generation prompts randomize scenario/persona/legal-area per request for diversity, are difficulty-graded at generation time (easy/medium/hard labels — graded data is what worked in the German-law analogue), and require IRAC-structured reasoning for analysis tasks.
+Throughput plan: batched generation (~10 examples/request), multiple providers in parallel (OpenRouter free: 50 req/day, or 1,000/day/model after a one-time $10 credit purchase — recommended, user's choice; plus Groq/Cerebras free tiers).
+
+**Generation is resumable by design** (multi-day job across quota-limited providers): local state store (SQLite or JSONL — chunk ID → task type → status → output path), exponential backoff on 429/5xx, per-provider daily-budget tracking so quota is never double-spent, append-only raw output files, idempotent resume from any interruption. No external queue infrastructure — a state file is sufficient at this scale. Generation prompts randomize scenario/persona/legal-area per request for diversity, are difficulty-graded at generation time (easy/medium/hard labels — graded data is what worked in the German-law analogue), and require IRAC-structured reasoning for analysis tasks.
 
 ### 1.4 Quality gates (every synthetic example)
 
 1. **Two-judge blind scoring** — two models from different families than the generator, pointwise 1–5 rubric (grounding faithfulness to the source chunk, legal-reasoning validity, format compliance, difficulty-label accuracy), pass = both judges ≥ 4 on every criterion. Judge order/identity hidden; rule-based floor checks (length, language, structure) run before judges to save quota.
 2. **Citation verification** — every cited case/statute must exist in the grounding corpus (string + fuzzy match). Training on hallucinated citations is the field's worst documented failure (13–21% hallucinated citations in frontier models).
 3. **MinHash dedup** across the full assembled set.
-4. **Decontamination** — n-gram/embedding overlap screen against BhashaBench-Legal, MMLU/IFEval guard sets, and the held-out split.
+4. **Decontamination** — screen final training examples (not grounding chunks, which are never trained on verbatim) against BhashaBench-Legal, MMLU/IFEval guard sets, and the held-out split: 13-gram exact-match plus an embedding-similarity screen whose threshold is calibrated empirically during implementation (fixed cosine constants are embedding-model-specific). A shared statute quotation alone is not contamination — statutes are the domain being taught; the screen operates at question/answer level.
 5. **Provenance metadata per example**: source dataset or grounding-chunk ID, teacher model, license tag, difficulty, judge scores. Enables later audits and selective removal.
 
 Expected survival ~50–75%; generation targets are sized accordingly (~45–60k raw synthetic for ~30k accepted).
@@ -93,7 +95,7 @@ Expected survival ~50–75%; generation targets are sized accordingly (~45–60k
 | Checkpointing | push to private HF Hub repo every ~30 min / 500 steps; resume script | Survives session loss / credit exhaustion (Lightning force-stops at 0 credits) |
 | Packing / NEFTune | off in v1 (packing conflicts with masking + Gemma 4 FA quirks) | Second-run experiments only |
 
-**Runs:** (1) L4 smoke — ~1k-example subset, seq 2,048, verify loss curve, masking, checkpoint push/resume, ~2–3 h ≈ $1.50. (2) L40S main — 1 epoch ≈ 7–9 h ≈ $15–19.
+**Runs:** (1) L4 smoke — ~1k-example subset, seq 2,048, verify loss curve, masking, checkpoint push/resume, ~2–3 h ≈ $1.50. (2) L40S main — opens with a ~20-step probe of the 8,192 long bucket (~$0.35; the L4 cannot host 31B at 8k, so this is the first place it's testable): if peak VRAM > 44 GB, enable `unsloth_tiled_mlp` **for the long-bucket phase only** (~3% total-time cost vs ~30% if hardcoded globally). Then 1 epoch ≈ 7–9 h ≈ $15–19.
 
 ## 3. Evaluation
 
