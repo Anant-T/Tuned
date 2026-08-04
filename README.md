@@ -9,7 +9,7 @@ one LoRA per domain (Indian law first).
 
 | Path | Purpose |
 |---|---|
-| `src/tuned/` | Importable package (data, train, eval, serve). |
+| `src/tuned/` | Importable package (data, train — eval and serve arrive with the main-run plan). |
 | `configs/law_v1.yaml` | Single source of truth: model pin, LoRA, run settings. |
 | `scripts/` | Revision pinning, Studio bootstrap. |
 | `docs/superpowers/` | Design specs and implementation plans. |

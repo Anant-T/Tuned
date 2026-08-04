@@ -1,7 +1,6 @@
-"""tuned - code that runs locally and on Kaggle's free GPU.
+"""tuned - multi-adapter fine-tuning of Gemma 4 31B on Lightning.ai GPUs.
 
-The bridge is one-way: you edit here, push to GitHub, and the Kaggle
-notebook pulls. Model weights never live in this package.
+Model weights never live in this package.
 """
 
 __version__ = "0.1.1"
@@ -10,8 +9,7 @@ __version__ = "0.1.1"
 def where_am_i():
     """Report the runtime environment.
 
-    Run this in the notebook right after the bootstrap cell. If the printed
-    ``tuned_version`` matches what you just pushed, the bridge is live.
+    Run this on a fresh Studio to verify the environment.
     """
     import os
     import platform
@@ -37,7 +35,7 @@ def where_am_i():
 
     info = {
         "tuned_version": __version__,
-        "host": "kaggle" if os.path.isdir("/kaggle") else platform.node(),
+        "host": platform.node(),
         "python": sys.version.split()[0],
         "gpu": gpu,
         "package_path": os.path.dirname(__file__),
