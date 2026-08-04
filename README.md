@@ -1,62 +1,50 @@
 # tuned
 
-Local code, run on Kaggle's free GPU. GitHub is the bridge.
+Local code, trained on Lightning.ai GPUs. Multi-adapter fine-tuning of Gemma 4 31B —
+one LoRA per domain (Indian law first).
 
-```
-edit locally  ->  git push  ->  re-run Kaggle cell 1  ->  train
-```
-
-The bridge is **one-way**. Kaggle pulls from GitHub and never pushes back.
-Model weights and datasets stay out of git (see `.gitignore`) - they belong in
-`/kaggle/working`, and you retrieve them from the notebook's **Output** tab.
+    edit locally -> git push -> Studio: git pull -> train
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `src/tuned/` | Importable package. Kaggle puts `src/` on `sys.path`. |
-| `notebooks/kaggle_bootstrap.ipynb` | Import this into Kaggle once. |
+| `src/tuned/` | Importable package (data, train, eval, serve). |
+| `configs/law_v1.yaml` | Single source of truth: model pin, LoRA, run settings. |
+| `scripts/` | Revision pinning, Studio bootstrap. |
+| `docs/superpowers/` | Design specs and implementation plans. |
 
-## Local setup (once)
+## Local setup (Windows, no GPU)
 
-Matches Kaggle's interpreter exactly, so imports that work here work there.
+    uv venv && .venv\Scripts\Activate.ps1
+    uv pip install -e ".[dev]"
+    python -m pytest tests/ -q
 
-```powershell
-uv venv                      # reads .python-version -> CPython 3.12.13
-.venv\Scripts\Activate.ps1
-uv pip install -e .          # makes `import tuned` work without sys.path hacks
-```
+Training deps (`[train]`: unsloth, transformers 5.5.0) install only on a Studio.
 
-The version lives in one place: `__version__` in `src/tuned/__init__.py`.
-Hatchling reads it from there, so bumping that line is the whole release process.
+## Lightning Studio setup (once)
 
-## Kaggle setup (once)
+1. lightning.ai -> new Studio (CPU is fine for setup).
+2. Settings -> Environment variables -> add `HF_TOKEN` (a HuggingFace write token).
+3. Terminal: `curl -fsSL https://raw.githubusercontent.com/Anant-T/Tuned/main/scripts/lightning_bootstrap.sh | bash`
+4. Set `hub.checkpoint_repo` in `configs/law_v1.yaml` to `<your-hf-user>/tuned-law-v1-ckpt`, commit and push (or edit on the Studio).
 
-1. [kaggle.com/code](https://www.kaggle.com/code) -> **New Notebook**
-2. **File -> Import Notebook** -> upload `notebooks/kaggle_bootstrap.ipynb`
-3. Sidebar **Settings -> Internet: On** (needs a phone-verified account)
-4. Sidebar **Session options -> Accelerator** -> `GPU T4 x2` or `GPU P100`
-5. Run both cells. If cell 2 prints a GPU name, the bridge is live.
+## Smoke run (L4, ~$1.50)
 
-## Verifying a push reached Kaggle
+Switch the Studio to an L4 24GB, then:
 
-Bump `__version__` in `src/tuned/__init__.py`, push, then re-run cells 1 and 2.
-The printed `tuned_version` should match what you pushed.
+    python -m tuned.data.smoke                                    # ~1k examples
+    python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke
 
-## Two constraints that bite
+Success = loss trending down over 60 steps, `last-checkpoint/` visible in the HF
+checkpoint repo, and a clean resume after killing the process:
 
-**Target Python 3.12.** Kaggle runs 3.12.13 (verified). Code in `src/` that uses
-newer syntax will import locally and fail there.
+    python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --resume
 
-**Only `src/` crosses the bridge.** The Kaggle notebook is a detached copy made
-at import time - edits to `notebooks/kaggle_bootstrap.ipynb` here do *not* reach
-it. Keep the bootstrap cell thin; put real logic in `src/`, which is pulled fresh
-every run.
+## Rules that keep adapters swappable
 
-## Free-tier limits worth knowing
-
-- ~30 GPU-hours/week, reset weekly
-- Verified accelerator: `GPU T4 x2` = 2x Tesla T4, 15360 MiB each
-- 12h max per session (9h on TPU); an idle notebook is killed after 20 min
-- `/kaggle/working` persists during the session and caps at 20 GB
-- `/kaggle/temp` is scratch and is discarded when the session ends
+- The base model revision is **pinned** in `configs/law_v1.yaml`. Never train
+  against `main`. Re-pin deliberately with `python scripts/pin_revision.py`.
+- Every domain adapter uses the same base revision and the same
+  `lora.target_modules` list.
+- Secrets are env vars. `data/` and `outputs/` never enter git.
