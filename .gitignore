@@ -26,3 +26,7 @@ wandb/
 # --- Secrets ---
 kaggle.json
 .env
+
+# --- Agent scratch (worktrees, SDD ledgers) ---
+.claude/
+.superpowers/
