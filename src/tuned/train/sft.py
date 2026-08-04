@@ -1,16 +1,21 @@
-"""Unsloth QLoRA SFT entrypoint. Run on a Lightning Studio GPU, never locally.
+"""Unsloth QLoRA SFT entrypoint. Run on a Kaggle GPU (accelerator "GPU T4 x2",
+training pinned to one T4), never locally.
 
-Smoke:  python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke
-Resume: python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --resume
+Savetest: python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --max-steps 4 --save-steps 2
+Smoke:    python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke
+Resume:   python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --resume
 """
 
 import argparse
+import dataclasses
 from pathlib import Path
 
 from tuned.train.config import Config, RunCfg, load_config
 
 
-def build_sft_config(cfg: Config, run: RunCfg, output_dir: str) -> dict:
+def build_sft_config(
+    cfg: Config, run: RunCfg, output_dir: str, bf16_supported: bool = False
+) -> dict:
     kw = {
         "output_dir": output_dir,
         "max_steps": run.max_steps,
@@ -22,6 +27,10 @@ def build_sft_config(cfg: Config, run: RunCfg, output_dir: str) -> dict:
         "optim": cfg.train.optim,
         "lr_scheduler_type": cfg.train.lr_scheduler_type,
         "seed": cfg.train.seed,
+        # T4 (sm_75) has no bf16; flags are explicit so a bf16 default can
+        # never sneak in ("BFloat16 != Half" is the classic Kaggle failure).
+        "fp16": not bf16_supported,
+        "bf16": bf16_supported,
         "logging_steps": 1,
         "save_strategy": "steps",
         "save_steps": run.save_steps,
@@ -38,12 +47,44 @@ def build_sft_config(cfg: Config, run: RunCfg, output_dir: str) -> dict:
     return kw
 
 
+def apply_overrides(
+    run: RunCfg, max_steps: int | None = None, save_steps: int | None = None
+) -> RunCfg:
+    if max_steps is not None:
+        run = dataclasses.replace(run, max_steps=max_steps)
+    if save_steps is not None:
+        run = dataclasses.replace(run, save_steps=save_steps)
+    return run
+
+
+def check_gpu_capability(capability: tuple) -> None:
+    """Abort before any quota-burning work on unsupported GPUs (e.g. P100)."""
+    if tuple(capability) < (7, 0):
+        raise SystemExit(
+            f"GPU compute capability {capability[0]}.{capability[1]} is below 7.0 "
+            "(P100 is 6.0 - unsupported by current unsloth/bitsandbytes). "
+            "In Kaggle: Settings -> Accelerator -> 'GPU T4 x2'."
+        )
+
+
+def print_versions() -> None:
+    from importlib.metadata import version
+
+    for pkg in ("torch", "transformers", "trl", "unsloth", "bitsandbytes", "peft"):
+        try:
+            print(f"{pkg}=={version(pkg)}")
+        except Exception:
+            print(f"{pkg}: not installed")
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="configs/law_v1.yaml")
     p.add_argument("--mode", choices=["smoke"], default="smoke")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--no-hub", action="store_true")
+    p.add_argument("--max-steps", type=int, default=None)
+    p.add_argument("--save-steps", type=int, default=None)
     args = p.parse_args(argv)
 
     cfg = load_config(args.config)  # strict: refuses unpinned revision
@@ -58,18 +99,29 @@ def main(argv: list[str] | None = None) -> None:
     if args.resume and cfg.hub.checkpoint_repo is None:
         raise SystemExit("--resume requires hub.checkpoint_repo in the config")
 
-    run = getattr(cfg.train, args.mode)
+    run = apply_overrides(
+        getattr(cfg.train, args.mode), max_steps=args.max_steps, save_steps=args.save_steps
+    )
     output_dir = f"outputs/{args.mode}"
+
+    print_versions()
+
+    import torch
+
+    if not torch.cuda.is_available():
+        raise SystemExit("no CUDA device - in Kaggle set Accelerator to 'GPU T4 x2'")
+    check_gpu_capability(torch.cuda.get_device_capability(0))
 
     from datasets import load_dataset
     from trl import SFTConfig, SFTTrainer
-    from unsloth import FastModel
+    from unsloth import FastModel, is_bfloat16_supported
     from unsloth.chat_templates import train_on_responses_only
 
     model, tokenizer = FastModel.from_pretrained(
         model_name=cfg.model.repo,
         revision=cfg.model.revision,
         max_seq_length=run.max_seq_length,
+        dtype=torch.float16 if not is_bfloat16_supported() else None,
         load_in_4bit=True,
         full_finetuning=False,
     )
@@ -98,12 +150,15 @@ def main(argv: list[str] | None = None) -> None:
         model=model,
         processing_class=tokenizer,
         train_dataset=ds,
-        args=SFTConfig(dataset_text_field="text", **build_sft_config(cfg, run, output_dir)),
+        args=SFTConfig(
+            dataset_text_field="text",
+            **build_sft_config(cfg, run, output_dir, bf16_supported=is_bfloat16_supported()),
+        ),
     )
     trainer = train_on_responses_only(
         trainer,
-        instruction_part="<|turn>user\n",
-        response_part="<|turn>model\n",
+        instruction_part=cfg.model.instruction_part,
+        response_part=cfg.model.response_part,
     )
 
     resume = False
@@ -121,10 +176,21 @@ def main(argv: list[str] | None = None) -> None:
 
     stats = trainer.train(resume_from_checkpoint=resume)
     print(f"train_loss={stats.training_loss:.4f}")
-
-    import torch
-
     print(f"peak_vram_gb={torch.cuda.max_memory_allocated() / 1e9:.2f}")
+
+    runtime = stats.metrics.get("train_runtime")
+    if runtime:
+        tokens = (
+            run.max_steps
+            * run.per_device_train_batch_size
+            * run.gradient_accumulation_steps
+            * run.max_seq_length
+        )
+        print(
+            f"train_runtime_s={runtime:.0f} "
+            f"approx_tokens_per_sec={tokens / runtime:.0f} "
+            "(upper bound - assumes every sequence is max_seq_length)"
+        )
 
 
 if __name__ == "__main__":

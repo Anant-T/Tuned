@@ -31,3 +31,48 @@ def test_hub_kwargs_only_when_repo_set():
     assert kw["hub_strategy"] == "checkpoint"
     assert kw["push_to_hub"] is True
     assert kw["hub_private_repo"] is True
+
+
+from tuned.train.sft import apply_overrides, check_gpu_capability
+
+import pytest
+
+
+def test_precision_flags_fp16_when_no_bf16():
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o", bf16_supported=False)
+    assert kw["fp16"] is True
+    assert kw["bf16"] is False
+
+
+def test_precision_flags_bf16_when_supported():
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o", bf16_supported=True)
+    assert kw["fp16"] is False
+    assert kw["bf16"] is True
+
+
+def test_apply_overrides_replaces_steps():
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    run = apply_overrides(cfg.train.smoke, max_steps=4, save_steps=2)
+    assert run.max_steps == 4
+    assert run.save_steps == 2
+    # untouched fields survive
+    assert run.max_seq_length == cfg.train.smoke.max_seq_length
+    # original is not mutated
+    assert cfg.train.smoke.max_steps == 60
+
+
+def test_apply_overrides_none_is_noop():
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    run = apply_overrides(cfg.train.smoke)
+    assert run == cfg.train.smoke
+
+
+def test_capability_gate_rejects_p100():
+    with pytest.raises(SystemExit, match="T4 x2"):
+        check_gpu_capability((6, 0))
+
+
+def test_capability_gate_accepts_t4():
+    check_gpu_capability((7, 5))  # must not raise
