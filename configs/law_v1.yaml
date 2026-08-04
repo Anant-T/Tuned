@@ -1,6 +1,6 @@
 model:
   repo: unsloth/gemma-4-31B-it-unsloth-bnb-4bit
-  revision: null   # pinned by scripts/pin_revision.py (Task 2); training refuses null
+  revision: 8e256fc6d63003fc0ca8c91b976e6dcc38433385
 
 lora:
   r: 32

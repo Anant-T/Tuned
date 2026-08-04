@@ -25,6 +25,11 @@ def test_smoke_run_settings():
     assert cfg.train.seed == 3407
 
 
-def test_unpinned_revision_rejected():
+def test_unpinned_revision_rejected(tmp_path):
+    import re
+
+    tmp = tmp_path / "c.yaml"
+    text = CONFIG.read_text(encoding="utf-8")
+    tmp.write_text(re.sub(r"revision: \S+", "revision: null", text, count=1), encoding="utf-8")
     with pytest.raises(ValueError, match="revision"):
-        load_config(CONFIG)
+        load_config(tmp)
