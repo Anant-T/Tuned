@@ -16,7 +16,8 @@ one LoRA per domain (Indian law first).
 
 ## Local setup (Windows, no GPU)
 
-    uv venv && .venv\Scripts\Activate.ps1
+    uv venv
+    .venv\Scripts\Activate.ps1
     uv pip install -e ".[dev]"
     python -m pytest tests/ -q
 
