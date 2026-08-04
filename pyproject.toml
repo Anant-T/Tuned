@@ -3,6 +3,7 @@ name = "tuned"
 description = "Code that runs locally and on Kaggle's free GPU."
 requires-python = ">=3.12,<3.13"  # Kaggle runs 3.12.13; do not widen without checking
 dynamic = ["version"]
+dependencies = ["pyyaml>=6"]
 
 [build-system]
 requires = ["hatchling"]
@@ -14,3 +15,13 @@ path = "src/tuned/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tuned"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+train = [
+    "unsloth>=2026.8.2",
+    "transformers==5.5.0",
+    "trl",
+    "datasets",
+    "huggingface_hub",
+]

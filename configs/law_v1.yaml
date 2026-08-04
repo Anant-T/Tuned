@@ -1,0 +1,27 @@
+model:
+  repo: unsloth/gemma-4-31B-it-unsloth-bnb-4bit
+  revision: null   # pinned by scripts/pin_revision.py (Task 2); training refuses null
+
+lora:
+  r: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+train:
+  seed: 3407
+  lr: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.001
+  optim: adamw_8bit
+  lr_scheduler_type: linear
+  smoke:
+    max_seq_length: 2048
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 16
+    max_steps: 60
+    save_steps: 25
+    dataset: data/smoke_v1.jsonl
+
+hub:
+  checkpoint_repo: null   # operator sets e.g. "<hf-user>/tuned-law-v1-ckpt" before the smoke run
