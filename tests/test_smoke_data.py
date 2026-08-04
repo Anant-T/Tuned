@@ -80,3 +80,28 @@ def test_build_smoke_no_markup_in_output(tmp_path):
     assert "<|begin_of_solution|>" not in assistant_content
     assert "<|end_of_solution|>" not in assistant_content
     assert "<|" not in assistant_content
+
+
+def test_format_example_with_think_tags():
+    ex = format_example(
+        "What is 2+2?", "Two plus two makes four.", "4",
+        think_open="[THINK]", think_close="[/THINK]",
+    )
+    content = ex["messages"][1]["content"]
+    assert content == "[THINK]Two plus two makes four.[/THINK]4"
+
+
+def test_build_smoke_wraps_with_think_tags(tmp_path):
+    rows = [
+        {
+            "conversations": [
+                {"from": "user", "value": "q0"},
+                {"from": "assistant", "value": "<|begin_of_thought|>r0<|end_of_thought|>\n<|begin_of_solution|>s0<|end_of_solution|>"},
+            ]
+        },
+    ]
+    out = tmp_path / "smoke.jsonl"
+    n = build_smoke(out, n=1, rows=iter(rows), think_open="[THINK]", think_close="[/THINK]")
+    assert n == 1
+    data = json.loads(out.read_text(encoding="utf-8").strip())
+    assert data["messages"][1]["content"] == "[THINK]r0[/THINK]s0"

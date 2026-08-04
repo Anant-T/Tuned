@@ -1,19 +1,29 @@
 """Build the ~1k-example smoke dataset from OpenThoughts-114k (Apache-2.0).
 
-Smoke-run purpose is plumbing validation, so assistant content is plain
-"reasoning + solution" text; thinking-template tag fidelity is handled in the
-main data pipeline, not here.
+Assistant content is wrapped in the base model's reasoning scaffold
+(config data.think_open / data.think_close), e.g. [THINK]trace[/THINK]solution
+for Ministral-3 Reasoning, so training matches the model's native template.
 """
 
 import json
 from pathlib import Path
 
 
-def format_example(problem: str, reasoning: str, solution: str) -> dict:
+def format_example(
+    problem: str,
+    reasoning: str,
+    solution: str,
+    think_open: str = "",
+    think_close: str = "",
+) -> dict:
+    if think_open or think_close:
+        content = f"{think_open}{reasoning}{think_close}{solution}"
+    else:
+        content = f"{reasoning}\n\n{solution}"
     return {
         "messages": [
             {"role": "user", "content": problem},
-            {"role": "assistant", "content": f"{reasoning}\n\n{solution}"},
+            {"role": "assistant", "content": content},
         ]
     }
 
@@ -26,7 +36,7 @@ def _stream_openthoughts():
         yield row
 
 
-def build_smoke(out_path: str | Path, n: int = 1000, rows=None) -> int:
+def build_smoke(out_path: str | Path, n: int = 1000, rows=None, think_open: str = "", think_close: str = "") -> int:
     if rows is None:
         rows = _stream_openthoughts()
     out_path = Path(out_path)
@@ -73,7 +83,11 @@ def build_smoke(out_path: str | Path, n: int = 1000, rows=None) -> int:
             if not (problem and reasoning and solution):
                 skipped += 1
                 continue
-            f.write(json.dumps(format_example(problem, reasoning, solution)) + "\n")
+            f.write(
+                json.dumps(
+                    format_example(problem, reasoning, solution, think_open, think_close)
+                ) + "\n"
+            )
             written += 1
 
     if written < n:
@@ -83,5 +97,19 @@ def build_smoke(out_path: str | Path, n: int = 1000, rows=None) -> int:
 
 
 if __name__ == "__main__":
-    count = build_smoke("data/smoke_v1.jsonl")
-    print(f"wrote {count} examples to data/smoke_v1.jsonl")
+    import argparse
+
+    from tuned.train.config import load_config
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default="configs/law_v1.yaml")
+    p.add_argument("--out", default="data/smoke_v1.jsonl")
+    args = p.parse_args()
+
+    cfg = load_config(args.config)
+    count = build_smoke(
+        args.out,
+        think_open=cfg.data.think_open,
+        think_close=cfg.data.think_close,
+    )
+    print(f"wrote {count} examples to {args.out}")
