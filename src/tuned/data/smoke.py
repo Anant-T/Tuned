@@ -36,25 +36,37 @@ def build_smoke(out_path: str | Path, n: int = 1000, rows=None) -> int:
         for row in rows:
             if written >= n:
                 break
-            # Try new dataset field names first (conversations structure)
+
             conversations = row.get("conversations") or []
-            if conversations and len(conversations) >= 2:
-                problem = (conversations[0].get("value") or "").strip()
-                assistant_msg = (conversations[1].get("value") or "").strip()
-                # Split assistant message at the end-of-thought marker if it exists
-                if "<|end_of_thought|>" in assistant_msg:
-                    parts = assistant_msg.split("<|end_of_thought|>", 1)
-                    reasoning = parts[0].replace("<|begin_of_thought|>", "").strip()
-                    solution = parts[1].strip()
-                else:
-                    # If no markers, treat whole message as reasoning
-                    reasoning = assistant_msg
-                    solution = ""
+
+            # Find first user message and first assistant message by role
+            user_msg = None
+            assistant_msg = None
+            for turn in conversations:
+                from_role = turn.get("from") or ""
+                if from_role == "user" and user_msg is None:
+                    user_msg = (turn.get("value") or "").strip()
+                elif from_role == "assistant" and assistant_msg is None:
+                    assistant_msg = (turn.get("value") or "").strip()
+
+            # Skip if either message is missing
+            if not user_msg or not assistant_msg:
+                continue
+
+            problem = user_msg
+
+            # Split assistant message at the end-of-thought marker and strip all markup tags
+            if "<|end_of_thought|>" in assistant_msg:
+                parts = assistant_msg.split("<|end_of_thought|>", 1)
+                reasoning = parts[0].replace("<|begin_of_thought|>", "").strip()
+                solution = parts[1].strip()
             else:
-                # Fallback to old field names for test compatibility
-                problem = (row.get("problem") or "").strip()
-                reasoning = (row.get("deepseek_reasoning") or "").strip()
-                solution = (row.get("deepseek_solution") or "").strip()
+                # If no markers, treat whole message as reasoning
+                reasoning = assistant_msg
+                solution = ""
+
+            # Strip solution markers
+            solution = solution.replace("<|begin_of_solution|>", "").replace("<|end_of_solution|>", "").strip()
 
             if not (problem and reasoning and solution):
                 continue

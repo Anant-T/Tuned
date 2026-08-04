@@ -17,11 +17,11 @@ venv/
 *.onnx
 
 # --- Never commit datasets or run artifacts ---
-data/
-checkpoints/
-outputs/
-runs/
-wandb/
+/data/
+/checkpoints/
+/outputs/
+/runs/
+/wandb/
 
 # --- Secrets ---
 kaggle.json
