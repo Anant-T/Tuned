@@ -37,8 +37,11 @@ def test_markers_and_think_tags_render(name):
     assert text.index(cfg.model.instruction_part) < text.index(cfg.model.response_part)
     # the reasoning scaffold survives rendering (single-turn: last assistant
     # message - Qwen3's template only strips think blocks from earlier turns)
-    # and must not be doubled by a template that injects its own empty scaffold.
-    assert text.count(cfg.data.think_open) == 1
-    assert text.count(cfg.data.think_close) == 1
+    # and must not be doubled by a template that re-wraps assistant reasoning.
+    # Count within the response region only: Ministral's auto-injected default
+    # system prompt legitimately mentions [THINK] once in its instruction text.
+    response_region = text[text.index(cfg.model.response_part) :]
+    assert response_region.count(cfg.data.think_open) == 1
+    assert response_region.count(cfg.data.think_close) == 1
     # the trainable answer sits after the response marker
     assert text.rindex("4") > text.index(cfg.model.response_part)
