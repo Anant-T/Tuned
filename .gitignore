@@ -7,7 +7,7 @@ venv/
 .ipynb_checkpoints/
 
 # --- Never commit model weights ---
-# These come back from the Studio via the HF checkpoint hub repo, not git.
+# These come back from Kaggle via the HF checkpoint hub repo, not git.
 *.safetensors
 *.bin
 *.pt

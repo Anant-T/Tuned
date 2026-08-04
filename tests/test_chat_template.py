@@ -37,6 +37,8 @@ def test_markers_and_think_tags_render(name):
     assert text.index(cfg.model.instruction_part) < text.index(cfg.model.response_part)
     # the reasoning scaffold survives rendering (single-turn: last assistant
     # message - Qwen3's template only strips think blocks from earlier turns)
-    assert cfg.data.think_open in text
+    # and must not be doubled by a template that injects its own empty scaffold.
+    assert text.count(cfg.data.think_open) == 1
+    assert text.count(cfg.data.think_close) == 1
     # the trainable answer sits after the response marker
     assert text.rindex("4") > text.index(cfg.model.response_part)

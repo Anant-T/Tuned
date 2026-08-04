@@ -21,6 +21,7 @@ def build_sft_config(
         "max_steps": run.max_steps,
         "per_device_train_batch_size": run.per_device_train_batch_size,
         "gradient_accumulation_steps": run.gradient_accumulation_steps,
+        "max_length": run.max_seq_length,
         "learning_rate": cfg.train.lr,
         "warmup_ratio": cfg.train.warmup_ratio,
         "weight_decay": cfg.train.weight_decay,
@@ -67,6 +68,27 @@ def check_gpu_capability(capability: tuple) -> None:
         )
 
 
+def read_gpu_capability() -> tuple | None:
+    """Compute capability via nvidia-smi, before any CUDA library loads. None = undetermined."""
+    import subprocess
+
+    try:
+        probe = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    line = probe.stdout.strip().splitlines()[0].strip() if probe.returncode == 0 and probe.stdout.strip() else ""
+    if not line:
+        return None
+    try:
+        major, minor = line.split(".")
+        return (int(major), int(minor))
+    except ValueError:
+        return None
+
+
 def print_versions() -> None:
     from importlib.metadata import version
 
@@ -106,22 +128,27 @@ def main(argv: list[str] | None = None) -> None:
 
     print_versions()
 
+    cap = read_gpu_capability()
+    if cap is not None:
+        check_gpu_capability(cap)
+
+    # Unsloth MUST be imported before torch/transformers/trl so its patches apply.
+    from unsloth import FastModel, is_bfloat16_supported
+    from unsloth.chat_templates import train_on_responses_only
+
     import torch
 
     if not torch.cuda.is_available():
         raise SystemExit("no CUDA device - in Kaggle set Accelerator to 'GPU T4 x2'")
-    check_gpu_capability(torch.cuda.get_device_capability(0))
 
     from datasets import load_dataset
     from trl import SFTConfig, SFTTrainer
-    from unsloth import FastModel, is_bfloat16_supported
-    from unsloth.chat_templates import train_on_responses_only
 
     model, tokenizer = FastModel.from_pretrained(
         model_name=cfg.model.repo,
         revision=cfg.model.revision,
         max_seq_length=run.max_seq_length,
-        dtype=torch.float16 if not is_bfloat16_supported() else None,
+        dtype=torch.float16 if not is_bfloat16_supported() else torch.bfloat16,
         load_in_4bit=True,
         full_finetuning=False,
     )
@@ -135,6 +162,12 @@ def main(argv: list[str] | None = None) -> None:
         use_gradient_checkpointing="unsloth",
         random_state=cfg.train.seed,
     )
+    model.print_trainable_parameters()
+    lora_modules = sorted({n.rsplit(".", 2)[0] for n, _ in model.named_parameters() if "lora_" in n})
+    print(f"lora_target_modules_sample={lora_modules[:5]}")
+    vision_hits = [m for m in lora_modules if "vision" in m.lower()]
+    if vision_hits:
+        raise SystemExit(f"LoRA attached to vision tower modules {vision_hits[:3]} - unsloth#5677 risk; fix target_modules regex")
 
     ds = load_dataset("json", data_files=run.dataset, split="train")
     ds = ds.map(
@@ -146,15 +179,22 @@ def main(argv: list[str] | None = None) -> None:
         remove_columns=ds.column_names,
     )
 
+    import inspect
+
+    sft_kw = build_sft_config(cfg, run, output_dir, bf16_supported=is_bfloat16_supported())
+    if "max_length" not in inspect.signature(SFTConfig.__init__).parameters:
+        sft_kw["max_seq_length"] = sft_kw.pop("max_length")
+
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=ds,
         args=SFTConfig(
             dataset_text_field="text",
-            **build_sft_config(cfg, run, output_dir, bf16_supported=is_bfloat16_supported()),
+            **sft_kw,
         ),
     )
+    print(f"trainer_max_len={getattr(trainer.args, 'max_length', None) or getattr(trainer.args, 'max_seq_length', None)}")
     trainer = train_on_responses_only(
         trainer,
         instruction_part=cfg.model.instruction_part,
@@ -176,10 +216,18 @@ def main(argv: list[str] | None = None) -> None:
 
     stats = trainer.train(resume_from_checkpoint=resume)
     print(f"train_loss={stats.training_loss:.4f}")
+
+    import math
+
+    if not math.isfinite(stats.training_loss):
+        raise SystemExit(
+            f"train_loss={stats.training_loss} - fp16 divergence; first lever: set max_grad_norm: 0.3"
+        )
+
     print(f"peak_vram_gb={torch.cuda.max_memory_allocated() / 1e9:.2f}")
 
     runtime = stats.metrics.get("train_runtime")
-    if runtime:
+    if runtime and not args.resume:
         tokens = (
             run.max_steps
             * run.per_device_train_batch_size

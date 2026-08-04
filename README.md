@@ -30,7 +30,7 @@ The template-drift test self-skips locally and runs on Kaggle.
 
 1. kaggle.com account -> Settings -> verify phone number (gates GPU + internet).
 2. Create a private HF checkpoint repo and a **write** token.
-3. Set `hub.checkpoint_repo` in `configs/law_v1.yaml` to `<hf-user>/tuned-law-v1-ckpt`; commit and push.
+3. Set `hub.checkpoint_repo` in **both** `configs/law_v1.yaml` and `configs/law_v1_qwen.yaml` to `<hf-user>/tuned-law-v1-ckpt`; commit and push.
 4. Kaggle -> Create -> Notebook -> File -> Import Notebook -> upload `notebooks/kaggle_smoke.ipynb`.
 5. Notebook settings: Accelerator **GPU T4 x2** (never P100 — unsupported), Internet **On**.
 6. Add-ons -> Secrets -> add `HF_TOKEN`.
@@ -45,6 +45,7 @@ The template-drift test self-skips locally and runs on Kaggle.
 
 If SAVETEST fails on the LoRA save after one session of debugging: set
 `CONFIG = "configs/law_v1_qwen.yaml"` in the notebook and rerun from step 1.
+(requires `hub.checkpoint_repo` set in that config too).
 
 ## Rules that keep adapters swappable
 

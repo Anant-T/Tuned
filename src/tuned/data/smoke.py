@@ -103,13 +103,14 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="configs/law_v1.yaml")
-    p.add_argument("--out", default="data/smoke_v1.jsonl")
+    p.add_argument("--out", default=None)
     args = p.parse_args()
 
     cfg = load_config(args.config)
+    out = args.out or cfg.train.smoke.dataset
     count = build_smoke(
-        args.out,
+        out,
         think_open=cfg.data.think_open,
         think_close=cfg.data.think_close,
     )
-    print(f"wrote {count} examples to {args.out}")
+    print(f"wrote {count} examples to {out}")

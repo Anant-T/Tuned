@@ -18,6 +18,7 @@ def test_smoke_sft_kwargs():
     assert kw["save_steps"] == 25
     assert kw["save_strategy"] == "steps"
     assert kw["output_dir"] == "outputs/smoke"
+    assert kw["max_length"] == 2048
 
 
 def test_hub_kwargs_only_when_repo_set():
@@ -76,3 +77,10 @@ def test_capability_gate_rejects_p100():
 
 def test_capability_gate_accepts_t4():
     check_gpu_capability((7, 5))  # must not raise
+
+
+def test_read_gpu_capability_no_crash():
+    from tuned.train.sft import read_gpu_capability
+
+    cap = read_gpu_capability()
+    assert cap is None or (isinstance(cap, tuple) and len(cap) == 2)
