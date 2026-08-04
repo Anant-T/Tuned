@@ -8,13 +8,13 @@ fi
 cd "$HOME/tuned"
 git pull --ff-only
 
-pip install --quiet uv
-uv pip install --system -e ".[dev,train]"
-
 if [ -z "${HF_TOKEN:-}" ]; then
   echo "ERROR: set HF_TOKEN in the Studio environment (Settings -> Environment variables)" >&2
   exit 1
 fi
+
+pip install --quiet uv
+uv pip install --system --python "$(command -v python)" -e ".[dev,train]"
 
 python -m pytest tests/ -q
 echo "bootstrap OK - next: python -m tuned.data.smoke && python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke"

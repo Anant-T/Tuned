@@ -20,9 +20,9 @@ def resolve_revision(repo: str, api=None) -> str:
 
 def write_pin(config_path: Path, revision: str) -> None:
     text = config_path.read_text(encoding="utf-8")
-    new = re.sub(r"^(\s*revision:)\s*null.*$", rf"\1 {revision}", text, count=1, flags=re.M)
+    new = re.sub(r"^(\s*revision:)\s*\S.*$", rf"\1 {revision}", text, count=1, flags=re.M)
     if new == text:
-        raise SystemExit("no 'revision: null' line found - already pinned? Edit manually to re-pin.")
+        raise SystemExit("no revision line found")
     config_path.write_text(new, encoding="utf-8")
 
 

@@ -22,3 +22,12 @@ def test_write_pin_replaces_null(tmp_path):
     cfg.write_text("model:\n  repo: r\n  revision: null\n", encoding="utf-8")
     write_pin(cfg, "abc123def456")
     assert "revision: abc123def456" in cfg.read_text(encoding="utf-8")
+
+
+def test_write_pin_replaces_existing(tmp_path):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("model:\n  repo: r\n  revision: oldhash123\n", encoding="utf-8")
+    write_pin(cfg, "abc123def456")
+    text = cfg.read_text(encoding="utf-8")
+    assert "revision: abc123def456" in text
+    assert "oldhash123" not in text

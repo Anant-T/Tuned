@@ -5,6 +5,7 @@ Resume: python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --re
 """
 
 import argparse
+from pathlib import Path
 
 from tuned.train.config import Config, RunCfg, load_config
 
@@ -37,15 +38,27 @@ def build_sft_config(cfg: Config, run: RunCfg, output_dir: str) -> dict:
     return kw
 
 
-def main(argv=None) -> None:
+def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="configs/law_v1.yaml")
     p.add_argument("--mode", choices=["smoke"], default="smoke")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--no-hub", action="store_true")
     args = p.parse_args(argv)
 
     cfg = load_config(args.config)  # strict: refuses unpinned revision
-    run = cfg.train.smoke
+
+    # Preflight - before any GPU import or model load.
+    if cfg.hub.checkpoint_repo is None and not args.no_hub:
+        raise SystemExit(
+            "hub.checkpoint_repo is null - set it in the config (checkpoint "
+            "push/resume is the point of the smoke run), or pass --no-hub to "
+            "train without it"
+        )
+    if args.resume and cfg.hub.checkpoint_repo is None:
+        raise SystemExit("--resume requires hub.checkpoint_repo in the config")
+
+    run = getattr(cfg.train, args.mode)
     output_dir = f"outputs/{args.mode}"
 
     from datasets import load_dataset
@@ -77,7 +90,8 @@ def main(argv=None) -> None:
             "text": tokenizer.apply_chat_template(
                 ex["messages"], tokenize=False, add_generation_prompt=False
             )
-        }
+        },
+        remove_columns=ds.column_names,
     )
 
     trainer = SFTTrainer(
@@ -96,14 +110,14 @@ def main(argv=None) -> None:
     if args.resume:
         from huggingface_hub import snapshot_download
 
-        if cfg.hub.checkpoint_repo is None:
-            raise SystemExit("--resume requires hub.checkpoint_repo in the config")
         snapshot_download(
             cfg.hub.checkpoint_repo,
             allow_patterns=["last-checkpoint/*"],
             local_dir=output_dir,
         )
         resume = f"{output_dir}/last-checkpoint"
+        if not Path(resume).is_dir():
+            raise SystemExit(f"no last-checkpoint found in {cfg.hub.checkpoint_repo}")
 
     stats = trainer.train(resume_from_checkpoint=resume)
     print(f"train_loss={stats.training_loss:.4f}")

@@ -25,6 +25,11 @@ def test_smoke_run_settings():
     assert cfg.train.seed == 3407
 
 
+def test_pinned_config_loads_strictly():
+    cfg = load_config(CONFIG)
+    assert isinstance(cfg.model.revision, str) and cfg.model.revision
+
+
 def test_unpinned_revision_rejected(tmp_path):
     import re
 

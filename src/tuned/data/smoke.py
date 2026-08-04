@@ -32,6 +32,7 @@ def build_smoke(out_path: str | Path, n: int = 1000, rows=None) -> int:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
+    skipped = 0
     with out_path.open("w", encoding="utf-8") as f:
         for row in rows:
             if written >= n:
@@ -51,27 +52,33 @@ def build_smoke(out_path: str | Path, n: int = 1000, rows=None) -> int:
 
             # Skip if either message is missing
             if not user_msg or not assistant_msg:
+                skipped += 1
                 continue
 
             problem = user_msg
 
+            # Completeness guard: rows without a full thought block are skipped.
+            if "<|end_of_thought|>" not in assistant_msg:
+                skipped += 1
+                continue
+
             # Split assistant message at the end-of-thought marker and strip all markup tags
-            if "<|end_of_thought|>" in assistant_msg:
-                parts = assistant_msg.split("<|end_of_thought|>", 1)
-                reasoning = parts[0].replace("<|begin_of_thought|>", "").strip()
-                solution = parts[1].strip()
-            else:
-                # If no markers, treat whole message as reasoning
-                reasoning = assistant_msg
-                solution = ""
+            parts = assistant_msg.split("<|end_of_thought|>", 1)
+            reasoning = parts[0].replace("<|begin_of_thought|>", "").strip()
+            solution = parts[1].strip()
 
             # Strip solution markers
             solution = solution.replace("<|begin_of_solution|>", "").replace("<|end_of_solution|>", "").strip()
 
             if not (problem and reasoning and solution):
+                skipped += 1
                 continue
             f.write(json.dumps(format_example(problem, reasoning, solution)) + "\n")
             written += 1
+
+    if written < n:
+        raise RuntimeError(f"only wrote {written} of {n}")
+    print(f"wrote {written}, skipped {skipped}")
     return written
 
 

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from tuned.data.smoke import build_smoke, format_example
 
 
@@ -49,8 +51,11 @@ def test_build_smoke_skips_incomplete_rows(tmp_path):
         },
     ]
     out = tmp_path / "smoke.jsonl"
-    n = build_smoke(out, n=5, rows=iter(rows))
-    assert n == 1
+    with pytest.raises(RuntimeError, match="only wrote 1 of 5"):
+        build_smoke(out, n=5, rows=iter(rows))
+    lines = out.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["messages"][0]["content"] == "q1"
 
 
 def test_build_smoke_no_markup_in_output(tmp_path):

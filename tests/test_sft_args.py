@@ -22,9 +22,9 @@ def test_smoke_sft_kwargs():
 
 def test_hub_kwargs_only_when_repo_set():
     cfg = load_config(CONFIG, allow_unpinned=True)
+    cfg.hub.checkpoint_repo = None
     kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o")
-    if cfg.hub.checkpoint_repo is None:
-        assert "hub_model_id" not in kw
+    assert "hub_model_id" not in kw
     cfg.hub.checkpoint_repo = "user/ckpt"
     kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o")
     assert kw["hub_model_id"] == "user/ckpt"
