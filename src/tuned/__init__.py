@@ -1,4 +1,4 @@
-"""tuned - multi-adapter fine-tuning of Gemma 4 31B on Lightning.ai GPUs.
+"""tuned - multi-adapter fine-tuning of Ministral-3-14B-Reasoning on Kaggle free-tier GPUs.
 
 Model weights never live in this package.
 """
@@ -9,7 +9,7 @@ __version__ = "0.1.1"
 def where_am_i():
     """Report the runtime environment.
 
-    Run this on a fresh Studio to verify the environment.
+    Run this in a fresh Kaggle session to verify the environment.
     """
     import os
     import platform
@@ -33,8 +33,10 @@ def where_am_i():
         except Exception as exc:
             gpu = f"nvidia-smi failed: {exc}"
 
+    run_type = os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
     info = {
         "tuned_version": __version__,
+        "platform": f"kaggle ({run_type})" if run_type else "local/other",
         "host": platform.node(),
         "python": sys.version.split()[0],
         "gpu": gpu,
