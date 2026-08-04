@@ -35,4 +35,4 @@ train:
     dataset: data/smoke_v1.jsonl
 
 hub:
-  checkpoint_repo: null   # operator sets e.g. "<hf-user>/tuned-law-v1-ckpt" before the smoke run
+  checkpoint_repo: tantan01/tuned-law-v1-ckpt   # private; created 2026-08-05

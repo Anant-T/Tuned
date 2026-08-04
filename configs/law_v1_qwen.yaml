@@ -34,4 +34,4 @@ train:
     dataset: data/smoke_v1.jsonl
 
 hub:
-  checkpoint_repo: null   # operator sets before use (may reuse the same ckpt repo)
+  checkpoint_repo: tantan01/tuned-law-v1-ckpt   # same private repo as primary config
