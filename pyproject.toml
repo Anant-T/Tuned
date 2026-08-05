@@ -19,9 +19,12 @@ packages = ["src/tuned"]
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 train = [
-    "unsloth>=2026.8.2",
+    # Pinned: the resolver silently bumped unsloth 2026.8.3 -> 2026.8.4 between
+    # otherwise-identical Kaggle runs. Every training dep that can drift is fixed.
+    "unsloth==2026.8.3",
+    "unsloth_zoo==2026.8.3",
     "transformers==5.5.0",
-    "trl",
+    "trl==0.24.0",
     "datasets",
     "huggingface_hub",
     "hf_transfer",
