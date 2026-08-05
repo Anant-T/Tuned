@@ -18,3 +18,8 @@ def test_notebook_is_valid_and_complete():
     # secrets come from Kaggle, never hardcoded
     assert "UserSecretsClient" in joined
     assert "hf_" not in joined.replace("hf_cache", "").replace("hf_transfer", "").replace("HF_", "")
+    # hf_transfer must be explicitly disabled: unsloth_zoo force-enables it when
+    # the var is absent, and its no-retry fast path can stall downloads silently
+    assert 'HF_HUB_ENABLE_HF_TRANSFER"] = "0"' in joined
+    # dataset build follows the CONFIG escape hatch (think tags must match the model)
+    assert '"--config", CONFIG' in joined
