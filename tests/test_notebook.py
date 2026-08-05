@@ -21,5 +21,9 @@ def test_notebook_is_valid_and_complete():
     # hf_transfer must be explicitly disabled: unsloth_zoo force-enables it when
     # the var is absent, and its no-retry fast path can stall downloads silently
     assert 'HF_HUB_ENABLE_HF_TRANSFER"] = "0"' in joined
+    # xet must stay ENABLED: disabling it forces the legacy bridge path, which
+    # stalls from Kaggle (v6-v8 all hung on downloads with xet off; v1-v5 were fine)
+    assert "HF_HUB_DISABLE_XET" not in joined.replace("HF_HUB_DISABLE_XET: v", "")
+    assert "UNSLOTH_STABLE_DOWNLOADS" not in joined.replace("UNSLOTH_STABLE_DOWNLOADS / ", "")
     # dataset build follows the CONFIG escape hatch (think tags must match the model)
     assert '"--config", CONFIG' in joined
