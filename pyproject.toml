@@ -25,6 +25,11 @@ train = [
     "unsloth_zoo==2026.8.3",
     "transformers==5.5.0",
     "trl==0.24.0",
+    # peft: the #5677 regex mitigation rides on peft's re.fullmatch semantics;
+    # bitsandbytes: a broken bnb flips ALLOW_PREQUANTIZED_MODELS and silently
+    # drops the pinned model revision. Values = what uv.lock resolved 2026-08-04.
+    "peft==0.20.0",
+    "bitsandbytes==0.50.0",
     "datasets",
     "huggingface_hub",
     "hf_transfer",

@@ -136,6 +136,20 @@ def main(argv: list[str] | None = None) -> None:
     from unsloth import FastModel, is_bfloat16_supported
     from unsloth.chat_templates import train_on_responses_only
 
+    # unsloth 2026.8.3: if bitsandbytes' native kernels fail to load, this flag
+    # flips False and loader.py silently strips the -unsloth-bnb-4bit suffix AND
+    # drops revision= - a doomed env would re-download ~28 GB fp16 inside the
+    # watchdog. Die here in milliseconds instead.
+    from unsloth import device_type as _unsloth_device
+
+    if not getattr(_unsloth_device, "ALLOW_PREQUANTIZED_MODELS", True):
+        raise SystemExit(
+            "unsloth ALLOW_PREQUANTIZED_MODELS is False - bitsandbytes native "
+            "kernels failed to load; the pre-quantized repo and its pinned "
+            "revision would be silently swapped for a full fp16 download. "
+            "Fix the bitsandbytes install; do not train."
+        )
+
     import torch
 
     if not torch.cuda.is_available():
