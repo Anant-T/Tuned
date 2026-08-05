@@ -17,7 +17,9 @@ lora:
   dropout: 0.0
   # Regex, not a list: scoped to language_model so the vision tower never gets
   # LoRA modules (works around unsloth#5677 LoRA-save failure). Single quotes required.
-  target_modules: 'language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)'
+  # PEFT applies string patterns with re.fullmatch against full module paths, which
+  # carry a leading "model." component - hence the optional prefix group.
+  target_modules: '(?:.*\.)?language_model\..*\.(?:q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)'
 
 train:
   seed: 3407

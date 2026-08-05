@@ -6,7 +6,10 @@ from tuned.train.config import load_config
 
 CONFIG = Path(__file__).parent.parent / "configs" / "law_v1.yaml"
 
-TARGET_REGEX = r"language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+TARGET_REGEX = (
+    r"(?:.*\.)?language_model\..*\."
+    r"(?:q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+)
 
 
 def test_loads_repo_and_lora():
@@ -17,6 +20,21 @@ def test_loads_repo_and_lora():
     # Regex string scoped to the language model - keeps LoRA off the vision
     # tower (unsloth#5677 save-failure workaround).
     assert cfg.lora.target_modules == TARGET_REGEX
+
+
+def test_target_regex_fullmatches_real_module_keys():
+    import re
+
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    pat = re.compile(cfg.lora.target_modules)
+    # PEFT matches string target_modules with re.fullmatch against the full
+    # module path, which starts with "model." on this architecture (the LoRA
+    # keys quoted in unsloth#5677 prove the prefix).
+    assert pat.fullmatch("model.language_model.layers.0.self_attn.q_proj")
+    assert pat.fullmatch("model.language_model.layers.39.mlp.down_proj")
+    assert not pat.fullmatch("model.vision_tower.transformer.layers.0.feed_forward.gate_proj")
+    assert not pat.fullmatch("model.multi_modal_projector.linear_1")
+    assert not pat.fullmatch("lm_head")
 
 
 def test_masking_markers_and_think_tags():
