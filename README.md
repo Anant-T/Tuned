@@ -1,7 +1,7 @@
 # tuned
 
 Local code, trained on Kaggle free-tier GPUs ($0). Multi-adapter fine-tuning of
-Ministral-3-14B-Reasoning — one LoRA per domain (Indian law first).
+Ministral-3-14B-Reasoning — one LoRA per domain (Indian law ).
 
     edit locally -> git push -> Kaggle notebook: clone -> train
 
