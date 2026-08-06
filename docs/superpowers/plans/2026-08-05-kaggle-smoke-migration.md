@@ -20,7 +20,7 @@
 - Think tags: Ministral `[THINK]` / `[/THINK]`; Qwen `<think>` / `</think>`.
 - fp16 explicit everywhere; no config may ship with `revision: null`; seed 3407; LoRA r=32/alpha=32.
 - YAML regexes must be single-quoted (`\.` is an invalid escape in double-quoted YAML).
-- Commit after every task with the trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
+- Commit after every task.
 
 ---
 
