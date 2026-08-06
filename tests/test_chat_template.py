@@ -15,7 +15,9 @@ from tuned.train.config import load_config
 CONFIGS = Path(__file__).parent.parent / "configs"
 
 
-@pytest.mark.parametrize("name", ["law_v1.yaml", "law_v1_qwen.yaml"])
+# Only live lanes are checked (law_v1_ddp.yaml shares law_v1.yaml's model; the
+# archived Ministral config is not worth a tokenizer fetch per Kaggle session).
+@pytest.mark.parametrize("name", ["law_v1.yaml"])
 def test_markers_and_think_tags_render(name):
     transformers = pytest.importorskip("transformers")
     cfg = load_config(CONFIGS / name)

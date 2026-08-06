@@ -1,6 +1,6 @@
 [project]
 name = "tuned"
-description = "Multi-adapter fine-tuning of Ministral-3-14B-Reasoning on Kaggle free-tier GPUs."
+description = "Multi-adapter fine-tuning of Qwen3-14B on Kaggle free-tier GPUs."
 requires-python = ">=3.12"  # unsloth supports >=3.9,<3.15
 dynamic = ["version"]
 dependencies = ["pyyaml>=6"]

@@ -6,43 +6,25 @@ from tuned.train.config import load_config
 
 CONFIG = Path(__file__).parent.parent / "configs" / "law_v1.yaml"
 
-TARGET_REGEX = (
-    r"(?:.*\.)?language_model\..*\."
-    r"(?:q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
-)
+MODULE_LIST = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
 def test_loads_repo_and_lora():
     cfg = load_config(CONFIG, allow_unpinned=True)
-    assert cfg.model.repo == "unsloth/Ministral-3-14B-Reasoning-2512-unsloth-bnb-4bit"
+    assert cfg.model.repo == "unsloth/Qwen3-14B-unsloth-bnb-4bit"
     assert cfg.lora.r == 32
     assert cfg.lora.alpha == 32
-    # Regex string scoped to the language model - keeps LoRA off the vision
-    # tower (unsloth#5677 save-failure workaround).
-    assert cfg.lora.target_modules == TARGET_REGEX
-
-
-def test_target_regex_fullmatches_real_module_keys():
-    import re
-
-    cfg = load_config(CONFIG, allow_unpinned=True)
-    pat = re.compile(cfg.lora.target_modules)
-    # PEFT matches string target_modules with re.fullmatch against the full
-    # module path, which starts with "model." on this architecture (the LoRA
-    # keys quoted in unsloth#5677 prove the prefix).
-    assert pat.fullmatch("model.language_model.layers.0.self_attn.q_proj")
-    assert pat.fullmatch("model.language_model.layers.39.mlp.down_proj")
-    assert not pat.fullmatch("model.vision_tower.transformer.layers.0.feed_forward.gate_proj")
-    assert not pat.fullmatch("model.multi_modal_projector.linear_1")
-    assert not pat.fullmatch("lm_head")
+    # Qwen3 is text-only - plain module list, no vision tower to exclude
+    # (Ministral's regex scoping lives on in configs/law_v1_ministral.yaml).
+    assert cfg.lora.target_modules == MODULE_LIST
 
 
 def test_masking_markers_and_think_tags():
     cfg = load_config(CONFIG, allow_unpinned=True)
-    assert cfg.model.instruction_part == "[INST]"
-    assert cfg.model.response_part == "[/INST]"
-    assert cfg.data.think_open == "[THINK]"
-    assert cfg.data.think_close == "[/THINK]"
+    assert cfg.model.instruction_part == "<|im_start|>user\n"
+    assert cfg.model.response_part == "<|im_start|>assistant\n"
+    assert cfg.data.think_open == "<think>"
+    assert cfg.data.think_close == "</think>"
 
 
 def test_smoke_run_settings():
@@ -54,7 +36,7 @@ def test_smoke_run_settings():
 
 def test_pinned_config_loads_strictly():
     cfg = load_config(CONFIG)
-    assert cfg.model.revision == "ec1befbd41647354531b2e09bd036cd1dc94b076"
+    assert cfg.model.revision == "46105e245750aad3be7fd1d81c21cb03a0e438ed"
 
 
 def test_unpinned_revision_rejected(tmp_path):
@@ -67,13 +49,15 @@ def test_unpinned_revision_rejected(tmp_path):
         load_config(tmp)
 
 
-def test_list_target_modules_still_accepted(tmp_path):
+def test_regex_target_modules_still_accepted(tmp_path):
+    # The loader must keep accepting a regex STRING (the Ministral-style
+    # vision-tower scoping) alongside the plain list.
     tmp = tmp_path / "c.yaml"
     text = CONFIG.read_text(encoding="utf-8")
     text = text.replace(
-        f"target_modules: '{TARGET_REGEX}'",
-        "target_modules: [q_proj, v_proj]",
+        "target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]",
+        r"target_modules: '(?:.*\.)?language_model\..*\.(?:q_proj|v_proj)'",
     )
     tmp.write_text(text, encoding="utf-8")
     cfg = load_config(tmp)
-    assert cfg.lora.target_modules == ["q_proj", "v_proj"]
+    assert cfg.lora.target_modules == r"(?:.*\.)?language_model\..*\.(?:q_proj|v_proj)"

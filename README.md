@@ -1,7 +1,7 @@
 # tuned
 
 Local code, trained on Kaggle free-tier GPUs ($0). Multi-adapter fine-tuning of
-Ministral-3-14B-Reasoning — one LoRA per domain (Indian law ).
+Qwen3-14B — one LoRA per domain (Indian law).
 
     edit locally -> git push -> Kaggle notebook: clone -> train
 
@@ -10,8 +10,9 @@ Ministral-3-14B-Reasoning — one LoRA per domain (Indian law ).
 | Path | Purpose |
 |---|---|
 | `src/tuned/` | Importable package (data, train — eval and serve arrive with the main-run plan). |
-| `configs/law_v1.yaml` | Single source of truth: model pin, LoRA, markers, run settings. |
-| `configs/law_v1_qwen.yaml` | Escape hatch (Qwen3-14B) if the Ministral LoRA-save bug fires. |
+| `configs/law_v1.yaml` | Single source of truth: model pin, LoRA, markers, run settings (single-GPU lane). |
+| `configs/law_v1_ddp.yaml` | 2x T4 data-parallel lane (torchrun) — same quota cost, ~2.1x tokens/s. |
+| `configs/law_v1_ministral.yaml` | Archived: Ministral, disqualified on T4 (see `docs/ministral-t4-disqualification.md`). |
 | `notebooks/kaggle_smoke.ipynb` | The one artifact uploaded to Kaggle; clones this repo and runs the CLI. |
 | `scripts/` | Revision pinning. |
 | `docs/superpowers/` | Design specs and implementation plans. |
@@ -29,23 +30,23 @@ The template-drift test self-skips locally and runs on Kaggle.
 ## Kaggle setup (once)
 
 1. kaggle.com account -> Settings -> verify phone number (gates GPU + internet).
-2. Create a private HF checkpoint repo and a **write** token.
-3. Set `hub.checkpoint_repo` in **both** `configs/law_v1.yaml` and `configs/law_v1_qwen.yaml` to `<hf-user>/tuned-law-v1-ckpt`; commit and push.
-4. Kaggle -> Create -> Notebook -> File -> Import Notebook -> upload `notebooks/kaggle_smoke.ipynb`.
-5. Notebook settings: Accelerator **GPU T4 x2** (never P100 — unsupported), Internet **On**.
-6. Add-ons -> Secrets -> add `HF_TOKEN`.
+2. Create an HF account with a **write** token (the notebook derives the private
+   checkpoint repo from your token's account automatically — no config edit needed).
+3. Kaggle -> Create -> Notebook -> File -> Import Notebook -> upload `notebooks/kaggle_smoke.ipynb`.
+4. Notebook settings: Accelerator **GPU T4 x2** (never P100 — unsupported), Internet **On**.
+5. Add-ons -> Secrets -> add `HF_TOKEN`.
 
 ## Smoke run (free, ~5-7 GPU-h of the 30 h/week quota)
 
 1. `MODE = "SAVETEST"` -> Run All interactively (~15 min). Green = checkpoint in the
-   HF repo, no LoRA-save error. This gate exists because of unsloth#5677.
-2. `MODE = "SMOKE"` -> **Save & Run All** (background, 4-6 h; immune to the
+   HF repo printed by the re-home cell, `grad_norm` finite by step 3.
+2. `MODE = "SMOKE"` -> **Save & Run All** (background, ~3.5 h single-GPU; immune to the
    20-min idle timeout). Green = loss down, no NaN, peak VRAM < 14 GB.
 3. Fresh session, `MODE = "RESUME"` -> verifies checkpoint resume from the Hub.
 
-If SAVETEST fails on the LoRA save after one session of debugging: set
-`CONFIG = "configs/law_v1_qwen.yaml"` in the notebook and rerun from step 1.
-(requires `hub.checkpoint_repo` set in that config too).
+`DDP = True` switches to the 2x T4 lane (`configs/law_v1_ddp.yaml`, own checkpoint
+repo, ~2.1x tokens/s at the same quota cost — a T4x2 session bills 1x wall-clock
+regardless of GPUs used). Resume in the same lane that saved.
 
 ## Rules that keep adapters swappable
 
@@ -56,3 +57,5 @@ If SAVETEST fails on the LoRA save after one session of debugging: set
 - fp16 only on T4 (no bf16) — precision flags are explicit in code, never "auto".
 - Save adapters only; never merge to 16-bit on Kaggle (blows the 20 GB disk).
 - Secrets are env vars / Kaggle Secrets. `data/` and `outputs/` never enter git.
+- One checkpoint repo per lane and per base model — sharing one means silent
+  last-push-wins clobbering and cross-loading on `--resume`.

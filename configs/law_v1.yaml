@@ -1,25 +1,25 @@
+# Primary config. Qwen3-14B replaced Ministral-3-14B-Reasoning on 2026-08-06:
+# Ministral OOMs on T4 at any sequence length (seq-invariant 1.25 GiB fp16
+# lm_head copy in unsloth's eager fused-CE fallback + untied embeddings) -
+# see docs/ministral-t4-disqualification.md. Ministral's config is archived
+# as configs/law_v1_ministral.yaml.
 model:
-  repo: unsloth/Ministral-3-14B-Reasoning-2512-unsloth-bnb-4bit
-  revision: ec1befbd41647354531b2e09bd036cd1dc94b076
-  # Completion-masking markers, verified against this revision's chat_template.jinja:
-  # user turns render as [INST]...[/INST], the assistant reply follows [/INST].
-  instruction_part: '[INST]'
-  response_part: '[/INST]'
+  repo: unsloth/Qwen3-14B-unsloth-bnb-4bit
+  revision: 46105e245750aad3be7fd1d81c21cb03a0e438ed
+  # Qwen3 ChatML markers (unsloth's documented train_on_responses_only pair).
+  instruction_part: "<|im_start|>user\n"
+  response_part: "<|im_start|>assistant\n"
 
 data:
-  # Ministral Reasoning's native scaffold; the smoke builder wraps traces in these.
-  think_open: '[THINK]'
-  think_close: '[/THINK]'
+  think_open: '<think>'
+  think_close: '</think>'
 
 lora:
   r: 32
   alpha: 32
   dropout: 0.0
-  # Regex, not a list: scoped to language_model so the vision tower never gets
-  # LoRA modules (works around unsloth#5677 LoRA-save failure). Single quotes required.
-  # PEFT applies string patterns with re.fullmatch against full module paths, which
-  # carry a leading "model." component - hence the optional prefix group.
-  target_modules: '(?:.*\.)?language_model\..*\.(?:q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)'
+  # Text-only model - no vision tower, plain module list is safe.
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 train:
   seed: 3407
@@ -37,4 +37,7 @@ train:
     dataset: data/smoke_v1.jsonl
 
 hub:
-  checkpoint_repo: tantan01/tuned-law-v1-ckpt   # private; created 2026-08-05
+  # Private; auto-created on first push (hub_private_repo). Single-GPU lane -
+  # the DDP lane pushes elsewhere (see law_v1_ddp.yaml). Never share one ckpt
+  # repo across base models or lanes: --resume would cross-load.
+  checkpoint_repo: tantan01/tuned-law-v1-qwen-ckpt
