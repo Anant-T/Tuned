@@ -1,13 +1,16 @@
-"""Unsloth QLoRA SFT entrypoint. Run on a Kaggle GPU (accelerator "GPU T4 x2",
-training pinned to one T4), never locally.
+"""Unsloth QLoRA SFT entrypoint. Run on a Kaggle GPU (accelerator "GPU T4 x2"),
+never locally. Single-GPU by default; the DDP lane uses both T4s via torchrun
+(unsloth auto-assigns one rank per GPU when no device_map is passed).
 
 Savetest: python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --max-steps 4 --save-steps 2
 Smoke:    python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke
 Resume:   python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --resume
+DDP:      CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 -m tuned.train.sft --config configs/law_v1_ddp.yaml --mode smoke
 """
 
 import argparse
 import dataclasses
+import os
 from pathlib import Path
 
 from tuned.train.config import Config, RunCfg, load_config
@@ -33,6 +36,11 @@ def build_sft_config(
         "fp16": not bf16_supported,
         "bf16": bf16_supported,
         "logging_steps": 1,
+        # No-op single-GPU; under DDP the trainer otherwise defaults this to
+        # True and burns an extra autograd-graph traversal every step (torch
+        # warned about it on the qualified 2026-08-06 SAVETEST). Every LoRA
+        # param gets a grad each step, so False is safe.
+        "ddp_find_unused_parameters": False,
         "save_strategy": "steps",
         "save_steps": run.save_steps,
         "save_total_limit": 2,
@@ -65,6 +73,20 @@ def check_gpu_capability(capability: tuple) -> None:
             f"GPU compute capability {capability[0]}.{capability[1]} is below 7.0 "
             "(P100 is 6.0 - unsupported by current unsloth/bitsandbytes). "
             "In Kaggle: Settings -> Accelerator -> 'GPU T4 x2'."
+        )
+
+
+def check_ddp_visibility(world_size: int, visible_gpus: int) -> None:
+    """Under torchrun, every rank must see every GPU (rank N places itself on
+    cuda:N). A leaked single-GPU CUDA_VISIBLE_DEVICES mask makes rank 1 die
+    minutes later inside the model load with "invalid device ordinal" - die
+    here in milliseconds instead."""
+    if world_size > 1 and visible_gpus < world_size:
+        raise SystemExit(
+            f"WORLD_SIZE={world_size} but only {visible_gpus} CUDA device(s) "
+            "visible - a CUDA_VISIBLE_DEVICES mask (e.g. the notebook's "
+            "single-GPU default) leaked into the torchrun launch. Prefix the "
+            "command with CUDA_VISIBLE_DEVICES=0,1."
         )
 
 
@@ -154,6 +176,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("no CUDA device - in Kaggle set Accelerator to 'GPU T4 x2'")
+    check_ddp_visibility(int(os.environ.get("WORLD_SIZE", "1")), torch.cuda.device_count())
 
     from datasets import load_dataset
     from trl import SFTConfig, SFTTrainer

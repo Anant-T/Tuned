@@ -1,0 +1,49 @@
+# DDP lane: 2x T4 data-parallel via torchrun. Kaggle bills T4x2 sessions at 1x
+# wall-clock quota regardless of GPUs used, so the second GPU is free. Launch:
+#
+#   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 -m tuned.train.sft \
+#       --config configs/law_v1_ddp.yaml --mode smoke
+#
+# The CUDA_VISIBLE_DEVICES override is mandatory: the notebook's single-GPU
+# default mask otherwise leaks into the ranks, every rank sees one GPU, and
+# rank 1 dies with "CUDA error: invalid device ordinal" (sft.py now fails fast
+# on this). ga=8, not 16: with 2 ranks the effective batch is 1x8x2 = 16 -
+# identical optimization to the single-GPU plan at ~2x the throughput.
+# Qualified by the 2026-08-06 DDP SAVETEST: 2.14x tokens/s vs single-GPU,
+# peak 13.6/13.45 GiB per rank of 14.56, grad_norm finite from step 3
+# (fp16 GradScaler calibrates over the first 2 steps under DDP - benign).
+model:
+  repo: unsloth/Qwen3-14B-unsloth-bnb-4bit
+  revision: 46105e245750aad3be7fd1d81c21cb03a0e438ed
+  instruction_part: "<|im_start|>user\n"
+  response_part: "<|im_start|>assistant\n"
+
+data:
+  think_open: '<think>'
+  think_close: '</think>'
+
+lora:
+  r: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+train:
+  seed: 3407
+  lr: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.001
+  optim: adamw_8bit
+  lr_scheduler_type: linear
+  smoke:
+    max_seq_length: 2048
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 8   # x2 ranks = effective batch 16
+    max_steps: 60
+    save_steps: 25
+    dataset: data/smoke_v1.jsonl
+
+hub:
+  # Private. Already holds the 2026-08-06 DDP SAVETEST history; a SMOKE run
+  # overwrites last-checkpoint - do not run RESUME before SMOKE in this lane.
+  checkpoint_repo: tantan01/tuned-law-v1-qwen-ckpt-ddp
