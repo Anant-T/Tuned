@@ -6,6 +6,8 @@ Savetest: python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --
 Smoke:    python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke
 Resume:   python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --resume
 DDP:      CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 -m tuned.train.sft --config configs/law_v1_ddp.yaml --mode smoke
+MP:       CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft --config configs/law_v1_mp.yaml --mode smoke
+MP probe: CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft --config configs/law_v1_mp.yaml --mode smoke --max-steps 2 --no-hub --dataset data/probe_6k.jsonl
 """
 
 import argparse
@@ -13,7 +15,7 @@ import dataclasses
 import os
 from pathlib import Path
 
-from tuned.train.config import Config, RunCfg, load_config
+from tuned.train.config import Config, HubCfg, RunCfg, load_config
 
 
 def build_sft_config(
@@ -57,12 +59,17 @@ def build_sft_config(
 
 
 def apply_overrides(
-    run: RunCfg, max_steps: int | None = None, save_steps: int | None = None
+    run: RunCfg,
+    max_steps: int | None = None,
+    save_steps: int | None = None,
+    dataset: str | None = None,
 ) -> RunCfg:
     if max_steps is not None:
         run = dataclasses.replace(run, max_steps=max_steps)
     if save_steps is not None:
         run = dataclasses.replace(run, save_steps=save_steps)
+    if dataset is not None:
+        run = dataclasses.replace(run, dataset=dataset)
     return run
 
 
@@ -87,6 +94,41 @@ def check_ddp_visibility(world_size: int, visible_gpus: int) -> None:
             "visible - a CUDA_VISIBLE_DEVICES mask (e.g. the notebook's "
             "single-GPU default) leaked into the torchrun launch. Prefix the "
             "command with CUDA_VISIBLE_DEVICES=0,1."
+        )
+
+
+def check_mp_torchrun_conflict(device_map: str | None, world_size: int) -> None:
+    """Model-parallel (device_map) and torchrun DDP are mutually exclusive:
+    each rank would try to split the model across all GPUs while DDP also
+    replicates it per rank. Die before the model load."""
+    if device_map is not None and world_size > 1:
+        raise SystemExit(
+            f"model.device_map={device_map!r} under torchrun (WORLD_SIZE="
+            f"{world_size}) - the MP lane launches with plain python, not "
+            "torchrun. Use the DDP config for torchrun launches."
+        )
+
+
+def check_mp_gpu_count(device_map: str | None, visible_gpus: int) -> None:
+    """A leaked single-GPU CUDA_VISIBLE_DEVICES mask would make device_map
+    cram the full model onto one T4 and OOM mid-load. Die in milliseconds."""
+    if device_map is not None and visible_gpus < 2:
+        raise SystemExit(
+            f"model.device_map={device_map!r} but only {visible_gpus} CUDA "
+            "device(s) visible - the MP lane needs both T4s. Prefix the "
+            "launch with CUDA_VISIBLE_DEVICES=0,1."
+        )
+
+
+def check_model_split(param_devices: list[str]) -> None:
+    """After load with a device_map, parameters must actually live on >= 2
+    CUDA devices - a silently ignored device_map looks green until OOM."""
+    cuda_devices = {d for d in param_devices if d.startswith("cuda")}
+    if len(cuda_devices) < 2:
+        raise SystemExit(
+            f"device_map was set but parameters sit on {sorted(param_devices)} "
+            "- the split did not happen (unsloth ignored device_map, or a GPU "
+            "mask leaked). Do not trust this run's memory numbers."
         )
 
 
@@ -129,9 +171,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--no-hub", action="store_true")
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--save-steps", type=int, default=None)
+    p.add_argument("--dataset", default=None, help="override run dataset path (PROBE runs)")
     args = p.parse_args(argv)
 
     cfg = load_config(args.config)  # strict: refuses unpinned revision
+    if args.no_hub:
+        # Actually strip the repo, not just skip the preflight: a PROBE run
+        # must never push to (or depend on) the lane's checkpoint repo.
+        cfg = dataclasses.replace(cfg, hub=HubCfg(checkpoint_repo=None))
 
     # Preflight - before any GPU import or model load.
     if cfg.hub.checkpoint_repo is None and not args.no_hub:
@@ -144,8 +191,12 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--resume requires hub.checkpoint_repo in the config")
 
     run = apply_overrides(
-        getattr(cfg.train, args.mode), max_steps=args.max_steps, save_steps=args.save_steps
+        getattr(cfg.train, args.mode),
+        max_steps=args.max_steps,
+        save_steps=args.save_steps,
+        dataset=args.dataset,
     )
+    check_mp_torchrun_conflict(cfg.model.device_map, int(os.environ.get("WORLD_SIZE", "1")))
     output_dir = f"outputs/{args.mode}"
 
     print_versions()
@@ -177,10 +228,14 @@ def main(argv: list[str] | None = None) -> None:
     if not torch.cuda.is_available():
         raise SystemExit("no CUDA device - in Kaggle set Accelerator to 'GPU T4 x2'")
     check_ddp_visibility(int(os.environ.get("WORLD_SIZE", "1")), torch.cuda.device_count())
+    check_mp_gpu_count(cfg.model.device_map, torch.cuda.device_count())
 
     from datasets import load_dataset
     from trl import SFTConfig, SFTTrainer
 
+    load_kw = {}
+    if cfg.model.device_map is not None:
+        load_kw["device_map"] = cfg.model.device_map
     model, tokenizer = FastModel.from_pretrained(
         model_name=cfg.model.repo,
         revision=cfg.model.revision,
@@ -188,6 +243,7 @@ def main(argv: list[str] | None = None) -> None:
         dtype=torch.float16 if not is_bfloat16_supported() else torch.bfloat16,
         load_in_4bit=True,
         full_finetuning=False,
+        **load_kw,
     )
     model = FastModel.get_peft_model(
         model,
@@ -205,6 +261,11 @@ def main(argv: list[str] | None = None) -> None:
     vision_hits = [m for m in lora_modules if "vision" in m.lower()]
     if vision_hits:
         raise SystemExit(f"LoRA attached to vision tower modules {vision_hits[:3]} - unsloth#5677 risk; fix target_modules regex")
+
+    if cfg.model.device_map is not None:
+        param_devices = sorted({str(p.device) for p in model.parameters()})
+        print(f"param_devices={param_devices}")
+        check_model_split(param_devices)
 
     ds = load_dataset("json", data_files=run.dataset, split="train")
     ds = ds.map(
@@ -261,7 +322,12 @@ def main(argv: list[str] | None = None) -> None:
             f"train_loss={stats.training_loss} - fp16 divergence; first lever: set max_grad_norm: 0.3"
         )
 
-    print(f"peak_vram_gb={torch.cuda.max_memory_allocated() / 1e9:.2f}")
+    peaks = [
+        torch.cuda.max_memory_allocated(i) / 1e9 for i in range(torch.cuda.device_count())
+    ]
+    print(f"peak_vram_gb={max(peaks):.2f}")
+    for i, gb in enumerate(peaks):
+        print(f"peak_vram_gb_dev{i}={gb:.2f}")
 
     runtime = stats.metrics.get("train_runtime")
     if runtime and not args.resume:

@@ -12,12 +12,24 @@ def test_notebook_is_valid_and_complete():
     # the operator's switches exist and default to the cheap single-GPU gate
     assert 'MODE = "SAVETEST"' in joined
     assert "DDP = False" in joined
+    assert "MP = False" in joined
+    # the two multi-GPU lanes are mutually exclusive - torchrun replicating a
+    # device_map-split model would be neither DDP nor MP
+    assert "DDP and MP" in joined
     # GPU mask and config follow the lane together: DDP needs every rank to see
     # both GPUs (a leaked single-GPU mask killed rank 1 with "invalid device
-    # ordinal" on 2026-08-06), and the DDP config halves grad accumulation
-    assert '"0,1" if DDP else "0"' in joined
-    assert '"configs/law_v1_ddp.yaml" if DDP else "configs/law_v1.yaml"' in joined
-    assert '["torchrun", "--nproc_per_node=2"]' in joined
+    # ordinal" on 2026-08-06), MP splits layers across both, and each lane has
+    # its own config (grad accumulation, seq length, device_map, ckpt repo)
+    assert '"0,1" if (DDP or MP) else "0"' in joined
+    assert '"configs/law_v1_mp.yaml" if MP' in joined
+    assert '"configs/law_v1_ddp.yaml" if DDP' in joined
+    assert '"configs/law_v1.yaml"' in joined
+    # MP must NOT go through torchrun - only DDP selects it
+    assert '["torchrun", "--nproc_per_node=2"] if DDP else' in joined
+    # the MP lane's gate: PROBE runs no-hub on the long probe dataset (short
+    # unpacked examples would make the seq-6144 VRAM probe a false green)
+    assert '"PROBE": ["--max-steps", "2", "--no-hub", "--dataset", "data/probe_6k.jsonl"]' in joined
+    assert "tuned.data.probe" in joined
     # allocator headroom - DDP peaks ~1 GiB from the 14.56 GiB cap
     assert 'PYTORCH_ALLOC_CONF"] = "expandable_segments:True"' in joined
     # scratch cache - never /kaggle/working

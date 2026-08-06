@@ -1,0 +1,55 @@
+# MP lane: model-parallel across 2x T4 via device_map=balanced (unsloth's
+# documented multi-GPU split; plain python launch, NEVER torchrun). Kaggle
+# bills T4x2 at 1x wall-clock, so the split costs no extra quota - it trades
+# DDP's 2.14x throughput for seq 6144 (weights ~5.2 GiB/GPU instead of 10.36
+# on one; DDP caps at 2048 with 13.6 GiB/rank). Launch:
+#
+#   CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft \
+#       --config configs/law_v1_mp.yaml --mode smoke
+#
+# Gate order: PROBE first (2 steps, --no-hub, data/probe_6k.jsonl - built by
+# tuned.data.probe so batches really reach 6144 tokens), then SAVETEST, then
+# SMOKE/RESUME only when the long-tail phase is planned. PROBE green: params
+# on both GPUs (sft.py verifies), finite loss, worst-GPU peak <= ~13.5 GiB
+# (expected ~11.5). Contingencies: imbalance -> explicit max_memory skew
+# keeping the LAST GPU light (it carries lm_head + CE spike + logits; this is
+# the mirror of balanced_low_0, which would make things worse); OOM -> retry
+# max_seq_length 4096. ga=5: 6144 x 5 = 30,720 tokens/step, matching the
+# ~32,768 tokens/step of the 2048 lanes. See
+# docs/superpowers/specs/2026-08-07-mp-lane-6144-design.md.
+model:
+  repo: unsloth/Qwen3-14B-unsloth-bnb-4bit
+  revision: 46105e245750aad3be7fd1d81c21cb03a0e438ed
+  instruction_part: "<|im_start|>user\n"
+  response_part: "<|im_start|>assistant\n"
+  device_map: balanced
+
+data:
+  think_open: '<think>'
+  think_close: '</think>'
+
+lora:
+  r: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+train:
+  seed: 3407
+  lr: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.001
+  optim: adamw_8bit
+  lr_scheduler_type: linear
+  smoke:
+    max_seq_length: 6144
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 5   # 6144 x 5 ~= the 2048 lanes' tokens/step
+    max_steps: 60
+    save_steps: 25
+    dataset: data/smoke_v1.jsonl
+
+hub:
+  # Private; own repo per lane per base model - sharing one means silent
+  # last-push-wins clobbering and cross-loading on --resume.
+  checkpoint_repo: tantan01/tuned-law-v1-qwen-ckpt-mp

@@ -12,6 +12,9 @@ class ModelCfg:
     revision: str | None
     instruction_part: str
     response_part: str
+    # "balanced" = split layers across all visible GPUs (MP lane). None = the
+    # single-GPU / DDP behavior every qualified lane runs with.
+    device_map: str | None = None
 
 
 @dataclass
