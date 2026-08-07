@@ -9,9 +9,14 @@
 #
 # Gate order: PROBE first (2 steps, --no-hub, data/probe_6k.jsonl - built by
 # tuned.data.probe so batches really reach 6144 tokens), then SAVETEST, then
-# SMOKE/RESUME only when the long-tail phase is planned. PROBE green: params
-# on both GPUs (sft.py verifies), finite loss, worst-GPU peak <= ~13.5 GiB
-# (expected ~11.5). Contingencies: imbalance -> explicit max_memory skew
+# SMOKE/RESUME only when the long-tail phase is planned.
+# PROBE GREEN 2026-08-07: param_devices both GPUs, loss finite (0.637,
+# grad_norm finite by step 2), peaks 5.98 / 12.56 GiB (dev1 = lm_head side;
+# ~2.0 GiB margin), 179.6 s/step at ga=5 (~162 tok/s upper bound). The ~6.6
+# GiB dev0 slack suggests a max_memory skew could reach seq ~8k if ever
+# needed. Before real training here: replace warmup_ratio (deprecated in
+# transformers 5.5, lr logged 0 in the probe) with warmup_steps.
+# Contingencies: imbalance -> explicit max_memory skew
 # keeping the LAST GPU light (it carries lm_head + CE spike + logits; this is
 # the mirror of balanced_low_0, which would make things worse); OOM -> retry
 # max_seq_length 4096. ga=5: 6144 x 5 = 30,720 tokens/step, matching the
