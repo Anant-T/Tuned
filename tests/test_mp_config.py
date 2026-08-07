@@ -12,6 +12,8 @@ import pytest
 from tuned.train.config import load_config
 from tuned.train.sft import (
     apply_overrides,
+    build_sft_config,
+    check_max_memory_requires_device_map,
     check_model_split,
     check_mp_gpu_count,
     check_mp_torchrun_conflict,
@@ -23,7 +25,9 @@ CONFIGS = Path(__file__).parent.parent / "configs"
 def test_mp_matches_primary_except_seq_ga_devicemap_repo():
     primary = load_config(CONFIGS / "law_v1.yaml")
     mp = load_config(CONFIGS / "law_v1_mp.yaml")
-    assert mp.model == dataclasses.replace(primary.model, device_map="balanced")
+    assert mp.model == dataclasses.replace(
+        primary.model, device_map="balanced", max_memory={0: "13GiB", 1: "5GiB"}
+    )
     assert mp.data == primary.data
     assert mp.lora == primary.lora  # swappability: same target-module scoping
     assert mp.train.smoke.max_seq_length == 6144
@@ -80,7 +84,33 @@ def test_split_check_passes_two_gpus():
     check_model_split(["cuda:0", "cuda:1"])
 
 
-def test_dataset_override():
+def test_max_memory_skew_keeps_last_gpu_light():
+    mm = load_config(CONFIGS / "law_v1_mp.yaml").model.max_memory
+    # dev1 carries lm_head + CE spike + logits at runtime; its WEIGHT budget
+    # must stay the small one. A flipped skew would recreate the unskewed
+    # ~14.0 GiB projection at seq 8192.
+    assert int(mm[1].replace("GiB", "")) < int(mm[0].replace("GiB", ""))
+
+
+def test_max_memory_guard_requires_device_map():
+    with pytest.raises(SystemExit, match="device_map"):
+        check_max_memory_requires_device_map(None, {0: "13GiB", 1: "5GiB"})
+    check_max_memory_requires_device_map("balanced", {0: "13GiB", 1: "5GiB"})
+    check_max_memory_requires_device_map(None, None)
+
+
+def test_dataset_and_seq_overrides():
     run = load_config(CONFIGS / "law_v1_mp.yaml").train.smoke
     assert apply_overrides(run).dataset == run.dataset
-    assert apply_overrides(run, dataset="data/probe_6k.jsonl").dataset == "data/probe_6k.jsonl"
+    assert apply_overrides(run, dataset="data/probe_long.jsonl").dataset == "data/probe_long.jsonl"
+    assert apply_overrides(run).max_seq_length == 6144
+    assert apply_overrides(run, max_seq_length=8192).max_seq_length == 8192
+
+
+def test_warmup_converted_to_steps():
+    # warmup_ratio is deprecated in transformers 5.5 (lr logged 0 in the
+    # 2026-08-07 probe); build_sft_config converts it.
+    cfg = load_config(CONFIGS / "law_v1_mp.yaml")
+    kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o")
+    assert "warmup_ratio" not in kw
+    assert kw["warmup_steps"] == 2  # round(0.03 * 60)

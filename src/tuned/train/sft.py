@@ -7,7 +7,7 @@ Smoke:    python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke
 Resume:   python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --resume
 DDP:      CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 -m tuned.train.sft --config configs/law_v1_ddp.yaml --mode smoke
 MP:       CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft --config configs/law_v1_mp.yaml --mode smoke
-MP probe: CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft --config configs/law_v1_mp.yaml --mode smoke --max-steps 2 --no-hub --dataset data/probe_6k.jsonl
+MP probe: CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft --config configs/law_v1_mp.yaml --mode smoke --max-steps 2 --no-hub --dataset data/probe_long.jsonl --max-seq-length 8192
 """
 
 import argparse
@@ -28,7 +28,10 @@ def build_sft_config(
         "gradient_accumulation_steps": run.gradient_accumulation_steps,
         "max_length": run.max_seq_length,
         "learning_rate": cfg.train.lr,
-        "warmup_ratio": cfg.train.warmup_ratio,
+        # warmup_ratio is deprecated in transformers 5.5 (it logged lr=0 in the
+        # 2026-08-07 MP probe); the ratio stays the config's semantic knob and
+        # is converted to steps here.
+        "warmup_steps": max(0, round(cfg.train.warmup_ratio * run.max_steps)),
         "weight_decay": cfg.train.weight_decay,
         "optim": cfg.train.optim,
         "lr_scheduler_type": cfg.train.lr_scheduler_type,
@@ -63,6 +66,7 @@ def apply_overrides(
     max_steps: int | None = None,
     save_steps: int | None = None,
     dataset: str | None = None,
+    max_seq_length: int | None = None,
 ) -> RunCfg:
     if max_steps is not None:
         run = dataclasses.replace(run, max_steps=max_steps)
@@ -70,6 +74,8 @@ def apply_overrides(
         run = dataclasses.replace(run, save_steps=save_steps)
     if dataset is not None:
         run = dataclasses.replace(run, dataset=dataset)
+    if max_seq_length is not None:
+        run = dataclasses.replace(run, max_seq_length=max_seq_length)
     return run
 
 
@@ -117,6 +123,17 @@ def check_mp_gpu_count(device_map: str | None, visible_gpus: int) -> None:
             f"model.device_map={device_map!r} but only {visible_gpus} CUDA "
             "device(s) visible - the MP lane needs both T4s. Prefix the "
             "launch with CUDA_VISIBLE_DEVICES=0,1."
+        )
+
+
+def check_max_memory_requires_device_map(device_map: str | None, max_memory: dict | None) -> None:
+    """max_memory only shapes a device_map split; alone it silently does
+    nothing - refuse the misconfiguration instead."""
+    if max_memory is not None and device_map is None:
+        raise SystemExit(
+            "model.max_memory is set but model.device_map is null - max_memory "
+            "only applies to a device_map split. Set device_map: balanced or "
+            "remove max_memory."
         )
 
 
@@ -172,6 +189,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--save-steps", type=int, default=None)
     p.add_argument("--dataset", default=None, help="override run dataset path (PROBE runs)")
+    p.add_argument("--max-seq-length", type=int, default=None, help="override run seq length (PROBE runs)")
     args = p.parse_args(argv)
 
     cfg = load_config(args.config)  # strict: refuses unpinned revision
@@ -195,8 +213,10 @@ def main(argv: list[str] | None = None) -> None:
         max_steps=args.max_steps,
         save_steps=args.save_steps,
         dataset=args.dataset,
+        max_seq_length=args.max_seq_length,
     )
     check_mp_torchrun_conflict(cfg.model.device_map, int(os.environ.get("WORLD_SIZE", "1")))
+    check_max_memory_requires_device_map(cfg.model.device_map, cfg.model.max_memory)
     output_dir = f"outputs/{args.mode}"
 
     print_versions()
@@ -236,6 +256,8 @@ def main(argv: list[str] | None = None) -> None:
     load_kw = {}
     if cfg.model.device_map is not None:
         load_kw["device_map"] = cfg.model.device_map
+        if cfg.model.max_memory is not None:
+            load_kw["max_memory"] = cfg.model.max_memory
     model, tokenizer = FastModel.from_pretrained(
         model_name=cfg.model.repo,
         revision=cfg.model.revision,

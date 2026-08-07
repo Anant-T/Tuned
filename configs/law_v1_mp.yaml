@@ -1,15 +1,23 @@
-# MP lane: model-parallel across 2x T4 via device_map=balanced (unsloth's
-# documented multi-GPU split; plain python launch, NEVER torchrun). Kaggle
-# bills T4x2 at 1x wall-clock, so the split costs no extra quota - it trades
-# DDP's 2.14x throughput for seq 6144 (weights ~5.2 GiB/GPU instead of 10.36
-# on one; DDP caps at 2048 with 13.6 GiB/rank). Launch:
+# MP lane - PRIMARY as of 2026-08-07 (operator decision; DDP lane remains
+# available for throughput work). Model-parallel across 2x T4 via
+# device_map=balanced (unsloth's documented multi-GPU split; plain python
+# launch, NEVER torchrun). Kaggle bills T4x2 at 1x wall-clock, so the split
+# costs no extra quota - it trades DDP's 2.14x throughput (~half the tokens
+# per quota-week; the charter's dataset budget shrinks accordingly) for 3-4x
+# sequence length. max_memory keeps the LAST GPU light: it carries lm_head +
+# the 1.45 GiB CE spike + logits (~0.58 GiB per 1k tokens), none of which
+# max_memory accounts for - unskewed, 8192 projects ~14.0 GiB on dev1 vs the
+# 14.56 cap. The 8k+ probe qualifies the skewed layout before any seq bump
+# here. Launch:
 #
 #   CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft \
 #       --config configs/law_v1_mp.yaml --mode smoke
 #
-# Gate order: PROBE first (2 steps, --no-hub, data/probe_6k.jsonl - built by
-# tuned.data.probe so batches really reach 6144 tokens), then SAVETEST, then
-# SMOKE/RESUME only when the long-tail phase is planned.
+# Gate order: PROBE first (2 steps, --no-hub, data/probe_long.jsonl - built
+# by tuned.data.probe so batches really reach the probed length), then
+# SAVETEST, then SMOKE, then RESUME - the full ladder now that this is the
+# primary lane. Probe above-config lengths with --max-seq-length (notebook
+# PROBE_SEQ); bump max_seq_length here only after that length probes green.
 # PROBE GREEN 2026-08-07: param_devices both GPUs, loss finite (0.637,
 # grad_norm finite by step 2), peaks 5.98 / 12.56 GiB (dev1 = lm_head side;
 # ~2.0 GiB margin), 179.6 s/step at ga=5 (~162 tok/s upper bound). The ~6.6
@@ -28,6 +36,11 @@ model:
   instruction_part: "<|im_start|>user\n"
   response_part: "<|im_start|>assistant\n"
   device_map: balanced
+  # Weight-placement caps only (runtime activations/logits land on top): dev1
+  # gets ~5 GiB of weights, pushing the rest to dev0's measured ~6.6 GiB of
+  # slack. Qualification note above is the PRE-skew layout; the 8k probe
+  # re-measures with this skew.
+  max_memory: {0: "13GiB", 1: "5GiB"}
 
 data:
   think_open: '<think>'

@@ -9,7 +9,9 @@ English/reasoning text; overshoot is free because the trainer truncates at
 max_length, undershoot is the failure mode). One probe file serves any lane
 with max_seq_length <= target_tokens.
 
-Build:  python -m tuned.data.probe --src data/smoke_v1.jsonl --out data/probe_6k.jsonl
+Build:  python -m tuned.data.probe --config configs/law_v1_mp.yaml
+        (target defaults to the config's smoke max_seq_length; --target-tokens
+        overrides it for above-config probes, e.g. 8192)
 """
 
 import json
@@ -59,12 +61,17 @@ def build_probe(
 if __name__ == "__main__":
     import argparse
 
+    from tuned.train.config import load_config
+
     p = argparse.ArgumentParser()
+    p.add_argument("--config", default="configs/law_v1_mp.yaml")
     p.add_argument("--src", default="data/smoke_v1.jsonl")
-    p.add_argument("--out", default="data/probe_6k.jsonl")
+    p.add_argument("--out", default="data/probe_long.jsonl")
     p.add_argument("--n", type=int, default=8)
-    p.add_argument("--target-tokens", type=int, default=6144)
+    p.add_argument("--target-tokens", type=int, default=None,
+                   help="default: the config's smoke max_seq_length")
     args = p.parse_args()
 
-    count = build_probe(args.out, args.src, n=args.n, target_tokens=args.target_tokens)
-    print(f"wrote {count} probe examples to {args.out}")
+    target = args.target_tokens or load_config(args.config).train.smoke.max_seq_length
+    count = build_probe(args.out, args.src, n=args.n, target_tokens=target)
+    print(f"wrote {count} probe examples (target {target} tokens) to {args.out}")

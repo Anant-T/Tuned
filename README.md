@@ -11,7 +11,8 @@ Qwen3-14B — one LoRA per domain (Indian law).
 |---|---|
 | `src/tuned/` | Importable package (data, train — eval and serve arrive with the main-run plan). |
 | `configs/law_v1.yaml` | Single source of truth: model pin, LoRA, markers, run settings (single-GPU lane). |
-| `configs/law_v1_ddp.yaml` | 2x T4 data-parallel lane (torchrun) — same quota cost, ~2.1x tokens/s. |
+| `configs/law_v1_ddp.yaml` | 2x T4 data-parallel lane (torchrun) — same quota cost, ~2.1x tokens/s at seq 2048. |
+| `configs/law_v1_mp.yaml` | **Primary lane (2026-08-07)**: 2x T4 model-parallel (`device_map=balanced` + `max_memory` skew) — 3-4x sequence length (6144 qualified, 8k+ probing) at ~single-GPU token rate. |
 | `configs/law_v1_ministral.yaml` | Archived: Ministral, disqualified on T4 (see `docs/ministral-t4-disqualification.md`). |
 | `notebooks/kaggle_smoke.ipynb` | The one artifact uploaded to Kaggle; clones this repo and runs the CLI. |
 | `scripts/` | Revision pinning. |
@@ -44,9 +45,12 @@ The template-drift test self-skips locally and runs on Kaggle.
    20-min idle timeout). Green = loss down, no NaN, peak VRAM < 14 GB.
 3. Fresh session, `MODE = "RESUME"` -> verifies checkpoint resume from the Hub.
 
-`DDP = True` switches to the 2x T4 lane (`configs/law_v1_ddp.yaml`, own checkpoint
-repo, ~2.1x tokens/s at the same quota cost — a T4x2 session bills 1x wall-clock
-regardless of GPUs used). Resume in the same lane that saved.
+`DDP = True` switches to the 2x T4 data-parallel lane (`configs/law_v1_ddp.yaml`,
+own checkpoint repo, ~2.1x tokens/s at the same quota cost — a T4x2 session bills
+1x wall-clock regardless of GPUs used). `MP = True` switches to the model-parallel
+primary lane (`configs/law_v1_mp.yaml`, own checkpoint repo, long sequences; probe
+above-config lengths with `MODE = "PROBE"` + `PROBE_SEQ`). The flags are mutually
+exclusive. Resume in the same lane that saved.
 
 ## Rules that keep adapters swappable
 

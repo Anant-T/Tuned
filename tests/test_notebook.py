@@ -27,8 +27,12 @@ def test_notebook_is_valid_and_complete():
     # MP must NOT go through torchrun - only DDP selects it
     assert '["torchrun", "--nproc_per_node=2"] if DDP else' in joined
     # the MP lane's gate: PROBE runs no-hub on the long probe dataset (short
-    # unpacked examples would make the seq-6144 VRAM probe a false green)
-    assert '"PROBE": ["--max-steps", "2", "--no-hub", "--dataset", "data/probe_6k.jsonl"]' in joined
+    # unpacked examples would make the long-seq VRAM probe a false green);
+    # PROBE_SEQ probes above-config lengths without a config edit
+    assert '"data/probe_long.jsonl"' in joined
+    assert "--no-hub" in joined
+    assert "PROBE_SEQ" in joined
+    assert "--max-seq-length" in joined
     assert "tuned.data.probe" in joined
     # allocator headroom - DDP peaks ~1 GiB from the 14.56 GiB cap
     assert 'PYTORCH_ALLOC_CONF"] = "expandable_segments:True"' in joined
