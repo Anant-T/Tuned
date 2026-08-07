@@ -15,9 +15,13 @@ from tuned.train.config import load_config
 CONFIGS = Path(__file__).parent.parent / "configs"
 
 
-# Only live lanes are checked (law_v1_ddp.yaml shares law_v1.yaml's model; the
-# archived Ministral config is not worth a tokenizer fetch per Kaggle session).
-@pytest.mark.parametrize("name", ["law_v1.yaml"])
+# Only live lanes are checked (law_v1_ddp.yaml and law_v1_mp.yaml share
+# law_v1.yaml's model, so they're skipped to avoid a redundant fetch; the
+# archived Ministral config is not worth a tokenizer fetch per Kaggle
+# session). law_v1_8b_ddp.yaml pins a DIFFERENT base model (Qwen3-8B, not
+# 14B) so it gets its own fetch - this is what actually validates the 8B
+# lane's chat template renders think tags identically to the 14B family.
+@pytest.mark.parametrize("name", ["law_v1.yaml", "law_v1_8b_ddp.yaml"])
 def test_markers_and_think_tags_render(name):
     transformers = pytest.importorskip("transformers")
     cfg = load_config(CONFIGS / name)

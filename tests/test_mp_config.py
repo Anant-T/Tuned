@@ -42,17 +42,23 @@ def test_mp_matches_primary_except_seq_ga_devicemap_repo():
 def test_mp_checkpoint_repo_isolated():
     repos = {
         name: load_config(CONFIGS / f"law_v1{suffix}.yaml").hub.checkpoint_repo
-        for name, suffix in [("primary", ""), ("ddp", "_ddp"), ("mp", "_mp")]
+        for name, suffix in [
+            ("primary", ""),
+            ("ddp", "_ddp"),
+            ("mp", "_mp"),
+            ("8b_ddp", "_8b_ddp"),
+        ]
     }
     assert repos["mp"].endswith("-mp")
-    assert len(set(repos.values())) == 3  # no two lanes share a repo
+    assert len(set(repos.values())) == 4  # no two lanes share a repo
 
 
 def test_existing_lanes_have_no_device_map():
-    # device_map=None must remain the byte-for-byte behavior of the two
-    # qualified lanes; only the MP lane sets it.
+    # device_map=None must remain the byte-for-byte behavior of the
+    # non-model-parallel lanes; only the MP lane sets it.
     assert load_config(CONFIGS / "law_v1.yaml").model.device_map is None
     assert load_config(CONFIGS / "law_v1_ddp.yaml").model.device_map is None
+    assert load_config(CONFIGS / "law_v1_8b_ddp.yaml").model.device_map is None
 
 
 def test_mp_guard_rejects_torchrun():
