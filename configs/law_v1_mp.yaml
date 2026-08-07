@@ -23,12 +23,14 @@
 # SAVETEST, then SMOKE, then RESUME - the full ladder now that this is the
 # primary lane. Probe above-config lengths with --max-seq-length (notebook
 # PROBE_SEQ); bump max_seq_length here only after that length probes green.
-# PROBE GREEN 2026-08-07: param_devices both GPUs, loss finite (0.637,
-# grad_norm finite by step 2), peaks 5.98 / 12.56 GiB (dev1 = lm_head side;
-# ~2.0 GiB margin), 179.6 s/step at ga=5 (~162 tok/s upper bound). The ~6.6
-# GiB dev0 slack suggests a max_memory skew could reach seq ~8k if ever
-# needed. Before real training here: replace warmup_ratio (deprecated in
-# transformers 5.5, lr logged 0 in the probe) with warmup_steps.
+# PROBE GREEN @6144 2026-08-07 (pre-skew balanced layout): peaks 5.98/12.56
+# GiB, 179.6 s/step at ga=5 (~162 tok/s upper bound).
+# PROBE GREEN @8192 2026-08-07 (sequential {0:8,1:13} layout, now primary):
+# param_devices both GPUs, loss finite (0.607, grad_norm finite by step 2),
+# peaks 9.91 / 8.75 GiB - ~4.6 GiB margin on the worst GPU. 295.7 s/step at
+# ga=5/seq 8192 (~131 tok/s upper bound; quadratic-attention tax vs 162 @
+# 6144). Margin projects 10240-12288 viable (~11-11.5 GiB both) if the
+# long-tail data ever justifies the extra slowdown.
 # Contingencies: imbalance -> explicit max_memory skew
 # keeping the LAST GPU light (it carries lm_head + CE spike + logits; this is
 # the mirror of balanced_low_0, which would make things worse); OOM -> retry
@@ -67,9 +69,9 @@ train:
   optim: adamw_8bit
   lr_scheduler_type: linear
   smoke:
-    max_seq_length: 6144
+    max_seq_length: 8192             # qualified by the 2026-08-07 8k probe
     per_device_train_batch_size: 1
-    gradient_accumulation_steps: 5   # 6144 x 5 ~= the 2048 lanes' tokens/step
+    gradient_accumulation_steps: 4   # 8192 x 4 = the 2048 lanes' 32,768 tokens/step
     max_steps: 60
     save_steps: 25
     dataset: data/smoke_v1.jsonl

@@ -30,9 +30,9 @@ def test_mp_matches_primary_except_seq_ga_devicemap_repo():
     )
     assert mp.data == primary.data
     assert mp.lora == primary.lora  # swappability: same target-module scoping
-    assert mp.train.smoke.max_seq_length == 6144
-    # 6144 x 5 = 30,720 tokens/step ~= the 2048 lanes' 32,768.
-    assert mp.train.smoke.gradient_accumulation_steps == 5
+    assert mp.train.smoke.max_seq_length == 8192  # 2026-08-07 probe-qualified
+    # 8192 x 4 = the 2048 lanes' 32,768 tokens/step.
+    assert mp.train.smoke.gradient_accumulation_steps == 4
     assert dataclasses.replace(
         mp.train.smoke, max_seq_length=2048, gradient_accumulation_steps=16
     ) == primary.train.smoke
@@ -108,8 +108,8 @@ def test_dataset_and_seq_overrides():
     run = load_config(CONFIGS / "law_v1_mp.yaml").train.smoke
     assert apply_overrides(run).dataset == run.dataset
     assert apply_overrides(run, dataset="data/probe_long.jsonl").dataset == "data/probe_long.jsonl"
-    assert apply_overrides(run).max_seq_length == 6144
-    assert apply_overrides(run, max_seq_length=8192).max_seq_length == 8192
+    assert apply_overrides(run).max_seq_length == 8192
+    assert apply_overrides(run, max_seq_length=10240).max_seq_length == 10240
 
 
 def test_warmup_converted_to_steps():
