@@ -26,7 +26,7 @@ def test_mp_matches_primary_except_seq_ga_devicemap_repo():
     primary = load_config(CONFIGS / "law_v1.yaml")
     mp = load_config(CONFIGS / "law_v1_mp.yaml")
     assert mp.model == dataclasses.replace(
-        primary.model, device_map="balanced", max_memory={0: "13GiB", 1: "5GiB"}
+        primary.model, device_map="sequential", max_memory={0: "8GiB", 1: "13GiB"}
     )
     assert mp.data == primary.data
     assert mp.lora == primary.lora  # swappability: same target-module scoping
@@ -85,11 +85,16 @@ def test_split_check_passes_two_gpus():
 
 
 def test_max_memory_skew_keeps_last_gpu_light():
-    mm = load_config(CONFIGS / "law_v1_mp.yaml").model.max_memory
-    # dev1 carries lm_head + CE spike + logits at runtime; its WEIGHT budget
-    # must stay the small one. A flipped skew would recreate the unskewed
-    # ~14.0 GiB projection at seq 8192.
-    assert int(mm[1].replace("GiB", "")) < int(mm[0].replace("GiB", ""))
+    cfg = load_config(CONFIGS / "law_v1_mp.yaml").model
+    # sequential fills dev0 FIRST, so the dev0 cap is what bounds dev1's
+    # weight spill - dev0's cap must be the small one, and it must be below
+    # the ~10.4 GiB total 4-bit footprint or everything lands on dev0.
+    # (balanced + max_memory instead pushes the surplus to CPU and bnb
+    # refuses - the 2026-08-07 failure.)
+    assert cfg.device_map == "sequential"
+    mm = cfg.max_memory
+    assert int(mm[0].replace("GiB", "")) < int(mm[1].replace("GiB", ""))
+    assert int(mm[0].replace("GiB", "")) < 10
 
 
 def test_max_memory_guard_requires_device_map():

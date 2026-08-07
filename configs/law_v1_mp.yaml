@@ -4,10 +4,15 @@
 # launch, NEVER torchrun). Kaggle bills T4x2 at 1x wall-clock, so the split
 # costs no extra quota - it trades DDP's 2.14x throughput (~half the tokens
 # per quota-week; the charter's dataset budget shrinks accordingly) for 3-4x
-# sequence length. max_memory keeps the LAST GPU light: it carries lm_head +
-# the 1.45 GiB CE spike + logits (~0.58 GiB per 1k tokens), none of which
-# max_memory accounts for - unskewed, 8192 projects ~14.0 GiB on dev1 vs the
-# 14.56 cap. The 8k+ probe qualifies the skewed layout before any seq bump
+# sequence length. device_map=sequential + max_memory keeps the LAST GPU
+# light: it carries lm_head + the 1.45 GiB CE spike + logits (~0.58 GiB per
+# 1k tokens), none of which max_memory accounts for - unskewed balanced hit
+# 12.56 GiB on dev1 at 6144 and projects ~14.0 at 8192 vs the 14.56 cap.
+# NOT balanced+max_memory: balanced computes ~equal per-GPU targets and caps
+# only SHRINK a GPU's share - the surplus went to CPU and bnb-4bit refused
+# ("Some modules are dispatched on the CPU", 2026-08-07 run). sequential
+# fills dev0 up to its cap first, so the spill to dev1 stays small by
+# construction. The 8k+ probe qualifies this layout before any seq bump
 # here. Launch:
 #
 #   CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft \
@@ -35,12 +40,14 @@ model:
   revision: 46105e245750aad3be7fd1d81c21cb03a0e438ed
   instruction_part: "<|im_start|>user\n"
   response_part: "<|im_start|>assistant\n"
-  device_map: balanced
-  # Weight-placement caps only (runtime activations/logits land on top): dev1
-  # gets ~5 GiB of weights, pushing the rest to dev0's measured ~6.6 GiB of
-  # slack. Qualification note above is the PRE-skew layout; the 8k probe
-  # re-measures with this skew.
-  max_memory: {0: "13GiB", 1: "5GiB"}
+  device_map: sequential
+  # Weight-placement caps only (runtime activations/logits land on top).
+  # sequential fills dev0 first: the 8GiB cap puts embed + most layers there
+  # (~6.5 GiB after accelerate's largest-layer reserve) and spills only the
+  # tail + norm + lm_head (~3-4 GiB) to dev1, whose 13GiB cap is effectively
+  # "no cap". Expected @8192: dev0 ~9, dev1 ~10.5-11. Qualification note
+  # above is the pre-skew balanced layout; the 8k probe re-measures this one.
+  max_memory: {0: "8GiB", 1: "13GiB"}
 
 data:
   think_open: '<think>'
