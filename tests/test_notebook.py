@@ -9,10 +9,13 @@ def test_notebook_is_valid_and_complete():
     assert nb["nbformat"] == 4
     sources = ["".join(c["source"]) for c in nb["cells"]]
     joined = "\n".join(sources)
-    # the operator's switches exist and default to the cheap single-GPU gate
-    assert 'MODE = "SAVETEST"' in joined
+    # the operator's switches default to the 8B DDP lane's first gate: the lane
+    # is UNPROBED, so PROBE (2-step, no-hub - the cheapest gate) must run before
+    # SAVETEST (gate ladder 2026-08-07)
+    assert 'MODE = "PROBE"' in joined
     assert "DDP = False" in joined
     assert "MP = False" in joined
+    assert "DDP_8B = True" in joined
     # the two multi-GPU lanes are mutually exclusive - torchrun replicating a
     # device_map-split model would be neither DDP nor MP
     assert "DDP and MP" in joined
@@ -24,8 +27,14 @@ def test_notebook_is_valid_and_complete():
     assert '"configs/law_v1_mp.yaml" if MP' in joined
     assert '"configs/law_v1_ddp.yaml" if DDP' in joined
     assert '"configs/law_v1.yaml"' in joined
-    # MP must NOT go through torchrun - only DDP selects it
+    # MP must NOT go through torchrun - only the DDP-style lanes select it
     assert '["torchrun", "--nproc_per_node=2"] if DDP else' in joined
+    assert "if DDP_8B else [sys.executable" in joined
+    # 8B lane wiring: its own config, and the chunked-CE env var must be set
+    # lane-scoped BEFORE `import unsloth` in the torchrun children (default
+    # n_chunks=4 leaves a ~2.4-3.0 GiB loss-step transient at seq 8192)
+    assert '"configs/law_v1_8b_ddp.yaml" if DDP_8B' in joined
+    assert 'UNSLOTH_CE_LOSS_N_CHUNKS"] = "16"' in joined
     # the MP lane's gate: PROBE runs no-hub on the long probe dataset (short
     # unpacked examples would make the long-seq VRAM probe a false green);
     # PROBE_SEQ probes above-config lengths without a config edit
