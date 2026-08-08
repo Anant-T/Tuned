@@ -9,11 +9,20 @@ def test_notebook_is_valid_and_complete():
     assert nb["nbformat"] == 4
     sources = ["".join(c["source"]) for c in nb["cells"]]
     joined = "\n".join(sources)
-    # the operator's only switch is the gate: SMOKE ran green 2026-08-08 05:04
-    # UTC (60/60 steps, train_loss 0.5722 trending down, grad_norm finite after
-    # calibration, peaks 12.98/13.18 GiB, ~74.7 s/step, checkpoints on the
-    # Hub), so the ladder advances to RESUME (fresh session)
-    assert 'MODE = "RESUME"' in joined
+    # the operator's only switch is the gate: the 2026-08-09 hardening
+    # (schedule guard, step-0 gates, max_grad_norm 0.3, reserved peaks) gets a
+    # validation pass on the known-green recipe, and that ladder starts at
+    # SMOKE - RESUME follows in a fresh session and exercises the guard
+    assert 'MODE = "SMOKE"' in joined
+    # re-import preflight: a re-imported notebook is a FRESH kernel and Kaggle
+    # silently drops attached Secrets and Input mounts (2026-08-07, twice).
+    # The notebook must discover that in seconds - before clone/install - and
+    # must warn when the staged snapshot is missing, because its absence
+    # silently re-opens the v6-v9 hub-download stall class
+    assert 'socket.create_connection(("github.com", 443)' in joined
+    assert "re-attach before running" in joined
+    assert joined.count("qwen3-8b-staged/REVISION.txt") == 2
+    assert joined.count('get_secret("HF_TOKEN")') == 2
     # ONE lane: the notebook IS configs/law_v1_8b_ddp.yaml. No lane flags, no
     # config ternary - the config, the GPU mask and the launcher are fixed and
     # can no longer drift apart from each other.
