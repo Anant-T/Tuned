@@ -98,6 +98,8 @@ def build_smoke(out_path: str | Path, n: int = 1000, rows=None, think_open: str 
 
 if __name__ == "__main__":
     import argparse
+    import os
+    import sys
 
     from tuned.train.config import load_config
 
@@ -114,3 +116,11 @@ if __name__ == "__main__":
         think_close=cfg.data.think_close,
     )
     print(f"wrote {count} examples to {out}")
+    # build_smoke abandons the streaming iterator with a break; the datasets/
+    # hf-xet machinery behind it can leave non-daemon threads that wedge
+    # interpreter shutdown AFTER everything is written - the caller then waits
+    # forever on a finished child (Kaggle cell hang, 2026-08-08). The output
+    # file is closed by its with-block; skip shutdown entirely.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

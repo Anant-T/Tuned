@@ -60,6 +60,11 @@ def test_notebook_is_valid_and_complete():
     assert "UNSLOTH_STABLE_DOWNLOADS" not in joined.replace("UNSLOTH_STABLE_DOWNLOADS / ", "")
     # dataset build follows CONFIG (think tags must match the model)
     assert '"--config", CONFIG' in joined
+    # dataset-build phases must be BOUNDED: an unbounded subprocess.run wedged
+    # interactive sessions when the smoke-build child hung at interpreter
+    # shutdown after finishing its work (2026-08-08; likely v9's real stall)
+    assert 'CONFIG], timeout=20 * 60' in joined
+    assert joined.count("_probe_cmd, timeout=5 * 60") == 2
     # notebook cells read configs with plain yaml and never import the package:
     # a kernel started before the editable install misses the .pth, so only
     # subprocesses can import tuned
