@@ -53,6 +53,16 @@ def test_precision_flags_bf16_when_supported():
     assert kw["bf16"] is True
 
 
+def test_report_to_gated_on_wandb_key(monkeypatch):
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o")
+    assert kw["report_to"] == "none"
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o")
+    assert kw["report_to"] == "wandb"
+
+
 def test_apply_overrides_replaces_steps():
     cfg = load_config(CONFIG, allow_unpinned=True)
     run = apply_overrides(cfg.train.smoke, max_steps=4, save_steps=2)

@@ -95,7 +95,10 @@ def build_sft_config(
         "save_strategy": "steps",
         "save_steps": run.save_steps,
         "save_total_limit": 2,
-        "report_to": "none",
+        # Opt-in W&B: keyed on the secret's presence so a notebook without the
+        # WANDB_API_KEY secret runs exactly as before. Live metrics matter on
+        # Kaggle batch runs, which flush output only per completed cell.
+        "report_to": "wandb" if os.environ.get("WANDB_API_KEY") else "none",
     }
     if cfg.hub.checkpoint_repo is not None:
         kw.update(
