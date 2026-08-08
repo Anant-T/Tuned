@@ -86,7 +86,12 @@ def test_notebook_is_valid_and_complete():
     # sits AT max_steps, so a bare --resume loads it and exits without stepping
     # - a no-op false green. Forcing 4 extra steps proves optimizer/scaler/rng
     # state actually reloads and trains (2026-08-08 SMOKE-green lesson).
-    assert '"RESUME": ["--resume", "--max-steps", "64"]' in joined
+    # --allow-schedule-change is REQUIRED here: sft.py refuses a resume whose
+    # max_steps differs from the checkpoint's, because warmup and the decay
+    # denominator are rebuilt from the session's max_steps while scheduler.pt
+    # restores only the step counter (the gate's LR jumped +134% at step 62).
+    # The gate accepts that jump; the main run must never opt into it.
+    assert '"RESUME": ["--resume", "--max-steps", "64", "--allow-schedule-change"]' in joined
     # notebook cells read configs with plain yaml and never import the package:
     # a kernel started before the editable install misses the .pth, so only
     # subprocesses can import tuned

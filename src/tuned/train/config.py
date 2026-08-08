@@ -46,6 +46,7 @@ class TrainCfg:
     weight_decay: float
     optim: str
     lr_scheduler_type: str
+    max_grad_norm: float
     smoke: RunCfg
 
 

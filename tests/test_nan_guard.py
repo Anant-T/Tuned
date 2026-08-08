@@ -12,6 +12,16 @@ Design constraints it encodes (research-verified 2026-08-08):
 from tuned.train.sft import _NonFiniteWindow
 
 
+def test_grace_window_documents_that_the_step_is_absolute():
+    # observe() keys on state.global_step, so a run resumed at step 61 gets NO
+    # fresh grace window - which is correct, a restored GradScaler must not
+    # recalibrate. A refactor to a step-relative counter would silently open a
+    # 2-step blind spot on every resume, so the reason has to be written down.
+    doc = _NonFiniteWindow.__doc__
+    assert "global_step" in doc
+    assert "resumed" in doc
+
+
 def test_calibration_nans_within_grace_do_not_abort():
     w = _NonFiniteWindow(grace_steps=2, window=3)
     assert w.observe(1, "nan") is False

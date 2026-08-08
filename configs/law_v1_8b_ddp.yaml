@@ -84,6 +84,10 @@ train:
   weight_decay: 0.001
   optim: adamw_8bit
   lr_scheduler_type: linear
+  # Measured grad_norm runs 0.08-0.19 on this lane, so the transformers
+  # default 1.0 clip never binds; 0.3 is the QLoRA-paper value and the only
+  # clip that actually bounds an fp16 spike here.
+  max_grad_norm: 0.3
   smoke:
     max_seq_length: 8192
     per_device_train_batch_size: 1

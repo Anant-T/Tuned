@@ -8,13 +8,17 @@ All launches are prefixed CUDA_VISIBLE_DEVICES=0,1 and go through
 Probe:    ... --max-steps 2 --no-hub --dataset data/probe_long.jsonl --max-seq-length 8192
 Savetest: ... --max-steps 4 --save-steps 2
 Smoke:    ... (no extra args)
-Resume:   ... --resume --max-steps 64
+Resume:   ... --resume --max-steps 64 --allow-schedule-change
+
+The resume flag is gate-only: changing max_steps rebuilds the LR schedule.
 """
 
 import argparse
 import dataclasses
+import json
 import math
 import os
+import time
 from pathlib import Path
 
 from tuned.train.config import Config, HubCfg, RunCfg, load_config
@@ -29,6 +33,11 @@ class _NonFiniteWindow:
     healthy run - observed in both green 8B gates); after that only `window`
     CONSECUTIVE non-finite values count - a lone nan is ordinary GradScaler
     backoff. Unparseable values neither advance nor reset the streak.
+
+    `step` is state.global_step - absolute, never relative to the session - so
+    a run resumed at step 61 gets NO fresh grace window. That is correct: the
+    restored GradScaler does not recalibrate. Re-keying this on a step-relative
+    counter would silently open a 2-step blind spot on every resume.
     """
 
     def __init__(self, grace_steps: int = 2, window: int = 3):
@@ -65,6 +74,31 @@ def resolve_model_source(
     return repo, revision
 
 
+def check_resume_schedule(
+    checkpoint_dir: str | Path, max_steps: int, allow_schedule_change: bool = False
+) -> None:
+    """Refuse a resume that would silently rebuild the LR schedule.
+
+    scheduler.pt restores the step counter and nothing else: warmup_steps and
+    the decay denominator are both derived from THIS session's max_steps in
+    build_sft_config. A changed max_steps therefore reshapes the whole curve
+    mid-run - the RESUME gate's LR jumped +134% at step 62 that way."""
+    state = Path(checkpoint_dir) / "trainer_state.json"
+    if not state.is_file():
+        return
+    saved = json.loads(state.read_text(encoding="utf-8")).get("max_steps")
+    if saved is None or saved == max_steps or allow_schedule_change:
+        return
+    raise SystemExit(
+        f"checkpoint was trained with max_steps={saved}, this run has "
+        f"max_steps={max_steps} - the LR schedule would be REBUILT (warmup and "
+        "the decay denominator both derive from the session's max_steps, while "
+        "scheduler.pt restores only the step counter) and the learning rate "
+        "would jump at the resume step. --allow-schedule-change accepts that; "
+        "it is meant for the RESUME gate, never for the main run."
+    )
+
+
 def build_sft_config(
     cfg: Config, run: RunCfg, output_dir: str, bf16_supported: bool = False
 ) -> dict:
@@ -80,6 +114,8 @@ def build_sft_config(
         # is converted to steps here.
         "warmup_steps": max(0, round(cfg.train.warmup_ratio * run.max_steps)),
         "weight_decay": cfg.train.weight_decay,
+        # Measured grad_norm 0.08-0.19: the default 1.0 clip never binds.
+        "max_grad_norm": cfg.train.max_grad_norm,
         "optim": cfg.train.optim,
         "lr_scheduler_type": cfg.train.lr_scheduler_type,
         "seed": cfg.train.seed,
@@ -88,6 +124,9 @@ def build_sft_config(
         "fp16": not bf16_supported,
         "bf16": bf16_supported,
         "logging_steps": 1,
+        # The printed approx_tokens_per_sec assumes every sequence fills
+        # max_seq_length - an upper bound. This logs tokens actually consumed.
+        "include_num_input_tokens_seen": True,
         # Under DDP the trainer otherwise defaults this to True and burns an
         # extra autograd-graph traversal every step (torch warned about it on
         # the qualified 2026-08-06 SAVETEST). Every LoRA param gets a grad
@@ -107,6 +146,10 @@ def build_sft_config(
             hub_model_id=cfg.hub.checkpoint_repo,
             hub_strategy="checkpoint",
             hub_private_repo=True,
+            # Default False skips a checkpoint push outright when the previous
+            # upload is still in flight; on Kaggle the Hub copy is the only
+            # artifact that survives the session, so never skip one.
+            hub_always_push=True,
         )
     return kw
 
@@ -188,11 +231,15 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--config", default="configs/law_v1_8b_ddp.yaml")
     p.add_argument("--mode", choices=["smoke"], default="smoke")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--allow-schedule-change", action="store_true",
+                   help="permit a resume whose max_steps differs from the checkpoint's (RESUME gate only)")
     p.add_argument("--no-hub", action="store_true")
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--save-steps", type=int, default=None)
     p.add_argument("--dataset", default=None, help="override run dataset path (PROBE runs)")
     p.add_argument("--max-seq-length", type=int, default=None, help="override run seq length (PROBE runs)")
+    p.add_argument("--time-budget-s", type=float, default=None,
+                   help="checkpoint and stop cleanly after this many seconds (default: no budget)")
     args = p.parse_args(argv)
 
     cfg = load_config(args.config)  # strict: refuses unpinned revision
@@ -313,6 +360,27 @@ def main(argv: list[str] | None = None) -> None:
         response_part=cfg.model.response_part,
     )
 
+    # Step-0 gates - both mandatory before any loss/grad_norm number out of
+    # this lane is worth reading, and both only meaningful once the response
+    # mask above is applied.
+    # unsloth#4104: a <|vision_pad|> pad silently NaNs LoRA-A grads at batch > 1.
+    assert tokenizer.pad_token == "<|endoftext|>", (
+        f"pad_token is {tokenizer.pad_token!r}, expected '<|endoftext|>' - "
+        "unsloth#4104: a <|vision_pad|> pad silently NaNs LoRA-A grads at batch > 1"
+    )
+    probe_rows = [trainer.train_dataset[i] for i in range(min(8, len(trainer.train_dataset)))]
+    probe_labels = trainer.data_collator(probe_rows)["labels"]
+    kept = int((probe_labels != -100).sum())
+    total = int(probe_labels.numel())
+    print(f"label_coverage={kept}/{total} ({100 * kept / total:.1f}%)")
+    if kept == 0:
+        raise SystemExit(
+            "label_coverage=0 - masking or truncation ate every response token; "
+            "this run would train on nothing. Check instruction_part/response_part "
+            "against the chat template and max_seq_length against the data "
+            "(unsloth#2771 / trl#3927)."
+        )
+
     from transformers import TrainerCallback
 
     class _NonFiniteGuard(TrainerCallback):
@@ -335,20 +403,51 @@ def main(argv: list[str] | None = None) -> None:
                     "aborting early to save quota. First lever: max_grad_norm: 0.3"
                 )
 
+    class _TimeBudget(TrainerCallback):
+        """Spend the wall-clock budget, then checkpoint and stop cleanly.
+
+        Kaggle's 12h ceiling and the notebook watchdog both SIGKILL the child,
+        which discards up to save_steps-1 steps every session. The deliberate
+        contrast with _NonFiniteGuard: there a clean rc=0 would read a
+        divergence as green, so it must raise; here rc=0 IS correct, and the
+        signal telling the two apart is the printed line plus a global_step
+        below max_steps."""
+
+        def __init__(self, budget_s: float):
+            self.budget_s = budget_s
+            self._start = time.monotonic()
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if time.monotonic() - self._start > self.budget_s:
+                print(f"time_budget_reached step={state.global_step} - saving and stopping")
+                control.should_save = True
+                control.should_training_stop = True
+            return control
+
     trainer.add_callback(_NonFiniteGuard())
+    if args.time_budget_s is not None:
+        trainer.add_callback(_TimeBudget(args.time_budget_s))
 
     resume = False
     if args.resume:
         from huggingface_hub import snapshot_download
 
-        snapshot_download(
-            cfg.hub.checkpoint_repo,
-            allow_patterns=["last-checkpoint/*"],
-            local_dir=output_dir,
-        )
+        # One rank downloads: both share this local_dir, so a second pull is
+        # duplicate ~0.5-0.7 GB of bandwidth and two writers on one tree. The
+        # barrier holds rank 1 until the checkpoint is fully written.
+        if trainer.accelerator.is_main_process:
+            snapshot_download(
+                cfg.hub.checkpoint_repo,
+                allow_patterns=["last-checkpoint/*"],
+                local_dir=output_dir,
+            )
+        trainer.accelerator.wait_for_everyone()
         resume = f"{output_dir}/last-checkpoint"
         if not Path(resume).is_dir():
             raise SystemExit(f"no last-checkpoint found in {cfg.hub.checkpoint_repo}")
+        check_resume_schedule(
+            resume, run.max_steps, allow_schedule_change=args.allow_schedule_change
+        )
 
     stats = trainer.train(resume_from_checkpoint=resume)
     print(f"train_loss={stats.training_loss:.4f}")
@@ -364,6 +463,15 @@ def main(argv: list[str] | None = None) -> None:
     print(f"peak_vram_gb={max(peaks):.2f}")
     for i, gb in enumerate(peaks):
         print(f"peak_vram_gb_dev{i}={gb:.2f}")
+
+    # Reserved (the allocator's segment high-water), not allocated, is what
+    # OOMs - the ~13.5 GiB abort line must be checked against these numbers.
+    reserved = [
+        torch.cuda.max_memory_reserved(i) / 1e9 for i in range(torch.cuda.device_count())
+    ]
+    print(f"peak_vram_reserved_gb={max(reserved):.2f}")
+    for i, gb in enumerate(reserved):
+        print(f"peak_vram_reserved_gb_dev{i}={gb:.2f}")
 
     runtime = stats.metrics.get("train_runtime")
     if runtime and not args.resume:
