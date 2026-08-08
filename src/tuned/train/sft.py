@@ -12,10 +12,38 @@ MP probe: CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft --config configs/la
 
 import argparse
 import dataclasses
+import math
 import os
 from pathlib import Path
 
 from tuned.train.config import Config, HubCfg, RunCfg, load_config
+
+
+class _NonFiniteWindow:
+    """Divergence detector for the trainer's log stream.
+
+    Keyed on grad_norm, never loss: logging_nan_inf_filter defaults True and
+    rewrites nan losses in logs, so loss cannot show divergence. grace_steps
+    covers DDP GradScaler calibration (steps 1-2 log grad_norm=nan on a
+    healthy run - observed in both green 8B gates); after that only `window`
+    CONSECUTIVE non-finite values count - a lone nan is ordinary GradScaler
+    backoff. Unparseable values neither advance nor reset the streak.
+    """
+
+    def __init__(self, grace_steps: int = 2, window: int = 3):
+        self.grace_steps = grace_steps
+        self.window = window
+        self._streak = 0
+
+    def observe(self, step: int, grad_norm) -> bool:
+        if step <= self.grace_steps:
+            return False
+        try:
+            finite = math.isfinite(float(grad_norm))
+        except (TypeError, ValueError):
+            return False
+        self._streak = 0 if finite else self._streak + 1
+        return self._streak >= self.window
 
 
 def build_sft_config(
@@ -321,6 +349,30 @@ def main(argv: list[str] | None = None) -> None:
         response_part=cfg.model.response_part,
     )
 
+    from transformers import TrainerCallback
+
+    class _NonFiniteGuard(TrainerCallback):
+        """Abort a diverged run after ~3 steps instead of burning the whole
+        budget. Must RAISE, not set control.should_training_stop: that flag
+        ends the run rc=0 - the exact flag normal completion uses - so the
+        notebook supervisor would read a divergence as green. Under torchrun
+        the raising rank takes the whole job down nonzero."""
+
+        def __init__(self):
+            self._window = _NonFiniteWindow()
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs or "grad_norm" not in logs:
+                return
+            if self._window.observe(state.global_step, logs["grad_norm"]):
+                raise RuntimeError(
+                    f"grad_norm non-finite {self._window.window} logs in a row "
+                    f"(through step {state.global_step}) - fp16 divergence; "
+                    "aborting early to save quota. First lever: max_grad_norm: 0.3"
+                )
+
+    trainer.add_callback(_NonFiniteGuard())
+
     resume = False
     if args.resume:
         from huggingface_hub import snapshot_download
@@ -336,8 +388,6 @@ def main(argv: list[str] | None = None) -> None:
 
     stats = trainer.train(resume_from_checkpoint=resume)
     print(f"train_loss={stats.training_loss:.4f}")
-
-    import math
 
     if not math.isfinite(stats.training_loss):
         raise SystemExit(
