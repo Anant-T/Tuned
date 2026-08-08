@@ -1,7 +1,8 @@
 # tuned
 
-Local code, trained on Kaggle free-tier GPUs ($0). Multi-adapter fine-tuning of
-Qwen3-14B — one LoRA per domain (Indian law).
+Local code, trained on Kaggle free-tier GPUs ($0). Single production lane:
+Qwen3-8B QLoRA, 2x T4 data-parallel (DDP) via `torchrun`, one LoRA per domain
+(Indian law is the first).
 
     edit locally -> git push -> Kaggle notebook: clone -> train
 
@@ -10,12 +11,11 @@ Qwen3-14B — one LoRA per domain (Indian law).
 | Path | Purpose |
 |---|---|
 | `src/tuned/` | Importable package (data, train — eval and serve arrive with the main-run plan). |
-| `configs/law_v1.yaml` | Single source of truth: model pin, LoRA, markers, run settings (single-GPU lane). |
-| `configs/law_v1_ddp.yaml` | 2x T4 data-parallel lane (torchrun) — same quota cost, ~2.1x tokens/s at seq 2048. |
-| `configs/law_v1_mp.yaml` | **Primary lane (2026-08-07)**: 2x T4 model-parallel (`device_map=balanced` + `max_memory` skew) — 3-4x sequence length (6144 qualified, 8k+ probing) at ~single-GPU token rate. |
-| `configs/law_v1_ministral.yaml` | Archived: Ministral, disqualified on T4 (see `docs/ministral-t4-disqualification.md`). |
+| `configs/law_v1_8b_ddp.yaml` | The only config: model pin, LoRA, markers, run settings for the DDP lane. |
 | `notebooks/kaggle_smoke.ipynb` | The one artifact uploaded to Kaggle; clones this repo and runs the CLI. |
+| `notebooks/stage_model.ipynb` | Optional one-time, CPU-only notebook: stages the pinned model snapshot as a Kaggle Dataset input so training skips the hub download. |
 | `scripts/` | Revision pinning. |
+| `docs/reports/2026-08-08-project-record.md` | Full lane history (including retired lanes) and qualification metrics. |
 | `docs/superpowers/` | Design specs and implementation plans. |
 
 ## Local setup (Windows, no GPU)
@@ -35,22 +35,48 @@ The template-drift test self-skips locally and runs on Kaggle.
    checkpoint repo from your token's account automatically — no config edit needed).
 3. Kaggle -> Create -> Notebook -> File -> Import Notebook -> upload `notebooks/kaggle_smoke.ipynb`.
 4. Notebook settings: Accelerator **GPU T4 x2** (never P100 — unsupported), Internet **On**.
-5. Add-ons -> Secrets -> add `HF_TOKEN`.
+5. Add-ons -> Secrets -> add `HF_TOKEN`. Optionally add `WANDB_API_KEY` too — it
+   turns on live Weights & Biases metrics for the training cell (unset = no W&B,
+   same as before).
+6. Optional, saves ~7 GiB of hub traffic per session: run `notebooks/stage_model.ipynb`
+   once (CPU only, zero GPU quota), then attach its output as an Input to
+   `kaggle_smoke` (**+ Add Input -> Your Work**). It stages the pinned snapshot
+   with a `REVISION.txt` guard — `kaggle_smoke` uses it only if that revision
+   still matches the config pin, otherwise it falls back to the hub download.
 
-## Smoke run (free, ~5-7 GPU-h of the 30 h/week quota)
+## Smoke run
+
+The lane (`configs/law_v1_8b_ddp.yaml`) is **fully qualified** — all four gates
+ran green on Kaggle on 2026-08-08:
+
+- **PROBE** (2-step VRAM-ceiling check, no Hub push): per-rank peaks 12.80/13.00 GiB.
+- **SAVETEST** (4-step save/push gate): checkpoint pushed and visible on the Hub.
+- **SMOKE** (60 steps): 60/60 complete, 74.7 s/step, ~438 tok/s aggregate, peaks 12.98/13.18 GiB.
+- **RESUME**: fresh session, training continued from step 61 with optimizer/scaler state restored.
+
+Set `MODE` in the first code cell of `kaggle_smoke.ipynb`, then Run All:
 
 1. `MODE = "SAVETEST"` -> Run All interactively (~15 min). Green = checkpoint in the
    HF repo printed by the re-home cell, `grad_norm` finite by step 3.
-2. `MODE = "SMOKE"` -> **Save & Run All** (background, ~3.5 h single-GPU; immune to the
+2. `MODE = "SMOKE"` -> **Save & Run All** (background, ~1.2 h; immune to the
    20-min idle timeout). Green = loss down, no NaN, peak VRAM < 14 GB.
 3. Fresh session, `MODE = "RESUME"` -> verifies checkpoint resume from the Hub.
+4. `MODE = "PROBE"` (+ optional `PROBE_SEQ`) -> checks VRAM headroom at a given
+   sequence length before committing to it in the config.
 
-`DDP = True` switches to the 2x T4 data-parallel lane (`configs/law_v1_ddp.yaml`,
-own checkpoint repo, ~2.1x tokens/s at the same quota cost — a T4x2 session bills
-1x wall-clock regardless of GPUs used). `MP = True` switches to the model-parallel
-primary lane (`configs/law_v1_mp.yaml`, own checkpoint repo, long sequences; probe
-above-config lengths with `MODE = "PROBE"` + `PROBE_SEQ`). The flags are mutually
-exclusive. Resume in the same lane that saved.
+Training always launches as 2-rank DDP via `torchrun` at seq 8192 — both T4s,
+every session, no lane switches left to flip. A Kaggle T4x2 session bills
+1x wall-clock regardless of GPU count. See
+`docs/reports/2026-08-08-project-record.md` for the full lane history —
+including the Ministral, Qwen3-14B single-GPU, 2048-DDP, and 14B
+model-parallel lanes this one replaced — and detailed metrics.
+
+## Next milestone
+
+The lane is qualified end to end; the only blocker for a main run is the
+Indian-law dataset build. Spec:
+`docs/superpowers/specs/2026-08-04-indian-law-adapter-design.md` (its sizing
+is superseded — see the project record for current numbers).
 
 ## Rules that keep adapters swappable
 
