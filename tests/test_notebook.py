@@ -29,8 +29,7 @@ def test_notebook_is_valid_and_complete():
     assert '"configs/law_v1_ddp.yaml" if DDP' in joined
     assert '"configs/law_v1.yaml"' in joined
     # MP must NOT go through torchrun - only the DDP-style lanes select it
-    assert '["torchrun", "--nproc_per_node=2"] if DDP else' in joined
-    assert "if DDP_8B else [sys.executable" in joined
+    assert '["torchrun", "--nproc_per_node=2"] if (DDP or DDP_8B) else [sys.executable, "-u"]' in joined
     # 8B lane wiring: its own config, and the chunked-CE env var must be set
     # lane-scoped BEFORE `import unsloth` in the torchrun children (default
     # n_chunks=4 leaves a ~2.4-3.0 GiB loss-step transient at seq 8192)
@@ -51,6 +50,20 @@ def test_notebook_is_valid_and_complete():
     assert "/kaggle/working/hf_cache" not in joined
     # secrets come from Kaggle, never hardcoded
     assert "UserSecretsClient" in joined
+    # token hunt must be depth-bounded: rglob walks EVERY attached dataset, and
+    # the not-found diagnostic must stream lazily (islice), never materialize
+    # the whole /kaggle/input tree - a mounted multi-GB dataset turns either
+    # into a minutes-long network-FS crawl
+    assert 'rglob("token.txt")' not in joined
+    assert '"*/token.txt"' in joined
+    assert "islice" in joined
+    # xet turbo is scoped to the pre-download child only (hub 1.x ignores
+    # HF_HUB_ENABLE_HF_TRANSFER; this is the xet-native equivalent), and the
+    # 25-min timeout still bounds the phase
+    assert 'HF_XET_HIGH_PERFORMANCE": "1"' in joined
+    # progress pushes must never block the watchdog loop (a hung upload would
+    # freeze heartbeats AND the timeout check)
+    assert "_push_inflight" in joined
     assert "hf_" not in joined.replace("hf_cache", "").replace("hf_transfer", "").replace("HF_", "")
     # hf_transfer must be explicitly disabled: unsloth_zoo force-enables it when
     # the var is absent, and its no-retry fast path can stall downloads silently
