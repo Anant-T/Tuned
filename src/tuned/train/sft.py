@@ -311,6 +311,12 @@ def main(argv: list[str] | None = None) -> None:
         load_in_4bit=True,
         full_finetuning=False,
     )
+    # unsloth auto-selects <|vision_pad|> as Qwen3's pad; at batch > 1 that
+    # pad silently NaNs LoRA-A grads (unsloth#4104 - the step-0 tripwire
+    # caught it live, 2026-08-08 21:12 UTC). Pin the pad here, before the
+    # trainer and collator capture the tokenizer.
+    tokenizer.pad_token = "<|endoftext|>"
+    model.config.pad_token_id = tokenizer.pad_token_id
     model = FastModel.get_peft_model(
         model,
         r=cfg.lora.r,

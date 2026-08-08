@@ -161,6 +161,21 @@ def test_read_gpu_capability_no_crash():
     assert cap is None or (isinstance(cap, tuple) and len(cap) == 2)
 
 
+def test_pad_token_is_pinned_before_the_trainer_captures_it():
+    # unsloth auto-selects <|vision_pad|> as Qwen3's pad; at batch > 1 that
+    # pad silently NaNs LoRA-A grads (unsloth#4104) - the step-0 tripwire
+    # caught exactly this live on 2026-08-08 21:12 UTC. The pin must run
+    # BEFORE SFTTrainer(...) so the collator captures the corrected
+    # tokenizer; the assert stays downstream as the tripwire.
+    src = SFT.read_text(encoding="utf-8")
+    pin = src.find('tokenizer.pad_token = "<|endoftext|>"')
+    trainer_ctor = src.find("trainer = SFTTrainer(")
+    tripwire = src.find('assert tokenizer.pad_token == "<|endoftext|>"')
+    assert -1 not in (pin, trainer_ctor, tripwire)
+    assert pin < trainer_ctor < tripwire
+    assert "model.config.pad_token_id = tokenizer.pad_token_id" in src
+
+
 def test_resume_refuses_a_silently_rebuilt_lr_schedule(tmp_path):
     from tuned.train.sft import check_resume_schedule
 
