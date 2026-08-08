@@ -46,6 +46,24 @@ class _NonFiniteWindow:
         return self._streak >= self.window
 
 
+def resolve_model_source(
+    repo: str, revision: str | None, staged_path: str | None
+) -> tuple[str, str | None]:
+    """Prefer a pre-staged local snapshot (TUNED_MODEL_PATH, set by the
+    notebook after verifying the staged REVISION.txt against the config pin)
+    over the hub repo. A local path carries no revision - and loading by path
+    never touches the network, which sidesteps both the hub-stall failure
+    class and unsloth's history of ignoring HF_HUB_OFFLINE (unsloth#5316)."""
+    if staged_path:
+        p = Path(staged_path)
+        if not (p / "config.json").is_file():
+            raise SystemExit(
+                f"TUNED_MODEL_PATH={staged_path} has no config.json - not a model snapshot"
+            )
+        return str(p), None
+    return repo, revision
+
+
 def build_sft_config(
     cfg: Config, run: RunCfg, output_dir: str, bf16_supported: bool = False
 ) -> dict:
@@ -286,9 +304,12 @@ def main(argv: list[str] | None = None) -> None:
         load_kw["device_map"] = cfg.model.device_map
         if cfg.model.max_memory is not None:
             load_kw["max_memory"] = cfg.model.max_memory
+    model_source, model_revision = resolve_model_source(
+        cfg.model.repo, cfg.model.revision, os.environ.get("TUNED_MODEL_PATH")
+    )
     model, tokenizer = FastModel.from_pretrained(
-        model_name=cfg.model.repo,
-        revision=cfg.model.revision,
+        model_name=model_source,
+        revision=model_revision,
         max_seq_length=run.max_seq_length,
         dtype=torch.float16 if not is_bfloat16_supported() else torch.bfloat16,
         load_in_4bit=True,

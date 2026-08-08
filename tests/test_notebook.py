@@ -61,6 +61,11 @@ def test_notebook_is_valid_and_complete():
     # HF_HUB_ENABLE_HF_TRANSFER; this is the xet-native equivalent), and the
     # 25-min timeout still bounds the phase
     assert 'HF_XET_HIGH_PERFORMANCE": "1"' in joined
+    # staged-snapshot fast path: pre-download prefers a mounted snapshot whose
+    # REVISION.txt matches the config pin (staleness guard), else falls back
+    # to the bounded hub download
+    assert "TUNED_MODEL_PATH" in joined
+    assert "qwen3-8b-staged/REVISION.txt" in joined
     # progress pushes must never block the watchdog loop (a hung upload would
     # freeze heartbeats AND the timeout check)
     assert "_push_inflight" in joined
@@ -85,3 +90,21 @@ def test_notebook_is_valid_and_complete():
     assert "from tuned" not in joined
     # every run is re-homed to the session account's own HF namespace
     assert "whoami" in joined
+
+
+def test_stage_model_notebook_matches_the_8b_pin():
+    import yaml
+
+    stage = json.loads((NB.parent / "stage_model.ipynb").read_text(encoding="utf-8"))
+    src = "\n".join("".join(c["source"]) for c in stage["cells"])
+    cfg = yaml.safe_load(
+        (Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml").read_text(encoding="utf-8")
+    )
+    # the staging notebook must stage EXACTLY the lane's pinned repo+revision -
+    # a drifted pin would make the fast path silently fall back (or worse,
+    # stage a snapshot no lane can use)
+    assert cfg["model"]["repo"] in src
+    assert cfg["model"]["revision"] in src
+    # staged layout contract shared with kaggle_smoke's pre-download cell
+    assert "qwen3-8b-staged" in src
+    assert "REVISION.txt" in src
