@@ -9,10 +9,11 @@ def test_notebook_is_valid_and_complete():
     assert nb["nbformat"] == 4
     sources = ["".join(c["source"]) for c in nb["cells"]]
     joined = "\n".join(sources)
-    # the operator's switches default to the 8B DDP lane's next gate: PROBE ran
-    # green 2026-08-08 (peaks 12.80/13.00 GiB @ seq 8192), so the ladder advances
-    # to SAVETEST (4-step save/push gate; grad_norm must go finite by step 3)
-    assert 'MODE = "SAVETEST"' in joined
+    # the operator's switches default to the 8B DDP lane's next gate: PROBE and
+    # SAVETEST both ran green 2026-08-08 (peaks ~13.0 GiB @ seq 8192; grad_norm
+    # finite at step 3; last-checkpoint/ verified in the hub repo with both
+    # ranks' rng states), so the ladder advances to SMOKE (60 steps, ~1.4 h)
+    assert 'MODE = "SMOKE"' in joined
     assert "DDP = False" in joined
     assert "MP = False" in joined
     assert "DDP_8B = True" in joined
