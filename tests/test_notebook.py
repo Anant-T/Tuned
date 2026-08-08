@@ -9,10 +9,10 @@ def test_notebook_is_valid_and_complete():
     assert nb["nbformat"] == 4
     sources = ["".join(c["source"]) for c in nb["cells"]]
     joined = "\n".join(sources)
-    # the operator's switches default to the 8B DDP lane's first gate: the lane
-    # is UNPROBED, so PROBE (2-step, no-hub - the cheapest gate) must run before
-    # SAVETEST (gate ladder 2026-08-07)
-    assert 'MODE = "PROBE"' in joined
+    # the operator's switches default to the 8B DDP lane's next gate: PROBE ran
+    # green 2026-08-08 (peaks 12.80/13.00 GiB @ seq 8192), so the ladder advances
+    # to SAVETEST (4-step save/push gate; grad_norm must go finite by step 3)
+    assert 'MODE = "SAVETEST"' in joined
     assert "DDP = False" in joined
     assert "MP = False" in joined
     assert "DDP_8B = True" in joined
