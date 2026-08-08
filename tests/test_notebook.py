@@ -9,11 +9,11 @@ def test_notebook_is_valid_and_complete():
     assert nb["nbformat"] == 4
     sources = ["".join(c["source"]) for c in nb["cells"]]
     joined = "\n".join(sources)
-    # the operator's switches default to the 8B DDP lane's next gate: PROBE and
-    # SAVETEST both ran green 2026-08-08 (peaks ~13.0 GiB @ seq 8192; grad_norm
-    # finite at step 3; last-checkpoint/ verified in the hub repo with both
-    # ranks' rng states), so the ladder advances to SMOKE (60 steps, ~1.4 h)
-    assert 'MODE = "SMOKE"' in joined
+    # the operator's switches default to the 8B DDP lane's next gate: SMOKE ran
+    # green 2026-08-08 05:04 UTC (60/60 steps, train_loss 0.5722 trending down,
+    # grad_norm finite after calibration, peaks 12.98/13.18 GiB, ~74.7 s/step,
+    # checkpoints on the Hub), so the ladder advances to RESUME (fresh session)
+    assert 'MODE = "RESUME"' in joined
     assert "DDP = False" in joined
     assert "MP = False" in joined
     assert "DDP_8B = True" in joined
@@ -84,6 +84,11 @@ def test_notebook_is_valid_and_complete():
     # shutdown after finishing its work (2026-08-08; likely v9's real stall)
     assert 'CONFIG], timeout=20 * 60' in joined
     assert joined.count("_probe_cmd, timeout=5 * 60") == 2
+    # RESUME must extend past the smoke run's 60 steps: SMOKE's final checkpoint
+    # sits AT max_steps, so a bare --resume loads it and exits without stepping
+    # - a no-op false green. Forcing 4 extra steps proves optimizer/scaler/rng
+    # state actually reloads and trains (2026-08-08 SMOKE-green lesson).
+    assert '"RESUME": ["--resume", "--max-steps", "64"]' in joined
     # notebook cells read configs with plain yaml and never import the package:
     # a kernel started before the editable install misses the .pth, so only
     # subprocesses can import tuned
