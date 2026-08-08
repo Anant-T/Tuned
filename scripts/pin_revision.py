@@ -27,7 +27,7 @@ def write_pin(config_path: Path, revision: str) -> None:
 
 
 if __name__ == "__main__":
-    cfg_path = Path(sys.argv[1] if len(sys.argv) > 1 else "configs/law_v1.yaml")
+    cfg_path = Path(sys.argv[1] if len(sys.argv) > 1 else "configs/law_v1_8b_ddp.yaml")
     repo = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["model"]["repo"]
     sha = resolve_revision(repo)
     write_pin(cfg_path, sha)

@@ -1,4 +1,4 @@
-"""Typed loader for configs/law_v1.yaml. The revision pin is enforced here."""
+"""Typed loader for configs/law_v1_8b_ddp.yaml. The revision pin is enforced here."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,14 +12,6 @@ class ModelCfg:
     revision: str | None
     instruction_part: str
     response_part: str
-    # "balanced" = split layers across all visible GPUs (MP lane). None = the
-    # single-GPU / DDP behavior every qualified lane runs with.
-    device_map: str | None = None
-    # Per-GPU weight-placement caps for the balanced split, e.g. {0: "13GiB",
-    # 1: "5GiB"} to keep the LAST GPU light (it carries lm_head + CE spike +
-    # logits at runtime, which max_memory does not account for). Only valid
-    # together with device_map.
-    max_memory: dict | None = None
 
 
 @dataclass

@@ -1,4 +1,4 @@
-"""tuned - multi-adapter fine-tuning of Ministral-3-14B-Reasoning on Kaggle free-tier GPUs.
+"""tuned - QLoRA fine-tuning of Qwen3-8B on Kaggle free-tier GPUs (2x T4, DDP).
 
 Model weights never live in this package.
 """

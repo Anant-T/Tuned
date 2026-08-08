@@ -1,13 +1,14 @@
 """Unsloth QLoRA SFT entrypoint. Run on a Kaggle GPU (accelerator "GPU T4 x2"),
-never locally. Single-GPU by default; the DDP lane uses both T4s via torchrun
-(unsloth auto-assigns one rank per GPU when no device_map is passed).
+never locally. Always 2x T4 data-parallel under torchrun - unsloth auto-assigns
+one rank per GPU, and each rank holds the full model.
 
-Savetest: python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --max-steps 4 --save-steps 2
-Smoke:    python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke
-Resume:   python -m tuned.train.sft --config configs/law_v1.yaml --mode smoke --resume
-DDP:      CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 -m tuned.train.sft --config configs/law_v1_ddp.yaml --mode smoke
-MP:       CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft --config configs/law_v1_mp.yaml --mode smoke
-MP probe: CUDA_VISIBLE_DEVICES=0,1 python -m tuned.train.sft --config configs/law_v1_mp.yaml --mode smoke --max-steps 2 --no-hub --dataset data/probe_long.jsonl --max-seq-length 8192
+All launches are prefixed CUDA_VISIBLE_DEVICES=0,1 and go through
+`torchrun --nproc_per_node=2 -m tuned.train.sft --config configs/law_v1_8b_ddp.yaml --mode smoke`:
+
+Probe:    ... --max-steps 2 --no-hub --dataset data/probe_long.jsonl --max-seq-length 8192
+Savetest: ... --max-steps 4 --save-steps 2
+Smoke:    ... (no extra args)
+Resume:   ... --resume --max-steps 64
 """
 
 import argparse
@@ -74,8 +75,8 @@ def build_sft_config(
         "gradient_accumulation_steps": run.gradient_accumulation_steps,
         "max_length": run.max_seq_length,
         "learning_rate": cfg.train.lr,
-        # warmup_ratio is deprecated in transformers 5.5 (it logged lr=0 in the
-        # 2026-08-07 MP probe); the ratio stays the config's semantic knob and
+        # warmup_ratio is deprecated in transformers 5.5 (it logged lr=0 in a
+        # 2026-08-07 probe); the ratio stays the config's semantic knob and
         # is converted to steps here.
         "warmup_steps": max(0, round(cfg.train.warmup_ratio * run.max_steps)),
         "weight_decay": cfg.train.weight_decay,
@@ -87,10 +88,10 @@ def build_sft_config(
         "fp16": not bf16_supported,
         "bf16": bf16_supported,
         "logging_steps": 1,
-        # No-op single-GPU; under DDP the trainer otherwise defaults this to
-        # True and burns an extra autograd-graph traversal every step (torch
-        # warned about it on the qualified 2026-08-06 SAVETEST). Every LoRA
-        # param gets a grad each step, so False is safe.
+        # Under DDP the trainer otherwise defaults this to True and burns an
+        # extra autograd-graph traversal every step (torch warned about it on
+        # the qualified 2026-08-06 SAVETEST). Every LoRA param gets a grad
+        # each step, so False is safe.
         "ddp_find_unused_parameters": False,
         "save_strategy": "steps",
         "save_steps": run.save_steps,
@@ -146,55 +147,8 @@ def check_ddp_visibility(world_size: int, visible_gpus: int) -> None:
     if world_size > 1 and visible_gpus < world_size:
         raise SystemExit(
             f"WORLD_SIZE={world_size} but only {visible_gpus} CUDA device(s) "
-            "visible - a CUDA_VISIBLE_DEVICES mask (e.g. the notebook's "
-            "single-GPU default) leaked into the torchrun launch. Prefix the "
-            "command with CUDA_VISIBLE_DEVICES=0,1."
-        )
-
-
-def check_mp_torchrun_conflict(device_map: str | None, world_size: int) -> None:
-    """Model-parallel (device_map) and torchrun DDP are mutually exclusive:
-    each rank would try to split the model across all GPUs while DDP also
-    replicates it per rank. Die before the model load."""
-    if device_map is not None and world_size > 1:
-        raise SystemExit(
-            f"model.device_map={device_map!r} under torchrun (WORLD_SIZE="
-            f"{world_size}) - the MP lane launches with plain python, not "
-            "torchrun. Use the DDP config for torchrun launches."
-        )
-
-
-def check_mp_gpu_count(device_map: str | None, visible_gpus: int) -> None:
-    """A leaked single-GPU CUDA_VISIBLE_DEVICES mask would make device_map
-    cram the full model onto one T4 and OOM mid-load. Die in milliseconds."""
-    if device_map is not None and visible_gpus < 2:
-        raise SystemExit(
-            f"model.device_map={device_map!r} but only {visible_gpus} CUDA "
-            "device(s) visible - the MP lane needs both T4s. Prefix the "
-            "launch with CUDA_VISIBLE_DEVICES=0,1."
-        )
-
-
-def check_max_memory_requires_device_map(device_map: str | None, max_memory: dict | None) -> None:
-    """max_memory only shapes a device_map split; alone it silently does
-    nothing - refuse the misconfiguration instead."""
-    if max_memory is not None and device_map is None:
-        raise SystemExit(
-            "model.max_memory is set but model.device_map is null - max_memory "
-            "only applies to a device_map split. Set device_map: balanced or "
-            "remove max_memory."
-        )
-
-
-def check_model_split(param_devices: list[str]) -> None:
-    """After load with a device_map, parameters must actually live on >= 2
-    CUDA devices - a silently ignored device_map looks green until OOM."""
-    cuda_devices = {d for d in param_devices if d.startswith("cuda")}
-    if len(cuda_devices) < 2:
-        raise SystemExit(
-            f"device_map was set but parameters sit on {sorted(param_devices)} "
-            "- the split did not happen (unsloth ignored device_map, or a GPU "
-            "mask leaked). Do not trust this run's memory numbers."
+            "visible - a single-GPU CUDA_VISIBLE_DEVICES mask leaked into the "
+            "torchrun launch. Prefix the command with CUDA_VISIBLE_DEVICES=0,1."
         )
 
 
@@ -231,7 +185,7 @@ def print_versions() -> None:
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/law_v1.yaml")
+    p.add_argument("--config", default="configs/law_v1_8b_ddp.yaml")
     p.add_argument("--mode", choices=["smoke"], default="smoke")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--no-hub", action="store_true")
@@ -264,8 +218,6 @@ def main(argv: list[str] | None = None) -> None:
         dataset=args.dataset,
         max_seq_length=args.max_seq_length,
     )
-    check_mp_torchrun_conflict(cfg.model.device_map, int(os.environ.get("WORLD_SIZE", "1")))
-    check_max_memory_requires_device_map(cfg.model.device_map, cfg.model.max_memory)
     output_dir = f"outputs/{args.mode}"
 
     print_versions()
@@ -297,16 +249,10 @@ def main(argv: list[str] | None = None) -> None:
     if not torch.cuda.is_available():
         raise SystemExit("no CUDA device - in Kaggle set Accelerator to 'GPU T4 x2'")
     check_ddp_visibility(int(os.environ.get("WORLD_SIZE", "1")), torch.cuda.device_count())
-    check_mp_gpu_count(cfg.model.device_map, torch.cuda.device_count())
 
     from datasets import load_dataset
     from trl import SFTConfig, SFTTrainer
 
-    load_kw = {}
-    if cfg.model.device_map is not None:
-        load_kw["device_map"] = cfg.model.device_map
-        if cfg.model.max_memory is not None:
-            load_kw["max_memory"] = cfg.model.max_memory
     model_source, model_revision = resolve_model_source(
         cfg.model.repo, cfg.model.revision, os.environ.get("TUNED_MODEL_PATH")
     )
@@ -317,7 +263,6 @@ def main(argv: list[str] | None = None) -> None:
         dtype=torch.float16 if not is_bfloat16_supported() else torch.bfloat16,
         load_in_4bit=True,
         full_finetuning=False,
-        **load_kw,
     )
     model = FastModel.get_peft_model(
         model,
@@ -335,11 +280,6 @@ def main(argv: list[str] | None = None) -> None:
     vision_hits = [m for m in lora_modules if "vision" in m.lower()]
     if vision_hits:
         raise SystemExit(f"LoRA attached to vision tower modules {vision_hits[:3]} - unsloth#5677 risk; fix target_modules regex")
-
-    if cfg.model.device_map is not None:
-        param_devices = sorted({str(p.device) for p in model.parameters()})
-        print(f"param_devices={param_devices}")
-        check_model_split(param_devices)
 
     ds = load_dataset("json", data_files=run.dataset, split="train")
     ds = ds.map(

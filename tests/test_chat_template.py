@@ -3,7 +3,7 @@ config's masking markers appear. Skips locally (no [train] extra); runs on
 Kaggle where transformers is installed and internet is on.
 
 Catches: a transformers/tokenizer change silently altering the template, or a
-config pointing at markers from the wrong template family (ChatML vs Mistral).
+config pointing at markers from the wrong template family.
 """
 
 from pathlib import Path
@@ -12,19 +12,12 @@ import pytest
 
 from tuned.train.config import load_config
 
-CONFIGS = Path(__file__).parent.parent / "configs"
+CONFIG = Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml"
 
 
-# Only live lanes are checked (law_v1_ddp.yaml and law_v1_mp.yaml share
-# law_v1.yaml's model, so they're skipped to avoid a redundant fetch; the
-# archived Ministral config is not worth a tokenizer fetch per Kaggle
-# session). law_v1_8b_ddp.yaml pins a DIFFERENT base model (Qwen3-8B, not
-# 14B) so it gets its own fetch - this is what actually validates the 8B
-# lane's chat template renders think tags identically to the 14B family.
-@pytest.mark.parametrize("name", ["law_v1.yaml", "law_v1_8b_ddp.yaml"])
-def test_markers_and_think_tags_render(name):
+def test_markers_and_think_tags_render():
     transformers = pytest.importorskip("transformers")
-    cfg = load_config(CONFIGS / name)
+    cfg = load_config(CONFIG)
     tok = transformers.AutoTokenizer.from_pretrained(
         cfg.model.repo, revision=cfg.model.revision
     )
@@ -44,8 +37,8 @@ def test_markers_and_think_tags_render(name):
     # the reasoning scaffold survives rendering (single-turn: last assistant
     # message - Qwen3's template only strips think blocks from earlier turns)
     # and must not be doubled by a template that re-wraps assistant reasoning.
-    # Count within the response region only: Ministral's auto-injected default
-    # system prompt legitimately mentions [THINK] once in its instruction text.
+    # Count within the response region only, so an auto-injected system prompt
+    # that mentions the think tags cannot skew the count.
     response_region = text[text.index(cfg.model.response_part) :]
     assert response_region.count(cfg.data.think_open) == 1
     assert response_region.count(cfg.data.think_close) == 1

@@ -1,8 +1,8 @@
 """Build the ~1k-example smoke dataset from OpenThoughts-114k (Apache-2.0).
 
 Assistant content is wrapped in the base model's reasoning scaffold
-(config data.think_open / data.think_close), e.g. [THINK]trace[/THINK]solution
-for Ministral-3 Reasoning, so training matches the model's native template.
+(config data.think_open / data.think_close), e.g. <think>trace</think>solution
+for Qwen3, so training matches the model's native template.
 """
 
 import json
@@ -104,7 +104,7 @@ if __name__ == "__main__":
     from tuned.train.config import load_config
 
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/law_v1.yaml")
+    p.add_argument("--config", default="configs/law_v1_8b_ddp.yaml")
     p.add_argument("--out", default=None)
     args = p.parse_args()
 

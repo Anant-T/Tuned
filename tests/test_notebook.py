@@ -9,47 +9,45 @@ def test_notebook_is_valid_and_complete():
     assert nb["nbformat"] == 4
     sources = ["".join(c["source"]) for c in nb["cells"]]
     joined = "\n".join(sources)
-    # the operator's switches default to the 8B DDP lane's next gate: SMOKE ran
-    # green 2026-08-08 05:04 UTC (60/60 steps, train_loss 0.5722 trending down,
-    # grad_norm finite after calibration, peaks 12.98/13.18 GiB, ~74.7 s/step,
-    # checkpoints on the Hub), so the ladder advances to RESUME (fresh session)
+    # the operator's only switch is the gate: SMOKE ran green 2026-08-08 05:04
+    # UTC (60/60 steps, train_loss 0.5722 trending down, grad_norm finite after
+    # calibration, peaks 12.98/13.18 GiB, ~74.7 s/step, checkpoints on the
+    # Hub), so the ladder advances to RESUME (fresh session)
     assert 'MODE = "RESUME"' in joined
-    assert "DDP = False" in joined
-    assert "MP = False" in joined
-    assert "DDP_8B = True" in joined
-    # the two multi-GPU lanes are mutually exclusive - torchrun replicating a
-    # device_map-split model would be neither DDP nor MP
-    assert "DDP and MP" in joined
-    # GPU mask and config follow the lane together: DDP needs every rank to see
-    # both GPUs (a leaked single-GPU mask killed rank 1 with "invalid device
-    # ordinal" on 2026-08-06), MP splits layers across both, and each lane has
-    # its own config (grad accumulation, seq length, device_map, ckpt repo)
-    assert '"0,1" if (DDP or MP) else "0"' in joined
-    assert '"configs/law_v1_mp.yaml" if MP' in joined
-    assert '"configs/law_v1_ddp.yaml" if DDP' in joined
-    assert '"configs/law_v1.yaml"' in joined
-    # MP must NOT go through torchrun - only the DDP-style lanes select it
-    assert '["torchrun", "--nproc_per_node=2"] if (DDP or DDP_8B) else [sys.executable, "-u"]' in joined
-    # 8B lane wiring: its own config, and the chunked-CE env var must be set
-    # lane-scoped BEFORE `import unsloth` in the torchrun children (default
-    # n_chunks=4 leaves a ~2.4-3.0 GiB loss-step transient at seq 8192)
-    assert '"configs/law_v1_8b_ddp.yaml" if DDP_8B' in joined
+    # ONE lane: the notebook IS configs/law_v1_8b_ddp.yaml. No lane flags, no
+    # config ternary - the config, the GPU mask and the launcher are fixed and
+    # can no longer drift apart from each other.
+    assert 'CONFIG = "configs/law_v1_8b_ddp.yaml"' in joined
+    # every rank must see BOTH GPUs (rank N places itself on cuda:N): a leaked
+    # single-GPU mask killed rank 1 with "invalid device ordinal" on 2026-08-06
+    assert 'os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"' in joined
+    # torchrun unconditionally - one rank per GPU, full model per rank
+    assert 'launcher = ["torchrun", "--nproc_per_node=2"]' in joined
+    # the chunked-CE env var must be set BEFORE `import unsloth` in the
+    # torchrun children (default n_chunks=4 leaves a ~2.4-3.0 GiB loss-step
+    # transient at seq 8192), so it has to sit in the parent env
     assert 'UNSLOTH_CE_LOSS_N_CHUNKS"] = "16"' in joined
-    # the MP lane's gate: PROBE runs no-hub on the long probe dataset (short
-    # unpacked examples would make the long-seq VRAM probe a false green);
-    # PROBE_SEQ probes above-config lengths without a config edit
+    # the retired lanes must not creep back in as dead switches
+    for dead in ("DDP = ", "MP = ", "DDP_8B", "law_v1_mp.yaml", "law_v1_ddp.yaml",
+                 '"configs/law_v1.yaml"', "device_map"):
+        assert dead not in joined, f"retired-lane leftover in the notebook: {dead}"
+    # PROBE runs no-hub on the long probe dataset (short unpacked examples
+    # would make the long-seq VRAM probe a false green); PROBE_SEQ probes
+    # above-config lengths without a config edit
     assert '"data/probe_long.jsonl"' in joined
     assert "--no-hub" in joined
     assert "PROBE_SEQ" in joined
     assert "--max-seq-length" in joined
     assert "tuned.data.probe" in joined
-    # allocator headroom - DDP peaks ~1 GiB from the 14.56 GiB cap
+    # allocator headroom - peaks land ~1.4 GiB from the 14.56 GiB cap
     assert 'PYTORCH_ALLOC_CONF"] = "expandable_segments:True"' in joined
     # scratch cache - never /kaggle/working
     assert "/tmp/hf_cache" in joined
     assert "/kaggle/working/hf_cache" not in joined
     # secrets come from Kaggle, never hardcoded
     assert "UserSecretsClient" in joined
+    # W&B run names carry the lane so Hub/W&B history stays readable
+    assert "8b-ddp" in joined
     # token hunt must be depth-bounded: rglob walks EVERY attached dataset, and
     # the not-found diagnostic must stream lazily (islice), never materialize
     # the whole /kaggle/input tree - a mounted multi-GB dataset turns either

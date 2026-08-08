@@ -1,30 +1,30 @@
 # 8B DDP lane - Qwen3-8B under plain 2x T4 data-parallel via torchrun.
-# UNPROBED: no Kaggle run yet (quota exhausted 2026-08-07). Projected per-rank
-# peak 13.0-13.4 GiB vs 14.56 GiB usable - a knife-edge GO (opus research
-# 2026-08-07). Dynamic 4-bit weights measured 6.97 GiB (repo total_size, NOT
-# params/2 - the naive halving estimate under-counts quantization overhead).
-# Chunked cross-entropy is confirmed active on this stack: the 14B MP lane's
-# GPU1 peak of 8.75 GiB at seq 8192 (see law_v1_mp.yaml) proves logits never
-# materialize in full, which is what keeps this lane's projected peak below
-# the cap despite the longer sequence. Precision (unsloth source read
+# The production lane, FULLY QUALIFIED on Kaggle 2026-08-08 - all four gates
+# green: PROBE (per-rank peaks 12.80/13.00 GiB), SAVETEST (checkpoint pushed
+# and visible on the Hub), SMOKE (60/60 steps, 74.7 s/step, train_loss 0.5722
+# trending down, peaks 12.98/13.18 GiB vs 14.56 GiB usable), RESUME (fresh
+# session, resumed at step 61 with scaler state restored). Dynamic 4-bit
+# weights measured 6.97 GiB (repo total_size, NOT params/2 - the naive halving
+# estimate under-counts quantization overhead).
+# Chunked cross-entropy is confirmed active on this stack: measured peaks stay
+# ~1.4 GiB under the cap at seq 8192, which only holds if logits never
+# materialize in full. Precision (unsloth source read
 # 2026-08-07): the active path is unsloth's own chunked fused CE
 # (unsloth_fused_ce_loss) - Apple's cut-cross-entropy is dead code on sm_75
 # (commented out upstream; its Triton kernels need 96KB shared mem vs T4's
 # 64KB). Default chunking (n_chunks=4 at this seq/vocab) leaves a ~2.4-3.0
 # GiB transient at the loss step; the notebook sets UNSLOTH_CE_LOSS_N_CHUNKS=16
-# for this lane (must be in env before `import unsloth`), cutting that to
-# ~0.7 GiB and improving the projected per-rank peak to ~12.0-12.6 GiB.
-# Like law_v1_ddp.yaml, each rank holds
-# the FULL model (no device_map / no model split) - the parallelism is over
+# (must be in env before `import unsloth`), cutting that to ~0.7 GiB - that
+# margin is what the measured peaks above depend on.
+# Each rank holds the FULL model (no model split) - the parallelism is over
 # data, not layers. Launch:
 #
 #   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 -m tuned.train.sft \
 #       --config configs/law_v1_8b_ddp.yaml --mode smoke
 #
-# ga=2, not 8: 8B halves the per-token memory footprint vs the 14B DDP lane,
-# so this lane doubles max_seq_length (2048 -> 8192) instead of throughput -
-# 8192 x 1 x 2 x 2 ranks = 32,768 tokens/optimizer-step, matching every other
-# lane's token budget per step.
+# ga=2: at 8B the per-token memory footprint is small enough to spend the
+# budget on sequence length rather than throughput - 8192 x 1 x 2 x 2 ranks =
+# 32,768 tokens/optimizer-step.
 #
 # Step-0 gate (mandatory before trusting any loss/grad_norm number out of this
 # lane): assert non-zero assistant-label coverage. unsloth#2771 / trl#3927 -
@@ -40,15 +40,15 @@
 #   3. drop max_seq_length to 6144 (still keeps most judgments intact).
 # NOT on the ladder: use_gradient_checkpointing "unsloth" (CPU offload) - it
 # is a no-op under DDP; unsloth PR#4240 states prior DDP fixes "eliminated
-# CPU offloading entirely" for compatibility. That lever exists only for the
-# MP/single-GPU lanes.
+# CPU offloading entirely" for compatibility. That lever only does anything
+# outside DDP.
 #
 # Watch-items (crash signatures with known one-line fixes):
 #   - unsloth#3769: transformers >= 4.57.3 defaults
 #     average_tokens_across_devices=True, which reportedly breaks the fused CE
-#     backward under DDP ("'int' object has no attribute 'mean'"). Our 14B DDP
-#     SAVETEST ran green on this exact stack (transformers 5.5.0), so we appear
-#     unaffected - but if this probe crashes with that message, set
+#     backward under DDP ("'int' object has no attribute 'mean'"). All four
+#     gates ran green on this exact stack (transformers 5.5.0), so we are
+#     unaffected - but if a run crashes with that message, set
 #     average_tokens_across_devices=False in build_sft_config.
 #   - Never call FastModel.for_inference() pre-training without a matching
 #     for_training(): it sets UNSLOTH_RETURN_LOGITS=1, silently re-materializing
@@ -56,7 +56,7 @@
 #   - Pinned unsloth_zoo 2026.8.3 predates zoo PR#988 (2026-08-05): Kaggle
 #     Dataset.map fork workers can be OOM-killed -> "One of the subprocesses
 #     has abruptly died" at SFTTrainer construction. If hit, bump unsloth_zoo
-#     >= 2026.8.4 in a scratch branch (do NOT bump for qualified lanes).
+#     >= 2026.8.4 in a scratch branch (do NOT bump this qualified lane).
 #   - Step-0 asserts: tokenizer.pad_token == "<|endoftext|>" (unsloth#4104:
 #     a <|vision_pad|> pad silently NaNs LoRA-A grads at batch > 1), and scan
 #     the log for unsloth's masked-row drop notice - rows < 90% masked are
@@ -93,6 +93,8 @@ train:
     dataset: data/smoke_v1.jsonl
 
 hub:
-  # Private; own repo per lane per base model - sharing one means silent
-  # last-push-wins clobbering and cross-loading on --resume.
+  # Private, and scoped to this base model + launch shape - a repo shared with
+  # another training shape means silent last-push-wins clobbering and
+  # cross-loading on --resume. The notebook re-homes the NAMESPACE per session
+  # (see the re-home cell); the repo NAME here is the live contract.
   checkpoint_repo: tantan01/tuned-law-v1-qwen8b-ckpt-ddp

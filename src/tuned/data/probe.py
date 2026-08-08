@@ -6,10 +6,10 @@ false green. Rows from an existing smoke jsonl are concatenated into
 multi-turn conversations until each exceeds a character threshold of
 chars_per_token * target_tokens (>= 6 chars/token is conservative for
 English/reasoning text; overshoot is free because the trainer truncates at
-max_length, undershoot is the failure mode). One probe file serves any lane
+max_length, undershoot is the failure mode). One probe file serves any run
 with max_seq_length <= target_tokens.
 
-Build:  python -m tuned.data.probe --config configs/law_v1_mp.yaml
+Build:  python -m tuned.data.probe --config configs/law_v1_8b_ddp.yaml
         (target defaults to the config's smoke max_seq_length; --target-tokens
         overrides it for above-config probes, e.g. 8192)
 """
@@ -64,7 +64,7 @@ if __name__ == "__main__":
     from tuned.train.config import load_config
 
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/law_v1_mp.yaml")
+    p.add_argument("--config", default="configs/law_v1_8b_ddp.yaml")
     p.add_argument("--src", default="data/smoke_v1.jsonl")
     p.add_argument("--out", default="data/probe_long.jsonl")
     p.add_argument("--n", type=int, default=8)

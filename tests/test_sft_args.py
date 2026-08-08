@@ -3,7 +3,7 @@ from pathlib import Path
 from tuned.train.config import load_config
 from tuned.train.sft import build_sft_config
 
-CONFIG = Path(__file__).parent.parent / "configs" / "law_v1.yaml"
+CONFIG = Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml"
 
 
 def test_smoke_sft_kwargs():
@@ -11,14 +11,14 @@ def test_smoke_sft_kwargs():
     kw = build_sft_config(cfg, cfg.train.smoke, output_dir="outputs/smoke")
     assert kw["max_steps"] == 60
     assert kw["per_device_train_batch_size"] == 1
-    assert kw["gradient_accumulation_steps"] == 16
+    assert kw["gradient_accumulation_steps"] == 2
     assert kw["learning_rate"] == 2.0e-4
     assert kw["optim"] == "adamw_8bit"
     assert kw["seed"] == 3407
     assert kw["save_steps"] == 25
     assert kw["save_strategy"] == "steps"
     assert kw["output_dir"] == "outputs/smoke"
-    assert kw["max_length"] == 2048
+    assert kw["max_length"] == 8192
 
 
 def test_hub_kwargs_only_when_repo_set():
@@ -34,7 +34,7 @@ def test_hub_kwargs_only_when_repo_set():
     assert kw["hub_private_repo"] is True
 
 
-from tuned.train.sft import apply_overrides, check_gpu_capability
+from tuned.train.sft import apply_overrides, check_ddp_visibility, check_gpu_capability
 
 import pytest
 
@@ -63,6 +63,23 @@ def test_report_to_gated_on_wandb_key(monkeypatch):
     assert kw["report_to"] == "wandb"
 
 
+def test_find_unused_parameters_disabled():
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o")
+    # TRL defaults this to True under DDP - an extra autograd-graph traversal
+    # every step for nothing (every LoRA param gets a grad each step).
+    assert kw["ddp_find_unused_parameters"] is False
+
+
+def test_warmup_converted_to_steps():
+    # warmup_ratio is deprecated in transformers 5.5 (lr logged 0 in the
+    # 2026-08-07 probe); build_sft_config converts it.
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o")
+    assert "warmup_ratio" not in kw
+    assert kw["warmup_steps"] == 2  # round(0.03 * 60)
+
+
 def test_apply_overrides_replaces_steps():
     cfg = load_config(CONFIG, allow_unpinned=True)
     run = apply_overrides(cfg.train.smoke, max_steps=4, save_steps=2)
@@ -80,6 +97,16 @@ def test_apply_overrides_none_is_noop():
     assert run == cfg.train.smoke
 
 
+def test_dataset_and_seq_overrides():
+    # The PROBE gate's two levers: swap in the long probe dataset and probe an
+    # above-config sequence length without editing the config.
+    run = load_config(CONFIG, allow_unpinned=True).train.smoke
+    assert apply_overrides(run).dataset == run.dataset
+    assert apply_overrides(run, dataset="data/probe_long.jsonl").dataset == "data/probe_long.jsonl"
+    assert apply_overrides(run).max_seq_length == 8192
+    assert apply_overrides(run, max_seq_length=10240).max_seq_length == 10240
+
+
 def test_capability_gate_rejects_p100():
     with pytest.raises(SystemExit, match="T4 x2"):
         check_gpu_capability((6, 0))
@@ -87,6 +114,19 @@ def test_capability_gate_rejects_p100():
 
 def test_capability_gate_accepts_t4():
     check_gpu_capability((7, 5))  # must not raise
+
+
+def test_visibility_guard_rejects_masked_ranks():
+    # The exact 2026-08-06 failure: a CUDA_VISIBLE_DEVICES=0 mask leaked into
+    # torchrun, each rank saw one GPU, rank 1 asked for cuda:1 and died with
+    # "invalid device ordinal" mid-load.
+    with pytest.raises(SystemExit, match="CUDA_VISIBLE_DEVICES"):
+        check_ddp_visibility(world_size=2, visible_gpus=1)
+
+
+def test_visibility_guard_passes_valid_setups():
+    check_ddp_visibility(world_size=1, visible_gpus=1)  # not under torchrun
+    check_ddp_visibility(world_size=2, visible_gpus=2)  # the production launch
 
 
 def test_read_gpu_capability_no_crash():
