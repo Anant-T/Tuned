@@ -324,16 +324,22 @@ def test_main_mode_refuses_the_underived_max_steps_sentinel():
     assert guard < gpu_import  # refuse in milliseconds, not after model load
 
 
-def test_group_by_length_attacks_ddp_straggler_skew():
+def test_length_grouped_sampling_attacks_ddp_straggler_skew():
     # At bs=1 with variable-length data, every step costs max(rank0, rank1) -
     # rank 0 can draw a 900-token example while rank 1 draws 7,800. The
     # length-grouped sampler makes ranks draw similar lengths at the same
     # time, with no attention-mask change (it cannot demote the SDPA backend
     # or contaminate anything - the safe substitute for packing's other
     # benefit). No-op on the uniform-length smoke data.
+    # transformers 5.5 RENAMED the knob: the bool group_by_length field is
+    # gone, replaced by train_sampling_strategy="group_by_length" - and
+    # unsloth's code-generated UnslothSFTConfig rejects unknown kwargs
+    # outright ("unexpected keyword argument 'group_by_length'", the
+    # 2026-08-09 02:45 UTC SAVETEST failure, 65 s into the session).
     cfg = load_config(CONFIG, allow_unpinned=True)
     kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o")
-    assert kw["group_by_length"] is True
+    assert kw["train_sampling_strategy"] == "group_by_length"
+    assert "group_by_length" not in kw  # the transformers<5 spelling crashes
 
 
 def test_dataloader_drop_last_prevents_duplicate_examples():

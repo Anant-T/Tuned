@@ -199,7 +199,11 @@ def build_sft_config(
         # length-grouped sampler has ranks draw similar lengths at the same
         # time. No attention-mask or kernel change (cannot demote the SDPA
         # backend, cannot contaminate); no-op on uniform-length smoke data.
-        "group_by_length": True,
+        # transformers 5.5 spelling: the old bool group_by_length field is
+        # GONE, and unsloth's code-generated UnslothSFTConfig rejects unknown
+        # kwargs outright (the 2026-08-09 02:45 UTC SAVETEST died on it 65 s
+        # into the session - same 5.x-rename class as warmup_ratio above).
+        "train_sampling_strategy": "group_by_length",
         # accelerate's even_batches=True default DUPLICATES wrap-around
         # samples so every rank sees equal batch counts - silent example
         # duplication in a one-epoch run. max_steps is floored to full
