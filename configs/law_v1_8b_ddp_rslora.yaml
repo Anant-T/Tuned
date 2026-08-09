@@ -1,18 +1,20 @@
-# TEMPORARY A/B EXPERIMENT - the qualified 8B DDP lane with exactly two knobs
-# turned; delete this file once the comparison is read. Everything not listed
-# here is byte-identical to configs/law_v1_8b_ddp.yaml (enforced by
-# tests/test_rslora_config.py), so any loss/VRAM/throughput delta is
-# attributable to rsLoRA alone:
+# TEMPORARY A/B EXPERIMENT - the qualified 8B DDP lane with exactly three
+# knobs turned; delete this file once the comparison is read. Everything not
+# listed here is byte-identical to configs/law_v1_8b_ddp.yaml (enforced by
+# tests/test_rslora_config.py). NOTE this is a JOINT treatment - rsLoRA AND
+# alpha 64 together (operator's call, 2026-08-09) - so a delta is
+# attributable to the pair, not to rsLoRA alone:
 #
 #   1. lora.use_rslora: true - adapter scale becomes alpha/sqrt(r) instead of
-#      alpha/r. At r=32/alpha=32 that is a 5.66x jump in effective adapter
-#      scale on top of the unchanged 2e-4 LR. The 2026-08-09 research verdict
-#      (arXiv:2312.03732 tested r=32 exactly: LoRA ~= rsLoRA there, gains
-#      start at r>=128) predicts same-or-worse loss and possibly instability;
-#      this run is the empirical check of that prediction. Deliberately NOT
-#      LR-compensated: lowering alpha to sqrt(r) would reproduce the baseline
-#      scale exactly (scale is the only place alpha enters) and test nothing.
-#   2. hub.checkpoint_repo: -rslora suffix - a repo shared with the production
+#      alpha/r.
+#   2. lora.alpha: 64 - combined with (1) the effective adapter scale is
+#      64/sqrt(32) = 11.3x the baseline's 32/32 = 1.0, on the unchanged 2e-4
+#      LR. This is HOT: the 2026-08-09 research verdict (arXiv:2312.03732
+#      tested r=32 exactly: LoRA ~= rsLoRA there, gains start at r>=128)
+#      predicted same-or-worse at 5.66x already; 11.3x makes instability the
+#      expected outcome and this run the empirical check. If it diverges, the
+#      clean follow-up that isolates rsLoRA alone is alpha: 32 here (5.66x).
+#   3. hub.checkpoint_repo: -rslora suffix - a repo shared with the production
 #      lane means silent last-push-wins clobbering and cross-loading on
 #      --resume (the base yaml's own contract).
 #
@@ -38,7 +40,7 @@ data:
 
 lora:
   r: 32
-  alpha: 32
+  alpha: 64
   dropout: 0.0
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   use_rslora: true
