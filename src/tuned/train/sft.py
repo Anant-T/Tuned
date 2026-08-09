@@ -9,6 +9,8 @@ Probe:    ... --max-steps 2 --no-hub --dataset data/probe_long.jsonl --max-seq-l
 Savetest: ... --max-steps 4 --save-steps 2
 Smoke:    ... (no extra args)
 Resume:   ... --resume --max-steps 64 --allow-schedule-change
+Main:     ... --mode main --time-budget-s 37800 (later sessions add --resume;
+          NEVER --allow-schedule-change - that jump is the +134% LR bug)
 
 The resume flag is gate-only: changing max_steps rebuilds the LR schedule.
 """
@@ -99,6 +101,66 @@ def check_resume_schedule(
     )
 
 
+def check_main_max_steps(mode: str, max_steps: int) -> None:
+    """train.main.max_steps ships as 0 - a deliberate sentinel. The real value
+    must come from the POST-FILTER row count: train_on_responses_only DROPS
+    fully-masked rows with only a print, so the raw file line count over-counts,
+    and check_resume_schedule freezes whatever value the first session trains
+    with. Training on the sentinel would build a nonsense LR schedule."""
+    if mode == "main" and max_steps <= 0:
+        raise SystemExit(
+            f"train.main.max_steps={max_steps} is the underived sentinel - derive "
+            "it first from the post-filter row count: run a 2-step --no-hub probe "
+            "on the real dataset, read the post_filter_rows= line, set "
+            "max_steps = post_filter_rows // (bs * ga * world_size) in the config "
+            "and commit. It is immutable after the first main session "
+            "(check_resume_schedule refuses a changed schedule on resume)."
+        )
+
+
+def _gib(nbytes: int) -> float:
+    """Binary GiB - the unit of every reference line (14.56 usable, 13.5 abort).
+    The old math divided by decimal 1e9 under a _gb label, understating true
+    headroom by ~0.9 GiB against those GiB references."""
+    return nbytes / 2**30
+
+
+def check_vram_reserved(reserved_gib: list[float], limit_gib: float = 13.5) -> None:
+    """The ~13.5 GiB abort line, enforced in code instead of notebook prose
+    (whose two mentions disagreed on which number it applies to). Reserved -
+    the allocator's segment high-water - is what actually OOMs against the
+    14.56 GiB cap; allocated is always smaller and reads falsely green."""
+    worst = max(reserved_gib)
+    if worst > limit_gib:
+        raise SystemExit(
+            f"peak reserved VRAM {worst:.2f} GiB exceeds the {limit_gib} GiB "
+            "abort line - too close to the 14.56 GiB cap to trust across a "
+            "multi-session run (fragmentation only grows). OOM ladder in "
+            "configs/law_v1_8b_ddp.yaml: standard-quant repo (-1.31 GiB) -> "
+            "UNSLOTH_CE_LOSS_N_CHUNKS 32 -> seq 6144."
+        )
+
+
+def check_eos_in_labels(eos_kept: int, mode: str) -> None:
+    """A model whose labels never contain <|im_end|> (the Qwen3 turn
+    terminator) never learns to STOP - it fails the blind-judge eval by
+    rambling, while loss and grad_norm stay green. Keyed on <|im_end|> and
+    NEVER on <|endoftext|>: that token is this lane's PAD, and pad positions
+    must stay -100. Smoke data truncates single-turn OpenThoughts rows at
+    max_seq by design (cutting their only <|im_end|>), so zero there is a
+    data artifact -> warn; the main dataset is drop-never-truncate, so zero
+    there means the builder or masking is broken -> fatal."""
+    if eos_kept > 0:
+        return
+    msg = (
+        "eos_in_labels=0 - no <|im_end|> token among the unmasked labels of "
+        "the probe batch; nothing teaches the model to end a turn"
+    )
+    if mode == "main":
+        raise SystemExit(msg + " - main data is drop-never-truncate, so this is a builder/masking bug")
+    print(f"WARNING: {msg} (expected artifact when every probe row truncates at max_seq)")
+
+
 def build_sft_config(
     cfg: Config, run: RunCfg, output_dir: str, bf16_supported: bool = False
 ) -> dict:
@@ -132,6 +194,17 @@ def build_sft_config(
         # the qualified 2026-08-06 SAVETEST). Every LoRA param gets a grad
         # each step, so False is safe.
         "ddp_find_unused_parameters": False,
+        # bs=1 + variable-length data: every DDP step costs max(rank0, rank1)
+        # - rank 0 can draw a 900-token row while rank 1 draws 7,800. The
+        # length-grouped sampler has ranks draw similar lengths at the same
+        # time. No attention-mask or kernel change (cannot demote the SDPA
+        # backend, cannot contaminate); no-op on uniform-length smoke data.
+        "group_by_length": True,
+        # accelerate's even_batches=True default DUPLICATES wrap-around
+        # samples so every rank sees equal batch counts - silent example
+        # duplication in a one-epoch run. max_steps is floored to full
+        # batches anyway (see check_main_max_steps), so the tail is free.
+        "dataloader_drop_last": True,
         "save_strategy": "steps",
         "save_steps": run.save_steps,
         "save_total_limit": 2,
@@ -227,9 +300,10 @@ def print_versions() -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    _proc_t0 = time.monotonic()  # --time-budget-s anchor: process start
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="configs/law_v1_8b_ddp.yaml")
-    p.add_argument("--mode", choices=["smoke"], default="smoke")
+    p.add_argument("--mode", choices=["smoke", "main"], default="smoke")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--allow-schedule-change", action="store_true",
                    help="permit a resume whose max_steps differs from the checkpoint's (RESUME gate only)")
@@ -265,6 +339,9 @@ def main(argv: list[str] | None = None) -> None:
         dataset=args.dataset,
         max_seq_length=args.max_seq_length,
     )
+    # After overrides (a --max-steps 2 probe of the main dataset is legal and
+    # is exactly how the real value gets derived), before any GPU import.
+    check_main_max_steps(args.mode, run.max_steps)
     output_dir = f"outputs/{args.mode}"
 
     print_versions()
@@ -334,15 +411,25 @@ def main(argv: list[str] | None = None) -> None:
     if vision_hits:
         raise SystemExit(f"LoRA attached to vision tower modules {vision_hits[:3]} - unsloth#5677 risk; fix target_modules regex")
 
-    ds = load_dataset("json", data_files=run.dataset, split="train")
-    ds = ds.map(
-        lambda ex: {
-            "text": tokenizer.apply_chat_template(
-                ex["messages"], tokenize=False, add_generation_prompt=False
-            )
-        },
-        remove_columns=ds.column_names,
-    )
+    from accelerate import PartialState
+
+    # Rank 0 computes and writes the datasets cache; rank 1 waits at the
+    # barrier, then re-runs the same code as a cache hit. Without this BOTH
+    # ranks ran every prep stage - the 2026-08-08 log shows two interleaved
+    # "Unsloth: Tokenizing (num_proc=8)" bars at ~43 s each: 16 fork workers
+    # on a 4-vCPU box, doubling the zoo<2026.8.4 fork-OOM exposure for zero
+    # benefit (the sampler shards data across ranks at iteration time anyway).
+    _dist = PartialState()
+    with _dist.local_main_process_first():
+        ds = load_dataset("json", data_files=run.dataset, split="train")
+        ds = ds.map(
+            lambda ex: {
+                "text": tokenizer.apply_chat_template(
+                    ex["messages"], tokenize=False, add_generation_prompt=False
+                )
+            },
+            remove_columns=ds.column_names,
+        )
 
     import inspect
 
@@ -350,21 +437,30 @@ def main(argv: list[str] | None = None) -> None:
     if "max_length" not in inspect.signature(SFTConfig.__init__).parameters:
         sft_kw["max_seq_length"] = sft_kw.pop("max_length")
 
-    trainer = SFTTrainer(
-        model=model,
-        processing_class=tokenizer,
-        train_dataset=ds,
-        args=SFTConfig(
-            dataset_text_field="text",
-            **sft_kw,
-        ),
-    )
-    print(f"trainer_max_len={getattr(trainer.args, 'max_length', None) or getattr(trainer.args, 'max_seq_length', None)}")
-    trainer = train_on_responses_only(
-        trainer,
-        instruction_part=cfg.model.instruction_part,
-        response_part=cfg.model.response_part,
-    )
+    # Same rank-0-first treatment: the SFTTrainer ctor runs unsloth's
+    # num_proc=8 tokenization map and train_on_responses_only runs the
+    # masking map - the two other stages the log showed twice. Neither does
+    # a collective (the first NCCL op happens once training starts), so
+    # serializing them under the barrier is safe.
+    with _dist.local_main_process_first():
+        trainer = SFTTrainer(
+            model=model,
+            processing_class=tokenizer,
+            train_dataset=ds,
+            args=SFTConfig(
+                dataset_text_field="text",
+                **sft_kw,
+            ),
+        )
+        print(f"trainer_max_len={getattr(trainer.args, 'max_length', None) or getattr(trainer.args, 'max_seq_length', None)}")
+        trainer = train_on_responses_only(
+            trainer,
+            instruction_part=cfg.model.instruction_part,
+            response_part=cfg.model.response_part,
+        )
+    # The max_steps derivation input (see check_main_max_steps): rows LEFT
+    # after train_on_responses_only dropped fully-masked ones with a print.
+    print(f"post_filter_rows={len(trainer.train_dataset)}")
 
     # Step-0 gates - both mandatory before any loss/grad_norm number out of
     # this lane is worth reading, and both only meaningful once the response
@@ -375,7 +471,10 @@ def main(argv: list[str] | None = None) -> None:
         "unsloth#4104: a <|vision_pad|> pad silently NaNs LoRA-A grads at batch > 1"
     )
     probe_rows = [trainer.train_dataset[i] for i in range(min(8, len(trainer.train_dataset)))]
-    probe_labels = trainer.data_collator(probe_rows)["labels"]
+    # ONE collator call feeds all three gates below - two calls could pad
+    # differently and silently check different tensors.
+    probe_batch = trainer.data_collator(probe_rows)
+    probe_labels = probe_batch["labels"]
     kept = int((probe_labels != -100).sum())
     total = int(probe_labels.numel())
     print(f"label_coverage={kept}/{total} ({100 * kept / total:.1f}%)")
@@ -385,6 +484,22 @@ def main(argv: list[str] | None = None) -> None:
             "this run would train on nothing. Check instruction_part/response_part "
             "against the chat template and max_seq_length against the data "
             "(unsloth#2771 / trl#3927)."
+        )
+    # Third step-0 gate: the turn terminator must be LEARNED, not just seen.
+    # <|im_end|> closes every assistant turn in the Qwen3 template; if none
+    # survives unmasked, the model never learns to stop generating.
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    eos_kept = int((probe_labels == im_end_id).sum())
+    print(f"eos_in_labels={eos_kept}")
+    check_eos_in_labels(eos_kept, args.mode)
+    # Fourth gate, the EOS gate's inverse: the pad IS <|endoftext|>, so an
+    # unmasked pad position would train the model to EMIT padding.
+    pad_leak = int((probe_labels[probe_batch["attention_mask"] == 0] != -100).sum())
+    if pad_leak:
+        raise SystemExit(
+            f"{pad_leak} pad positions carry labels - the collator is not "
+            "masking padding; every one of them trains the model to emit "
+            "<|endoftext|> mid-sequence"
         )
 
     from transformers import TrainerCallback
@@ -419,9 +534,13 @@ def main(argv: list[str] | None = None) -> None:
         signal telling the two apart is the printed line plus a global_step
         below max_steps."""
 
-        def __init__(self, budget_s: float):
+        def __init__(self, budget_s: float, start: float | None = None):
+            # Anchored to PROCESS start, not construction: this callback is
+            # built after model load + dataset prep, while the notebook
+            # watchdog's 11 h SIGKILL clock starts at spawn. Unanchored, the
+            # setup minutes would silently spend the 30-min kill margin.
             self.budget_s = budget_s
-            self._start = time.monotonic()
+            self._start = time.monotonic() if start is None else start
 
         def on_step_end(self, args, state, control, **kwargs):
             if time.monotonic() - self._start > self.budget_s:
@@ -430,9 +549,38 @@ def main(argv: list[str] | None = None) -> None:
                 control.should_training_stop = True
             return control
 
+    class _ReservedCeiling(TrainerCallback):
+        """The 13.5 GiB abort line, live. A pre-training check can never fire
+        (adamw_8bit state appears at the first optimizer step, DDP buckets at
+        the first backward), and the post-run check_vram_reserved fires after
+        the quota is spent - so check the first steps (the full memory shape
+        exists by step 1-2 at bs=1 with a fixed bucket) and every 25th after
+        (fragmentation only grows). A stats-counter read, no CUDA sync.
+        Raises like _NonFiniteGuard: rc=0 must never carry an OOM-bound
+        profile."""
+
+        def __init__(self, limit_gib: float = 13.5, early: int = 3, every: int = 25):
+            self.limit_gib, self.early, self.every = limit_gib, early, every
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step > self.early and state.global_step % self.every:
+                return control
+            worst = max(
+                _gib(torch.cuda.max_memory_reserved(i))
+                for i in range(torch.cuda.device_count())
+            )
+            if worst > self.limit_gib:
+                raise RuntimeError(
+                    f"peak reserved {worst:.2f} GiB > {self.limit_gib} GiB at "
+                    f"step {state.global_step} - OOM-bound profile; ladder: "
+                    "standard-quant repo -> UNSLOTH_CE_LOSS_N_CHUNKS 32 -> seq 6144"
+                )
+            return control
+
     trainer.add_callback(_NonFiniteGuard())
+    trainer.add_callback(_ReservedCeiling())
     if args.time_budget_s is not None:
-        trainer.add_callback(_TimeBudget(args.time_budget_s))
+        trainer.add_callback(_TimeBudget(args.time_budget_s, start=_proc_t0))
 
     resume = False
     if args.resume:
@@ -463,17 +611,19 @@ def main(argv: list[str] | None = None) -> None:
             f"train_loss={stats.training_loss} - fp16 divergence; first lever: set max_grad_norm: 0.3"
         )
 
+    # Binary GiB throughout (_gib): decimal-GB math under a _gb label
+    # understated headroom ~0.9 GiB vs the GiB reference lines.
     peaks = [
-        torch.cuda.max_memory_allocated(i) / 1e9 for i in range(torch.cuda.device_count())
+        _gib(torch.cuda.max_memory_allocated(i)) for i in range(torch.cuda.device_count())
     ]
     print(f"peak_vram_gb={max(peaks):.2f}")
     for i, gb in enumerate(peaks):
         print(f"peak_vram_gb_dev{i}={gb:.2f}")
 
     # Reserved (the allocator's segment high-water), not allocated, is what
-    # OOMs - the ~13.5 GiB abort line must be checked against these numbers.
+    # OOMs - the ~13.5 GiB abort line is enforced against these numbers.
     reserved = [
-        torch.cuda.max_memory_reserved(i) / 1e9 for i in range(torch.cuda.device_count())
+        _gib(torch.cuda.max_memory_reserved(i)) for i in range(torch.cuda.device_count())
     ]
     print(f"peak_vram_reserved_gb={max(reserved):.2f}")
     for i, gb in enumerate(reserved):
@@ -492,6 +642,10 @@ def main(argv: list[str] | None = None) -> None:
             f"approx_tokens_per_sec={tokens / runtime:.0f} "
             "(upper bound - assumes every sequence is max_seq_length)"
         )
+
+    # Last so a breach still reports its throughput above; the live
+    # _ReservedCeiling already aborted early if the profile was OOM-bound.
+    check_vram_reserved(reserved)
 
 
 if __name__ == "__main__":

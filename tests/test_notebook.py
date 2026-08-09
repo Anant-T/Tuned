@@ -101,6 +101,40 @@ def test_notebook_is_valid_and_complete():
     # restores only the step counter (the gate's LR jumped +134% at step 62).
     # The gate accepts that jump; the main run must never opt into it.
     assert '"RESUME": ["--resume", "--max-steps", "64", "--allow-schedule-change"]' in joined
+    # MAIN/MAIN_RESUME are the production entries (2026-08-09 audit): they
+    # carry the clean-stop budget (10.5 h, ~30 min inside the 11 h watchdog
+    # SIGKILL - without it every session discards up to save_steps-1 steps,
+    # worst case ~30 min of compute) and must NEVER carry
+    # --allow-schedule-change: a schedule change on a production resume is
+    # the +134% LR jump the guard exists to prevent.
+    assert '"MAIN": ["--time-budget-s", "37800"]' in joined
+    assert '"MAIN_RESUME": ["--resume", "--time-budget-s", "37800"]' in joined
+    for line in joined.splitlines():
+        if '"MAIN' in line:
+            assert "--allow-schedule-change" not in line, line
+    # the child's --mode follows the notebook MODE: gates run the smoke
+    # config block, MAIN* runs train.main (ga=6, save_steps=10, law_v1)
+    assert 'MODE.startswith("MAIN")' in joined
+    # watchdog kill correctness (2026-08-09 adjudication): without
+    # start_new_session the child shares the KERNEL's process group - any
+    # killpg would take the kernel down and Kaggle discards its buffered
+    # output. And torchrun spawns each rank as its own session leader, so
+    # killing the launcher's group alone orphans two ~13 GiB processes:
+    # SIGTERM lets torchrun reap its own workers (killpg TERM -> 30s -> KILL
+    # per rank), the /proc ppid sweep SIGKILLs any survivor.
+    assert "start_new_session=True" in joined
+    assert "signal.SIGTERM" in joined
+    assert "os.killpg" in joined
+    assert "_rank_pids(" in joined
+    assert "proc.kill()" not in joined
+    # spawning MAIN without the real dataset would die 55s into the child;
+    # fail in milliseconds instead (same belt-and-suspenders as PROBE's)
+    assert '["train"]["main"]["dataset"]' in joined
+    # the 13.5 abort line applies to RESERVED (the allocator high-water that
+    # actually OOMs) - the PROBE bullet used to point readers at the smaller
+    # allocated number, and the two mentions disagreed with each other
+    assert "abort-and-rethink at ~13.5 GiB reserved" in joined
+    assert "abort-and-rethink at ~13.5." not in joined
     # notebook cells read configs with plain yaml and never import the package:
     # a kernel started before the editable install misses the .pth, so only
     # subprocesses can import tuned

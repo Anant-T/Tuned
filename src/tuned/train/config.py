@@ -48,6 +48,7 @@ class TrainCfg:
     lr_scheduler_type: str
     max_grad_norm: float
     smoke: RunCfg
+    main: RunCfg
 
 
 @dataclass
@@ -72,6 +73,7 @@ def load_config(path: str | Path, *, allow_unpinned: bool = False) -> Config:
         lora=LoraCfg(**raw["lora"]),
         train=TrainCfg(
             smoke=RunCfg(**raw["train"].pop("smoke")),
+            main=RunCfg(**raw["train"].pop("main")),
             **raw["train"],
         ),
         hub=HubCfg(**raw["hub"]),

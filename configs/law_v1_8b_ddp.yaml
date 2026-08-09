@@ -95,6 +95,34 @@ train:
     max_steps: 60
     save_steps: 25
     dataset: data/smoke_v1.jsonl
+  # The production run. ga=6, not packing: the 2026-08-09 audit verified
+  # packing=True would NOT contaminate on this pinned stack (TRL bfd forces
+  # padding-free, seq_lengths -> position_ids survive the collator because
+  # unsloth_zoo skips its DataCollatorForSeq2Seq swap when packing is on, and
+  # transformers 5.5 builds the block-diagonal mask from position_ids on
+  # plain SDPA) - but it IS net-negative here: it forfeits SDPA's is_causal
+  # fast path AND enable_gqa (8->32 KV-head expansion per layer), materializes
+  # a 64 MiB bool mask, and pays 8192^2 attention over ~2,500-token segments.
+  # At bs=1 the collator pads to the longest row IN THE BATCH (= the row
+  # itself), so the unpacked lane wastes zero tokens on padding; packing's
+  # only real benefit is the 3x gradient batch, and ga=6 buys exactly that
+  # (~30k real tokens/optimizer step) at zero VRAM or kernel change.
+  # save_steps counts OPTIMIZER steps, which get ~3x longer (~224 s at the
+  # measured 74.7 s/step for ga=2) - so it shrinks 25 -> 10, it does not
+  # grow: 10 x ~224 s ~= 37 min, the cadence band the lane qualified at
+  # (25 x 74.7 s ~= 31 min). 50 would have been ~3.1 h between checkpoints.
+  # max_steps: 0 is a SENTINEL - sft.py refuses to train main on it. Derive
+  # it from the POST-FILTER row count (train_on_responses_only drops fully
+  # masked rows with only a print): run a 2-step --no-hub probe on the real
+  # dataset, read post_filter_rows=, set max_steps = rows // (bs * ga * 2),
+  # commit. check_resume_schedule then freezes it for every later session.
+  main:
+    max_seq_length: 8192
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 6
+    max_steps: 0
+    save_steps: 10
+    dataset: data/law_v1.jsonl
 
 hub:
   # Private, and scoped to this base model + launch shape - a repo shared with

@@ -236,6 +236,12 @@ def test_time_budget_saves_and_stops_instead_of_raising():
     assert "time_budget_reached step=" in body
     assert "control.should_save = True" in body
     assert "control.should_training_stop = True" in body
+    # The budget must be measured from PROCESS start, not callback
+    # construction: the callback is built after model load + dataset prep,
+    # and the notebook watchdog's 11 h clock starts at spawn - an unanchored
+    # budget silently spends the 30-min kill margin on setup time.
+    assert "_TimeBudget(args.time_budget_s, start=_proc_t0)" in src
+    assert src.find("_proc_t0 = time.monotonic()") < src.find("from unsloth import FastModel")
 
 
 def test_step_zero_gates_sit_between_masking_and_the_first_step():
@@ -265,3 +271,142 @@ def test_reserved_peak_is_reported_beside_allocated():
     assert "torch.cuda.max_memory_reserved" in src
     assert "peak_vram_reserved_gb=" in src
     assert "peak_vram_reserved_gb_dev{i}=" in src
+
+
+def test_vram_math_is_binary_gib_not_decimal_gb():
+    # The peaks were divided by 1e9 (decimal GB) but labelled _gb and read
+    # against GiB reference lines (14.56 usable, 13.5 abort) - understating
+    # the real headroom by ~0.9 GiB (2026-08-09 audit). One unit everywhere.
+    from tuned.train.sft import _gib
+
+    assert _gib(2**30) == 1.0
+    assert abs(_gib(int(14.56 * 2**30)) - 14.56) < 1e-6
+    src = SFT.read_text(encoding="utf-8")
+    assert "/ 1e9" not in src
+    assert "/1e9" not in src
+
+
+def test_reserved_gate_is_enforced_in_code_not_prose():
+    # Until now the ~13.5 GiB abort line lived only in notebook markdown - and
+    # its two mentions disagreed on WHICH number it applies to. Reserved (the
+    # allocator segment high-water) is what OOMs, so the gate compares
+    # reserved and raises: a profile that close to the 14.56 GiB cap must
+    # never silently qualify for a multi-session run.
+    from tuned.train.sft import check_vram_reserved
+
+    check_vram_reserved([12.98, 13.18])  # the qualified profile: fine
+    check_vram_reserved([13.49, 13.50])  # at the line: fine
+    with pytest.raises(SystemExit, match="reserved"):
+        check_vram_reserved([12.98, 13.51])
+    src = SFT.read_text(encoding="utf-8")
+    reserved_calc = src.find("torch.cuda.max_memory_reserved")
+    gate_call = src.rfind("check_vram_reserved(")
+    assert -1 not in (reserved_calc, gate_call)
+    assert reserved_calc < gate_call
+
+
+def test_main_mode_refuses_the_underived_max_steps_sentinel():
+    # train.main.max_steps ships as 0 on purpose: the real value must come
+    # from the POST-FILTER row count (train_on_responses_only DROPS fully
+    # masked rows with only a print) and check_resume_schedule then freezes
+    # it for every later session. Training on the sentinel would build a
+    # nonsense LR schedule; refuse before any GPU work.
+    from tuned.train.sft import check_main_max_steps
+
+    with pytest.raises(SystemExit, match="post-filter"):
+        check_main_max_steps("main", 0)
+    check_main_max_steps("main", 1500)  # derived value: fine
+    check_main_max_steps("smoke", 60)  # smoke unaffected
+    src = SFT.read_text(encoding="utf-8")
+    guard = src.find("check_main_max_steps(args.mode")
+    gpu_import = src.find("from unsloth import FastModel")
+    assert -1 not in (guard, gpu_import)
+    assert guard < gpu_import  # refuse in milliseconds, not after model load
+
+
+def test_group_by_length_attacks_ddp_straggler_skew():
+    # At bs=1 with variable-length data, every step costs max(rank0, rank1) -
+    # rank 0 can draw a 900-token example while rank 1 draws 7,800. The
+    # length-grouped sampler makes ranks draw similar lengths at the same
+    # time, with no attention-mask change (it cannot demote the SDPA backend
+    # or contaminate anything - the safe substitute for packing's other
+    # benefit). No-op on the uniform-length smoke data.
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o")
+    assert kw["group_by_length"] is True
+
+
+def test_dataloader_drop_last_prevents_duplicate_examples():
+    # accelerate's even_batches=True default DUPLICATES wrap-around samples so
+    # every rank sees equal batch counts - silent example duplication in a
+    # one-epoch run. max_steps is floored to full batches anyway, so dropping
+    # the partial tail costs nothing.
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    kw = build_sft_config(cfg, cfg.train.smoke, output_dir="o")
+    assert kw["dataloader_drop_last"] is True
+
+
+def test_reserved_ceiling_aborts_early_not_post_mortem():
+    # A pre-training reserved check can never fire: adamw_8bit state appears
+    # at the first optimizer step and DDP buckets at the first backward. And
+    # the post-run gate fires after the quota is already spent. So the live
+    # callback checks the first steps (full memory shape by step 1-2 at bs=1,
+    # fixed bucket) and periodically after (fragmentation growth), raising
+    # like _NonFiniteGuard - rc=0 must never carry an OOM-bound profile.
+    src = SFT.read_text(encoding="utf-8")
+    body = src[src.index("class _ReservedCeiling(TrainerCallback):") :]
+    assert "def on_step_end(" in body[:2500]
+    assert "max_memory_reserved" in body[:2500]
+    assert "raise RuntimeError" in body[:2500]
+    assert "trainer.add_callback(_ReservedCeiling())" in src
+
+
+def test_pad_positions_never_carry_labels():
+    # The pad IS <|endoftext|>; an unmasked pad position would train the
+    # model to emit padding - the exact inverse of the EOS gate. One collator
+    # call feeds coverage, EOS and pad-leak checks (two calls could pad
+    # differently and check different tensors).
+    src = SFT.read_text(encoding="utf-8")
+    assert "probe_batch = trainer.data_collator(probe_rows)" in src
+    assert 'probe_batch["attention_mask"]' in src
+    assert "pad positions carry labels" in src
+
+
+def test_eos_gate_teaches_stopping_and_never_requires_the_pad():
+    # A model whose labels never contain <|im_end|> (the Qwen3 turn
+    # terminator) never learns to stop - fatal for the blind-judge eval. The
+    # gate must key on <|im_end|>, NEVER on <|endoftext|>: that token is the
+    # PAD in this lane, and pad positions are -100 by design. Smoke data
+    # truncates single-turn OpenThoughts rows at max_seq (cutting their only
+    # <|im_end|>) by design, so zero there is a data artifact -> warn; the
+    # main dataset is drop-never-truncate, so zero there is fatal.
+    from tuned.train.sft import check_eos_in_labels
+
+    check_eos_in_labels(3, "main")  # present: silent
+    check_eos_in_labels(0, "smoke")  # truncation artifact: warns, returns
+    with pytest.raises(SystemExit, match="im_end"):
+        check_eos_in_labels(0, "main")
+    src = SFT.read_text(encoding="utf-8")
+    coverage = src.find('print(f"label_coverage=')
+    eos = src.find('print(f"eos_in_labels=')
+    train = src.find("trainer.train(resume_from_checkpoint")
+    assert -1 not in (coverage, eos, train)
+    assert coverage < eos < train  # step-0 gate, after masking, before step 1
+    assert 'convert_tokens_to_ids("<|im_end|>")' in src
+
+
+def test_dataset_prep_runs_rank0_first_not_twice():
+    # The 2026-08-08 logs show every prep stage twice: two interleaved
+    # "Unsloth: Tokenizing (num_proc=8)" bars at ~43 s EACH - both torchrun
+    # ranks independently tokenizing, 16 fork workers on a 4-vCPU box (the
+    # zoo<2026.8.4 fork-OOM class, doubled). local_main_process_first makes
+    # rank 0 compute and write the datasets cache; rank 1 waits at the
+    # barrier, then re-runs the same code as a cache hit.
+    src = SFT.read_text(encoding="utf-8")
+    first = src.find("local_main_process_first()")
+    second = src.find("local_main_process_first()", first + 1)
+    load = src.find('load_dataset("json"')
+    ctor = src.find("trainer = SFTTrainer(")
+    assert -1 not in (first, second, load, ctor)
+    assert first < load < second < ctor  # one block for load+map, one for the
+    # trainer ctor (unsloth's internal num_proc=8 tokenization) + masking map
