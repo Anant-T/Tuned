@@ -1,0 +1,70 @@
+# TEMPORARY A/B EXPERIMENT - the qualified 8B DDP lane with exactly two knobs
+# turned; delete this file once the comparison is read. Everything not listed
+# here is byte-identical to configs/law_v1_8b_ddp.yaml (enforced by
+# tests/test_rslora_config.py), so any loss/VRAM/throughput delta is
+# attributable to rsLoRA alone:
+#
+#   1. lora.use_rslora: true - adapter scale becomes alpha/sqrt(r) instead of
+#      alpha/r. At r=32/alpha=32 that is a 5.66x jump in effective adapter
+#      scale on top of the unchanged 2e-4 LR. The 2026-08-09 research verdict
+#      (arXiv:2312.03732 tested r=32 exactly: LoRA ~= rsLoRA there, gains
+#      start at r>=128) predicts same-or-worse loss and possibly instability;
+#      this run is the empirical check of that prediction. Deliberately NOT
+#      LR-compensated: lowering alpha to sqrt(r) would reproduce the baseline
+#      scale exactly (scale is the only place alpha enters) and test nothing.
+#   2. hub.checkpoint_repo: -rslora suffix - a repo shared with the production
+#      lane means silent last-push-wins clobbering and cross-loading on
+#      --resume (the base yaml's own contract).
+#
+# Run it exactly like a validation SMOKE: in the notebook's first cell set
+#   CONFIG = "configs/law_v1_8b_ddp_rslora.yaml"   and   MODE = "SMOKE"
+# (W&B run name picks up an -rslora suffix automatically). Read the A/B
+# against the requalification baseline W&B run omeotmzx / 8b-ddp-smoke,
+# 2026-08-09: train_loss 0.5601, grad_norm band 0.06-0.16, 363 tok/s,
+# reserved peaks 12.33/12.55 GiB. Watch for: grad_norm riding the 0.3 clip
+# (baseline never binds it), loss stuck above the baseline curve, or the
+# non-finite guard aborting - all three are "rsLoRA rejected" evidence, not
+# infrastructure failures. NEVER --resume across this config and the
+# production one in either direction.
+model:
+  repo: unsloth/Qwen3-8B-unsloth-bnb-4bit
+  revision: 62efd7f9d748e394734a7adae2adf96e13a2abc8
+  instruction_part: "<|im_start|>user\n"
+  response_part: "<|im_start|>assistant\n"
+
+data:
+  think_open: '<think>'
+  think_close: '</think>'
+
+lora:
+  r: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  use_rslora: true
+
+train:
+  seed: 3407
+  lr: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.001
+  optim: adamw_8bit
+  lr_scheduler_type: linear
+  max_grad_norm: 0.3
+  smoke:
+    max_seq_length: 8192
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 2   # 8192 x 2 x 2 ranks = 32,768 tokens/step
+    max_steps: 60
+    save_steps: 25
+    dataset: data/smoke_v1.jsonl
+  main:
+    max_seq_length: 8192
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 6
+    max_steps: 0
+    save_steps: 10
+    dataset: data/law_v1.jsonl
+
+hub:
+  checkpoint_repo: tantan01/tuned-law-v1-qwen8b-ckpt-ddp-rslora

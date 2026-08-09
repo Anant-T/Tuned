@@ -405,6 +405,7 @@ def main(argv: list[str] | None = None) -> None:
         lora_dropout=cfg.lora.dropout,
         target_modules=cfg.lora.target_modules,
         bias="none",
+        use_rslora=cfg.lora.use_rslora,
         use_gradient_checkpointing="unsloth",
         random_state=cfg.train.seed,
     )

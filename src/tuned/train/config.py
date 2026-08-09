@@ -26,6 +26,10 @@ class LoraCfg:
     alpha: int
     dropout: float
     target_modules: list[str] | str  # list of module names, or a regex string
+    # rsLoRA scales the adapter by alpha/sqrt(r) instead of alpha/r - at
+    # r=32/alpha=32 that is a 5.66x jump in effective scale, so the production
+    # lane never sets this; only the _rslora A/B config flips it.
+    use_rslora: bool = False
 
 
 @dataclass

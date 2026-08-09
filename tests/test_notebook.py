@@ -159,3 +159,13 @@ def test_stage_model_notebook_matches_the_8b_pin():
     # staged layout contract shared with kaggle_smoke's pre-download cell
     assert "qwen3-8b-staged" in src
     assert "REVISION.txt" in src
+
+
+def test_wandb_run_name_distinguishes_the_rslora_ab():
+    # The rsLoRA experiment reuses MODE="SMOKE", so without a suffix both arms
+    # of the A/B would land in W&B as "8b-ddp-smoke" and be told apart only by
+    # run id. The name must key off CONFIG, which is the switch the operator
+    # actually flips.
+    nb = json.loads(NB.read_text(encoding="utf-8"))
+    joined = "\n".join("".join(c["source"]) for c in nb["cells"])
+    assert '"-rslora" if "rslora" in CONFIG' in joined

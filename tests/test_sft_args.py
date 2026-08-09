@@ -176,6 +176,18 @@ def test_pad_token_is_pinned_before_the_trainer_captures_it():
     assert "model.config.pad_token_id = tokenizer.pad_token_id" in src
 
 
+def test_rslora_flag_reaches_get_peft_model():
+    # The rsLoRA A/B lane is config-driven: the flag must flow from the yaml
+    # into FastModel.get_peft_model, not be hardcoded - the production lane
+    # keeps the default False, only law_v1_8b_ddp_rslora.yaml flips it.
+    src = SFT.read_text(encoding="utf-8")
+    peft_ctor = src.find("FastModel.get_peft_model(")
+    flag = src.find("use_rslora=cfg.lora.use_rslora", peft_ctor)
+    trainer_ctor = src.find("trainer = SFTTrainer(")
+    assert -1 not in (peft_ctor, flag, trainer_ctor)
+    assert peft_ctor < flag < trainer_ctor
+
+
 def test_resume_refuses_a_silently_rebuilt_lr_schedule(tmp_path):
     from tuned.train.sft import check_resume_schedule
 
