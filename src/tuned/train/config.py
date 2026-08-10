@@ -26,9 +26,14 @@ class LoraCfg:
     alpha: int
     dropout: float
     target_modules: list[str] | str  # list of module names, or a regex string
-    # rsLoRA scales the adapter by alpha/sqrt(r) instead of alpha/r - at
-    # r=32/alpha=32 that is a 5.66x jump in effective scale, so the production
-    # lane never sets this; only the _rslora A/B config flips it.
+    # rsLoRA scales the adapter by alpha/sqrt(r) instead of alpha/r. Rejected
+    # on two 2026-08-10 SMOKE A/Bs: the alpha-64 arm (11.3x, W&B bh920zyh) was
+    # cancelled by the 0.3 clip binding every step; the clean isolate arm
+    # (alpha 32 = 5.66x, clip opened to 1.5, W&B wl5estcl, 60/60) finished
+    # 0.5585 vs baseline 0.5601 (-0.3%, mixed sign per-step) while running
+    # 3-4x hotter grad norms (0.21-0.45, spikes to 1.0) that are incompatible
+    # with the qualified 0.3 clip - same loss, less stability margin, so the
+    # production lane keeps this False.
     use_rslora: bool = False
 
 
