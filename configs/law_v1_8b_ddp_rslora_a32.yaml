@@ -1,0 +1,78 @@
+# TEMPORARY A/B EXPERIMENT #2 - isolates rsLoRA proper; delete this file once
+# the comparison is read. Everything not listed here is byte-identical to
+# configs/law_v1_8b_ddp.yaml (enforced by tests/test_rslora_a32_config.py).
+#
+# Why a second arm: the first A/B (alpha 64 joint treatment, W&B bh920zyh,
+# 2026-08-10, stopped at step 41/60) was cancelled by its own clip - pre-clip
+# grad_norm ran 0.38-1.5 at the 11.3x scale, so max_grad_norm 0.3 bound EVERY
+# step from step 3 and renormalized the treatment away; loss tracked the
+# baseline step-for-step (0.4278 vs 0.4309 at the stop). This arm removes
+# both confounds:
+#
+#   1. lora.use_rslora: true with alpha KEPT at the base 32 - adapter scale
+#      becomes 32/sqrt(32) = 5.66x the baseline's 1.0. Pure rsLoRA, nothing
+#      else riding along.
+#   2. train.max_grad_norm: 1.5 - just above the first arm's observed
+#      pre-clip ceiling at double this scale, so at 5.66x the norms
+#      (expected roughly 0.2-0.75) should clear it and clipping stops being
+#      the treatment. Baseline-neutral knob: base norms run 0.06-0.16 and
+#      never approach 0.3, let alone 1.5 - it only has effect under rsLoRA.
+#   3. hub.checkpoint_repo: -rslora32 suffix - distinct from BOTH the
+#      production repo and the retired alpha-64 repo (which still holds a
+#      stale checkpoint-25 a --resume would silently cross-load).
+#
+# Run it exactly like a validation SMOKE: in the notebook's first cell set
+#   CONFIG = "configs/law_v1_8b_ddp_rslora_a32.yaml"   and   MODE = "SMOKE"
+# W&B picks up the -rslora suffix automatically, so the display name matches
+# the retired arm's (8b-ddp-smoke-rslora) - tell them apart by date/run id
+# (the alpha-64 run bh920zyh is state "crashed"). Read against the baseline
+# SMOKE signature: train_loss 0.5601-0.5602, grad_norm band 0.06-0.16,
+# 363-394 tok/s, reserved peaks 12.33/12.55 GiB; steps 1-2 grad_norm=nan is
+# GradScaler cold-start in every arm, benign. Expected per arXiv:2312.03732
+# (tested r=32 exactly): loss ~= baseline. "rsLoRA harmful" evidence: loss
+# stuck above the baseline curve, norms riding the 1.5 clip, or a non-finite
+# abort. "rsLoRA helpful" (would overturn the rejection): loss clearly below
+# the baseline curve with norms settled. NEVER --resume across this config
+# and any other in either direction.
+model:
+  repo: unsloth/Qwen3-8B-unsloth-bnb-4bit
+  revision: 62efd7f9d748e394734a7adae2adf96e13a2abc8
+  instruction_part: "<|im_start|>user\n"
+  response_part: "<|im_start|>assistant\n"
+
+data:
+  think_open: '<think>'
+  think_close: '</think>'
+
+lora:
+  r: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  use_rslora: true
+
+train:
+  seed: 3407
+  lr: 2.0e-4
+  warmup_ratio: 0.03
+  weight_decay: 0.001
+  optim: adamw_8bit
+  lr_scheduler_type: linear
+  max_grad_norm: 1.5
+  smoke:
+    max_seq_length: 8192
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 2   # 8192 x 2 x 2 ranks = 32,768 tokens/step
+    max_steps: 60
+    save_steps: 25
+    dataset: data/smoke_v1.jsonl
+  main:
+    max_seq_length: 8192
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 6
+    max_steps: 0
+    save_steps: 10
+    dataset: data/law_v1.jsonl
+
+hub:
+  checkpoint_repo: tantan01/tuned-law-v1-qwen8b-ckpt-ddp-rslora32
