@@ -1,6 +1,7 @@
 import json
 import re
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -338,6 +339,85 @@ def test_claim_runs_inside_an_immediate_transaction(store):
     assert statements[-1].strip().upper().startswith("COMMIT")
 
 
+def test_threads_sharing_one_handle_never_double_claim(tmp_path):
+    # This suite avoids threads by policy. This test is the documented
+    # exception, because the handle lock IS the subject under test and nothing
+    # else can exercise it: the connection is opened check_same_thread=False,
+    # so one Store can legitimately be shared by several worker threads.
+    # Without a lock held across the whole transaction, their BEGIN/COMMIT
+    # boundaries interleave on the single connection - the claim's
+    # SELECT+UPDATE stops being indivisible and one thread's COMMIT publishes
+    # another thread's half-built transaction. Review measured 4 genuine
+    # double-claims this way. The two-handle test cannot catch it: separate
+    # connections are serialised by SQLite itself, one connection is not.
+    n_tasks, n_threads, batch = 400, 6, 7
+    store = Store.open(tmp_path / "state" / "shared.sqlite3")
+    try:
+        store.upsert_source("ikanoon", "CC-BY-4.0")
+        store.upsert_seeds(_seed_rows(n_tasks))
+        store.create_tasks(_task_rows(n_tasks))
+
+        claimed: list[str] = []
+        errors: list[str] = []
+        guard = threading.Lock()
+        start = threading.Barrier(n_threads)
+
+        def worker(wid):
+            mine = []
+            try:
+                start.wait(timeout=10)
+                while True:
+                    rows = store.claim_tasks(f"worker-{wid}", batch)
+                    if not rows:
+                        break
+                    mine.extend(r["task_id"] for r in rows)
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                with guard:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+            with guard:
+                claimed.extend(mine)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert errors == []
+        assert len(claimed) == n_tasks
+        assert len(set(claimed)) == n_tasks  # zero double-claims
+        assert store.task_counts() == {"generating": n_tasks}
+    finally:
+        store.close()
+
+
+def test_set_task_state_fences_against_a_lost_lease(store):
+    # A worker that stalled past its lease has already had its task reclaimed.
+    # When it wakes up and reports, an unfenced UPDATE would clobber the live
+    # holder and two workers would be generating one task with only one visible.
+    _populate(store, n=1)
+    store.claim_tasks("worker-A", 1)
+    store.conn.execute("UPDATE task SET claimed_at = ? WHERE task_id = 't0'", (_ago(3600),))
+    assert [r["task_id"] for r in store.claim_tasks("worker-B", 1)] == ["t0"]
+
+    stale = store.set_task_state("t0", "accepted", disposition="from-A", expect_worker="worker-A")
+    assert stale is False
+    row = store.get_task("t0")
+    assert row["state"] == "generating"  # untouched
+    assert row["claimed_by"] == "worker-B"
+    assert row["disposition"] is None
+
+    # The live holder still succeeds.
+    assert store.set_task_state("t0", "accepted", expect_worker="worker-B") is True
+    assert store.get_task("t0")["state"] == "accepted"
+
+
+def test_set_task_state_reports_whether_it_updated_anything(store):
+    _populate(store, n=1)
+    assert store.set_task_state("t0", "accepted") is True
+    assert store.set_task_state("no-such-task", "accepted") is False
+
+
 def test_set_task_state_releases_the_lease(store):
     _populate(store, n=2)
     store.claim_tasks("worker-A", 1)
@@ -644,6 +724,119 @@ def test_one_malformed_envelope_does_not_poison_the_sweep(store, tmp_path):
     assert store.latest_generation("t0") is None
     assert store.latest_generation("t1")["answer"] == "perfectly fine"
     assert "reconcile_rejected" in [e["kind"] for e in store.events()]
+
+
+def test_judgement_binds_by_natural_key_not_a_stale_gen_id(store, tmp_path):
+    # gen_id is an AUTOINCREMENT surrogate, so it is NOT stable across a
+    # rebuild: recover the same logs into a fresh DB and the ids come out in a
+    # different order. Here the judge envelope remembers a gen_id that now
+    # belongs to t0's generation, while the answer it actually judged (t1) got
+    # a different id. Trusting the surrogate silently attaches the judgement to
+    # the wrong answer - corrupt training labels, not a crash.
+    _populate(store, n=2)
+    gen_t0 = store.record_generation(_gen_envelope("t0", 1, raw_path="a", raw_offset=0))
+    gen_t1 = store.record_generation(_gen_envelope("t1", 1, raw_path="a", raw_offset=64))
+    assert gen_t0 != gen_t1
+
+    raw = tmp_path / "judge.ndjson"
+    append_ndjson(
+        raw,
+        {
+            "kind": "judgement",
+            "task_id": "t1",
+            "attempt": 1,
+            "gen_id": gen_t0,  # stale surrogate from before the rebuild
+            "judge_slot": "j1",
+            "grounding": 5,
+        },
+    )
+
+    assert store.reconcile_raw([raw]) == 1
+    assert store.judgements_for(gen_t0) == []  # must NOT land on t0's answer
+    assert [r["judge_slot"] for r in store.judgements_for(gen_t1)] == ["j1"]
+    remapped = store.events("reconcile_gen_id_remapped")
+    assert len(remapped) == 1
+    detail = json.loads(remapped[0]["detail_json"])
+    assert (detail["envelope_gen_id"], detail["resolved_gen_id"]) == (gen_t0, gen_t1)
+
+
+def test_a_contradictory_envelope_gen_id_is_not_trusted(store, tmp_path):
+    # No attempt, so the natural key cannot resolve and the surrogate is the
+    # only lead - but it points at t0's row while the envelope says t1. Binding
+    # it anyway is the misbind; refusing is correct.
+    _populate(store, n=2)
+    gen_t0 = store.record_generation(_gen_envelope("t0", 1, raw_path="a", raw_offset=0))
+    raw = tmp_path / "judge.ndjson"
+    append_ndjson(
+        raw, {"kind": "judgement", "task_id": "t1", "gen_id": gen_t0, "judge_slot": "j1"}
+    )
+
+    assert store.reconcile_raw([raw]) == 0
+    assert store.judgements_for(gen_t0) == []
+    kinds = [e["kind"] for e in store.events()]
+    assert "reconcile_gen_id_mismatch" in kinds
+    assert "reconcile_orphan_judgement" in kinds
+
+
+def test_a_matching_envelope_gen_id_is_still_usable(store, tmp_path):
+    # The surrogate fallback must still work when nothing contradicts it.
+    _populate(store, n=1)
+    gen_id = store.record_generation(_gen_envelope("t0", 1, raw_path="a", raw_offset=0))
+    raw = tmp_path / "judge.ndjson"
+    append_ndjson(raw, {"kind": "judgement", "gen_id": gen_id, "judge_slot": "j1", "validity": 4})
+    assert store.reconcile_raw([raw]) == 1
+    assert [r["judge_slot"] for r in store.judgements_for(gen_id)] == ["j1"]
+
+
+def test_reconcile_diagnostics_survive_a_failed_sweep(store, tmp_path, monkeypatch):
+    # Diagnostics used to be log_event'd inside the sweep's own transaction, so
+    # a rollback destroyed exactly the records explaining why it rolled back.
+    _populate(store, n=1)
+    raw = tmp_path / "log.ndjson"
+    raw.write_bytes(b"{not json at all\n")
+    append_ndjson(raw, _gen_envelope("t0", 1))
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("disk fell over mid-sweep")
+
+    monkeypatch.setattr(store, "_recover_generation", boom)
+    with pytest.raises(RuntimeError, match="disk fell over"):
+        store.reconcile_raw([raw])
+
+    # The sweep's own writes rolled back ...
+    assert store.conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+    # ... but the diagnostic for the corrupt line outlived it.
+    bad = store.events("reconcile_bad_line")
+    assert len(bad) == 1
+    assert json.loads(bad[0]["detail_json"])["offset"] == 0
+
+
+def test_a_failure_on_a_later_file_keeps_earlier_files_recovered(store, tmp_path, monkeypatch):
+    # Consequence of one transaction PER FILE rather than one per sweep: work
+    # already committed is kept, and because reconcile is idempotent, re-running
+    # finishes the job instead of redoing it.
+    _populate(store, n=2)
+    first, second = tmp_path / "one.ndjson", tmp_path / "two.ndjson"
+    append_ndjson(first, _gen_envelope("t0", 1))
+    append_ndjson(second, _gen_envelope("t1", 1))
+
+    real = store._recover_generation
+
+    def selective(rec, path, offset, diag):
+        if rec.get("task_id") == "t1":
+            raise RuntimeError("boom on the second file")
+        return real(rec, path, offset, diag)
+
+    monkeypatch.setattr(store, "_recover_generation", selective)
+    with pytest.raises(RuntimeError, match="second file"):
+        store.reconcile_raw([first, second])
+
+    assert store.latest_generation("t0") is not None  # first file survived
+    assert store.latest_generation("t1") is None
+
+    monkeypatch.undo()
+    assert store.reconcile_raw([first, second]) == 1  # re-run finishes the job
+    assert store.latest_generation("t1") is not None
 
 
 def test_reconcile_does_not_overwrite_an_existing_row(store, tmp_path):

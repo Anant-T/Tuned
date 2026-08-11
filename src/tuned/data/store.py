@@ -28,6 +28,7 @@ Conventions
 
 import json
 import sqlite3
+import threading
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -186,6 +187,16 @@ def _fill(row: dict, **defaults) -> dict:
     return row
 
 
+def _diag(sink: list, kind: str, detail: dict) -> None:
+    """Buffer one reconcile diagnostic, stamped when it happened.
+
+    Diagnostics are NOT written through log_event during a sweep: they would
+    live inside the sweep's transaction and be rolled back by the very failure
+    they explain. They are flushed separately once the sweep is over.
+    """
+    sink.append((utcnow(), kind, _dumps(detail)))
+
+
 def _cap(limits: Mapping, key: str) -> float:
     """Read a budget cap; missing or None means unlimited."""
     value = limits.get(key)
@@ -198,6 +209,18 @@ class Store:
     def __init__(self, conn: sqlite3.Connection, path: Path):
         self._conn = conn
         self.path = path
+        # The connection is opened check_same_thread=False, so ONE handle can be
+        # shared by several worker threads. SQLite serialises single statements
+        # for us, but a transaction is not a statement: without this lock two
+        # threads interleave their BEGIN/COMMIT on the same connection, so one
+        # thread's claim SELECT+UPDATE stops being indivisible (measured: real
+        # double-claims) and one thread's COMMIT publishes another's half-built
+        # transaction. Every write path takes it; it is held for the WHOLE
+        # transaction, not per statement.
+        # RLock, not Lock: a nested _write_txn is a programming error, and an
+        # RLock surfaces it as a loud "cannot start a transaction within a
+        # transaction" instead of hanging the worker forever on a deadlock.
+        self._lock = threading.RLock()
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -221,7 +244,10 @@ class Store:
         return self._conn
 
     def ensure_schema(self) -> None:
-        self._conn.executescript(SCHEMA)
+        # executescript issues an implicit COMMIT first, so it must not run
+        # while another thread holds an open transaction on this handle.
+        with self._lock:
+            self._conn.executescript(SCHEMA)
 
     def close(self) -> None:
         self._conn.close()
@@ -234,26 +260,44 @@ class Store:
 
     @contextmanager
     def _write_txn(self) -> Iterator[sqlite3.Connection]:
-        """BEGIN IMMEDIATE ... COMMIT, rolling back on any exception."""
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self._conn
-        except BaseException:
+        """BEGIN IMMEDIATE ... COMMIT, rolling back on any exception.
+
+        The handle lock is held for the whole transaction so that concurrent
+        threads sharing this Store serialise instead of interleaving their
+        transaction boundaries. It is released as the exception unwinds.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                # Some errors make SQLite unwind the transaction itself; a
-                # "no transaction is active" here must not mask the real one.
-                pass
-            raise
-        self._conn.execute("COMMIT")
+                yield self._conn
+            except BaseException:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    # Some errors make SQLite unwind the transaction itself; a
+                    # "no transaction is active" here must not mask the real one.
+                    pass
+                raise
+            self._conn.execute("COMMIT")
+
+    def _write(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        """One autocommit write, serialised against this handle's transactions.
+
+        Without the lock a standalone INSERT/UPDATE issued from another thread
+        gets swallowed into whatever transaction is currently open on this
+        connection - committing at that transaction's time, or vanishing with
+        its ROLLBACK. rowcount/lastrowid are captured on the returned cursor at
+        execute time, so reading them after the lock is released is safe.
+        """
+        with self._lock:
+            return self._conn.execute(sql, params)
 
     # ------------------------------------------------------------ sources/seeds
 
     def upsert_source(
         self, source_id: str, license: str, url: str | None = None, version: str | None = None
     ) -> None:
-        self._conn.execute(
+        self._write(
             "INSERT OR REPLACE INTO source (source_id, license, url, version, retrieved_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (source_id, license, url, version, utcnow()),
@@ -357,25 +401,44 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def set_task_state(self, task_id: str, state: str, disposition: str | None = None) -> None:
+    def set_task_state(
+        self,
+        task_id: str,
+        state: str,
+        disposition: str | None = None,
+        *,
+        expect_worker: str | None = None,
+    ) -> bool:
         """Move a task to `state`, releasing its lease unless it stays 'generating'.
+
+        Returns True if a row was actually updated.
+
+        `expect_worker` is a lease fence. A worker that stalled past its lease
+        (GC pause, hung socket) has already had its task legitimately reclaimed
+        by someone else; when it finally comes back and reports its result, an
+        unfenced UPDATE would clobber the live holder's row and two workers
+        would be generating the same task with only one visible. Passing the
+        worker id makes the UPDATE a no-op in that case and returns False, so
+        the caller can detect the lost lease and drop its stale result.
 
         disposition=None leaves any existing disposition intact (a terminal
         state transition should not erase the diagnostic that caused it);
-        pass a string to overwrite it.
+        pass a string to overwrite it. Keyword-only so it can never be
+        confused positionally with `disposition`.
         """
-        if state == "generating":
-            self._conn.execute(
-                "UPDATE task SET state = ?, disposition = COALESCE(?, disposition), "
-                "updated_at = ? WHERE task_id = ?",
-                (state, disposition, utcnow(), task_id),
-            )
-        else:
-            self._conn.execute(
-                "UPDATE task SET state = ?, disposition = COALESCE(?, disposition), "
-                "claimed_by = NULL, claimed_at = NULL, updated_at = ? WHERE task_id = ?",
-                (state, disposition, utcnow(), task_id),
-            )
+        assignments = "state = ?, disposition = COALESCE(?, disposition), updated_at = ?"
+        params: list = [state, disposition, utcnow()]
+        if state != "generating":
+            assignments += ", claimed_by = NULL, claimed_at = NULL"
+        where = "task_id = ?"
+        params.append(task_id)
+        if expect_worker is not None:
+            # Evaluated against the pre-UPDATE row, so this still fences
+            # correctly even though the same statement nulls claimed_by.
+            where += " AND claimed_by = ?"
+            params.append(expect_worker)
+        cur = self._write(f"UPDATE task SET {assignments} WHERE {where}", tuple(params))
+        return cur.rowcount > 0
 
     def get_task(self, task_id: str) -> dict | None:
         row = self._conn.execute("SELECT * FROM task WHERE task_id = ?", (task_id,)).fetchone()
@@ -406,7 +469,7 @@ class Store:
         Raises sqlite3.IntegrityError if (task_id, attempt) is already
         indexed - that duplicate is a bug in the worker, not a retry.
         """
-        cur = self._conn.execute(
+        cur = self._write(
             _insert_sql("generation", _GEN_COLS),
             _pack(_fill(dict(row), created_at=utcnow()), _GEN_COLS),
         )
@@ -437,7 +500,7 @@ class Store:
         packed = dict(row)
         packed["gen_id"] = gen_id
         packed["judge_slot"] = judge_slot
-        self._conn.execute(
+        self._write(
             _insert_sql("judgement", _JUDGEMENT_COLS, "INSERT OR REPLACE"),
             _pack(_fill(packed, created_at=utcnow()), _JUDGEMENT_COLS),
         )
@@ -496,7 +559,7 @@ class Store:
         under the write lock, so concurrent workers can never lose an
         increment the way a SELECT-then-UPDATE pair would.
         """
-        self._conn.execute(
+        self._write(
             "INSERT INTO budget_ledger "
             "(day, provider, model, requests, prompt_tokens, completion_tokens, errors_429) "
             "VALUES (?, ?, ?, 1, ?, ?, ?) "
@@ -528,12 +591,19 @@ class Store:
     # ------------------------------------------------------- events & reconcile
 
     def log_event(self, kind: str, detail: dict) -> None:
-        # Single statement: safe to call inside an open _write_txn (it simply
-        # joins that transaction) as well as standalone.
-        self._conn.execute(
+        self._write(
             "INSERT INTO run_event (at, kind, detail_json) VALUES (?, ?, ?)",
             (utcnow(), kind, _dumps(detail)),
         )
+
+    def _flush_events(self, buffered: list[tuple[str, str, str | None]]) -> None:
+        """Write diagnostics buffered during a sweep, in their own transaction."""
+        if not buffered:
+            return
+        with self._write_txn() as conn:
+            conn.executemany(
+                "INSERT INTO run_event (at, kind, detail_json) VALUES (?, ?, ?)", buffered
+            )
 
     def events(self, kind: str | None = None) -> list[dict]:
         if kind is None:
@@ -554,49 +624,76 @@ class Store:
         a second run recovers 0. Corrupt or truncated lines are logged as
         run_events and skipped, never raised: a half-written last line is the
         expected shape of a crash, not an error.
+
+        Transaction shape: ONE TRANSACTION PER FILE, not one for the whole
+        sweep. Two reasons. The write lock is released between files, so a
+        multi-GB recovery does not block every worker for its whole duration;
+        and because the pass is idempotent, a failure part-way through keeps
+        the files already recovered instead of discarding them - re-running
+        finishes the job. The trade is that a failed sweep leaves recovery
+        partially applied, which is exactly what idempotency makes safe.
+
+        Diagnostics are buffered in memory and written AFTER the sweep, in
+        their own transaction, so that a rollback cannot destroy the records
+        explaining why it rolled back.
         """
         recovered = 0
         deferred: list[tuple[dict, Path, int]] = []
-        with self._write_txn():
+        diag: list[tuple[str, str, str | None]] = []
+        try:
             for raw_path in raw_paths:
                 path = Path(raw_path)
                 if not path.exists():
-                    self.log_event("reconcile_missing_file", {"path": str(path)})
+                    _diag(diag, "reconcile_missing_file", {"path": str(path)})
                     continue
-                for offset, rec in self._scan_raw(path):
-                    kind = rec.get("kind")
-                    if kind == "generation":
-                        recovered += self._recover_generation(rec, path, offset)
-                    elif kind == "judgement":
-                        gen_id = self._resolve_gen_id(rec)
-                        if gen_id is None:
-                            # Its generation may live later in this file or in
-                            # a file not scanned yet - retry after the sweep.
-                            deferred.append((rec, path, offset))
+                with self._write_txn():
+                    for offset, rec in self._scan_raw(path, diag):
+                        kind = rec.get("kind")
+                        if kind == "generation":
+                            recovered += self._recover_generation(rec, path, offset, diag)
+                        elif kind == "judgement":
+                            gen_id = self._resolve_gen_id(rec, diag)
+                            if gen_id is None:
+                                # Its generation may live later in this file or
+                                # in a file not scanned yet - retry after the
+                                # sweep, so the result cannot depend on the
+                                # order the caller passed the paths in.
+                                deferred.append((rec, path, offset))
+                            else:
+                                recovered += self._recover_judgement(
+                                    gen_id, rec, path, offset, diag
+                                )
                         else:
-                            recovered += self._recover_judgement(gen_id, rec, path, offset)
-                    else:
-                        self.log_event(
-                            "reconcile_unknown_kind",
-                            {"path": str(path), "offset": offset, "kind": kind},
-                        )
-            for rec, path, offset in deferred:
-                gen_id = self._resolve_gen_id(rec)
-                if gen_id is None:
-                    self.log_event(
-                        "reconcile_orphan_judgement",
-                        {
-                            "path": str(path),
-                            "offset": offset,
-                            "task_id": rec.get("task_id"),
-                            "attempt": rec.get("attempt"),
-                        },
-                    )
-                    continue
-                recovered += self._recover_judgement(gen_id, rec, path, offset)
+                            _diag(
+                                diag,
+                                "reconcile_unknown_kind",
+                                {"path": str(path), "offset": offset, "kind": kind},
+                            )
+            if deferred:
+                with self._write_txn():
+                    for rec, path, offset in deferred:
+                        gen_id = self._resolve_gen_id(rec, diag)
+                        if gen_id is None:
+                            _diag(
+                                diag,
+                                "reconcile_orphan_judgement",
+                                {
+                                    "path": str(path),
+                                    "offset": offset,
+                                    "task_id": rec.get("task_id"),
+                                    "attempt": rec.get("attempt"),
+                                },
+                            )
+                            continue
+                        recovered += self._recover_judgement(gen_id, rec, path, offset, diag)
+        finally:
+            # Runs on the failure path too, so the diagnostics outlive the
+            # sweep that produced them. If this flush itself fails mid-crash
+            # the original error is preserved as __context__.
+            self._flush_events(diag)
         return recovered
 
-    def _scan_raw(self, path: Path) -> Iterator[tuple[int, dict]]:
+    def _scan_raw(self, path: Path, diag: list) -> Iterator[tuple[int, dict]]:
         """Yield (byte offset of line start, record) for every parsable line.
 
         Read in BINARY and count bytes by hand: len(line) includes the line
@@ -618,43 +715,97 @@ class Store:
                 try:
                     rec = json.loads(payload)
                 except ValueError as exc:  # JSONDecodeError / UnicodeDecodeError
-                    self.log_event(
+                    _diag(
+                        diag,
                         "reconcile_bad_line",
                         {"path": str(path), "offset": start, "error": str(exc)},
                     )
                     continue
                 if not isinstance(rec, dict):
-                    self.log_event(
+                    _diag(
+                        diag,
                         "reconcile_bad_line",
                         {"path": str(path), "offset": start, "error": "record is not an object"},
                     )
                     continue
                 yield start, rec
 
-    def _resolve_gen_id(self, rec: Mapping) -> int | None:
-        if rec.get("gen_id") is not None:
-            row = self._conn.execute(
-                "SELECT gen_id FROM generation WHERE gen_id = ?", (rec["gen_id"],)
-            ).fetchone()
-            if row is not None:
-                return int(row[0])
+    def _resolve_gen_id(self, rec: Mapping, diag: list) -> int | None:
+        """Map a raw envelope onto a gen_id - by NATURAL key first.
+
+        gen_id is an AUTOINCREMENT surrogate, and surrogates are not stable
+        across a rebuild: recover the same logs into a fresh database and the
+        ids get handed out in a different order. An envelope's remembered
+        gen_id can therefore address a DIFFERENT generation than the one it was
+        written for, silently binding a judgement to the wrong answer - which
+        would corrupt training labels rather than crash. (task_id, attempt) is
+        the natural key and carries the UNIQUE constraint, so it always wins;
+        the envelope's gen_id is only ever a fallback for envelopes that lack
+        the natural key, and even then it must not contradict what it does
+        carry.
+        """
         task_id, attempt = rec.get("task_id"), rec.get("attempt")
-        if task_id is None or attempt is None:
+        env_gen_id = rec.get("gen_id")
+
+        if task_id is not None and attempt is not None:
+            row = self._conn.execute(
+                "SELECT gen_id FROM generation WHERE task_id = ? AND attempt = ?",
+                (task_id, attempt),
+            ).fetchone()
+            if row is None:
+                # The generation genuinely is not indexed yet. Falling back to
+                # the envelope's gen_id here is what caused the misbind: it
+                # would attach this judgement to whichever row now owns that id.
+                return None
+            gen_id = int(row[0])
+            if env_gen_id is not None and env_gen_id != gen_id:
+                _diag(
+                    diag,
+                    "reconcile_gen_id_remapped",
+                    {
+                        "task_id": task_id,
+                        "attempt": attempt,
+                        "envelope_gen_id": env_gen_id,
+                        "resolved_gen_id": gen_id,
+                    },
+                )
+            return gen_id
+
+        if env_gen_id is None:
             return None
         row = self._conn.execute(
-            "SELECT gen_id FROM generation WHERE task_id = ? AND attempt = ?", (task_id, attempt)
+            "SELECT task_id, attempt FROM generation WHERE gen_id = ?", (env_gen_id,)
         ).fetchone()
-        return int(row[0]) if row is not None else None
+        if row is None:
+            return None
+        # A partial natural key still has to agree, or the surrogate is stale.
+        if (task_id is not None and row["task_id"] != task_id) or (
+            attempt is not None and row["attempt"] != attempt
+        ):
+            _diag(
+                diag,
+                "reconcile_gen_id_mismatch",
+                {
+                    "envelope_gen_id": env_gen_id,
+                    "envelope_task_id": task_id,
+                    "envelope_attempt": attempt,
+                    "row_task_id": row["task_id"],
+                    "row_attempt": row["attempt"],
+                },
+            )
+            return None
+        return int(env_gen_id)
 
-    def _recover_generation(self, rec: dict, path: Path, offset: int) -> int:
+    def _recover_generation(self, rec: dict, path: Path, offset: int, diag: list) -> int:
         task_id, attempt = rec.get("task_id"), rec.get("attempt")
         if task_id is None or attempt is None:
-            self.log_event(
+            _diag(
+                diag,
                 "reconcile_bad_record",
                 {"path": str(path), "offset": offset, "error": "generation lacks task_id/attempt"},
             )
             return 0
-        if self._resolve_gen_id({"task_id": task_id, "attempt": attempt}) is not None:
+        if self._resolve_gen_id({"task_id": task_id, "attempt": attempt}, diag) is not None:
             return 0
         # raw_path/raw_offset always come from where the record ACTUALLY sits,
         # never from the envelope's own (possibly stale) copy of them.
@@ -666,17 +817,21 @@ class Store:
         except _UNUSABLE_RECORD as exc:
             # Statement-level rollback only: the surrounding transaction stays
             # usable, so one bad envelope cannot poison the whole recovery.
-            self.log_event(
+            _diag(
+                diag,
                 "reconcile_rejected",
                 {"path": str(path), "offset": offset, "kind": "generation", "error": str(exc)},
             )
             return 0
         return 1
 
-    def _recover_judgement(self, gen_id: int, rec: dict, path: Path, offset: int) -> int:
+    def _recover_judgement(
+        self, gen_id: int, rec: dict, path: Path, offset: int, diag: list
+    ) -> int:
         judge_slot = rec.get("judge_slot")
         if judge_slot is None:
-            self.log_event(
+            _diag(
+                diag,
                 "reconcile_bad_record",
                 {"path": str(path), "offset": offset, "error": "judgement lacks judge_slot"},
             )
@@ -696,7 +851,8 @@ class Store:
                 _insert_sql("judgement", _JUDGEMENT_COLS), _pack(row, _JUDGEMENT_COLS)
             )
         except _UNUSABLE_RECORD as exc:
-            self.log_event(
+            _diag(
+                diag,
                 "reconcile_rejected",
                 {"path": str(path), "offset": offset, "kind": "judgement", "error": str(exc)},
             )
