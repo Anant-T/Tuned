@@ -1,0 +1,91 @@
+# law_v1 dataset-curation build config. This file is churn-heavy (API
+# providers/models/limits change weekly) so it lives separately from the
+# training config and only ever REFERENCES it (build.train_config) for
+# anything the trainer owns - think tags, tokenizer pin, dataset path.
+# Never duplicate those values here; src/tuned/data/config.py resolves them
+# from the referenced training config at load time.
+
+build:
+  train_config: configs/law_v1_8b_ddp.yaml
+  workdir: data/build
+  target_total: 18000
+  mvp_total: 10300
+  mix: {grounded_synthesis: 0.60, curated: 0.16, replay: 0.24}
+  overgeneration: 2.0
+  held_out_frac: 0.10
+  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 3000, answer_min: 120}
+  difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
+  appointed_day: "2024-07-01"
+
+providers:
+  - name: cerebras
+    base_url: https://api.cerebras.ai/v1
+    api_key_env: CEREBRAS_API_KEY
+    quirks: [cerebras]
+    models:
+      - id: gpt-oss-120b
+        family: gpt-oss
+        roles: [generator]
+        limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 8192, max_output: 4096}
+        params: {temperature: 0.7, top_p: 0.95, reasoning_effort: medium}
+      - id: zai-glm-4.7
+        family: glm
+        roles: [judge, tiebreak]
+        limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 8192, max_output: 4096}
+        params: {temperature: 0.2}
+      - id: gemma-4-31b
+        family: gemma
+        roles: [tiebreak]
+        limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 8192, max_output: 4096}
+        params: {temperature: 0.2}
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    quirks: [groq]
+    models:
+      - id: qwen/qwen3.6-27b
+        family: qwen
+        roles: [judge]
+        limits: {rpm: 30, tpm: 6000, tpd: 200000, rpd: 1000, max_context: 131072, max_output: 16384}
+        params: {temperature: 0.2}
+      - id: openai/gpt-oss-20b
+        family: gpt-oss
+        roles: [tiebreak]
+        limits: {rpm: 30, tpm: 8000, tpd: 200000, rpd: 1000, max_context: 131072, max_output: 65536}
+        params: {temperature: 0.2}
+      - id: llama-3.1-8b-instant
+        family: llama
+        roles: [probe]
+        limits: {rpm: 30, tpm: 6000, tpd: 500000, rpd: 14400, max_context: 131072, max_output: 32768}
+        params: {temperature: 0.6}
+  - name: mistral
+    base_url: https://api.mistral.ai/v1
+    api_key_env: MISTRAL_API_KEY
+    quirks: [mistral]
+    models:
+      - id: magistral-small-latest
+        family: mistral
+        roles: [generator]
+        limits: {rpm: 60, tpm: 500000, tpd: 33000000, max_context: 40000, max_output: 8192}
+        params: {temperature: 0.7, top_p: 0.95}
+      - id: mistral-small-latest
+        family: mistral
+        roles: [judge]
+        limits: {rpm: 60, tpm: 500000, tpd: 33000000, max_context: 32000, max_output: 8192}
+        params: {temperature: 0.2}
+
+# Mistral rpm/tpm are UNVERIFIED (console check pending) - placeholders, kept
+# conservative at rpm 60. Cerebras tpd may actually be account-wide shared
+# rather than per-model; treated per-model here until it is empirically
+# tested. qwen/qwen3.6-27b is a Groq PREVIEW model and may vanish without
+# notice - never make it the sole judge; the routing lists below always give
+# fallbacks. Model refs in routing are "provider/model-id" strings - note
+# that "groq/qwen/qwen3.6-27b" contains TWO slashes, so refs are split on the
+# FIRST slash only (provider="groq", model="qwen/qwen3.6-27b").
+routing:
+  generator: [cerebras/gpt-oss-120b, mistral/magistral-small-latest]
+  judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b, cerebras/zai-glm-4.7]
+  tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b, cerebras/zai-glm-4.7]
+  probe: [groq/llama-3.1-8b-instant]
+  family_separation: true
+  judge_mode: dual        # dual | audit
