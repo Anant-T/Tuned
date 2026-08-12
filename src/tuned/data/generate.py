@@ -71,6 +71,7 @@ from tuned.data.config import ModelRef
 from tuned.data.gates import GateContext, split_think
 from tuned.data.jsonl import append_ndjson
 from tuned.data.providers import (
+    CHARS_PER_TOKEN_LATIN,
     DEFAULT_JUDGE_REPLY_TOKENS,
     ProviderError,
     context_estimate,
@@ -104,8 +105,28 @@ GEN_UNROUTABLE_STATE = "gen_unroutable"
 ROW_SHAPED_SKIPS = frozenset({"family-excluded"})
 
 # How many times a task may be claimed before a regenerate-disposition stops
-# buying another attempt. Counted on task.attempts, which claim_tasks bumps.
+# buying another attempt. Counted on task.attempts, which claim_tasks bumps -
+# and which tasks.reopen_tasks zeroes, because a row parked at the cap by a
+# fleet-wide failure has spent none of its budget on the answer.
 MAX_ATTEMPTS = 3
+
+# Prompt ids for the judge's two calls. They live in this module, beside the
+# judge sizing that the startup preflight needs, because judge.py imports
+# generate.py and not the reverse; judge.py re-exports them under its own
+# names so there is one definition of each.
+JUDGE_PROMPT_ID = "judge_pointwise_v1"
+TIEBREAK_PROMPT_ID = "judge_tiebreak_v1"
+
+# The character the worst-case judge prompt is built out of: Devanagari DA.
+# The point is the SCRIPT, not the letter - the corpus is largely Indic and
+# those codepoints cost ~2.7x what the gates' chars/4 band charges for them.
+WORST_CASE_CHAR = "द"
+
+# Roles the GENERATION fleet refuses to start without. The judging roles are
+# in here for the same reason the judge pool is checked: filling a queue no
+# judge can drain is money spent on rows that will park, and a judge role
+# with no key drains nothing at all.
+GENERATOR_PREFLIGHT_ROLES = ("generator", "judge", "tiebreak")
 
 # Reasoning-effort ladder for retries. A regeneration that failed on format,
 # an empty trace or a missing self-check is usually a model that did not
@@ -292,6 +313,71 @@ def make_router(store, cfg, **kwargs):
     return Router(cfg, budget_ok=budget_ok_for(store, cfg), **kwargs)
 
 
+def judge_messages(
+    source: str,
+    candidate_think: str,
+    candidate_answer: str,
+    *,
+    prompt_id: str = JUDGE_PROMPT_ID,
+) -> list[dict]:
+    """Render one judge call. THE renderer - judge_slot calls this one.
+
+    It lives here rather than in judge.py because the startup preflight has to
+    size the judge's largest possible call and judge.py imports this module,
+    not the other way round. judge.py re-exports both names, so there is
+    exactly one definition of each and the preflight cannot end up measuring a
+    prompt nobody sends.
+    """
+    return prompt_registry.render(
+        prompt_id,
+        source=source,
+        candidate_think=candidate_think,
+        candidate_answer=candidate_answer,
+    )
+
+
+def judge_needed_tokens(
+    messages: Sequence[Mapping], *, reply_tokens: int = DEFAULT_JUDGE_REPLY_TOKENS
+) -> int:
+    """Context a judge call needs: the rendered prompt plus its own reply.
+
+    ROUTING currency (script- and template-aware), never the gates' chars/4:
+    this number is compared against hard context ceilings, where under-
+    counting means a truncated judge prompt or a 400.
+    """
+    return context_estimate(messages) + int(reply_tokens)
+
+
+def worst_case_judge_tokens(
+    cfg,
+    *,
+    reply_tokens: int = DEFAULT_JUDGE_REPLY_TOKENS,
+    prompt_id: str = JUDGE_PROMPT_ID,
+) -> int:
+    """The largest judge call this build can produce, measured the real way.
+
+    Constructed rather than sampled, and then pushed through the SAME renderer
+    and the SAME estimator the judge worker uses - which is the whole point.
+    Deriving it instead (length_band.total_max + reply) mixes currencies:
+    `total_max` is chars/4 by definition, because that is what
+    gates.check_length_band compares against, while the judge is sized with
+    context_estimate. The two disagree by 9% on English and by 2.3x on
+    Devanagari, and the preflight was reading the small one.
+
+    The worst case: the length gate passes a row whose prompt + trace + answer
+    is at most `total_max` chars/4 tokens, i.e. `total_max * 4` characters.
+    The judge's {source} is a SUBSET of the generator's prompt (the grounding
+    slots), so that character budget bounds everything the judge is shown -
+    and the hardest way to spend it is entirely in Devanagari, which is a
+    large fraction of this corpus and tokenizes at 1.5 chars/token.
+    """
+    chars = int(cfg.build.length_band.total_max * CHARS_PER_TOKEN_LATIN)
+    material = WORST_CASE_CHAR * chars
+    return judge_needed_tokens(
+        judge_messages(material, "", "", prompt_id=prompt_id), reply_tokens=reply_tokens
+    )
+
+
 def preflight_messages(
     cfg,
     roles: Sequence[str],
@@ -309,15 +395,19 @@ def preflight_messages(
       Never overridable - there is nothing to override, the calls cannot be
       made.
     * a judge SLOT the pool cannot fill for the longest row the length band
-      permits. Family separation plus context length can empty the judge role
-      for a whole class of rows, and the row only discovers that AFTER paying
-      for the other judge. Overridable with allow_pool_gaps, because an
-      operator who knows the gap may legitimately want to run short rows
-      while the fourth-family judge is still being sourced.
+      permits - on family separation, on context length, or because the only
+      family left sits behind an API key that has not arrived. All three empty
+      the judge role for a whole class of rows, and the row only discovers
+      that AFTER paying for the other judge. Overridable with allow_pool_gaps,
+      because an operator who knows the gap may legitimately want to run short
+      rows while the fourth-family judge is still being sourced.
 
     The tiebreak's own gap is a warning, never a refusal: judge.py has a
     defined, unpaid fallback for it (decide on the two judges, reject the
     unresolved disagreement) and round 1 shipped it deliberately.
+
+    The size the pool is checked at comes from worst_case_judge_tokens, i.e.
+    from the judge's own renderer and estimator. Nothing here re-derives it.
     """
     refusals: list[str] = []
     warnings: list[str] = []
@@ -327,7 +417,14 @@ def preflight_messages(
             f"{', '.join(envs)} is set, so every {role} call would fail to route. "
             f"Put the key in .env (providers.load_dotenv_keys reads it)."
         )
-    for gap in pool_gaps(cfg, judge_reply_tokens=judge_reply_tokens):
+    gaps = pool_gaps(
+        cfg,
+        needed_tokens=worst_case_judge_tokens(cfg, reply_tokens=judge_reply_tokens),
+        tiebreak_needed_tokens=worst_case_judge_tokens(
+            cfg, reply_tokens=judge_reply_tokens, prompt_id=TIEBREAK_PROMPT_ID
+        ),
+    )
+    for gap in gaps:
         line = f"routing.{gap.role} slot {gap.slot}: {gap.detail}"
         if gap.fatal and not allow_pool_gaps:
             refusals.append(line)
@@ -1181,9 +1278,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"loaded {load_dotenv_keys()} key(s) from .env")
     # Before anything is claimed: a role with no key, or a judge slot no
     # model can fill, is knowable now and costs paid rows to discover later.
-    # The generation worker checks the JUDGE pool too - filling a queue no
+    # The generation worker checks the JUDGE roles too - filling a queue no
     # judge pool can drain is money spent on rows that will park.
-    if not print_preflight(cfg, ("generator",), allow_pool_gaps=args.allow_pool_gaps):
+    if not print_preflight(
+        cfg, GENERATOR_PREFLIGHT_ROLES, allow_pool_gaps=args.allow_pool_gaps
+    ):
         raise SystemExit(2)
     paths = build_paths(cfg.build.workdir).ensure()
     store = Store.open(paths.state_db)

@@ -24,6 +24,7 @@ from tuned.data import gates
 from tuned.data.config import ModelRef
 from tuned.data.generate import (
     GEN_UNROUTABLE_STATE,
+    GENERATOR_PREFLIGHT_ROLES,
     MAX_ATTEMPTS,
     QUESTION_BY_TASK_TYPE,
     GenResult,
@@ -45,7 +46,7 @@ from tuned.data.generate import (
 from tuned.data.generate import main as generate_main
 from tuned.data.jsonl import read_at
 from tuned.data.providers import ProviderError
-from tuned.data.tasks import plan_wave
+from tuned.data.tasks import plan_wave, reopen_tasks
 
 
 @pytest.fixture
@@ -675,6 +676,58 @@ def test_a_transient_pool_skip_still_re_queues(tmp_path, cfg, paths):
 
 
 # --------------------------------------------------------------------------
+# R3-C1: --reopen must hand the row back with a budget, not just a state.
+# --------------------------------------------------------------------------
+
+def _park_keyless(store, cfg, paths):
+    """The motivating park: nothing routable, so the row exhausts unspent."""
+    router = FakeRouter(cfg, missing_keys={"cerebras", "mistral"})
+    for _ in range(MAX_ATTEMPTS):
+        run(store, cfg, router, paths)
+    task = only_task(store)
+    assert (task["state"], task["attempts"]) == (GEN_UNROUTABLE_STATE, MAX_ATTEMPTS)
+    return task
+
+
+def test_a_reopened_row_survives_the_first_failure_after_recovery(tmp_path, cfg, paths):
+    """R3-C1. The park happens AT the cap, so a re-open that restores only the
+    state hands the row back already exhausted: one 429 - the ordinary weather
+    of a free tier - closed it as `rejected`, which is deliberately not
+    re-openable and has already spent its per-seed slot."""
+    with make_store(tmp_path) as store:
+        _park_keyless(store, cfg, paths)
+        reopen_tasks(store, [GEN_UNROUTABLE_STATE])
+        assert only_task(store)["attempts"] == 0
+
+        error = ProviderError(
+            "429 everywhere", status=429, provider="cerebras", model="gpt-oss-120b",
+            retryable=True,
+        )
+        run(store, cfg, FakeRouter(cfg, {"generator": [error]}), paths)
+        task = only_task(store)
+        assert task["state"] == "pending"
+        assert task["attempts"] == 1
+
+
+def test_a_reopened_row_still_buys_the_regenerations_it_never_used(tmp_path, cfg, paths):
+    """The worse half of R3-C1: a reply with no reasoning channel is the most
+    common free-tier outcome (it is why the effort ladder exists), and post-
+    reopen it cost a PAID generation and then rejected with zero
+    regenerations - as `exhausted:regenerate:...`, i.e. counted as a legal-
+    quality reject."""
+    with make_store(tmp_path) as store:
+        _park_keyless(store, cfg, paths)
+        reopen_tasks(store, [GEN_UNROUTABLE_STATE])
+
+        traceless = chat_response(CLEAN_ANSWER, reasoning=None)
+        run(store, cfg, FakeRouter(cfg, {"generator": [traceless]}), paths)
+        task = only_task(store)
+        assert task["state"] == "pending"
+        assert task["disposition"].startswith("regenerate:")
+        assert "think_format" in task["disposition"]
+
+
+# --------------------------------------------------------------------------
 # R2-C2: a 400 must not burn the row, and the estimate needs headroom.
 # --------------------------------------------------------------------------
 
@@ -919,6 +972,48 @@ def test_the_generator_cli_exits_rather_than_claiming_anything(tmp_path, cfg, mo
     assert "routing.generator has no usable API key" in out
     # Nothing was opened, claimed or spent.
     assert not (tmp_path / "build" / "state").exists()
+
+
+def test_the_preflight_refuses_a_16k_fourth_family_judge(cfg, monkeypatch):
+    """R3-C2 end to end. 16k is above the >= 11520 the preflight used to
+    print, so this config STARTED: a Devanagari row then passed the length
+    gate, paid for judge A and parked in judge_unroutable at needed=14042.
+    Many free-tier candidates for the pending operator decision are 16k."""
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    sixteen_k = cfg_with_fourth_judge_family(cfg, max_context=16384)
+    refusals, _ = preflight_messages(sixteen_k, ("generator",))
+    assert any("routing.judge" in line for line in refusals)
+    # ...and the same config with a 32k model in the same slot starts clean.
+    thirty_two_k = cfg_with_fourth_judge_family(cfg, max_context=32768)
+    assert preflight_messages(thirty_two_k, ("generator",)) == ([], [])
+
+
+def test_the_preflight_refuses_a_judge_slot_that_is_only_missing_a_key(cfg, monkeypatch):
+    """R3-C3 end to end, in the shape the operator will actually meet it:
+    keys arrive piecemeal, the fourth-family judge lands behind the provider
+    whose key has not arrived, and every routed role still passes
+    unkeyed_roles because one of its refs IS keyed. The fleet used to start
+    and buy judge A for every row in the wave."""
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    widened = cfg_with_fourth_judge_family(cfg)  # the new judge is a groq model
+    refusals, _ = preflight_messages(widened, ("generator", "judge", "tiebreak"))
+    assert any("routing.judge" in line and "GROQ_API_KEY" in line for line in refusals)
+
+
+def test_the_generation_fleet_checks_the_judging_keys_too(cfg, monkeypatch):
+    """generate.main's own comment says it checks the judge pool "because
+    filling a queue no judge pool can drain is money spent on rows that will
+    park" - which is just as true of the judge's KEYS. It passed only
+    ("generator",)."""
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
+    refusals, _ = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
+    assert any("routing.generator has no usable API key" in line for line in refusals)
+    assert any("routing.judge has no usable API key" in line for line in refusals)
+    assert any("routing.tiebreak has no usable API key" in line for line in refusals)
 
 
 def test_the_judge_reply_allowance_is_shared_with_the_preflight():

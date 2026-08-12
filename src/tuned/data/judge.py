@@ -98,11 +98,15 @@ from dataclasses import dataclass, field
 from tuned.data import prompt_registry
 from tuned.data.config import ModelRef
 from tuned.data.generate import (
+    JUDGE_PROMPT_ID,
     ROW_SHAPED_SKIPS,
+    TIEBREAK_PROMPT_ID,
     SlotError,
     apply_gate_disposition,
     build_prompt,
     generate_once,
+    judge_messages,
+    judge_needed_tokens,
     make_router,
     print_preflight,
     usage_recorder,
@@ -112,7 +116,6 @@ from tuned.data.jsonl import append_ndjson
 from tuned.data.providers import (
     DEFAULT_JUDGE_REPLY_TOKENS,
     ProviderError,
-    context_estimate,
     undersized_families,
 )
 from tuned.data.store import utcday, utcnow
@@ -137,8 +140,11 @@ ERROR_STATE = "judge_error"
 # judges that did answer and arrive at the same wall, so it parks at once.
 UNROUTABLE_STATE = "judge_unroutable"
 
-JUDGE_PROMPT = "judge_pointwise_v1"
-TIEBREAK_PROMPT = "judge_tiebreak_v1"
+# Defined in generate.py and re-exported here: the startup preflight sizes
+# the judge's largest possible call with the SAME renderer this worker uses,
+# and generate.py is the module both fleets' preflight lives in.
+JUDGE_PROMPT = JUDGE_PROMPT_ID
+TIEBREAK_PROMPT = TIEBREAK_PROMPT_ID
 JUDGE_SLOTS = ("a", "b")
 TIEBREAK_SLOT = "tiebreak"
 
@@ -525,16 +531,14 @@ async def judge_slot(
     nothing eligible and turn a garbled sentence into a routing failure.
     """
     outcome = SlotOutcome(slot=slot)
-    messages = prompt_registry.render(
-        prompt_id,
-        source=source,
-        candidate_think=gen.get("think") or "",
-        candidate_answer=gen.get("answer") or "",
+    # The renderer and the sizer the STARTUP PREFLIGHT runs, on this row
+    # rather than on a constructed worst case. Two implementations of "how big
+    # is this judge call" is how the preflight came to clear a pool that then
+    # parked rows half-paid, so there is only one of each.
+    messages = judge_messages(
+        source, gen.get("think") or "", gen.get("answer") or "", prompt_id=prompt_id
     )
-    # Routing currency (script- and template-aware), not the gates' chars/4:
-    # this number is compared against hard context ceilings, where under-
-    # counting means a truncated judge prompt or a 400.
-    needed = context_estimate(messages) + max_tokens
+    needed = judge_needed_tokens(messages, reply_tokens=max_tokens)
     exclude = frozenset(exclude_families) | undersized_families(cfg, role, needed)
 
     for attempt in (1, 2):

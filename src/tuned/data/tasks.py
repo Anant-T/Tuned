@@ -353,8 +353,14 @@ def plan_wave(
     return commit_rows(store, rows, stream=stream, arm=arm, target=n)
 
 
-def reopen_tasks(store, states: Sequence[str], *, stream: str | None = None) -> dict[str, int]:
+def reopen_tasks(
+    store, states: Sequence[str], *, stream: str | None = None
+) -> dict[str, int]:
     """Return parked tasks to the queue that owns them. Counts per state.
+
+    `stream=None` means every stream, which is what the recovery command in
+    the config's TODO block actually needs: a pool gap parks whatever was in
+    flight, and that is rarely one stream.
 
     The workers park a row rather than close it whenever the failure is about
     the POOL and not about the answer: no judge left for slot B, no generator
@@ -365,7 +371,23 @@ def reopen_tasks(store, states: Sequence[str], *, stream: str | None = None) -> 
     Nothing here re-pays for work already done: a re-opened row keeps its
     generations and its recorded judgements, and judge.py reuses any slot the
     judgement table already holds (judge_slot_reused). Re-opening a row whose
-    judge A answered costs exactly slot B.
+    judge A answered costs exactly slot B - PROVIDED the re-judge scores the
+    same generation, because store.judgements_for is keyed on gen_id. A row
+    that judge.py parked in `gen_unroutable` from its regeneration path
+    (judge.py's borderline branch) comes back to the GENERATOR, so the next
+    pass produces a new gen_id and both slots are bought again. That is
+    correct - they would be scoring a different answer - but it is not free.
+
+    THE ATTEMPT BUDGET COMES BACK WITH THE ROW. The park this exists for
+    happens AT the cap: a wave that could not route at all burnt three claims
+    finding that out, and every one of them was spent on a fact about the
+    fleet rather than on the answer. Restoring the state alone hands the row
+    back exhausted, so the first ordinary failure afterwards - a 429, or a
+    reply with no reasoning channel - is terminal, lands in `rejected`
+    (which is deliberately not re-openable) and is then counted as a
+    legal-quality reject. Zeroing `attempts` is the honest reading of
+    "return it to the queue"; the per-seed cap and the operator-initiated
+    nature of this command are what bound it.
 
     `rejected` is deliberately not re-openable. It is a decision - the gates
     or the judges said this example is wrong - and re-opening decisions is
@@ -392,7 +414,9 @@ def reopen_tasks(store, states: Sequence[str], *, stream: str | None = None) -> 
         for (task_id,) in rows:
             # No fence: a parked row holds no lease (set_task_state released
             # it when it parked), so there is no live holder to lose to.
-            if store.set_task_state(task_id, target, f"reopened:from-{state}"):
+            if store.set_task_state(
+                task_id, target, f"reopened:from-{state}", reset_attempts=True
+            ):
                 moved += 1
         if moved:
             store.log_event(
@@ -401,6 +425,30 @@ def reopen_tasks(store, states: Sequence[str], *, stream: str | None = None) -> 
             )
         counts[state] = moved
     return counts
+
+
+def parked_by_stream(
+    store, states: Sequence[str], *, stream: str | None = None
+) -> dict[str, int]:
+    """stream -> how many rows are sitting in `states`. READ-only (see 3.).
+
+    The CLI prints this before re-opening so the operator sees which streams
+    a pool gap actually caught, and - when a filter is passed - what is being
+    left behind.
+    """
+    clauses = [f"state IN ({', '.join('?' * len(states))})"]
+    params: list = list(states)
+    if stream is not None:
+        clauses.append("stream = ?")
+        params.append(stream)
+    return {
+        row[0]: row[1]
+        for row in store.conn.execute(
+            f"SELECT stream, COUNT(*) FROM task WHERE {' AND '.join(clauses)} "
+            f"GROUP BY stream ORDER BY stream",
+            params,
+        ).fetchall()
+    }
 
 
 def parse_mix(spec: str) -> dict[str, float]:
@@ -444,9 +492,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--reopen-all-streams",
-        action="store_true",
-        help="with --reopen, act on every stream rather than only --stream",
+        "--reopen-stream",
+        default=None,
+        metavar="STREAM",
+        help=(
+            "with --reopen, act on this stream only. The default is EVERY "
+            "stream: a pool gap parks whatever was in flight, and the "
+            "recovery command in the config TODO is written without a stream"
+        ),
     )
     args = parser.parse_args(argv)
     if args.n is None and not args.reopen:
@@ -460,14 +513,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             states = (
                 sorted(REOPEN_STATES) if "all" in args.reopen else list(dict.fromkeys(args.reopen))
             )
-            counts = reopen_tasks(
-                store,
-                states,
-                stream=None if args.reopen_all_streams else args.stream,
-            )
+            # Read the per-stream shape BEFORE the move, and read it again
+            # unfiltered afterwards: with --reopen-stream the difference is
+            # the residue this command deliberately left parked, which is
+            # otherwise invisible until the wave comes up short.
+            touched = parked_by_stream(store, states, stream=args.reopen_stream)
+            counts = reopen_tasks(store, states, stream=args.reopen_stream)
+            residue = parked_by_stream(store, states)
             print(f"re-opened {sum(counts.values())}")
             for state in states:
                 print(f"  {state} -> {REOPEN_STATES[state]:<12}{counts[state]:>6}")
+            for name, count in sorted(touched.items()):
+                print(f"  stream {name:<14}{count:>6}")
+            if residue:
+                left = ", ".join(f"{name}={count}" for name, count in sorted(residue.items()))
+                print(f"  STILL PARKED (not in --reopen-stream {args.reopen_stream!r}): {left}")
             print(
                 "task states: "
                 + ", ".join(f"{k}={v}" for k, v in sorted(store.task_counts().items()))

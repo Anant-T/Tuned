@@ -438,10 +438,19 @@ class Store:
         disposition: str | None = None,
         *,
         expect_worker: str | None = None,
+        reset_attempts: bool = False,
     ) -> bool:
         """Move a task to `state`, releasing its lease unless it stays 'generating'.
 
         Returns True if a row was actually updated.
+
+        `reset_attempts` zeroes the claim counter in the SAME statement as the
+        state move. Only the re-open path passes it: a task parked because
+        nothing in the pool could serve it spent its whole budget discovering
+        a fact about the FLEET, and handing it back to the queue still
+        exhausted means the first ordinary failure after the operator fixes
+        the cause is terminal. Default False, so every other caller is
+        byte-for-byte unaffected.
 
         `expect_worker` is a lease fence. A worker that stalled past its lease
         (GC pause, hung socket) has already had its task legitimately reclaimed
@@ -458,6 +467,8 @@ class Store:
         """
         assignments = "state = ?, disposition = COALESCE(?, disposition), updated_at = ?"
         params: list = [state, disposition, utcnow()]
+        if reset_attempts:
+            assignments += ", attempts = 0"
         if state != "generating":
             assignments += ", claimed_by = NULL, claimed_at = NULL"
         where = "task_id = ?"

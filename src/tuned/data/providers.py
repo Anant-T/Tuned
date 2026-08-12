@@ -96,9 +96,13 @@ _CONTEXT_OVERFLOW_MARKERS = (
     "prompt is too long",
     "input is too long",
     "input length exceeds",
-    "too many tokens",
-    "reduce the length",
 )
+# NOT markers, and the reason is worth recording: "too many tokens" and
+# "reduce the length" also describe a max_tokens larger than the model's
+# max_output, which is a payload bug of ours.  Treating one as an overflow
+# would fail over at every ref, aggregate as context_exceeded, and park the
+# WHOLE wave in gen_unroutable - a bug that reads like a pool gap.  A real
+# overflow body from a shipped provider is what earns a new marker here.
 
 
 def looks_like_context_overflow(body: str) -> bool:
@@ -488,6 +492,7 @@ class ChatClient:
         retryable: bool,
         provider_dead: bool = False,
         context_exceeded: bool = False,
+        skipped: frozenset[str] = frozenset(),
     ) -> ProviderError:
         return ProviderError(
             f"{self.provider.name}/{self.model.id}: {message}",
@@ -497,6 +502,7 @@ class ChatClient:
             retryable=retryable,
             provider_dead=provider_dead,
             context_exceeded=context_exceeded,
+            skipped=skipped,
         )
 
     def build_payload(self, req: ChatRequest) -> dict:
@@ -557,8 +563,16 @@ class ChatClient:
         """
         key = os.environ.get(self.provider.api_key_env)
         if not key:
+            # Carries the same skip reason the Router reports, because the
+            # race it covers (a key removed from the environment between the
+            # Router's eligibility check and this call) is the same fact:
+            # without it the worker sees an error with no `skipped` at all and
+            # takes the provider-failure path, which ends in `rejected`.
             raise self._error(
-                f"API key env {self.provider.api_key_env} is not set", status=None, retryable=False
+                f"API key env {self.provider.api_key_env} is not set",
+                status=None,
+                retryable=False,
+                skipped=frozenset({"missing-key"}),
             )
         payload = self.build_payload(req)
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -703,7 +717,6 @@ class _BreakerState:
 # deciding a task's fate has to classify the reasons the same way this module
 # does; a private copy in the workers would drift.
 TRANSIENT_SKIPS = frozenset({"cooling", "over-budget"})
-_TRANSIENT_SKIPS = TRANSIENT_SKIPS  # legacy alias, kept for in-module reads
 
 # --- context estimation -----------------------------------------------------
 #
@@ -791,7 +804,7 @@ def undersized_families(cfg: BuildConfig, role: str, needed_tokens: int) -> froz
     carries the same materials PLUS the candidate and is the longest in the
     pipeline.
     """
-    required = int(max(0, needed_tokens) * CONTEXT_SAFETY_MARGIN)
+    required = required_context(needed_tokens)
     fits_by_family: dict[str, bool] = {}
     for ref in cfg.routing_refs(role):
         _, model = cfg.model_for(ref)
@@ -854,79 +867,122 @@ class PoolGap:
     fatal: bool
 
 
-def max_judge_prompt_tokens(
-    cfg: BuildConfig, *, judge_reply_tokens: int = DEFAULT_JUDGE_REPLY_TOKENS
-) -> int:
-    """The largest judge call the pipeline can produce, in routing currency.
+def required_context(needed_tokens: int) -> int:
+    """The max_context a model must declare to be routed a call this size.
 
-    The judge prompt is the row's own material plus the candidate, and the
-    length band caps exactly that sum (``total_max``) - a row above it fails
-    the length gate and never reaches a judge.  Add the judge's reply
-    allowance, because the window has to hold both.
+    ONE definition, used by ``undersized_families`` (which enforces it) and by
+    the preflight (which advises it).  When those were two expressions the
+    preflight told the operator to buy a model the router would then refuse.
     """
-    return int(cfg.build.length_band.total_max) + int(judge_reply_tokens)
+    return int(max(0, needed_tokens) * CONTEXT_SAFETY_MARGIN)
 
 
-def _first_family(
-    cfg: BuildConfig, role: str, exclude: set[str], undersized: frozenset[str]
-) -> str | None:
-    """The family Router.pick would land on, walking the real preference order."""
+def _blocking_key_envs(cfg: BuildConfig, role: str, exclude: frozenset[str]) -> tuple[str, ...]:
+    """API-key env vars that would open this slot if they were set.
+
+    Only refs that are otherwise usable count: naming the env var of a model
+    that is excluded on family or on context length would send the operator
+    after a key that changes nothing.
+    """
+    envs: list[str] = []
     for ref in cfg.routing_refs(role):
-        _, model = cfg.model_for(ref)
-        if model.family in exclude or model.family in undersized:
+        provider, model = cfg.model_for(ref)
+        if model.family in exclude:
             continue
-        return model.family
+        if not os.environ.get(provider.api_key_env) and provider.api_key_env not in envs:
+            envs.append(provider.api_key_env)
+    return tuple(envs)
+
+
+def _first_family(router: "Router", role: str, exclude: frozenset[str]) -> str | None:
+    """The family this role would actually land on, via the Router's own walk.
+
+    Not a model of ``Router.eligible`` - literally its filter (``eligible_refs``),
+    so a ref the Router would skip cannot read here as a filled slot.  That
+    matters most for keys: they arrive piecemeal, and a judge slot whose only
+    remaining family sits behind an unset env var is empty in exactly the way
+    a family exclusion makes it empty.
+    """
+    for ref in router.eligible_refs(role, exclude_families=exclude):
+        return router.cfg.model_for(ref)[1].family
     return None
 
 
 def pool_gaps(
-    cfg: BuildConfig, *, judge_reply_tokens: int = DEFAULT_JUDGE_REPLY_TOKENS
+    cfg: BuildConfig,
+    *,
+    needed_tokens: int,
+    tiebreak_needed_tokens: int | None = None,
+    router: "Router | None" = None,
 ) -> list[PoolGap]:
     """Every judge/tiebreak slot the pool cannot fill for the LONGEST row.
 
-    Family separation and context length are both per-call filters, so their
-    interaction is invisible in the config and only shows up once a row is
-    long enough - by which time the fleet has paid for judge A and parked the
-    row waiting for a judge B that does not exist.  This walks the same
-    preference order judge.py walks, at the largest prompt the length band
-    permits, and says so before anything is claimed.
+    Family separation, context length and a missing key are all per-call
+    filters, so their interaction is invisible in the config and only shows up
+    once a row is long enough - by which time the fleet has paid for judge A
+    and parked the row waiting for a judge B that does not exist.  This walks
+    the same preference order judge.py walks, through the same
+    ``Router.eligible_refs``, at a size the CALLER measured with the judge's
+    own prompt renderer.
+
+    ``needed_tokens`` is injected rather than derived here on purpose.  The
+    previous version computed it from ``build.length_band.total_max``, which
+    is a chars/4 number by definition, while the spender sizes the identical
+    call with ``context_estimate`` - Indic script at 1.5 chars/token plus
+    per-turn template overhead.  The preflight therefore under-stated the real
+    judge prompt by 9% on English and 2.3x on Devanagari, and cleared a pool
+    that then parked rows half-paid.  There is now one sizing function
+    (generate.worst_case_judge_tokens) and this reports what it is given.
 
     Deliberately NOT a fallback: reusing a family when the pool runs out
     would put a model's own family in front of its own prose, which is the
     invariant the separation exists to protect.  The fix is one more model in
-    the config; this is how the operator learns that in one second.
+    the config, or one more key in the environment; this is how the operator
+    learns which, in one second.
     """
-    needed = max_judge_prompt_tokens(cfg, judge_reply_tokens=judge_reply_tokens)
-    too_small_judge = undersized_families(cfg, "judge", needed)
-    too_small_tiebreak = undersized_families(cfg, "tiebreak", needed)
+    if router is None:
+        # A bare Router: nothing is cooling on a fresh one and the default
+        # budget gate passes, so what this adds over a raw config walk is
+        # precisely the key filter - which is the point.
+        router = Router(cfg)
+    tiebreak_needed = needed_tokens if tiebreak_needed_tokens is None else tiebreak_needed_tokens
+    too_small_judge = undersized_families(cfg, "judge", needed_tokens)
+    too_small_tiebreak = undersized_families(cfg, "tiebreak", tiebreak_needed)
+    judge_families = sorted({cfg.model_for(r)[1].family for r in cfg.routing_refs("judge")})
     gaps: list[PoolGap] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
     for gen_ref in cfg.routing_refs("generator"):
         _, gen_model = cfg.model_for(gen_ref)
         gen_family = gen_model.family
-        if (gen_family, "seen") in seen:
+        if gen_family in seen:
             continue
-        seen.add((gen_family, "seen"))
+        seen.add(gen_family)
         chosen: list[str] = []
         blocked = False
         for slot in ("a", "b"):
-            family = _first_family(
-                cfg, "judge", {gen_family, *chosen}, too_small_judge
-            )
+            exclude = frozenset({gen_family, *chosen}) | too_small_judge
+            family = _first_family(router, "judge", exclude)
             if family is None:
+                envs = _blocking_key_envs(cfg, "judge", exclude)
+                remedy = (
+                    f"set {', '.join(envs)}, or add one judge in a further family "
+                    f"with max_context >= {required_context(needed_tokens)}"
+                    if envs
+                    else f"add one judge in a further family with max_context >= "
+                    f"{required_context(needed_tokens)}"
+                )
                 gaps.append(
                     PoolGap(
                         role="judge",
                         generator_family=gen_family,
                         slot=slot,
                         detail=(
-                            f"a {gen_family} generation of {needed} tokens has no judge "
-                            f"for slot {slot}: the judge pool is "
-                            f"{sorted({cfg.model_for(r)[1].family for r in cfg.routing_refs('judge')})}, "
+                            f"a {gen_family} generation of {needed_tokens} tokens has no "
+                            f"judge for slot {slot}: the judge pool is {judge_families}, "
                             f"minus the generator's own {gen_family!r}, minus "
                             f"{sorted(too_small_judge)} on context length, minus "
-                            f"{chosen} already used. Add one judge in a further family "
-                            f"with max_context >= {int(needed * CONTEXT_SAFETY_MARGIN)}"
+                            f"{chosen} already used, minus anything whose API key is "
+                            f"unset. {remedy}"
                         ),
                         fatal=True,
                     )
@@ -936,9 +992,8 @@ def pool_gaps(
             chosen.append(family)
         if blocked:
             continue
-        tiebreak = _first_family(
-            cfg, "tiebreak", {gen_family, *chosen}, too_small_tiebreak
-        )
+        exclude = frozenset({gen_family, *chosen}) | too_small_tiebreak
+        tiebreak = _first_family(router, "tiebreak", exclude)
         if tiebreak is None:
             gaps.append(
                 PoolGap(
@@ -946,7 +1001,7 @@ def pool_gaps(
                     generator_family=gen_family,
                     slot="tiebreak",
                     detail=(
-                        f"a {gen_family} generation of {needed} tokens judged by "
+                        f"a {gen_family} generation of {tiebreak_needed} tokens judged by "
                         f"{chosen} has no third family left to break a tie; judge.py "
                         f"decides on the two judges and rejects the unresolved "
                         f"disagreement (run_event "
@@ -1067,19 +1122,23 @@ class Router:
 
     # -- selection
 
-    def eligible(
+    def eligible_refs(
         self,
         role: str,
         *,
         est_tokens: int = 0,
         exclude_families: frozenset[str] = frozenset(),
         skipped: set[str] | None = None,
-    ) -> Iterator[RoutedModel]:
-        """Yield eligible refs in preference order, re-checking state each step.
+    ) -> Iterator[ModelRef]:
+        """THE eligibility filter, over refs alone. Yields in preference order.
 
-        Re-checking matters for ``complete``: a ref that trips the breaker
-        part-way through a failover pass must not be re-offered later in the
-        same pass.
+        Split out from ``eligible`` so that a caller which only needs to know
+        WHICH refs would serve a call - the startup preflight - runs this
+        exact walk instead of a second copy of it.  A parallel walk is how the
+        preflight came to report a pool the Router would not actually have
+        called: it had no key filter, so a judge slot that could only be
+        filled by an unkeyed provider read as filled.  ``eligible`` is this
+        function plus client construction, and nothing else.
 
         ``skipped``, if given, collects the REASONS refs were passed over.
         That is what lets a caller tell "nothing is eligible because the whole
@@ -1103,6 +1162,29 @@ class Router:
                 if skipped is not None:
                     skipped.add(reason)
                 continue
+            yield ref
+
+    def eligible(
+        self,
+        role: str,
+        *,
+        est_tokens: int = 0,
+        exclude_families: frozenset[str] = frozenset(),
+        skipped: set[str] | None = None,
+    ) -> Iterator[RoutedModel]:
+        """``eligible_refs`` with a client attached, re-checked at each step.
+
+        Re-checking matters for ``complete``: a ref that trips the breaker
+        part-way through a failover pass must not be re-offered later in the
+        same pass - which the underlying generator gives us for free, because
+        it evaluates one ref per ``next()``.
+        """
+        for ref in self.eligible_refs(
+            role,
+            est_tokens=est_tokens,
+            exclude_families=exclude_families,
+            skipped=skipped,
+        ):
             yield self.routed(ref)
 
     def pick(
@@ -1234,10 +1316,15 @@ class Router:
         # exclusion will still be true in a minute, so it may not.  The
         # reasons ride along on the error: "no key set" and "this row fits
         # nowhere" are both non-retryable and mean opposite things to a task.
+        # An empty role list is a configuration fact, not a row fact, and it
+        # needs a NAME: with an empty `skipped` the caller cannot tell "nothing
+        # was tried" from "a provider refused us", so the row burnt its
+        # attempts into `rejected` instead of parking recoverably.
+        if not skipped:
+            skipped = {"empty-role-list"}
         transient = sorted(skipped & TRANSIENT_SKIPS)
-        reasons = ", ".join(sorted(skipped)) if skipped else "role list is empty"
         raise ProviderError(
-            f"role {role!r}: no eligible model (skipped: {reasons})",
+            f"role {role!r}: no eligible model (skipped: {', '.join(sorted(skipped))})",
             retryable=bool(transient),
             skipped=frozenset(skipped),
         )

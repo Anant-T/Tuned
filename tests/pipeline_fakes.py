@@ -315,7 +315,7 @@ def paths_for(tmp_path):
     return build_paths(tmp_path / "build").ensure()
 
 
-def cfg_with_fourth_judge_family(cfg: BuildConfig) -> BuildConfig:
+def cfg_with_fourth_judge_family(cfg: BuildConfig, *, max_context: int = 131072) -> BuildConfig:
     """The shipped config plus the 32k+ fourth-family judge it is missing.
 
     This is the operator-side half of the round-2 judge-pool fix, in the one
@@ -323,6 +323,12 @@ def cfg_with_fourth_judge_family(cfg: BuildConfig) -> BuildConfig:
     generator's nor either existing judge's, so slot B and the tiebreak have
     somewhere to go on a long row. Used to prove that widening the pool is
     what un-parks a row, rather than any weakening of family separation.
+
+    It lives behind GROQ_API_KEY on purpose: the fourth family is the model
+    the operator is still sourcing, keys arrive piecemeal, and "the new judge
+    is configured but its key has not landed" is the shape of the R3-C3
+    preflight hole. `max_context` is a parameter because 16k candidates are
+    common and a 16k judge cannot hold the longest row the length gate passes.
     """
     from dataclasses import replace
 
@@ -330,7 +336,7 @@ def cfg_with_fourth_judge_family(cfg: BuildConfig) -> BuildConfig:
         id="fourth-judge",
         family="fourth",
         roles=("judge", "tiebreak"),
-        limits={"rpm": 30, "tpm": 8000, "max_context": 131072, "max_output": 8192},
+        limits={"rpm": 30, "tpm": 8000, "max_context": max_context, "max_output": 8192},
         params={"temperature": 0.2},
     )
     providers = tuple(

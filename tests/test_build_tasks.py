@@ -355,6 +355,61 @@ def test_reopen_cli_reports_what_it_re_opened(tmp_path, cfg, capsys):
     assert "judge_unroutable -> judging" in out
 
 
+def test_a_reopened_row_gets_its_attempt_budget_back(store, cfg):
+    """R3-C1. The rows --reopen exists for parked AT the attempt cap: the
+    motivating case is a wave that could not route at all (no key, everything
+    cooling, the daily cap spent), and that park happens at attempts ==
+    MAX_ATTEMPTS. Restoring only the state hands the row back already
+    exhausted, so the first failure after the operator fixes the cause is
+    terminal - and `rejected` is not re-openable."""
+    plan_wave(store, cfg, "synthesis", 2)
+    ids = [r[0] for r in store.conn.execute("SELECT task_id FROM task ORDER BY rowid").fetchall()]
+    store.conn.execute("UPDATE task SET attempts = 8")
+    store.set_task_state(ids[0], "gen_unroutable", "exhausted:unroutable:missing-key")
+    store.set_task_state(ids[1], "judge_error", "judge-slot-a:boom")
+
+    reopen_tasks(store, ["gen_unroutable", "judge_error"])
+
+    rows = {
+        r["task_id"]: r
+        for r in store.conn.execute("SELECT task_id, state, attempts FROM task").fetchall()
+    }
+    assert (rows[ids[0]]["state"], rows[ids[0]]["attempts"]) == ("pending", 0)
+    assert (rows[ids[1]]["state"], rows[ids[1]]["attempts"]) == ("judging", 0)
+
+
+def test_reopen_covers_every_stream_unless_one_is_named(store, cfg):
+    """The recovery command printed in the config TODO is bare `--reopen
+    judge_unroutable`; when that silently meant `--stream synthesis` it left
+    the curated_c2 and transition rows of the same wave parked."""
+    plan_wave(store, cfg, "synthesis", 1)
+    plan_wave(store, cfg, "curated_c2", 1)
+    store.conn.execute("UPDATE task SET state = 'judge_unroutable'")
+
+    assert reopen_tasks(store, ["judge_unroutable"]) == {"judge_unroutable": 2}
+    assert store.task_counts() == {"judging": 2}
+
+    store.conn.execute("UPDATE task SET state = 'judge_unroutable'")
+    assert reopen_tasks(store, ["judge_unroutable"], stream="synthesis") == {
+        "judge_unroutable": 1
+    }
+    assert store.task_counts() == {"judging": 1, "judge_unroutable": 1}
+
+
+def test_reopen_cli_names_the_streams_it_touched(tmp_path, cfg, capsys):
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=6, db_path=paths.state_db) as store:
+        plan_wave(store, cfg, "synthesis", 2)
+        plan_wave(store, cfg, "transition", 1)
+        store.conn.execute("UPDATE task SET state = 'gen_unroutable'")
+
+    assert tasks_main(["--config", config_path, "--reopen", "gen_unroutable"]) == 0
+    out = capsys.readouterr().out
+    assert "re-opened 3" in out
+    assert "synthesis" in out and "transition" in out
+
+
 def test_rows_carry_pending_state_after_creation(store, cfg):
     plan_wave(store, cfg, "synthesis", 3)
     row = store.conn.execute("SELECT * FROM task LIMIT 1").fetchone()

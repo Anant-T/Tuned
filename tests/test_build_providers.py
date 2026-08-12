@@ -22,9 +22,16 @@ from tuned.data.config import (  # noqa: E402
     ProviderCfg,
     load_build_config,
 )
+from tuned.data.generate import (  # noqa: E402
+    judge_messages,
+    judge_needed_tokens,
+    worst_case_judge_tokens,
+)
 from tuned.data.providers import (  # noqa: E402
     CONTEXT_SAFETY_MARGIN,
+    DEFAULT_JUDGE_REPLY_TOKENS,
     QUIRKS,
+    TEMPLATE_TOKENS_PER_MESSAGE,
     ChatClient,
     ChatRequest,
     CheckResult,
@@ -39,6 +46,7 @@ from tuned.data.providers import (  # noqa: E402
     format_check_row,
     load_dotenv_keys,
     pool_gaps,
+    required_context,
     resolve_quirks,
     undersized_families,
     unkeyed_roles,
@@ -1490,8 +1498,15 @@ def test_the_token_estimate_counts_indic_script_far_harder_than_latin():
 
 
 def test_the_context_estimate_counts_chat_template_overhead():
+    """The overhead is a NUMBER, not a direction: `> 80 // 4` also holds at
+    TEMPLATE_TOKENS_PER_MESSAGE = 0 (estimate_tokens rounds up per string), so
+    the delta is what has to be pinned."""
     messages = [{"role": "system", "content": "a" * 40}, {"role": "user", "content": "b" * 40}]
-    assert context_estimate(messages) > 80 // 4
+    bare = sum(estimate_tokens(m["content"]) for m in messages)
+    assert context_estimate(messages) - bare == 2 * TEMPLATE_TOKENS_PER_MESSAGE
+    assert TEMPLATE_TOKENS_PER_MESSAGE > 0
+    # An empty turn still costs its role markers.
+    assert context_estimate([{"role": "user", "content": ""}]) == TEMPLATE_TOKENS_PER_MESSAGE
     assert context_estimate([]) == 0
 
 
@@ -1510,11 +1525,11 @@ def test_unkeyed_roles_names_the_role_and_the_env_vars(cfg, monkeypatch):
     assert unkeyed_roles(cfg, ("probe",))["probe"] == ("GROQ_API_KEY",)
 
 
-def test_pool_gaps_finds_the_judge_hole_the_shipped_config_still_has(cfg):
+def test_pool_gaps_finds_the_judge_hole_the_shipped_config_still_has(cfg, keys):
     """R2-C3: long rows route to magistral, family separation then removes
     mistral, the 8k glm judge is out on length, slot A takes qwen and slot B
     has NOTHING. The row parks having already paid for judge A."""
-    gaps = pool_gaps(cfg)
+    gaps = pool_gaps(cfg, needed_tokens=worst_case_judge_tokens(cfg))
     judge_gaps = [g for g in gaps if g.role == "judge"]
     assert [(g.generator_family, g.slot) for g in judge_gaps] == [("mistral", "b")]
     assert judge_gaps[0].fatal is True
@@ -1525,28 +1540,129 @@ def test_pool_gaps_finds_the_judge_hole_the_shipped_config_still_has(cfg):
     assert tiebreak_gaps and all(not g.fatal for g in tiebreak_gaps)
 
 
-def test_a_fourth_judge_family_closes_the_pool_gap(cfg):
-    """The other half of the fix is one config line; this proves the preflight
-    goes quiet the moment the operator adds it."""
+def _with_fourth_judge(cfg, *, max_context: int, provider: str = "groq"):
+    """The shipped config plus one fourth-family judge of a given size."""
     from dataclasses import replace
 
     extra = ModelCfg(
         id="big-judge",
         family="fourth",
         roles=("judge", "tiebreak"),
-        limits={"rpm": 30, "tpm": 8000, "max_context": 131072, "max_output": 8192},
+        limits={"rpm": 30, "tpm": 8000, "max_context": max_context, "max_output": 8192},
         params={"temperature": 0.2},
     )
     providers = tuple(
-        replace(p, models=p.models + (extra,)) if p.name == "groq" else p for p in cfg.providers
+        replace(p, models=p.models + (extra,)) if p.name == provider else p for p in cfg.providers
     )
-    patched = replace(
+    return replace(
         cfg,
         providers=providers,
         routing=replace(
             cfg.routing,
-            judge=cfg.routing.judge + ("groq/big-judge",),
-            tiebreak=cfg.routing.tiebreak + ("groq/big-judge",),
+            judge=cfg.routing.judge + (f"{provider}/big-judge",),
+            tiebreak=cfg.routing.tiebreak + (f"{provider}/big-judge",),
         ),
     )
-    assert pool_gaps(patched) == []
+
+
+def test_a_fourth_judge_family_closes_the_pool_gap(cfg, keys):
+    """The other half of the fix is one config line; this proves the preflight
+    goes quiet the moment the operator adds it."""
+    patched = _with_fourth_judge(cfg, max_context=131072)
+    assert pool_gaps(patched, needed_tokens=worst_case_judge_tokens(patched)) == []
+
+
+# --- R3-C2/C3: the preflight runs the spender's own sizing and eligibility --
+#
+# Both round-3 Criticals are one defect: pool_gaps used to MODEL what
+# judge_slot does (its own prompt sizing in the gates' currency, its own
+# eligibility walk with no key filter) instead of executing the same code.
+# These pin the two halves back together.
+
+
+def test_the_preflight_sizes_the_judge_prompt_in_the_routing_currency(cfg):
+    """R3-C2. `length_band.total_max` is chars/4 BY DEFINITION (it is what
+    gates.check_length_band compares against); judge_slot spends in the
+    routing currency, which charges Indic script at 1.5 chars/token and every
+    turn its template overhead. Sizing the pool in the gates' currency
+    under-states the corpus this build is actually made of by ~2.3x."""
+    gates_currency = cfg.build.length_band.total_max + DEFAULT_JUDGE_REPLY_TOKENS
+    needed = worst_case_judge_tokens(cfg)
+    assert needed > 2 * gates_currency
+
+    # ...and it is not a second formula: the same render and the same
+    # estimate judge_slot uses, over the largest row the length gate permits,
+    # in the script that tokenizes hardest.
+    material = "क" * (cfg.build.length_band.total_max * 4)
+    assert needed == judge_needed_tokens(judge_messages(material, "", ""))
+    # The Latin worst case is smaller, and still over the old number.
+    latin = judge_needed_tokens(judge_messages("a" * (cfg.build.length_band.total_max * 4), "", ""))
+    assert gates_currency < latin < needed
+
+
+def test_a_16k_fourth_family_judge_is_a_fatal_pool_gap(cfg, keys):
+    """The operator is choosing this model now, and many free-tier candidates
+    are 16k - which is ABOVE the >= 11520 the preflight used to print. It has
+    to be reported as the gap it is, before the fleet starts."""
+    patched = _with_fourth_judge(cfg, max_context=16384)
+    needed = worst_case_judge_tokens(patched)
+    assert "fourth" in undersized_families(patched, "judge", needed)
+    fatal = [g for g in pool_gaps(patched, needed_tokens=needed) if g.fatal]
+    assert fatal, "a 16k judge cannot hold the longest row the length gate passes"
+    assert "on context length" in fatal[0].detail
+    # The old preflight sized this pool at 9216 and advised >= 11520, so a
+    # 16k model read as comfortably large and the fleet started.
+    assert 11520 < 16384 < required_context(needed)
+
+
+def test_the_advice_the_preflight_prints_is_the_threshold_it_enforces(cfg, keys):
+    """The gap detail names a max_context; a model of exactly that size must
+    close the gap and one token smaller must not. Anything else is a preflight
+    that tells the operator to buy the wrong model."""
+    gaps = pool_gaps(cfg, needed_tokens=worst_case_judge_tokens(cfg))
+    fatal = next(g for g in gaps if g.fatal)
+    advised = int(fatal.detail.split("max_context >= ")[1].split()[0])
+
+    exact = _with_fourth_judge(cfg, max_context=advised)
+    assert pool_gaps(exact, needed_tokens=worst_case_judge_tokens(exact)) == []
+    short = _with_fourth_judge(cfg, max_context=advised - 1)
+    assert [g for g in pool_gaps(short, needed_tokens=worst_case_judge_tokens(short)) if g.fatal]
+
+
+def test_pool_gaps_applies_the_routers_own_key_filter(cfg, monkeypatch):
+    """R3-C3. Router.eligible skips an unkeyed ref as "missing-key"; a
+    preflight that walks routing_refs without that filter reports a pool it
+    cannot call. unkeyed_roles does not cover it - it passes a role as soon as
+    ONE ref is keyed, which is the right question for "can this role call at
+    all" and the wrong one for "can slot B be filled". Keys arrive piecemeal,
+    so a partially-keyed start is the likely first real launch."""
+    _unset(monkeypatch, "GROQ_API_KEY")
+    for env in ("MISTRAL_API_KEY", "CEREBRAS_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    # Small rows on purpose: nothing is undersized at this length, so a
+    # missing key is the only thing that can empty a slot.
+    assert unkeyed_roles(cfg, ("judge",)) == {}
+    assert undersized_families(cfg, "judge", 4000) == frozenset()
+
+    fatal = [g for g in pool_gaps(cfg, needed_tokens=4000) if g.fatal]
+    assert fatal
+    assert any("GROQ_API_KEY" in g.detail for g in fatal)
+
+    # ...and the same walk goes quiet once the key lands.
+    monkeypatch.setenv("GROQ_API_KEY", "sk-test")
+    assert [g for g in pool_gaps(cfg, needed_tokens=4000) if g.fatal] == []
+
+
+def test_eligible_refs_is_the_filter_eligible_itself_uses(cfg, keys):
+    """The preflight walks refs and the spender walks clients, but there is
+    one filter: `eligible` is `eligible_refs` plus client construction. A
+    second implementation is what let the preflight report a pool the Router
+    would not have called."""
+    router = _router(cfg)
+    walked = list(router.eligible_refs("judge"))
+    assert walked == [routed.ref for routed in router.eligible("judge")]
+    # ...including the reasons, in the Router's own order.
+    seen: set[str] = set()
+    assert list(router.eligible_refs("judge", exclude_families=frozenset({"mistral"}),
+                                    skipped=seen)) == walked[1:]
+    assert seen == {"family-excluded"}
