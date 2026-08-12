@@ -352,23 +352,47 @@ class Store:
         return self._conn.total_changes - before
 
     def claim_tasks(
-        self, worker_id: str, n: int, *, stream: str | None = None, lease_s: int = 900
+        self,
+        worker_id: str,
+        n: int,
+        *,
+        stream: str | None = None,
+        lease_s: int = 900,
+        state_from: str = "pending",
+        state_to: str = "generating",
     ) -> list[dict]:
         """Lease up to `n` tasks to `worker_id`, recovering expired leases.
 
-        Candidates are pending tasks plus tasks stuck in 'generating' whose
+        Candidates are `state_from` tasks plus tasks stuck in `state_to` whose
         lease expired (a worker died mid-flight), oldest rowid first.
+
+        The two state names are parameters because the pipeline has more than
+        one queue over the same table: the generation worker leases
+        pending -> generating, and the judge worker leases judging ->
+        judging_active. The defaults are the generation queue, so every
+        existing caller and test is unaffected.
+
+        state_from and state_to MUST differ. If they were the same string the
+        stale-lease clause would degenerate to "state = X OR state = X", i.e.
+        every row another worker is holding right now becomes a candidate the
+        moment it is claimed - the lease would stop fencing anything and two
+        workers would run the same task with only one of them visible.
         """
+        if state_from == state_to:
+            raise ValueError(
+                f"claim_tasks needs distinct states, got state_from == state_to == "
+                f"{state_from!r}; a shared name disables lease fencing entirely"
+            )
         if n <= 0:
             return []
         cutoff = _lease_cutoff(lease_s)
-        # claimed_at IS NULL counts as stale: a 'generating' row with no lease
+        # claimed_at IS NULL counts as stale: an in-flight row with no lease
         # stamp is unowned by construction and must not be stranded forever.
         clauses = [
-            "(state = 'pending' OR "
-            "(state = 'generating' AND (claimed_at IS NULL OR claimed_at < ?)))"
+            "(state = ? OR "
+            "(state = ? AND (claimed_at IS NULL OR claimed_at < ?)))"
         ]
-        params: list = [cutoff]
+        params: list = [state_from, state_to, cutoff]
         if stream is not None:
             clauses.append("stream = ?")
             params.append(stream)
@@ -391,9 +415,9 @@ class Store:
             if not ids:
                 return []
             conn.executemany(
-                "UPDATE task SET state = 'generating', claimed_by = ?, claimed_at = ?, "
+                "UPDATE task SET state = ?, claimed_by = ?, claimed_at = ?, "
                 "attempts = attempts + 1, updated_at = ? WHERE task_id = ?",
-                [(worker_id, now, now, task_id) for task_id in ids],
+                [(state_to, worker_id, now, now, task_id) for task_id in ids],
             )
             placeholders = ", ".join("?" * len(ids))
             rows = conn.execute(
