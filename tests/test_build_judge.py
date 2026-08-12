@@ -4,13 +4,16 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pipeline_fakes import (
+    LONG_SEED_TEXT,
     TRANSITION_META,
     FakeRouter,
     build_cfg,
+    cfg_with_fourth_judge_family,
     chat_response,
     judge_reply,
     open_store,
     paths_for,
+    temp_config,
 )
 
 from tuned.data.generate import run_workers
@@ -24,6 +27,7 @@ from tuned.data.judge import (
     PASS,
     JudgeParseError,
     JudgeScores,
+    JudgeStats,
     SlotOutcome,
     decide,
     failing_rationale,
@@ -34,7 +38,8 @@ from tuned.data.judge import (
     thresholds_active,
     undersized_families,
 )
-from tuned.data.tasks import plan_wave
+from tuned.data.judge import main as judge_main
+from tuned.data.tasks import plan_wave, reopen_tasks
 
 
 @pytest.fixture
@@ -591,6 +596,22 @@ def test_identical_claim_states_are_refused(tmp_path, cfg, paths):
             store.claim_tasks("judge-1", 1, state_from="judging", state_to="judging")
 
 
+@pytest.mark.parametrize(
+    "state", ["rejected", "accepted", "judge_unroutable", "judge_error", "judge_skipped",
+              "gen_unroutable"]
+)
+def test_terminal_and_parked_rows_are_invisible_to_both_queues(tmp_path, cfg, paths, state):
+    """Parking only works if it actually stops the claim: a state that a
+    worker can still lease is a re-claim loop with a different name, and the
+    money is spent before anyone notices."""
+    with judged_store(tmp_path, paths, cfg, n=1) as store:
+        store.conn.execute("UPDATE task SET state = ?", (state,))
+        assert store.claim_tasks("gen-1", 10) == []
+        assert store.claim_tasks(
+            "judge-1", 10, state_from=JUDGE_STATE_FROM, state_to=JUDGE_STATE_TO
+        ) == []
+
+
 def test_default_claim_behaviour_is_unchanged(tmp_path, cfg):
     with open_store(tmp_path, n_seeds=2) as store:
         plan_wave(store, cfg, "synthesis", 2, task_type_mix={"irac_analysis": 1.0})
@@ -631,6 +652,20 @@ def test_an_unroutable_judge_parks_instead_of_re_queueing(tmp_path, cfg, paths):
         assert {"glm", "mistral", "qwen"} <= set(event["excluded"])
         # And it stays parked: a second sweep does not re-claim it.
         assert run_judge(store, cfg, router, paths)["claimed"] == 0
+
+
+def test_a_keyless_judge_pool_re_queues_rather_than_parking(tmp_path, cfg, paths):
+    """The same distinction the generator now makes, on the judge side: a
+    missing key is a fact about the FLEET, so the row goes back to the queue
+    it came from rather than parking as if nothing could ever judge it."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(cfg, missing_keys={"mistral", "groq", "cerebras"})
+        totals = run_judge(store, cfg, router, paths)
+        assert only_task(store)["state"] == JUDGE_STATE_FROM
+        assert totals["unroutable"] == 0
+        event = json.loads(store.events("judge_route_error")[0]["detail_json"])
+        assert event["unroutable"] is False
+        assert event["skipped"] == ["missing-key"]
 
 
 def test_a_recorded_slot_is_never_bought_twice(tmp_path, cfg, paths):
@@ -689,6 +724,95 @@ def test_an_unroutable_tiebreak_decides_on_the_two_judges(tmp_path, cfg, paths):
         decision = json.loads(store.events("judge_decision")[0]["detail_json"])
         assert decision["tiebreak_unroutable"] is True
         assert decision["action"] == "reject"
+
+
+def test_slot_b_can_be_unroutable_after_slot_a_has_been_paid_for(tmp_path, cfg, paths):
+    """R2-C3, the realistic shape. A long row routes to magistral, family
+    separation removes mistral, the 8k glm judge is out on length, slot A
+    takes qwen - and slot B has nothing left. The row parks having already
+    paid for judge A, which is the money this costs."""
+    store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
+    plan_wave(store, cfg, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
+    with store:
+        asyncio.run(
+            run_workers(
+                store, cfg, FakeRouter(cfg), paths=paths, streams=["synthesis"],
+                n_workers=1, max_batches=1,
+            )
+        )
+        gen = store.latest_generation(only_task(store)["task_id"])
+        assert gen["model_family"] == "mistral"  # the long prompt diverted
+        _lengthen(store, only_task(store)["task_id"], 2000)
+
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5, "a says fine")]})
+        totals = run_judge(store, cfg, router, paths)
+        calls = router.calls_for("judge")
+        assert len(calls) == 2
+        assert calls[0]["ref"].model == "qwen/qwen3.6-27b"  # slot A paid for
+        assert calls[1]["ref"] is None  # slot B had no pool at all
+        task = only_task(store)
+        assert task["state"] == "judge_unroutable"
+        assert task["disposition"].startswith("judge-b-unroutable:")
+        assert totals["unroutable"] == 1
+        # The paid judgement is banked, not thrown away with the row.
+        assert [j["judge_slot"] for j in store.judgements_for(gen["gen_id"])] == ["a"]
+
+
+def test_a_reopened_row_never_re_pays_the_judge_it_already_bought(tmp_path, cfg, paths):
+    """The other half of R2-C3: parking is only survivable if something can
+    un-park it, and the re-opened row must cost one call, not two."""
+    store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
+    plan_wave(store, cfg, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
+    with store:
+        asyncio.run(
+            run_workers(
+                store, cfg, FakeRouter(cfg), paths=paths, streams=["synthesis"],
+                n_workers=1, max_batches=1,
+            )
+        )
+        task_id = only_task(store)["task_id"]
+        gen = _lengthen(store, task_id, 2000)
+        run_judge(store, cfg, FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5, "a")]}), paths)
+        assert only_task(store)["state"] == "judge_unroutable"
+
+        # The operator adds the 32k+ fourth-family judge the config is missing
+        # and re-opens the parked rows. Family separation is untouched: slot B
+        # goes to the NEW family, never back to one already used.
+        widened = cfg_with_fourth_judge_family(cfg)
+        assert reopen_tasks(store, ["judge_unroutable"]) == {"judge_unroutable": 1}
+        assert only_task(store)["state"] == JUDGE_STATE_FROM
+
+        second = FakeRouter(widened, {"judge": [judge_reply(4, 4, 4, "b agrees")]})
+        run_judge(store, widened, second, paths)
+        assert len(second.calls_for("judge")) == 1  # slot a came from the table
+        assert second.calls_for("judge")[0]["ref"].model == "fourth-judge"
+        assert {"mistral", "qwen"} <= second.calls_for("judge")[0]["exclude_families"]
+        assert store.events("judge_slot_reused")
+        judgements = store.judgements_for(gen["gen_id"])
+        assert [j["judge_slot"] for j in judgements] == ["a", "b"]
+        assert judgements[0]["rationale"] == "a"
+        assert only_task(store)["state"] == "accepted"
+
+
+def test_a_reused_slot_whose_family_cannot_be_resolved_is_re_bought(tmp_path, cfg, paths):
+    """I5: `if o.family` silently drops the constraint when the recorded model
+    has left the config, and slot B is then free to be the same family twice.
+    Re-buying the slot costs one call; two judges from one family costs the
+    invariant."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        gen = store.latest_generation(only_task(store)["task_id"])
+        store.record_judgement(
+            gen["gen_id"], "a",
+            {"provider": "retired", "model": "gone-v1", "grounding": 5, "validity": 5,
+             "coverage": 5, "rationale": "from a model the config no longer knows"},
+        )
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
+        run_judge(store, cfg, router, paths)
+        calls = router.calls_for("judge")
+        assert len(calls) == 2  # slot a bought again rather than reused blind
+        assert store.events("judge_slot_unresolved")
+        families = {call["ref"] for call in calls}
+        assert len(families) == 2
 
 
 def test_a_transient_tiebreak_failure_still_re_queues(tmp_path, cfg, paths):
@@ -751,23 +875,104 @@ def test_a_poisoned_task_does_not_kill_the_judge_batch(tmp_path, cfg, paths):
 
 
 def test_the_judge_logs_a_lost_lease(tmp_path, cfg, paths):
+    """A worker that no longer holds the lease neither spends nor writes: the
+    check happens before the first paid call, so the stale worker's verdict
+    never exists to be dropped."""
     with judged_store(tmp_path, paths, cfg) as store:
         task = only_task(store)
         # Claim it as somebody else, then hand the stale worker's verdict in.
         store.claim_tasks(
             "other-worker", 1, state_from=JUDGE_STATE_FROM, state_to=JUDGE_STATE_TO
         )
-        asyncio.run(
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
+        ended = asyncio.run(
             judge_task(
-                store, cfg, FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]}), task,
+                store, cfg, router, task,
                 paths=paths, worker_id="stale-worker",
             )
         )
+        assert ended == "lost-lease"
+        assert router.calls == []
         assert only_task(store)["state"] == JUDGE_STATE_TO
         assert only_task(store)["claimed_by"] == "other-worker"
+        gen = store.latest_generation(task["task_id"])
+        assert store.judgements_for(gen["gen_id"]) == []
         lost = json.loads(store.events("lost_lease")[0]["detail_json"])
         assert lost["worker"] == "stale-worker"
-        assert lost["wanted_state"] == "accepted"
+
+
+def test_a_stale_workers_judgement_cannot_overwrite_the_live_decision(tmp_path, cfg, paths):
+    """R2-C4. Worker A buys slot a and stalls on slot b; its lease expires,
+    worker B claims the row, reuses a, buys its own b and accepts. A's late
+    reply must not land on top of the scores that decision was made on -
+    otherwise the row reads `accepted` on a judgement nobody decided with,
+    which is exactly what P5 calibration and gold labelling read."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = only_task(store)
+        gen = store.latest_generation(task["task_id"])
+        store.claim_tasks("worker-a", 1, state_from=JUDGE_STATE_FROM, state_to=JUDGE_STATE_TO)
+        # Worker A's slot a lands while it still holds the lease.
+        assert store.record_judgement(
+            gen["gen_id"], "a",
+            {"provider": "mistral", "model": "mistral-small-latest", "grounding": 5,
+             "validity": 5, "coverage": 5, "rationale": "a says fine"},
+            expect_worker="worker-a",
+        ) is True
+
+        # The lease expires and worker B takes the row, reuses a and decides.
+        stale = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        store.conn.execute("UPDATE task SET claimed_at = ?", (stale,))
+        claimed = store.claim_tasks(
+            "worker-b", 1, state_from=JUDGE_STATE_FROM, state_to=JUDGE_STATE_TO
+        )
+        router = FakeRouter(cfg, {"judge": [judge_reply(4, 4, 4, "b agrees")]})
+        asyncio.run(
+            judge_task(store, cfg, router, claimed[0], paths=paths, worker_id="worker-b")
+        )
+        assert only_task(store)["state"] == "accepted"
+        decided = {j["judge_slot"]: j["grounding"] for j in store.judgements_for(gen["gen_id"])}
+        assert decided == {"a": 5, "b": 4}
+
+        # ...and now worker A wakes up with its own slot b.
+        assert store.record_judgement(
+            gen["gen_id"], "b",
+            {"provider": "cerebras", "model": "zai-glm-4.7", "grounding": 1,
+             "validity": 1, "coverage": 1, "rationale": "a's stalled reply"},
+            expect_worker="worker-a",
+        ) is False
+        after = {j["judge_slot"]: j["grounding"] for j in store.judgements_for(gen["gen_id"])}
+        assert after == decided
+
+
+def test_a_lost_lease_stops_the_decision_being_logged_twice(tmp_path, cfg, paths):
+    """Both slots already recorded, so nothing is bought and the lease check
+    on the paid path never runs - the decision itself has to be fenced too,
+    or a stale worker logs a second judge_decision and re-counts it."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = only_task(store)
+        gen = store.latest_generation(task["task_id"])
+        for slot, provider, model in (
+            ("a", "mistral", "mistral-small-latest"),
+            ("b", "groq", "qwen/qwen3.6-27b"),
+        ):
+            store.record_judgement(
+                gen["gen_id"], slot,
+                {"provider": provider, "model": model, "grounding": 5, "validity": 5,
+                 "coverage": 5, "rationale": "fine"},
+            )
+        store.claim_tasks("live-worker", 1, state_from=JUDGE_STATE_FROM, state_to=JUDGE_STATE_TO)
+        stats = JudgeStats()
+        ended = asyncio.run(
+            judge_task(
+                store, cfg, FakeRouter(cfg), task,
+                paths=paths, worker_id="stale-worker", stats=stats,
+            )
+        )
+        assert ended == "lost-lease"
+        assert store.events("judge_decision") == []
+        assert stats.decided == 0
+        assert stats.accepted == 0
+        assert only_task(store)["state"] == JUDGE_STATE_TO
 
 
 def test_idle_judge_batches_are_announced_once(tmp_path, cfg, paths, capsys):
@@ -786,6 +991,22 @@ def test_idle_judge_batches_are_announced_once(tmp_path, cfg, paths, capsys):
         lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("judge batch")]
         assert len(lines) == 1
         assert len(slept) == 3
+
+
+def test_the_judge_cli_refuses_the_pool_hole_before_claiming(tmp_path, cfg, monkeypatch, capsys):
+    """The judge worker is the one that discovers the hole by paying for
+    slot A, so it is the one that must not start into it."""
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    monkeypatch.setattr("tuned.data.providers.load_dotenv_keys", lambda path=None: 0)
+    config_path = temp_config(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        judge_main(["--config", config_path, "--max-batches", "1"])
+    assert excinfo.value.code == 2
+    out = capsys.readouterr().out
+    assert "REFUSING" in out and "routing.judge slot b" in out
+    assert "--allow-pool-gaps" in out
+    assert not (tmp_path / "build" / "state").exists()
 
 
 def test_judge_batch_line(tmp_path, cfg, paths, capsys):

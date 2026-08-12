@@ -12,15 +12,18 @@ from pipeline_fakes import (
     TRANSITION_META,
     FakeRouter,
     build_cfg,
+    cfg_with_fourth_judge_family,
     chat_response,
     open_store,
     paths_for,
     seed_rows,
+    temp_config,
 )
 
 from tuned.data import gates
 from tuned.data.config import ModelRef
 from tuned.data.generate import (
+    GEN_UNROUTABLE_STATE,
     MAX_ATTEMPTS,
     QUESTION_BY_TASK_TYPE,
     GenResult,
@@ -36,8 +39,10 @@ from tuned.data.generate import (
     generate_once,
     grounding_text,
     next_attempt,
+    preflight_messages,
     run_workers,
 )
+from tuned.data.generate import main as generate_main
 from tuned.data.jsonl import read_at
 from tuned.data.providers import ProviderError
 from tuned.data.tasks import plan_wave
@@ -561,25 +566,186 @@ def test_the_effort_bump_is_chosen_for_the_ref_that_answers(tmp_path, cfg, paths
         )
 
 
-def test_an_unroutable_generator_closes_the_task_at_once(tmp_path, cfg, paths):
-    """No eligible model is a fact about the row, not the moment: three more
-    claims would meet the same wall, so the task is closed with a diagnostic
-    instead of cycling."""
+def test_a_row_no_generator_can_hold_parks_recoverably(tmp_path, cfg, paths):
+    """No eligible model is a fact about the ROW, not the moment: three more
+    claims would meet the same wall. But it is not a fact about the LAW
+    either, so it parks in its own state instead of landing in `rejected`
+    alongside the answers that were legally wrong - and the write is fenced by
+    the lease the claim actually handed out."""
     with make_store(tmp_path) as store:
         # A seed longer than every generator's context window.
         store.upsert_seeds(
             [{**seed_rows(1)[0], "text": "word " * 60000}]
         )
-        task = only_task(store)
+        worker = "gen-fence-1"
+        task = store.claim_tasks(worker, 1)[0]
         router = FakeRouter(cfg)
         result = asyncio.run(generate_once(store, cfg, router, task, paths=paths))
         assert result.ok is False
-        assert result.permanent is True
-        assert apply_gate_disposition(store, task, result, worker_id=None) == "rejected"
+        assert result.unroutable is True
+        assert apply_gate_disposition(
+            store, task, result, worker_id=worker
+        ) == GEN_UNROUTABLE_STATE
+        assert only_task(store)["state"] == GEN_UNROUTABLE_STATE
         assert only_task(store)["disposition"] == "unroutable:generator"
+        assert only_task(store)["claimed_by"] is None
         event = json.loads(store.events("generation_error")[0]["detail_json"])
-        assert event["permanent"] is True
+        assert event["unroutable"] is True
         assert set(event["excluded_families"]) == {"gpt-oss", "mistral"}
+
+
+def test_a_stale_worker_cannot_park_a_task_it_no_longer_holds(tmp_path, cfg, paths):
+    """The fence is the point of passing worker_id at all: with it disabled
+    the permanent-close path was never tested against a live lease."""
+    with make_store(tmp_path) as store:
+        store.upsert_seeds([{**seed_rows(1)[0], "text": "word " * 60000}])
+        task = store.claim_tasks("stale-worker", 1)[0]
+        result = asyncio.run(generate_once(store, cfg, FakeRouter(cfg), task, paths=paths))
+        assert result.unroutable is True
+        # The lease expired and somebody else took the task while the call ran.
+        store.set_task_state(task["task_id"], "pending")
+        store.claim_tasks("live-worker", 1)
+        assert apply_gate_disposition(
+            store, task, result, worker_id="stale-worker"
+        ) == "lost-lease"
+        assert only_task(store)["claimed_by"] == "live-worker"
+        assert only_task(store)["state"] == "generating"
+
+
+# --------------------------------------------------------------------------
+# R2-C1: a fleet with no keys must never close the wave it cannot start.
+# --------------------------------------------------------------------------
+
+def test_a_keyless_batch_leaves_the_wave_intact(tmp_path, cfg, paths):
+    """The operator's .env carries no provider keys yet, so this is what the
+    FIRST pilot launch does. It used to take {'pending': 3} to
+    {'rejected': 3} with zero calls made, and `rejected` is terminal."""
+    with make_store(tmp_path, n_seeds=3, n_tasks=3) as store:
+        router = FakeRouter(cfg, missing_keys={"cerebras", "mistral"})
+        totals = run(store, cfg, router, paths, n_workers=3)
+        assert totals["gen_ok"] == 0
+        assert totals["errors"] == 3
+        assert store.task_counts() == {"pending": 3}
+        assert all(call["ref"] is None for call in router.calls_for("generator"))
+        event = json.loads(store.events("generation_error")[0]["detail_json"])
+        assert event["unroutable"] is False
+        assert event["skipped"] == ["missing-key"]
+
+
+def test_a_missing_key_is_never_a_row_shaped_failure(tmp_path, cfg, paths):
+    with make_store(tmp_path) as store:
+        router = FakeRouter(cfg, missing_keys={"cerebras", "mistral"})
+        result = asyncio.run(
+            generate_once(store, cfg, router, only_task(store), paths=paths)
+        )
+        assert result.unroutable is False
+        assert result.no_eligible_model is True
+        assert result.route_skips == ("missing-key",)
+
+
+def test_a_keyless_task_parks_recoverably_at_the_attempt_cap(tmp_path, cfg, paths):
+    """Even the exhausted end of the keyless path stays out of `rejected`:
+    nothing about the row was ever judged, so it must not be counted as a
+    reject, and re-opening it must be able to bring it back."""
+    with make_store(tmp_path) as store:
+        router = FakeRouter(cfg, missing_keys={"cerebras", "mistral"})
+        for _ in range(MAX_ATTEMPTS):
+            run(store, cfg, router, paths)
+        task = only_task(store)
+        assert task["state"] == GEN_UNROUTABLE_STATE
+        assert task["disposition"].startswith("exhausted:unroutable")
+        assert "missing-key" in task["disposition"]
+
+
+def test_a_transient_pool_skip_still_re_queues(tmp_path, cfg, paths):
+    """Cooling and over-budget lift on their own, so the row goes back to the
+    queue rather than parking."""
+    with make_store(tmp_path) as store:
+        router = FakeRouter(
+            cfg,
+            cooling={"cerebras/gpt-oss-120b"},
+            over_budget={"mistral/magistral-small-latest"},
+        )
+        result = asyncio.run(
+            generate_once(store, cfg, router, only_task(store), paths=paths)
+        )
+        assert result.unroutable is False
+        run(store, cfg, router, paths)
+        assert only_task(store)["state"] == "pending"
+
+
+# --------------------------------------------------------------------------
+# R2-C2: a 400 must not burn the row, and the estimate needs headroom.
+# --------------------------------------------------------------------------
+
+def test_a_context_overflow_at_every_model_parks_instead_of_rejecting(tmp_path, cfg, paths):
+    """A 400 context_length_exceeded used to close the task on claim #1 - the
+    exact failure the generator's context routing was added to prevent."""
+    overflow = ProviderError(
+        "role 'generator': all 2 eligible model(s) failed; last: 400 context_length_exceeded",
+        status=400,
+        provider="cerebras",
+        model="gpt-oss-120b",
+        retryable=False,
+        context_exceeded=True,
+    )
+    with make_store(tmp_path) as store:
+        router = FakeRouter(cfg, {"generator": [overflow]})
+        worker = "gen-1"
+        task = store.claim_tasks(worker, 1)[0]
+        result = asyncio.run(generate_once(store, cfg, router, task, paths=paths))
+        assert result.unroutable is True
+        assert apply_gate_disposition(
+            store, task, result, worker_id=worker
+        ) == GEN_UNROUTABLE_STATE
+        assert only_task(store)["state"] != "rejected"
+
+
+def test_a_plain_payload_400_costs_attempts_not_the_row(tmp_path, cfg, paths):
+    """A genuine payload bug is bounded by the attempt cap like any other
+    failed call - it never closes the task on the first claim."""
+    bad_payload = ProviderError(
+        "unknown parameter", status=400, provider="cerebras", model="gpt-oss-120b",
+        retryable=False,
+    )
+    with make_store(tmp_path) as store:
+        router = FakeRouter(cfg, {"generator": [bad_payload]})
+        run(store, cfg, router, paths)
+        assert only_task(store)["state"] == "pending"
+        assert only_task(store)["attempts"] == 1
+
+
+def test_the_context_estimate_routes_devanagari_past_the_8k_generator(tmp_path, cfg, paths):
+    """Same character count, different script: chars/4 says both fit the 8k
+    generator, and for the Devanagari one that is a 400 nobody fails over."""
+    latin = "the accused was convicted under section 302 of the code " * 90
+    devanagari = "अभियुक्त को भारतीय दंड संहिता की धारा तीन सौ दो के अंतर्गत " * 90
+    assert abs(len(latin) - len(devanagari)) < len(latin) * 0.25
+
+    with make_store(tmp_path, text=latin) as store:
+        router = FakeRouter(cfg)
+        asyncio.run(generate_once(store, cfg, router, only_task(store), paths=paths))
+        assert router.calls_for("generator")[0]["ref"].provider == "cerebras"
+
+    with make_store(tmp_path / "indic", text=devanagari) as store:
+        router = FakeRouter(cfg)
+        asyncio.run(generate_once(store, cfg, router, only_task(store), paths=paths))
+        call = router.calls_for("generator")[0]
+        assert "gpt-oss" in call["exclude_families"]
+        assert call["ref"] == ModelRef("mistral", "magistral-small-latest")
+
+
+def test_the_gate_estimate_is_not_moved_by_the_routing_estimate(tmp_path, cfg):
+    """The length band is calibrated in the gates' chars/4 currency. The
+    routing estimate is deliberately more pessimistic, and mixing the two
+    would silently re-scale every length gate in the build."""
+    with make_store(tmp_path) as store:
+        task = only_task(store)
+        bundle = build_prompt(cfg, task, store.get_seed(task["seed_id"]))
+        assert bundle.prompt_est_tokens == sum(
+            len(m.get("content") or "") for m in bundle.messages
+        ) // 4
+        assert bundle.context_est_tokens > bundle.prompt_est_tokens
 
 
 # --------------------------------------------------------------------------
@@ -605,14 +771,17 @@ def test_grounding_keeps_a_distinct_section_text(tmp_path, cfg):
         assert bundle.grounding == f"{SEED_TEXT}\n\n{meta['section_text']}"
 
 
-def test_transition_refuses_a_seed_without_its_dates(tmp_path, cfg, paths):
-    slots_only = {k: v for k, v in TRANSITION_META.items() if not k.endswith("date")}
-    slots_only.pop("proceeding_started")
+@pytest.mark.parametrize("missing", ["offence_date", "proceeding_started"])
+def test_transition_refuses_a_seed_without_its_dates(tmp_path, cfg, paths, missing):
+    """Each date is required on its own account: check_temporal picks the
+    substantive code from the offence date and the PROCEDURAL code from the
+    proceeding date, so a test that strips both proves nothing about either."""
+    partial = {k: v for k, v in TRANSITION_META.items() if k != missing}
     with make_store(
-        tmp_path, stream="transition", mix={"transition": 1.0}, meta=slots_only
+        tmp_path, stream="transition", mix={"transition": 1.0}, meta=partial
     ) as store:
         task = only_task(store)
-        with pytest.raises(SlotError, match="offence_date"):
+        with pytest.raises(SlotError, match=missing):
             build_slots(cfg, task, store.get_seed(task["seed_id"]))
         # And the worker refuses it unspent rather than paying for a row the
         # temporal gate will permanently reject.
@@ -697,6 +866,69 @@ def test_idle_batches_are_announced_once(tmp_path, cfg, paths, capsys):
         assert len(lines) == 1
         assert "claimed=0" in lines[0]
         assert len(slept) == 4
+
+
+# --------------------------------------------------------------------------
+# The startup preflight: what the fleet refuses to begin.
+# --------------------------------------------------------------------------
+
+def test_the_fleet_refuses_to_start_without_a_key_for_a_routed_role(tmp_path, cfg, monkeypatch):
+    """"loaded 0 key(s) from .env" and then running anyway is how a wave gets
+    claimed, failed and reported one row at a time instead of once."""
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
+    refusals, _ = preflight_messages(cfg, ("generator",))
+    assert any("routing.generator has no usable API key" in line for line in refusals)
+    assert any("CEREBRAS_API_KEY" in line for line in refusals)
+    # ...and no override exists for it: there is nothing to override.
+    forced, _ = preflight_messages(cfg, ("generator",), allow_pool_gaps=True)
+    assert any("no usable API key" in line for line in forced)
+
+
+def test_the_fleet_refuses_to_start_with_a_judge_slot_it_cannot_fill(cfg, monkeypatch):
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    refusals, warnings = preflight_messages(cfg, ("generator",))
+    assert any("routing.judge slot b" in line for line in refusals)
+    # The tiebreak gap has a defined fallback, so it warns rather than refuses.
+    assert any("routing.tiebreak" in line for line in warnings)
+    assert not any("routing.tiebreak" in line for line in refusals)
+    # An operator who knows the gap can still run short rows.
+    allowed, allowed_warnings = preflight_messages(cfg, ("generator",), allow_pool_gaps=True)
+    assert allowed == []
+    assert any("routing.judge slot b" in line for line in allowed_warnings)
+
+
+def test_a_widened_pool_starts_clean(cfg, monkeypatch):
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    refusals, warnings = preflight_messages(cfg_with_fourth_judge_family(cfg), ("generator",))
+    assert (refusals, warnings) == ([], [])
+
+
+def test_the_generator_cli_exits_rather_than_claiming_anything(tmp_path, cfg, monkeypatch, capsys):
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
+    monkeypatch.setattr("tuned.data.providers.load_dotenv_keys", lambda path=None: 0)
+    config_path = temp_config(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        generate_main(["--config", config_path, "--max-batches", "1"])
+    assert excinfo.value.code == 2
+    out = capsys.readouterr().out
+    assert "REFUSING" in out
+    assert "routing.generator has no usable API key" in out
+    # Nothing was opened, claimed or spent.
+    assert not (tmp_path / "build" / "state").exists()
+
+
+def test_the_judge_reply_allowance_is_shared_with_the_preflight():
+    """The preflight sizes the judge pool from providers.py's copy of the
+    judge's reply budget; a drift between the two makes the check measure a
+    prompt nobody sends."""
+    from tuned.data.judge import JUDGE_MAX_TOKENS
+    from tuned.data.providers import DEFAULT_JUDGE_REPLY_TOKENS
+
+    assert JUDGE_MAX_TOKENS == DEFAULT_JUDGE_REPLY_TOKENS
 
 
 def test_gate_context_is_built_from_the_seed(tmp_path, cfg):

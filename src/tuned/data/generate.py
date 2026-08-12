@@ -24,6 +24,18 @@ task legitimately re-claimed by somebody else; when it wakes up and reports,
 the fence turns its write into a no-op and it drops the result instead of
 overwriting the live holder's row.
 
+A ROUTING FAILURE IS NOT A REJECT. `rejected` means "this example is wrong
+about the law" and it is what reject-rate statistics are read over; a row
+nothing in the pool could serve parks in `gen_unroutable` instead, where
+`tasks.py --reopen` can bring it back once the pool is widened. Nothing
+here closes a task because the Router said "not retryable" - a missing key
+is not retryable either, and treating that as terminal marked an entire
+keyless wave dead with zero calls made. The fleet also REFUSES TO START
+when a routed role has no key or the judge pool cannot fill a slot for the
+longest row the length band permits (preflight_messages): both facts are
+knowable in a second and cost a wave of half-paid rows to discover at
+runtime.
+
 WHAT THE TEACHER IS SHOWN, THE GATES AND THE JUDGE SEE TOO. prompt_registry's
 first caller contract: GateContext.source_text - and later the judge's
 {source} slot - must be the concatenation of EVERY grounding slot the
@@ -58,13 +70,38 @@ from tuned.data import gates, prompt_registry
 from tuned.data.config import ModelRef
 from tuned.data.gates import GateContext, split_think
 from tuned.data.jsonl import append_ndjson
-from tuned.data.providers import ProviderError, undersized_families
+from tuned.data.providers import (
+    DEFAULT_JUDGE_REPLY_TOKENS,
+    ProviderError,
+    context_estimate,
+    pool_gaps,
+    undersized_families,
+    unkeyed_roles,
+)
 from tuned.data.store import utcday, utcnow
 
 # Task states this module owns. 'judging' is the hand-off to judge.py.
 JUDGING_STATE = "judging"
 PENDING_STATE = "pending"
 REJECTED_STATE = "rejected"
+# No model in the pool can serve this ROW (every family excluded by context
+# length, or nothing keyed at all). Parked, not claimable, visible in
+# task_counts, and re-opened by `tasks.py --reopen` once the pool is widened.
+#
+# Deliberately NOT `rejected`: that state means "this example is wrong about
+# the law" and it is what reject-rate statistics are computed over. A routing
+# failure is a fact about the fleet, and mixing the two makes both unreadable
+# - which is exactly what happened when a keyless batch marked a whole wave
+# `rejected` and the planner then read the wave as complete.
+GEN_UNROUTABLE_STATE = "gen_unroutable"
+
+# Skip reasons that are facts about the ROW rather than about the moment or
+# the configuration. "family-excluded" here always means the context filter:
+# generate.py excludes exactly the families too small to hold this prompt, so
+# a pool emptied by it will be just as empty on the next claim. A missing key,
+# a cooling breaker and a spent daily budget are all about the fleet, and all
+# three lift without the row changing at all.
+ROW_SHAPED_SKIPS = frozenset({"family-excluded"})
 
 # How many times a task may be claimed before a regenerate-disposition stops
 # buying another attempt. Counted on task.attempts, which claim_tasks bumps.
@@ -153,7 +190,18 @@ class PromptBundle:
     # judge_source_text.
     judge_source: str
     slots: dict
+    # TWO estimates, in two currencies, on purpose:
+    #
+    # prompt_est_tokens is chars/4 and belongs to the GATES. build.length_band
+    # is calibrated in that currency across the whole build, so changing it
+    # would silently re-scale every length gate in the dataset.
+    #
+    # context_est_tokens belongs to ROUTING. It counts chat-template overhead
+    # and charges Indic script at its real rate, because comparing it against
+    # a model's max_context is a decision where being wrong low is a 400 and
+    # being wrong high is a failover to a bigger model.
     prompt_est_tokens: int
+    context_est_tokens: int
 
 
 @dataclass
@@ -170,11 +218,17 @@ class GenResult:
     error: str | None = None
     skipped: str | None = None
     state: str | None = None
-    # The call failed for a reason another identical claim cannot fix: no
-    # eligible model at all (every family excluded, no key), or a payload the
-    # provider refuses. Re-queueing burns two more claims for the same
-    # failure, so the task is closed out instead.
-    permanent: bool = False
+    # Nothing in the POOL can serve this row: every family that could hold the
+    # prompt was excluded, or every model that was tried answered "too long
+    # for my window". Both are facts about the row, so the task parks rather
+    # than burning two more claims arriving at the same wall - and it parks in
+    # gen_unroutable, not rejected, because it is recoverable.
+    unroutable: bool = False
+    # The Router had nothing to try at all (as opposed to trying and failing).
+    # Its reasons are in route_skips; a missing key belongs here and must NOT
+    # close the task, because the key can land at any moment.
+    no_eligible_model: bool = False
+    route_skips: tuple[str, ...] = ()
 
 
 @dataclass
@@ -236,6 +290,68 @@ def make_router(store, cfg, **kwargs):
     from tuned.data.providers import Router
 
     return Router(cfg, budget_ok=budget_ok_for(store, cfg), **kwargs)
+
+
+def preflight_messages(
+    cfg,
+    roles: Sequence[str],
+    *,
+    allow_pool_gaps: bool = False,
+    judge_reply_tokens: int = DEFAULT_JUDGE_REPLY_TOKENS,
+) -> tuple[list[str], list[str]]:
+    """(refusals, warnings) for a fleet about to start. Pure over cfg + env.
+
+    Two facts are knowable in one second here and cost a wave of half-paid
+    rows to discover at runtime:
+
+    * a routed ROLE with no API key anywhere. The worker would claim tasks,
+      fail to route every one of them and report a routing error per row.
+      Never overridable - there is nothing to override, the calls cannot be
+      made.
+    * a judge SLOT the pool cannot fill for the longest row the length band
+      permits. Family separation plus context length can empty the judge role
+      for a whole class of rows, and the row only discovers that AFTER paying
+      for the other judge. Overridable with allow_pool_gaps, because an
+      operator who knows the gap may legitimately want to run short rows
+      while the fourth-family judge is still being sourced.
+
+    The tiebreak's own gap is a warning, never a refusal: judge.py has a
+    defined, unpaid fallback for it (decide on the two judges, reject the
+    unresolved disagreement) and round 1 shipped it deliberately.
+    """
+    refusals: list[str] = []
+    warnings: list[str] = []
+    for role, envs in sorted(unkeyed_roles(cfg, roles).items()):
+        refusals.append(
+            f"routing.{role} has no usable API key: none of "
+            f"{', '.join(envs)} is set, so every {role} call would fail to route. "
+            f"Put the key in .env (providers.load_dotenv_keys reads it)."
+        )
+    for gap in pool_gaps(cfg, judge_reply_tokens=judge_reply_tokens):
+        line = f"routing.{gap.role} slot {gap.slot}: {gap.detail}"
+        if gap.fatal and not allow_pool_gaps:
+            refusals.append(line)
+        else:
+            warnings.append(line)
+    return refusals, warnings
+
+
+def print_preflight(cfg, roles: Sequence[str], *, allow_pool_gaps: bool = False, **kwargs) -> bool:
+    """Print the preflight and return True when the fleet may start."""
+    refusals, warnings = preflight_messages(
+        cfg, roles, allow_pool_gaps=allow_pool_gaps, **kwargs
+    )
+    for line in warnings:
+        print(f"WARNING: {line}")
+    for line in refusals:
+        print(f"REFUSING: {line}")
+    if refusals:
+        print(
+            "not starting: fix the above, or pass --allow-pool-gaps to run "
+            "anyway where the gap is a pool gap (a missing key is never "
+            "overridable)"
+        )
+    return not refusals
 
 
 def worker_name(prefix: str = "gen") -> str:
@@ -394,9 +510,14 @@ def grounding_text(slots: Mapping) -> str:
 
     Deduped because a slot is often filled from another slot - the pilot's
     statute_qa fallback puts the seed text in both {source} and
-    {section_text}, and concatenating them would double every judge prompt
-    and every context-length estimate for no added grounding at all. A part
-    already carried (as normalized text) by one that was kept is dropped.
+    {section_text}. A part already carried (as normalized text) by one that
+    was kept is dropped.
+
+    What that saves, precisely: this string is the JUDGE's {source} and the
+    gates' verbatim/citation corpus, so the dedup halves the judge prompt and
+    the judge's context estimate. It does NOT shrink the generator's own
+    prompt - the teacher is still shown both rendered slots, because that is
+    what the template says and trimming it would change what was asked.
     """
     parts: list[str] = []
     kept: list[str] = []
@@ -434,14 +555,16 @@ def build_prompt(cfg, task: Mapping, seed: Mapping, *, reviewer_note: str | None
     messages = prompt_registry.render(task["prompt_id"], **slots)
     if reviewer_note:
         messages = append_reviewer_note(messages, reviewer_note)
-    est = sum(len(m.get("content") or "") for m in messages) // 4
     grounding = grounding_text(slots)
     return PromptBundle(
         messages=messages,
         grounding=grounding,
         judge_source=judge_source_text(task, slots, grounding),
         slots=slots,
-        prompt_est_tokens=est,
+        # chars/4 for the gates (see PromptBundle), and the conservative,
+        # script-aware count for the router.
+        prompt_est_tokens=sum(len(m.get("content") or "") for m in messages) // 4,
+        context_est_tokens=context_estimate(messages),
     )
 
 
@@ -490,13 +613,20 @@ def gate_context(cfg, task: Mapping, seed: Mapping, grounding: str, *, citation_
     second pass would measure a different thing and its demotions would be
     noise. Both call this.
 
-    proceeding_started comes from the seed's meta and NOWHERE else -
-    decision_date is deliberately not used as a stand-in. They are different
-    facts (when the matter was decided vs when it was instituted), and
-    check_temporal uses proceeding_started to decide which PROCEDURAL code
-    governs: substituting a later date would move a CrPC-era proceeding into
-    the BNSS era and flag a correct citation as cross-code. An unknown date
-    is left unknown, which is what the undecidable channel is for.
+    Both dates are read seed-column-first, then meta - the SAME two places
+    _require_date checks before the task is allowed to spend. That has to
+    hold literally: if this function read one of them from meta alone, a seed
+    carrying it in a column would pass the pre-spend check and then arrive
+    here undated, which on the transition stream is a fatal-undecidable gate
+    and a permanent reject of an answer already paid for.
+
+    decision_date is deliberately not used as a stand-in for
+    proceeding_started. They are different facts (when the matter was decided
+    vs when it was instituted), and check_temporal uses proceeding_started to
+    decide which PROCEDURAL code governs: substituting a later date would
+    move a CrPC-era proceeding into the BNSS era and flag a correct citation
+    as cross-code. An unknown date is left unknown, which is what the
+    undecidable channel is for.
     """
     meta = seed_meta(seed)
     return GateContext(
@@ -506,7 +636,9 @@ def gate_context(cfg, task: Mapping, seed: Mapping, grounding: str, *, citation_
         citation_index=citation_index,
         source_text=grounding,
         offence_date=_parse_date(seed.get("offence_date") or meta.get("offence_date")),
-        proceeding_started=_parse_date(meta.get("proceeding_started")),
+        proceeding_started=_parse_date(
+            seed.get("proceeding_started") or meta.get("proceeding_started")
+        ),
         stream=task["stream"],
         expect_reasoning=expects_reasoning(task["stream"]),
         answer_key=seed_answer_key(seed),
@@ -689,15 +821,18 @@ async def generate_once(
         return result
 
     max_tokens = max_output_tokens(cfg)
-    est_tokens = bundle.prompt_est_tokens + max_tokens
+    # ROUTING currency, not the gates' - see PromptBundle. chars/4 over the
+    # rendered messages models neither the chat template's per-turn overhead
+    # nor Devanagari (which tokenizes 2-4x harder than the estimate assumes),
+    # and under-counting here is what puts an over-long prompt at an 8k model.
+    est_tokens = bundle.context_est_tokens + max_tokens
     # CONTEXT ROUTING. cerebras/gpt-oss-120b is an 8k-context model and the
     # first generator in the preference list; a long seed makes
-    # prompt + max_tokens exceed that, which is a 400 - and a 400 does not
-    # fail over (providers.py treats it as our payload being wrong
-    # everywhere), so the task would burn its whole attempt budget on three
-    # identical refusals and the pilot's pass rates would be computed over
-    # short seeds only. Excluding the families that cannot hold this prompt
-    # routes it to magistral (40k) instead.
+    # prompt + max_tokens exceed that, which is a 400. providers.py now
+    # RECOGNISES a context-overflow 400 and fails over rather than aborting,
+    # but reaching that point still costs a paid round trip and a wasted
+    # attempt, so the families that cannot hold this prompt are excluded
+    # before the call and it routes to magistral (40k) directly.
     too_small = undersized_families(cfg, "generator", est_tokens)
     params_for_ref = effort_params_for_ref(attempt)
 
@@ -715,7 +850,20 @@ async def generate_once(
         # Every attempt this call made is already ledgered by on_attempt,
         # including the 429s the client retried through.
         result.error = str(exc)
-        result.permanent = not exc.retryable
+        skips = frozenset(getattr(exc, "skipped", frozenset()))
+        result.no_eligible_model = bool(skips)
+        result.route_skips = tuple(sorted(skips))
+        # UNROUTABLE means "no model in this pool can serve this ROW", and it
+        # is the only shape that closes a task without spending its attempts.
+        # Two ways to earn it: every family that could hold the prompt was
+        # excluded by the context filter, or every model that WAS tried came
+        # back saying the prompt is longer than its window. `not retryable`
+        # is NOT one of them - a missing key is also not retryable, and
+        # treating it as row-shaped is what marked a whole keyless wave
+        # terminal with zero calls made.
+        result.unroutable = bool(exc.context_exceeded) or (
+            bool(skips) and skips <= ROW_SHAPED_SKIPS
+        )
         store.log_event(
             "generation_error",
             {
@@ -723,7 +871,9 @@ async def generate_once(
                 "attempt": attempt,
                 "status": exc.status,
                 "retryable": exc.retryable,
-                "permanent": result.permanent,
+                "unroutable": result.unroutable,
+                "skipped": list(result.route_skips),
+                "context_exceeded": bool(exc.context_exceeded),
                 "est_tokens": est_tokens,
                 "excluded_families": sorted(too_small),
                 "error": str(exc)[:500],
@@ -807,11 +957,16 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
                           wrong about the law; the seed is burned, never
                           retried.
     * no generation    -> pending while attempts remain (a provider outage is
-                          not the task's fault), else rejected. But a
-                          PERMANENT routing/payload failure closes the task
-                          immediately: nothing about the next claim would be
-                          different, so re-queueing only spends two more
-                          claims arriving at the same refusal.
+                          not the task's fault). At the cap it lands in
+                          rejected if a provider actually refused the work,
+                          and in gen_unroutable if nothing was ever called.
+    * unroutable       -> gen_unroutable at once: no model in the pool can
+                          hold this row, so the next two claims would meet
+                          the identical wall.
+
+    NOTHING here closes a task because the Router said "not retryable". A
+    missing key is not retryable either, and a keyless fleet must leave its
+    wave exactly where it found it.
 
     Every write is lease-fenced: if this worker lost its lease while the call
     was in flight, the task already belongs to somebody else and this result
@@ -826,8 +981,16 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
             # A missing seed or an unrenderable slot set is permanent: the
             # next attempt would hit the identical wall, unspent.
             state, disposition = REJECTED_STATE, f"skip:{result.skipped}"
-        elif result.permanent:
-            state, disposition = REJECTED_STATE, "unroutable:generator"
+        elif result.unroutable:
+            state, disposition = GEN_UNROUTABLE_STATE, "unroutable:generator"
+        elif exhausted and result.no_eligible_model:
+            # Nothing was ever called, so nothing about this row was judged
+            # and it must not be counted as a reject. Park it where re-opening
+            # can bring it back once the fleet is fixed.
+            state, disposition = (
+                GEN_UNROUTABLE_STATE,
+                "exhausted:unroutable:" + ",".join(result.route_skips),
+            )
         elif exhausted:
             state, disposition = REJECTED_STATE, "exhausted:error"
         else:
@@ -1007,10 +1170,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--n-workers", type=int, default=4)
     parser.add_argument("--forever", action="store_true")
     parser.add_argument("--max-batches", type=int, default=None)
+    parser.add_argument(
+        "--allow-pool-gaps",
+        action="store_true",
+        help="start even though a judge slot cannot be filled for long rows",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_build_config(args.config)
     print(f"loaded {load_dotenv_keys()} key(s) from .env")
+    # Before anything is claimed: a role with no key, or a judge slot no
+    # model can fill, is knowable now and costs paid rows to discover later.
+    # The generation worker checks the JUDGE pool too - filling a queue no
+    # judge pool can drain is money spent on rows that will park.
+    if not print_preflight(cfg, ("generator",), allow_pool_gaps=args.allow_pool_gaps):
+        raise SystemExit(2)
     paths = build_paths(cfg.build.workdir).ensure()
     store = Store.open(paths.state_db)
     router = make_router(store, cfg)

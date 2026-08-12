@@ -36,6 +36,13 @@ identity: an armed wave and an unarmed wave are counted separately, so
 planning 300 unarmed tasks and then 100 "scripted" ones does not make the
 unarmed wave look finished.
 
+REJECTED ROWS DO NOT COUNT toward the target; parked ones do. See
+_existing_in_queue - the difference is whether the row can still become a
+dataset row, and the bound on replacing rejected ones is the per-seed cap.
+This module also owns the RE-OPEN path (reopen_tasks / --reopen): the
+workers park a row whenever the failure is about the pool rather than the
+answer, and parking is only survivable if something can un-park it.
+
 READ-ONLY SQL, DELIBERATELY. store.py is meant to be the only module that
 runs SQL, but it exposes no seed-iteration or per-seed-count API and this
 task's brief allows exactly one (unrelated) edit to it. The three SELECTs
@@ -91,6 +98,17 @@ STREAM_MIX: dict[str, dict[str, float]] = {
 # generated, and never enter this table.
 PLANNABLE_STREAMS = tuple(STREAM_MIX)
 
+# Parking state -> the queue state it belongs back in. These are the states a
+# worker uses when the failure is about the POOL rather than about the answer
+# (see reopen_tasks); each one goes back to the queue whose worker parked it,
+# so a re-opened row resumes where it stopped instead of being generated
+# again. `rejected` is absent on purpose - it is a decision, not a park.
+REOPEN_STATES = {
+    "gen_unroutable": "pending",
+    "judge_unroutable": "judging",
+    "judge_error": "judging",
+}
+
 
 def task_id_for(seed_id: str, task_type: str, prompt_id: str, sample_ix: int) -> str:
     """The task's identity - and therefore what INSERT OR IGNORE dedupes on.
@@ -138,19 +156,41 @@ def allocate(mix: Mapping[str, float], n: int) -> dict[str, int]:
 
 
 def _existing_in_queue(store, stream: str, arm: str | None) -> int:
-    """How many tasks the (stream, arm) queue already holds.
+    """How many LIVE tasks the (stream, arm) queue already holds.
 
     arm is matched exactly, NULL included: an unarmed wave and an armed wave
     are separate queues, so planning the A/B cells does not make the main
     wave look complete.
+
+    `rejected` rows are NOT counted, and that is the whole of the rule. A
+    wave asks for n candidate rows; a rejected one produced nothing and never
+    will, so counting it leaves the wave permanently short of what the
+    operator asked for - and when a routing bug marked a whole wave rejected,
+    re-running the plan reported "already at target" and did nothing at all.
+    The wave could not replace rows it had lost.
+
+    Everything else counts, INCLUDING the parking states. A parked row is
+    recoverable (`--reopen`) and it keeps whatever judgements it already paid
+    for, so planning a replacement as well would quietly double the wave
+    every time the pool had a bad afternoon.
+
+    The bound on replacement is the per-seed cap, not this count:
+    _candidate_seeds counts a seed's tasks regardless of state, so a seed
+    whose PER_SEED_CAP tasks were all rejected is never offered again. A
+    genuinely bad seed therefore costs at most PER_SEED_CAP tasks, once.
     """
+    clauses = ["stream = ?", "state != 'rejected'"]
+    params: list = [stream]
     if arm is None:
-        sql = "SELECT COUNT(*) FROM task WHERE stream = ? AND arm IS NULL"
-        params: tuple = (stream,)
+        clauses.append("arm IS NULL")
     else:
-        sql = "SELECT COUNT(*) FROM task WHERE stream = ? AND arm = ?"
-        params = (stream, arm)
-    return int(store.conn.execute(sql, params).fetchone()[0])
+        clauses.append("arm = ?")
+        params.append(arm)
+    return int(
+        store.conn.execute(
+            f"SELECT COUNT(*) FROM task WHERE {' AND '.join(clauses)}", params
+        ).fetchone()[0]
+    )
 
 
 def _candidate_seeds(store, *, limit: int, sources: Sequence[str] | None) -> list[tuple[str, int]]:
@@ -313,6 +353,56 @@ def plan_wave(
     return commit_rows(store, rows, stream=stream, arm=arm, target=n)
 
 
+def reopen_tasks(store, states: Sequence[str], *, stream: str | None = None) -> dict[str, int]:
+    """Return parked tasks to the queue that owns them. Counts per state.
+
+    The workers park a row rather than close it whenever the failure is about
+    the POOL and not about the answer: no judge left for slot B, no generator
+    that can hold the prompt, no key. Parking is only survivable if something
+    can un-park it, and until now "re-openable by hand" meant hand-written
+    SQL against a live WAL database.
+
+    Nothing here re-pays for work already done: a re-opened row keeps its
+    generations and its recorded judgements, and judge.py reuses any slot the
+    judgement table already holds (judge_slot_reused). Re-opening a row whose
+    judge A answered costs exactly slot B.
+
+    `rejected` is deliberately not re-openable. It is a decision - the gates
+    or the judges said this example is wrong - and re-opening decisions is
+    how a rejected row quietly re-enters the dataset.
+    """
+    unknown = [state for state in states if state not in REOPEN_STATES]
+    if unknown:
+        raise ValueError(
+            f"cannot re-open {unknown}: re-openable states are "
+            f"{sorted(REOPEN_STATES)} (a rejected row is a decision, not a park)"
+        )
+    counts: dict[str, int] = {}
+    for state in states:
+        target = REOPEN_STATES[state]
+        clauses = ["state = ?"]
+        params: list = [state]
+        if stream is not None:
+            clauses.append("stream = ?")
+            params.append(stream)
+        rows = store.conn.execute(
+            f"SELECT task_id FROM task WHERE {' AND '.join(clauses)} ORDER BY rowid", params
+        ).fetchall()
+        moved = 0
+        for (task_id,) in rows:
+            # No fence: a parked row holds no lease (set_task_state released
+            # it when it parked), so there is no live holder to lose to.
+            if store.set_task_state(task_id, target, f"reopened:from-{state}"):
+                moved += 1
+        if moved:
+            store.log_event(
+                "tasks_reopened",
+                {"from_state": state, "to_state": target, "stream": stream, "count": moved},
+            )
+        counts[state] = moved
+    return counts
+
+
 def parse_mix(spec: str) -> dict[str, float]:
     """"irac_analysis=0.5,statute_qa=0.5" -> {"irac_analysis": 0.5, ...}."""
     mix: dict[str, float] = {}
@@ -339,16 +429,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="configs/data_law_v1.yaml")
     parser.add_argument("--stream", default="synthesis")
-    parser.add_argument("--n", type=int, required=True, help="target task count for the queue")
+    parser.add_argument("--n", type=int, default=None, help="target task count for the queue")
     parser.add_argument("--arm", default=None, help="A/B label, e.g. unscripted|scripted")
     parser.add_argument("--mix", default=None, help="task_type=weight,... (overrides the default)")
     parser.add_argument("--source", action="append", default=None, help="restrict to a source_id")
+    parser.add_argument(
+        "--reopen",
+        action="append",
+        default=None,
+        metavar="STATE",
+        help=(
+            "return parked tasks to their queue (repeatable, or 'all'): "
+            + ", ".join(sorted(REOPEN_STATES))
+        ),
+    )
+    parser.add_argument(
+        "--reopen-all-streams",
+        action="store_true",
+        help="with --reopen, act on every stream rather than only --stream",
+    )
     args = parser.parse_args(argv)
+    if args.n is None and not args.reopen:
+        parser.error("nothing to do: pass --n (plan a wave) or --reopen STATE")
 
     cfg = load_build_config(args.config)
     paths = build_paths(cfg.build.workdir).ensure()
     store = Store.open(paths.state_db)
     try:
+        if args.reopen:
+            states = (
+                sorted(REOPEN_STATES) if "all" in args.reopen else list(dict.fromkeys(args.reopen))
+            )
+            counts = reopen_tasks(
+                store,
+                states,
+                stream=None if args.reopen_all_streams else args.stream,
+            )
+            print(f"re-opened {sum(counts.values())}")
+            for state in states:
+                print(f"  {state} -> {REOPEN_STATES[state]:<12}{counts[state]:>6}")
+            print(
+                "task states: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(store.task_counts().items()))
+            )
+            if args.n is None:
+                return 0
         mix = parse_mix(args.mix) if args.mix else None
         rows = plan_rows(
             store, cfg, args.stream, args.n, task_type_mix=mix, arm=args.arm, sources=args.source

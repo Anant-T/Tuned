@@ -36,6 +36,9 @@ RUN IT WHEN THE FLEET IS IDLE. A demotion is an unfenced task-state write
 (there is no lease to hold - this pass never claimed anything), so a task a
 judge worker is holding at that instant could have its state overwritten
 mid-decision. Assembly-time is the intended moment; between waves is fine.
+The CLI refuses to start while any lease is live, and every demotion
+re-checks its OWN row's lease immediately before writing - the opening check
+is a snapshot, and a sweep over tens of thousands of rows outlives it.
 
 Run:  python -m tuned.data.verify --config configs/data_law_v1.yaml
       [--index data/build/corpus/citations.txt] [--state accepted]
@@ -48,12 +51,15 @@ from datetime import UTC, datetime, timedelta
 from tuned.data import gates
 from tuned.data.generate import SlotError, build_prompt, gate_context
 from tuned.data.jsonl import read_at
+from tuned.data.store import DEFAULT_LEASE_S, _TS_FMT
 
 REJECTED_STATE = "rejected"
 
-# Matches store.claim_tasks' default lease.
-DEFAULT_LEASE_S = 900
-_TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
+# DEFAULT_LEASE_S and _TS_FMT are IMPORTED, never re-declared: this module
+# decides whether a task is under a live lease, and a private copy of either
+# constant is a fence that silently disagrees with the fencing it is meant to
+# respect.
+__all__ = ["DEFAULT_LEASE_S", "live_leases", "rerun_gates", "content_for", "main"]
 
 # Failing one of these means the row is wrong about the law. gates.py owns
 # the list; it is re-exported here so the demotion rule and the gate
@@ -69,13 +75,31 @@ def live_leases(store, lease_s: int = DEFAULT_LEASE_S) -> int:
     a decision a judge worker is in the middle of making. Counting the live
     leases is how the CLI refuses to do that by accident.
     """
-    cutoff = (datetime.now(UTC) - timedelta(seconds=lease_s)).strftime(_TS_FMT)
     return int(
         store.conn.execute(
             "SELECT COUNT(*) FROM task WHERE claimed_at IS NOT NULL AND claimed_at >= ?",
-            (cutoff,),
+            (_lease_cutoff(lease_s),),
         ).fetchone()[0]
     )
+
+
+def _lease_cutoff(lease_s: int) -> str:
+    return (datetime.now(UTC) - timedelta(seconds=lease_s)).strftime(_TS_FMT)
+
+
+def lease_is_live(store, task_id: str, lease_s: int = DEFAULT_LEASE_S) -> bool:
+    """Is THIS task under a live lease right now?
+
+    live_leases() is checked once, at the top of the CLI. A sweep over tens of
+    thousands of generations takes long enough for a worker to claim a row
+    after that check passed, and rerun_gates demotes into judging_active
+    without holding a lease of its own - so the row that matters is re-checked
+    at the moment it would be overwritten, not at the moment the pass began.
+    """
+    row = store.conn.execute(
+        "SELECT claimed_at FROM task WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return bool(row and row[0] and row[0] >= _lease_cutoff(lease_s))
 
 
 def load_index(path):
@@ -139,6 +163,7 @@ def rerun_gates(
     where_state: str | None = None,
     citation_index_path=None,
     demote_states: Sequence[str] = ("accepted", "judging", "judging_active"),
+    respect_leases: bool = True,
 ) -> dict:
     """Re-gate stored generations with the real citation index; returns counts.
 
@@ -147,6 +172,11 @@ def rerun_gates(
     been judged yet. Gate results are rewritten for every row scanned either
     way (record_gates is INSERT OR REPLACE), so the instrumentation is
     refreshed even where the disposition does not move.
+
+    `respect_leases` skips (and counts) any demotion whose row a worker holds
+    right now. It is the CLI's --force that turns this off, and turning it
+    off means accepting that a judge worker's decision may be overwritten
+    mid-flight.
     """
     index = load_index(citation_index_path)
     counts = {
@@ -156,6 +186,13 @@ def rerun_gates(
         "demoted": 0,
         "soft_fail": 0,
         "missing_seed": 0,
+        # Counted apart from missing_seed: a row whose SLOTS no longer render
+        # (a transition row generated before the dates became mandatory) is a
+        # row that will never be verified, and folding it into "missing seed"
+        # hid that class inside a number that reads as "nothing to do here".
+        "slot_error": 0,
+        # Demotions skipped because a worker holds the row right now.
+        "held_by_worker": 0,
         "rebuilt_content": 0,
         "unverified": 0,
     }
@@ -172,8 +209,8 @@ def rerun_gates(
             continue
         try:
             bundle = build_prompt(cfg, gen, seed)
-        except (SlotError, KeyError) as exc:  # unrenderable seed / retired prompt id
-            counts["missing_seed"] += 1
+        except (SlotError, KeyError) as exc:  # unrenderable slots / retired prompt id
+            counts["slot_error"] += 1
             store.log_event(
                 "verify_skipped",
                 {"task_id": gen["task_id"], "reason": f"{type(exc).__name__}: {exc}"[:200]},
@@ -204,6 +241,21 @@ def rerun_gates(
             )
             continue
         if gen["task_state"] not in demote_states:
+            continue
+        if respect_leases and lease_is_live(store, gen["task_id"]):
+            # Claimed since this pass started. The demotion is unfenced, so
+            # writing it now would overwrite a decision a worker is making at
+            # this instant; the next pass picks the row up.
+            counts["held_by_worker"] += 1
+            store.log_event(
+                "verify_demotion_deferred",
+                {
+                    "task_id": gen["task_id"],
+                    "gen_id": int(gen["gen_id"]),
+                    "from_state": gen["task_state"],
+                    "gates": permanent,
+                },
+            )
             continue
         counts["demoted"] += 1
         store.log_event(
@@ -255,7 +307,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 2
         counts = rerun_gates(
-            store, cfg, where_state=args.state, citation_index_path=args.index
+            store,
+            cfg,
+            where_state=args.state,
+            citation_index_path=args.index,
+            respect_leases=not args.force,
         )
         if args.index is None:
             print("WARNING: no --index given; the citation-existence half stays UNVERIFIED")

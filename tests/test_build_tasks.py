@@ -14,6 +14,7 @@ from tuned.data.tasks import (
     parse_mix,
     plan_rows,
     plan_wave,
+    reopen_tasks,
     task_id_for,
 )
 
@@ -267,6 +268,91 @@ def test_cli_names_the_per_seed_cap_when_that_is_what_stopped_it(tmp_path, cfg, 
     capsys.readouterr()
     tasks_main(["--config", config_path, "--stream", "synthesis", "--n", "20"])
     assert "no seeds under the per-seed cap" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# What counts toward the queue target, and what re-opens.
+# --------------------------------------------------------------------------
+
+def test_a_rejected_row_stops_counting_toward_the_target(store, cfg):
+    """A wave asks for n CANDIDATE rows. A rejected one produced nothing, so
+    counting it kept the wave permanently short - and when a bug marked a
+    whole wave rejected, replanning reported "already at target" and did
+    nothing at all."""
+    plan_wave(store, cfg, "synthesis", 4)
+    store.conn.execute("UPDATE task SET state = 'rejected' WHERE rowid <= 2")
+    assert plan_wave(store, cfg, "synthesis", 4) == 2
+    assert store.task_counts() == {"rejected": 2, "pending": 4}
+
+
+@pytest.mark.parametrize("state", ["gen_unroutable", "judge_unroutable", "judge_error"])
+def test_a_parked_row_still_counts_toward_the_target(store, cfg, state):
+    """Parked is not lost: re-opening brings the row back with whatever it
+    already paid for. Planning a replacement as well would quietly double the
+    wave every time the pool had a bad afternoon."""
+    plan_wave(store, cfg, "synthesis", 4)
+    store.conn.execute("UPDATE task SET state = ? WHERE rowid <= 2", (state,))
+    assert plan_wave(store, cfg, "synthesis", 4) == 0
+
+
+def test_an_accepted_row_still_counts_toward_the_target(store, cfg):
+    plan_wave(store, cfg, "synthesis", 4)
+    store.conn.execute("UPDATE task SET state = 'accepted'")
+    assert plan_wave(store, cfg, "synthesis", 4) == 0
+
+
+def test_replanning_a_rejected_seed_is_bounded_by_the_per_seed_cap(tmp_path, cfg):
+    """The bound on "rejected rows are replaced": _candidate_seeds counts
+    tasks per seed regardless of STATE, so a seed whose cap is spent is never
+    offered again however many of its rows were rejected. A genuinely bad
+    seed costs PER_SEED_CAP tasks, once, and then it is out of the pool."""
+    with open_store(tmp_path, n_seeds=1) as store:
+        assert plan_wave(store, cfg, "synthesis", PER_SEED_CAP) == PER_SEED_CAP
+        store.conn.execute("UPDATE task SET state = 'rejected'")
+        # The queue reads as empty and the target is unmet...
+        assert plan_wave(store, cfg, "synthesis", PER_SEED_CAP) == 0
+        # ...and it stays that way however often the operator re-runs it.
+        assert plan_wave(store, cfg, "synthesis", 100) == 0
+        assert store.conn.execute("SELECT COUNT(*) FROM task").fetchone()[0] == PER_SEED_CAP
+
+
+def test_reopen_returns_parked_rows_to_the_queue_that_owns_them(store, cfg):
+    plan_wave(store, cfg, "synthesis", 3)
+    ids = [r[0] for r in store.conn.execute("SELECT task_id FROM task ORDER BY rowid").fetchall()]
+    store.set_task_state(ids[0], "gen_unroutable", "unroutable:generator")
+    store.set_task_state(ids[1], "judge_unroutable", "judge-b-unroutable:x")
+    store.set_task_state(ids[2], "rejected", "reject:citations")
+
+    assert reopen_tasks(store, ["gen_unroutable", "judge_unroutable"]) == {
+        "gen_unroutable": 1,
+        "judge_unroutable": 1,
+    }
+    states = dict(
+        store.conn.execute("SELECT task_id, state FROM task").fetchall()
+    )
+    assert states[ids[0]] == "pending"
+    assert states[ids[1]] == "judging"
+    # A rejected row is a decision, not a park: it is never re-opened.
+    assert states[ids[2]] == "rejected"
+    assert store.events("tasks_reopened")
+
+
+def test_reopen_refuses_a_state_it_does_not_own(store, cfg):
+    with pytest.raises(ValueError, match="rejected"):
+        reopen_tasks(store, ["rejected"])
+
+
+def test_reopen_cli_reports_what_it_re_opened(tmp_path, cfg, capsys):
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=4, db_path=paths.state_db) as store:
+        plan_wave(store, cfg, "synthesis", 2)
+        store.conn.execute("UPDATE task SET state = 'judge_unroutable'")
+
+    assert tasks_main(["--config", config_path, "--reopen", "judge_unroutable"]) == 0
+    out = capsys.readouterr().out
+    assert "re-opened 2" in out
+    assert "judge_unroutable -> judging" in out
 
 
 def test_rows_carry_pending_state_after_creation(store, cfg):

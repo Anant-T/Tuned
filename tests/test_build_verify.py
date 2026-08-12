@@ -19,6 +19,7 @@ from pipeline_fakes import (
 
 from tuned.data.citations import CitationIndex
 from tuned.data.generate import run_workers
+from tuned.data.store import Store
 from tuned.data.tasks import plan_wave
 from tuned.data.verify import content_for, latest_generations, live_leases
 from tuned.data.verify import main as verify_main
@@ -113,7 +114,8 @@ def test_a_clean_row_survives_the_rerun(tmp_path, paths, cfg, index_path):
         counts = rerun_gates(store, cfg, citation_index_path=index_path)
         assert counts == {
             "scanned": 1, "regated": 1, "clean": 1, "demoted": 0, "soft_fail": 0,
-            "missing_seed": 0, "rebuilt_content": 0, "unverified": 0,
+            "missing_seed": 0, "slot_error": 0, "held_by_worker": 0,
+            "rebuilt_content": 0, "unverified": 0,
         }
         assert store.conn.execute("SELECT state FROM task").fetchone()[0] == "accepted"
         gen = store.latest_generation(task_id)
@@ -251,16 +253,26 @@ def test_cli_refuses_to_demote_under_a_live_fleet(tmp_path, paths, cfg, index_pa
     running it against live workers can overwrite a decision in flight."""
     config_path = temp_config(tmp_path)
     store, task_id = generated_store(
-        tmp_path, paths, cfg, answer=NOVEL_ANSWER, state="pending", db_path=paths.state_db
+        tmp_path, paths, cfg, answer=NOVEL_ANSWER, state="judging", db_path=paths.state_db
     )
     with store:
-        store.claim_tasks("gen-1", 1)
+        # A judge worker holding the row: a demotable state AND a live lease,
+        # which is the collision this refusal exists for.
+        store.claim_tasks("judge-1", 1, state_from="judging", state_to="judging_active")
     # The CLI opens its own handle on the same workdir.
     assert verify_main(["--config", config_path, "--index", index_path]) == 2
     out = capsys.readouterr().out
     assert "REFUSING" in out and "--force" in out
+    with Store.open(paths.state_db) as reopened:
+        assert reopened.conn.execute("SELECT state FROM task").fetchone()[0] == "judging_active"
+
+    # --force means "overwrite the live holder if you must", so it overrides
+    # the per-row re-check too - otherwise the flag would run the whole sweep
+    # and quietly demote nothing.
     assert verify_main(["--config", config_path, "--index", index_path, "--force"]) == 0
     assert "demoted" in capsys.readouterr().out
+    with Store.open(paths.state_db) as reopened:
+        assert reopened.conn.execute("SELECT state FROM task").fetchone()[0] == "rejected"
 
 
 def test_a_missing_seed_is_counted_not_raised(tmp_path, paths, cfg, index_path):
@@ -272,4 +284,53 @@ def test_a_missing_seed_is_counted_not_raised(tmp_path, paths, cfg, index_path):
         counts = rerun_gates(store, cfg, citation_index_path=index_path)
         assert counts["scanned"] == 1
         assert counts["missing_seed"] == 1
+        assert counts["slot_error"] == 0
         assert counts["regated"] == 0
+
+
+def test_an_unrenderable_row_is_counted_apart_from_a_missing_seed(tmp_path, paths, cfg):
+    """A transition row generated before the dates became mandatory can no
+    longer be re-gated (build_slots raises), and calling that "missing_seed"
+    hid a class of rows that will never be verified from the one number an
+    operator reads to decide the sweep was complete."""
+    store, task_id = generated_store(tmp_path, paths, cfg)
+    with store:
+        store.conn.execute("UPDATE task SET stream = 'transition', task_type = 'transition'")
+        counts = rerun_gates(store, cfg)
+        assert counts["scanned"] == 1
+        assert counts["slot_error"] == 1
+        assert counts["missing_seed"] == 0
+        assert counts["regated"] == 0
+        event = json.loads(store.events("verify_skipped")[0]["detail_json"])
+        assert event["reason"].startswith("SlotError")
+
+
+def test_a_demotion_re_checks_the_lease_it_is_about_to_overwrite(tmp_path, paths, cfg, index_path):
+    """This pass holds no lease of its own, and a sweep long enough to matter
+    is long enough for a worker to claim a row after the opening check. The
+    demotion is skipped and counted rather than racing the live holder."""
+    store, task_id = generated_store(tmp_path, paths, cfg, answer=NOVEL_ANSWER, state="judging")
+    with store:
+        store.claim_tasks(
+            "judge-1", 1, state_from="judging", state_to="judging_active"
+        )
+        counts = rerun_gates(store, cfg, citation_index_path=index_path)
+        assert counts["regated"] == 1
+        assert counts["demoted"] == 0
+        assert counts["held_by_worker"] == 1
+        assert store.conn.execute("SELECT state FROM task").fetchone()[0] == "judging_active"
+        assert store.events("verify_demotion_deferred")
+        # Once the lease expires the demotion goes through.
+        stale = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        store.conn.execute("UPDATE task SET claimed_at = ?", (stale,))
+        assert rerun_gates(store, cfg, citation_index_path=index_path)["demoted"] == 1
+        assert store.conn.execute("SELECT state FROM task").fetchone()[0] == "rejected"
+
+
+def test_verify_shares_the_stores_lease_constants(tmp_path):
+    """A second copy of the lease window is a fence that silently disagrees
+    with the fencing."""
+    from tuned.data import store as store_module
+    from tuned.data import verify as verify_module
+
+    assert verify_module.DEFAULT_LEASE_S is store_module.DEFAULT_LEASE_S

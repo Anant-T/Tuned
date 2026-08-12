@@ -23,6 +23,7 @@ from tuned.data.config import (  # noqa: E402
     load_build_config,
 )
 from tuned.data.providers import (  # noqa: E402
+    CONTEXT_SAFETY_MARGIN,
     QUIRKS,
     ChatClient,
     ChatRequest,
@@ -32,11 +33,15 @@ from tuned.data.providers import (  # noqa: E402
     TokenBucket,
     build_check_request,
     check_refs,
+    context_estimate,
+    estimate_tokens,
     format_check_header,
     format_check_row,
     load_dotenv_keys,
+    pool_gaps,
     resolve_quirks,
     undersized_families,
+    unkeyed_roles,
 )
 
 DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
@@ -1175,6 +1180,36 @@ def test_params_for_ref_overrides_params(cfg, keys):
     assert payloads[0]["temperature"] == 0.1
 
 
+def test_params_for_ref_merges_over_params_rather_than_dropping_them(cfg, keys):
+    """The hook expresses per-model deviation; the call-wide params it does
+    not mention still ship. Dropping them silently sent a payload the caller
+    never asked for."""
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    payloads: list[dict] = []
+
+    def factory(provider, model):
+        def handler(request):
+            payloads.append(json.loads(request.content))
+            return httpx.Response(200, json=_body())
+
+        return ChatClient(
+            provider, model, transport=httpx.MockTransport(handler),
+            clock=clock, sleeper=sleeper, rng=random.Random(3), max_retries=1,
+        )
+
+    router = _router(cfg, clock=clock, sleeper=sleeper, client_factory=factory)
+    asyncio.run(
+        router.complete(
+            "judge", [{"role": "user", "content": "go"}],
+            params={"temperature": 0.9, "top_p": 0.5},
+            params_for_ref=lambda ref, model_cfg: {"temperature": 0.1},
+        )
+    )
+    assert payloads[0]["temperature"] == 0.1
+    assert payloads[0]["top_p"] == 0.5
+
+
 def test_undersized_families_over_the_real_pool(cfg):
     # Nothing is too small for a short prompt.
     assert undersized_families(cfg, "judge", 4000) == frozenset()
@@ -1285,3 +1320,233 @@ def test_format_check_row_is_single_line_and_flags_failures():
         ref="x", key_present=True, status=500, text="", usage_present=False,
         reasoning_present=False, latency_ms=None,
     ).ok is False
+
+
+# --- 13. structural refusals: skip reasons, context overflow, pool preflight -
+#
+# Round-2 review: `retryable=bool(skipped & TRANSIENT_SKIPS)` is the single
+# hinge that decides whether a worker re-queues a row or closes it, and a 400
+# that means "this prompt does not fit THIS window" is a per-provider fact,
+# not a payload bug. Both are covered here at the transport level.
+
+
+def _overflow_factory(clock, sleeper, seen, overflowing, body, *, max_retries=2):
+    """Per-provider MockTransport that answers 400 with a context-overflow body."""
+
+    def factory(provider, model):
+        def handler(request):
+            seen.append(provider.name)
+            if provider.name in overflowing:
+                return httpx.Response(400, text=body)
+            return httpx.Response(200, json=_body(f"OK from {provider.name}"))
+
+        return ChatClient(
+            provider,
+            model,
+            transport=httpx.MockTransport(handler),
+            clock=clock,
+            sleeper=sleeper,
+            rng=random.Random(7),
+            max_retries=max_retries,
+        )
+
+    return factory
+
+
+OVERFLOW_BODY = (
+    '{"error": {"message": "This model has a maximum context length of 8192 tokens, '
+    'however you requested 11400 tokens.", "code": "context_length_exceeded"}}'
+)
+
+
+def test_no_eligible_model_carries_the_reasons_it_skipped(cfg, keys, monkeypatch):
+    """A caller has to tell "no key anywhere" from "this row fits nowhere":
+    one is a fleet-configuration fact a re-queue survives, the other is a fact
+    about the row. The message string alone is not a contract."""
+    _unset(monkeypatch, "MISTRAL_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY")
+    with pytest.raises(ProviderError) as excinfo:
+        asyncio.run(_router(cfg).complete("judge", [{"role": "user", "content": "hi"}]))
+    assert excinfo.value.skipped == frozenset({"missing-key"})
+    assert excinfo.value.retryable is False
+
+
+def test_a_family_exclusion_is_reported_separately_from_a_missing_key(cfg, keys):
+    with pytest.raises(ProviderError) as excinfo:
+        asyncio.run(
+            _router(cfg).complete(
+                "probe",
+                [{"role": "user", "content": "hi"}],
+                exclude_families=frozenset({"llama"}),
+            )
+        )
+    assert excinfo.value.skipped == frozenset({"family-excluded"})
+
+
+def test_a_context_overflow_400_fails_over_instead_of_aborting(cfg, keys):
+    """The exact failure the generator's context routing exists to prevent.
+    400 context_length_exceeded is a per-MODEL fact - the next, larger ref in
+    the list serves the identical request - so it must fail over, and it must
+    NOT charge the breaker: nothing is wrong with that provider."""
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    seen: list[str] = []
+    router = _router(
+        cfg,
+        clock=clock,
+        sleeper=sleeper,
+        breaker_threshold=1,  # one charged failure would cool it
+        client_factory=_overflow_factory(clock, sleeper, seen, {"mistral"}, OVERFLOW_BODY),
+    )
+
+    ref, response = asyncio.run(
+        router.complete("judge", [{"role": "user", "content": "grade this"}])
+    )
+
+    assert ref == GROQ_JUDGE
+    assert response.text == "OK from groq"
+    assert seen == ["mistral", "groq"]  # tried once, then moved on
+    assert not router.is_cooling(MISTRAL_JUDGE)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        OVERFLOW_BODY,
+        "Prompt is too long: 11400 tokens > 8192 maximum",
+        "input length exceeds the context window of this model",
+    ],
+)
+def test_context_overflow_bodies_are_recognised(body, monkeypatch):
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+
+    def handler(request):
+        return httpx.Response(400, text=body)
+
+    with pytest.raises(ProviderError) as excinfo:
+        _complete(_client(handler), _request())
+
+    assert excinfo.value.context_exceeded is True
+    assert excinfo.value.provider_dead is False
+
+
+def test_a_genuine_payload_400_still_aborts(monkeypatch):
+    """The abort class is not gone, only narrowed. A malformed payload is
+    still malformed everywhere and must surface rather than tour the pool."""
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+
+    def handler(request):
+        return httpx.Response(400, text='{"error": "unknown parameter: reasoning_effort"}')
+
+    with pytest.raises(ProviderError) as excinfo:
+        _complete(_client(handler), _request())
+
+    assert excinfo.value.context_exceeded is False
+    assert excinfo.value.retryable is False
+    assert excinfo.value.provider_dead is False
+
+
+def test_overflow_at_every_ref_is_reported_as_a_row_shaped_failure(cfg, keys):
+    """When every eligible model says the prompt does not fit, coming back
+    tomorrow with the same prompt changes nothing - so the aggregate error is
+    NOT retryable and says why."""
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    seen: list[str] = []
+    router = _router(
+        cfg,
+        clock=clock,
+        sleeper=sleeper,
+        client_factory=_overflow_factory(
+            clock, sleeper, seen, {"mistral", "groq", "cerebras"}, OVERFLOW_BODY
+        ),
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        asyncio.run(router.complete("judge", [{"role": "user", "content": "grade this"}]))
+
+    assert excinfo.value.context_exceeded is True
+    assert excinfo.value.retryable is False
+    assert seen == ["mistral", "groq", "cerebras"]  # every ref was offered it
+
+
+def test_undersized_families_keeps_an_explicit_safety_margin(cfg):
+    """chars/4 is an estimate, so a cap that merely EQUALS it is not headroom:
+    the 8k judge is excluded at an 8192-token estimate, not only past it."""
+    assert CONTEXT_SAFETY_MARGIN > 1.0
+    assert "glm" in undersized_families(cfg, "judge", 8192)
+    assert "gpt-oss" in undersized_families(cfg, "generator", 8192)
+    # ...and the margin does not start excluding models with real headroom.
+    assert undersized_families(cfg, "judge", 4000) == frozenset()
+
+
+def test_the_token_estimate_counts_indic_script_far_harder_than_latin():
+    """A BPE vocabulary trained on English runs ~1-2 chars/token on
+    Devanagari, so chars/4 under-counts an Indic passage by 2-4x - on exactly
+    this corpus, and the under-count is what lands the prompt at an 8k model."""
+    latin = "the accused was convicted under section 302 of the code " * 20
+    devanagari = "अभियुक्त को भारतीय दंड संहिता की धारा तीन सौ दो के अंतर्गत " * 20
+    assert abs(len(latin) - len(devanagari)) < len(latin) * 0.25
+    assert estimate_tokens(devanagari) > 2 * estimate_tokens(latin)
+
+
+def test_the_context_estimate_counts_chat_template_overhead():
+    messages = [{"role": "system", "content": "a" * 40}, {"role": "user", "content": "b" * 40}]
+    assert context_estimate(messages) > 80 // 4
+    assert context_estimate([]) == 0
+
+
+def test_unkeyed_roles_names_the_role_and_the_env_vars(cfg, monkeypatch):
+    """The fleet must refuse to start when a role it routes has no usable key
+    - the alternative is a wave of tasks that never reaches a provider."""
+    _unset(monkeypatch, "MISTRAL_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY")
+    gaps = unkeyed_roles(cfg, ("generator", "judge"))
+    assert set(gaps) == {"generator", "judge"}
+    assert "CEREBRAS_API_KEY" in gaps["generator"]
+    assert "MISTRAL_API_KEY" in gaps["generator"]
+    # One key is enough to make a role usable: the rest is failover.
+    monkeypatch.setenv("MISTRAL_API_KEY", "sk-test")
+    assert unkeyed_roles(cfg, ("generator", "judge")) == {}
+    # ...and a role whose every provider is still unkeyed keeps reporting.
+    assert unkeyed_roles(cfg, ("probe",))["probe"] == ("GROQ_API_KEY",)
+
+
+def test_pool_gaps_finds_the_judge_hole_the_shipped_config_still_has(cfg):
+    """R2-C3: long rows route to magistral, family separation then removes
+    mistral, the 8k glm judge is out on length, slot A takes qwen and slot B
+    has NOTHING. The row parks having already paid for judge A."""
+    gaps = pool_gaps(cfg)
+    judge_gaps = [g for g in gaps if g.role == "judge"]
+    assert [(g.generator_family, g.slot) for g in judge_gaps] == [("mistral", "b")]
+    assert judge_gaps[0].fatal is True
+    assert "mistral" in judge_gaps[0].detail
+    # The tiebreak hole is the one round 1 documented and gave a defined,
+    # unpaid fallback for, so it is reported but not fatal.
+    tiebreak_gaps = [g for g in gaps if g.role == "tiebreak"]
+    assert tiebreak_gaps and all(not g.fatal for g in tiebreak_gaps)
+
+
+def test_a_fourth_judge_family_closes_the_pool_gap(cfg):
+    """The other half of the fix is one config line; this proves the preflight
+    goes quiet the moment the operator adds it."""
+    from dataclasses import replace
+
+    extra = ModelCfg(
+        id="big-judge",
+        family="fourth",
+        roles=("judge", "tiebreak"),
+        limits={"rpm": 30, "tpm": 8000, "max_context": 131072, "max_output": 8192},
+        params={"temperature": 0.2},
+    )
+    providers = tuple(
+        replace(p, models=p.models + (extra,)) if p.name == "groq" else p for p in cfg.providers
+    )
+    patched = replace(
+        cfg,
+        providers=providers,
+        routing=replace(
+            cfg.routing,
+            judge=cfg.routing.judge + ("groq/big-judge",),
+            tiebreak=cfg.routing.tiebreak + ("groq/big-judge",),
+        ),
+    )
+    assert pool_gaps(patched) == []

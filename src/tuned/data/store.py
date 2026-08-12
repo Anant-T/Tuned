@@ -36,6 +36,12 @@ from pathlib import Path
 
 _TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
+# How long a claim owns a task before another worker may recover it.  Public
+# because it is a fact about the store's leases and other modules reason about
+# it (verify.py refuses to write task states while any lease is live); a
+# second copy elsewhere is a fence that silently disagrees with the fencing.
+DEFAULT_LEASE_S = 900
+
 # ORDER IS LOAD-BEARING: busy_timeout must be armed BEFORE journal_mode=WAL.
 # Switching the journal mode needs a brief exclusive lock, and with the default
 # timeout of 0 a second worker opening the same DB at the same moment fails
@@ -357,7 +363,7 @@ class Store:
         n: int,
         *,
         stream: str | None = None,
-        lease_s: int = 900,
+        lease_s: int = DEFAULT_LEASE_S,
         state_from: str = "pending",
         state_to: str = "generating",
     ) -> list[dict]:
@@ -520,14 +526,50 @@ class Store:
             ).fetchall()
         }
 
-    def record_judgement(self, gen_id: int, judge_slot: str, row: dict) -> None:
+    def record_judgement(
+        self,
+        gen_id: int,
+        judge_slot: str,
+        row: dict,
+        *,
+        expect_worker: str | None = None,
+    ) -> bool:
+        """Index one judge's scores for one generation.  Returns True if written.
+
+        `expect_worker` is the SAME lease fence set_task_state takes, and it
+        is here for the same reason.  This is an INSERT OR REPLACE on
+        (gen_id, judge_slot), and a judge worker reads the recorded slots
+        once and then awaits paid calls: a worker that stalls past its lease
+        has already had its task re-claimed, and the live holder may have
+        reused the stalled worker's slot A, bought its own slot B and
+        accepted the row.  An unfenced late write from the stalled worker
+        then replaces slot B with scores the accept was never made on - the
+        row reads `accepted` carrying a judgement that contradicts it, and
+        that pair is precisely what P5 calibration and gold labelling read.
+
+        The check and the write are one BEGIN IMMEDIATE transaction, so the
+        lease cannot move between them.  expect_worker=None writes
+        unconditionally, which is what rebuild paths (reconcile_raw) need -
+        they hold no lease and there is no live worker to lose to.
+        """
         packed = dict(row)
         packed["gen_id"] = gen_id
         packed["judge_slot"] = judge_slot
-        self._write(
-            _insert_sql("judgement", _JUDGEMENT_COLS, "INSERT OR REPLACE"),
-            _pack(_fill(packed, created_at=utcnow()), _JUDGEMENT_COLS),
-        )
+        params = _pack(_fill(packed, created_at=utcnow()), _JUDGEMENT_COLS)
+        sql = _insert_sql("judgement", _JUDGEMENT_COLS, "INSERT OR REPLACE")
+        if expect_worker is None:
+            self._write(sql, params)
+            return True
+        with self._write_txn() as conn:
+            holder = conn.execute(
+                "SELECT t.claimed_by FROM generation g JOIN task t ON t.task_id = g.task_id "
+                "WHERE g.gen_id = ?",
+                (gen_id,),
+            ).fetchone()
+            if holder is None or holder[0] != expect_worker:
+                return False
+            conn.execute(sql, params)
+        return True
 
     def judgements_for(self, gen_id: int) -> list[dict]:
         return [

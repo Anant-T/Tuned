@@ -83,14 +83,33 @@ providers:
 # that "groq/qwen/qwen3.6-27b" contains TWO slashes, so refs are split on the
 # FIRST slash only (provider="groq", model="qwen/qwen3.6-27b").
 #
-# WANTED: a 32k+ THIRD-FAMILY tiebreak model. The tiebreak pool below is
+# TODO(operator) WANTED, and the fleet REFUSES TO START without it: ONE more
+# judge model, in a FOURTH family - not mistral, not qwen, not gpt-oss - with
+# max_context >= 32768, added to BOTH routing.judge and routing.tiebreak
+# below. Config only, no code. providers.pool_gaps() names the gap at
+# startup and generate/judge exit 2 unless --allow-pool-gaps is passed.
+#
+# Why the JUDGE pool needs it (the fatal half). A long prompt is routed past
+# the 8k cerebras generator to mistral/magistral (40k). Family separation
+# then removes mistral from the judge pool; the 8k zai-glm-4.7 is removed on
+# context length; slot A takes groq/qwen; and slot B has NOTHING LEFT. The
+# row parks in judge_unroutable having ALREADY PAID for judge A. The
+# arithmetic makes this the rule and not an edge case: the generator diverts
+# above ~4.2k prompt tokens and slot B dies above ~7.2k judge-prompt tokens,
+# which grounding plus a trace near think_max (3000) clears routinely.
+# Recovery today is `python -m tuned.data.tasks --reopen judge_unroutable`
+# AFTER the fourth family is added; the re-opened row re-pays only slot B.
+#
+# Why the TIEBREAK pool needs it (the survivable half). The tiebreak pool is
 # gpt-oss (131k) plus two 8k models, so a long candidate produced by the
-# gpt-oss generator has NO eligible tiebreak at all: family separation
-# removes gpt-oss and the context check removes gemma and glm. judge.py
-# handles that by deciding on the two judges it has and rejecting the
-# unresolved disagreement (run_event tiebreak_unroutable_two_judge_decision,
-# which is the metric to watch), but the real fix is one more large
-# non-gpt-oss, non-mistral, non-qwen judge here - config only, no code.
+# gpt-oss generator has no eligible tiebreak: separation removes gpt-oss and
+# the context check removes gemma and glm. judge.py decides on the two judges
+# it has and rejects the unresolved disagreement (run_event
+# tiebreak_unroutable_two_judge_decision - the metric to watch), so this one
+# only warns.
+#
+# NOT an option: letting a judge share the generator's family when the pool
+# runs out. Family separation is a data-quality invariant, not a preference.
 routing:
   generator: [cerebras/gpt-oss-120b, mistral/magistral-small-latest]
   judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b, cerebras/zai-glm-4.7]

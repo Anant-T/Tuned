@@ -64,14 +64,51 @@ _MAX_RETRY_SLEEP_S = 120.0
 _CALL_DEADLINE_S = 300.0
 _DEFAULT_TIMEOUT_S = 120.0
 
-# How a non-429 4xx is classified.  400/413/422 are PAYLOAD-shaped: the same
-# request would fail at every provider, so the call aborts and the bug
-# surfaces.  Everything else in the 4xx range (401/403/404, and unlisted codes
-# such as 402 payment-required) is about our standing with THIS provider, so
-# the Router fails over.  Defaulting the unlisted codes to "fail over" keeps a
-# weeks-long build running; a genuine payload bug hiding in one of them still
-# surfaces, as "all N eligible model(s) failed".
+# How a non-429 4xx is classified.  400/413/422 are PAYLOAD-shaped: MOST of
+# the time the same request would fail at every provider, so the call aborts
+# and the bug surfaces rather than touring the pool.  Everything else in the
+# 4xx range (401/403/404, and unlisted codes such as 402 payment-required) is
+# about our standing with THIS provider, so the Router fails over.  Defaulting
+# the unlisted codes to "fail over" keeps a weeks-long build running; a genuine
+# payload bug hiding in one of them still surfaces, as "all N eligible model(s)
+# failed".
+#
+# "MOST of the time" is doing real work in that sentence, and getting it wrong
+# cost a row: a 400 carrying context_length_exceeded is a fact about ONE
+# model's window, and the next, larger ref in the failover list serves the
+# identical request.  Those are detected below (_CONTEXT_OVERFLOW_MARKERS) and
+# failed over instead of aborted.  A safety-filter 400 is per-provider in the
+# same way and is NOT detected - it is not distinguishable from a payload bug
+# by status alone, and inventing a marker list for refusal prose would misfire
+# on genuine bugs.  It costs the task attempts, never the row.
 _ABORT_STATUSES = frozenset({400, 413, 422})
+
+# Lower-cased substrings that identify a 400/413/422 as "this prompt does not
+# fit THIS model's context window".  Drawn from the OpenAI error code every
+# compatible server copies plus the prose the shipped providers actually
+# return.  Matched against the response body, so a body that merely mentions
+# tokens is not enough.
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "context length exceeded",
+    "maximum context length",
+    "context window",
+    "prompt is too long",
+    "input is too long",
+    "input length exceeds",
+    "too many tokens",
+    "reduce the length",
+)
+
+
+def looks_like_context_overflow(body: str) -> bool:
+    """True when a 4xx body says the prompt was too long for THAT model.
+
+    Pure and public because it is the difference between failing over to a
+    larger model and closing out a row that nothing was ever wrong with.
+    """
+    lowered = (body or "").lower()
+    return any(marker in lowered for marker in _CONTEXT_OVERFLOW_MARKERS)
 
 
 # --- .env loading -----------------------------------------------------------
@@ -112,17 +149,30 @@ def load_dotenv_keys(path: Path | None = None) -> int:
 
 
 class ProviderError(RuntimeError):
-    """A call failed.  Three outcomes the Router must be able to tell apart:
+    """A call failed.  Four outcomes the Router must be able to tell apart:
 
-    * ``retryable``     - 429/5xx/transport/timeout.  Try again, here or
+    * ``retryable``        - 429/5xx/transport/timeout.  Try again, here or
       somewhere else; the request itself was fine.
-    * ``provider_dead`` - 401/403/404 and friends.  THIS provider cannot serve
-      the call (revoked key, retired preview model) but the payload is fine,
-      so the Router marks the ref failed and fails over.  Not retryable *at
-      this ref* - retrying the same provider would just fail identically.
-    * neither           - 400/422/413.  Our payload is malformed, so it is
-      malformed everywhere; the call aborts immediately rather than making
-      the same bad request at every provider and hiding the bug.
+    * ``provider_dead``    - 401/403/404 and friends.  THIS provider cannot
+      serve the call (revoked key, retired preview model) but the payload is
+      fine, so the Router marks the ref failed and fails over.  Not retryable
+      *at this ref* - retrying the same provider would just fail identically.
+    * ``context_exceeded`` - a 4xx whose body says the prompt is longer than
+      THIS model's window.  Also a per-provider fact, but not a fault: the
+      Router fails over to a larger model WITHOUT charging the breaker,
+      because nothing is wrong with the provider it just left.
+    * none of the above    - 400/422/413 with no context marker.  Our payload
+      is malformed, so it is malformed everywhere; the call aborts
+      immediately rather than making the same bad request at every provider
+      and hiding the bug.
+
+    ``skipped`` is set only on the "no eligible model" error and carries the
+    REASONS refs were passed over ({"missing-key"}, {"cooling"}, ...).  It
+    exists because "nothing ran" has two very different meanings to a worker:
+    a missing key is a fleet-configuration fact that the row survives, while
+    "every family was excluded" is a fact about the row itself.  Callers that
+    decide a task's state on ``retryable`` alone cannot tell them apart, and
+    the difference is whether a wave is recoverable.
     """
 
     def __init__(
@@ -134,6 +184,8 @@ class ProviderError(RuntimeError):
         model: str | None = None,
         retryable: bool = False,
         provider_dead: bool = False,
+        context_exceeded: bool = False,
+        skipped: frozenset[str] = frozenset(),
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -141,6 +193,8 @@ class ProviderError(RuntimeError):
         self.model = model
         self.retryable = retryable
         self.provider_dead = provider_dead
+        self.context_exceeded = context_exceeded
+        self.skipped = frozenset(skipped)
 
 
 @dataclass(frozen=True)
@@ -433,6 +487,7 @@ class ChatClient:
         status: int | None,
         retryable: bool,
         provider_dead: bool = False,
+        context_exceeded: bool = False,
     ) -> ProviderError:
         return ProviderError(
             f"{self.provider.name}/{self.model.id}: {message}",
@@ -441,6 +496,7 @@ class ChatClient:
             model=self.model.id,
             retryable=retryable,
             provider_dead=provider_dead,
+            context_exceeded=context_exceeded,
         )
 
     def build_payload(self, req: ChatRequest) -> dict:
@@ -554,16 +610,22 @@ class ChatClient:
                         on_attempt(status, None)
                     if 400 <= status < 500 and status != 429:
                         dead = status not in _ABORT_STATUSES
-                        kind = (
-                            "provider unusable, failing over"
-                            if dead
-                            else "bad request, aborting the call"
-                        )
+                        # A 400 that says "too long for this window" is about
+                        # THIS model, not about the payload: the larger ref
+                        # next in the list takes the identical request.
+                        overflow = not dead and looks_like_context_overflow(last_detail)
+                        if dead:
+                            kind = "provider unusable, failing over"
+                        elif overflow:
+                            kind = "prompt exceeds this context window, failing over"
+                        else:
+                            kind = "bad request, aborting the call"
                         raise self._error(
                             f"HTTP {status} ({kind}): {last_detail}",
                             status=status,
                             retryable=False,
                             provider_dead=dead,
+                            context_exceeded=overflow,
                         )
                     retry_after = self.quirk.retry_after(response)
 
@@ -637,8 +699,71 @@ class _BreakerState:
 
 # Skip reasons that lift on their own: a caller that got nothing because of
 # these may usefully try again shortly.  "missing-key" and "family-excluded"
-# are structural - they will still hold in a minute.
-_TRANSIENT_SKIPS = frozenset({"cooling", "over-budget"})
+# are structural - they will still hold in a minute.  Public because a worker
+# deciding a task's fate has to classify the reasons the same way this module
+# does; a private copy in the workers would drift.
+TRANSIENT_SKIPS = frozenset({"cooling", "over-budget"})
+_TRANSIENT_SKIPS = TRANSIENT_SKIPS  # legacy alias, kept for in-module reads
+
+# --- context estimation -----------------------------------------------------
+#
+# Everything here is an ESTIMATE compared against a hard ceiling, so every
+# constant errs the same way: over-count rather than under-count.  Under-
+# counting routes an over-long prompt at a small model, which is a 400.
+
+# Characters per token.  Latin legal English runs ~4 chars/token under the
+# BPE vocabularies these providers use.  Devanagari and the other Indic
+# scripts run 1-2, because those vocabularies barely model them - so a
+# chars/4 estimate under-counts an Indic passage by 2-4x, on exactly the
+# corpus this build is made of.
+CHARS_PER_TOKEN_LATIN = 4.0
+CHARS_PER_TOKEN_INDIC = 1.5
+
+# Per-message chat-template overhead.  Every OpenAI-compatible server wraps
+# each turn in role markers and delimiters that the caller never sees but the
+# context window is charged for; ChatML-family templates spend roughly this
+# many tokens a turn.
+TEMPLATE_TOKENS_PER_MESSAGE = 8
+
+# Multiplied into the estimate before it is compared with a model's
+# max_context.  A cap that merely EQUALS the estimate is not headroom: the
+# estimate is a heuristic over characters, the provider counts real tokens,
+# and the two disagree by a few percent on ordinary English and by more on
+# mixed script.  This is the margin that turns "probably fits" into "routes
+# there".
+CONTEXT_SAFETY_MARGIN = 1.25
+
+# Codepoint ranges of the Indic scripts this corpus contains (Devanagari
+# through Sinhala, plus Devanagari Extended).  A range test rather than a
+# per-script list: they all tokenize badly for the same reason.
+_INDIC_RANGES = ((0x0900, 0x0DFF), (0xA8E0, 0xA8FF))
+
+
+def _is_indic(ch: str) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _INDIC_RANGES)
+
+
+def estimate_tokens(text: str) -> int:
+    """Conservative token estimate for one string, script-aware.
+
+    NOT the same currency as the gates' length band, which is chars/4 by
+    definition and is calibrated that way across the whole build.  This one
+    exists solely to answer "will this fit in that window", where being wrong
+    low is a 400 and being wrong high is a failover.
+    """
+    if not text:
+        return 0
+    indic = sum(1 for ch in text if _is_indic(ch))
+    latin = len(text) - indic
+    return int(latin / CHARS_PER_TOKEN_LATIN + indic / CHARS_PER_TOKEN_INDIC) + 1
+
+
+def context_estimate(messages: Sequence[Mapping]) -> int:
+    """Conservative token estimate for a rendered message list."""
+    return sum(
+        estimate_tokens(m.get("content") or "") + TEMPLATE_TOKENS_PER_MESSAGE for m in messages
+    )
 
 
 def undersized_families(cfg: BuildConfig, role: str, needed_tokens: int) -> frozenset[str]:
@@ -650,6 +775,11 @@ def undersized_families(cfg: BuildConfig, role: str, needed_tokens: int) -> froz
     family exclusion is what lets a caller express it with the filter the
     Router does have.
 
+    ``needed_tokens`` is scaled by CONTEXT_SAFETY_MARGIN before the
+    comparison: the caller's number is an estimate over characters and the
+    provider enforces a count of real tokens, so a model whose cap merely
+    equals the estimate is a coin flip on a 400.
+
     A family is excluded only when EVERY one of its models in that role is
     too small, so a mixed-size family keeps its large model and the
     preference order still decides between them.  A model that declares no
@@ -657,17 +787,175 @@ def undersized_families(cfg: BuildConfig, role: str, needed_tokens: int) -> froz
     guessing "too small" would silently remove a working provider.
 
     Callers on both sides of a generation need this - the generator because
-    an over-long prompt at an 8k model is a 400 that does not fail over, the
-    judge because its prompt carries the same materials PLUS the candidate
-    and is the longest in the pipeline.
+    an over-long prompt at an 8k model is a 400, the judge because its prompt
+    carries the same materials PLUS the candidate and is the longest in the
+    pipeline.
     """
+    required = int(max(0, needed_tokens) * CONTEXT_SAFETY_MARGIN)
     fits_by_family: dict[str, bool] = {}
     for ref in cfg.routing_refs(role):
         _, model = cfg.model_for(ref)
         cap = model.limits.get("max_context")
-        fits = cap is None or int(cap) >= needed_tokens
+        fits = cap is None or int(cap) >= required
         fits_by_family[model.family] = fits_by_family.get(model.family, False) or fits
     return frozenset(family for family, fits in fits_by_family.items() if not fits)
+
+
+# --- startup preflight ------------------------------------------------------
+#
+# Both checks below exist for the same reason: the two facts they test are
+# knowable in one second at startup and cost a wave of half-paid rows to
+# discover at runtime.
+
+
+def unkeyed_roles(cfg: BuildConfig, roles: Sequence[str]) -> dict[str, tuple[str, ...]]:
+    """role -> the api_key_env names it needs, for roles with NO usable model.
+
+    A role is fine if ONE of its refs has a key; the rest is failover.  A role
+    with none of them cannot make a single call, and a fleet started in that
+    state claims tasks, fails to route every one of them, and reports a
+    routing error per row instead of the one line the operator needed.
+    """
+    missing: dict[str, tuple[str, ...]] = {}
+    for role in roles:
+        envs: list[str] = []
+        usable = False
+        for ref in cfg.routing_refs(role):
+            provider, _ = cfg.model_for(ref)
+            if os.environ.get(provider.api_key_env):
+                usable = True
+                break
+            if provider.api_key_env not in envs:
+                envs.append(provider.api_key_env)
+        if not usable:
+            missing[role] = tuple(envs)
+    return missing
+
+
+# The judge's own reply allowance, in tokens.  judge.py owns the runtime
+# value (JUDGE_MAX_TOKENS) and passes it in; this default is what lets the
+# GENERATION worker run the same preflight, because a generator that fills a
+# queue no judge pool can drain is spending money on rows that will park.
+DEFAULT_JUDGE_REPLY_TOKENS = 1024
+
+
+@dataclass(frozen=True)
+class PoolGap:
+    """A (generator family, judge slot) pair the pool cannot serve at size."""
+
+    role: str  # "judge" | "tiebreak"
+    generator_family: str
+    slot: str  # "a" | "b" | "tiebreak"
+    detail: str
+    # A judge-slot gap parks a row that has ALREADY paid for the other slot,
+    # so it is fatal.  A tiebreak gap has a defined, unpaid fallback
+    # (judge.py decides on the two judges and rejects the unresolved
+    # disagreement), so it is reported and survivable.
+    fatal: bool
+
+
+def max_judge_prompt_tokens(
+    cfg: BuildConfig, *, judge_reply_tokens: int = DEFAULT_JUDGE_REPLY_TOKENS
+) -> int:
+    """The largest judge call the pipeline can produce, in routing currency.
+
+    The judge prompt is the row's own material plus the candidate, and the
+    length band caps exactly that sum (``total_max``) - a row above it fails
+    the length gate and never reaches a judge.  Add the judge's reply
+    allowance, because the window has to hold both.
+    """
+    return int(cfg.build.length_band.total_max) + int(judge_reply_tokens)
+
+
+def _first_family(
+    cfg: BuildConfig, role: str, exclude: set[str], undersized: frozenset[str]
+) -> str | None:
+    """The family Router.pick would land on, walking the real preference order."""
+    for ref in cfg.routing_refs(role):
+        _, model = cfg.model_for(ref)
+        if model.family in exclude or model.family in undersized:
+            continue
+        return model.family
+    return None
+
+
+def pool_gaps(
+    cfg: BuildConfig, *, judge_reply_tokens: int = DEFAULT_JUDGE_REPLY_TOKENS
+) -> list[PoolGap]:
+    """Every judge/tiebreak slot the pool cannot fill for the LONGEST row.
+
+    Family separation and context length are both per-call filters, so their
+    interaction is invisible in the config and only shows up once a row is
+    long enough - by which time the fleet has paid for judge A and parked the
+    row waiting for a judge B that does not exist.  This walks the same
+    preference order judge.py walks, at the largest prompt the length band
+    permits, and says so before anything is claimed.
+
+    Deliberately NOT a fallback: reusing a family when the pool runs out
+    would put a model's own family in front of its own prose, which is the
+    invariant the separation exists to protect.  The fix is one more model in
+    the config; this is how the operator learns that in one second.
+    """
+    needed = max_judge_prompt_tokens(cfg, judge_reply_tokens=judge_reply_tokens)
+    too_small_judge = undersized_families(cfg, "judge", needed)
+    too_small_tiebreak = undersized_families(cfg, "tiebreak", needed)
+    gaps: list[PoolGap] = []
+    seen: set[tuple[str, str]] = set()
+    for gen_ref in cfg.routing_refs("generator"):
+        _, gen_model = cfg.model_for(gen_ref)
+        gen_family = gen_model.family
+        if (gen_family, "seen") in seen:
+            continue
+        seen.add((gen_family, "seen"))
+        chosen: list[str] = []
+        blocked = False
+        for slot in ("a", "b"):
+            family = _first_family(
+                cfg, "judge", {gen_family, *chosen}, too_small_judge
+            )
+            if family is None:
+                gaps.append(
+                    PoolGap(
+                        role="judge",
+                        generator_family=gen_family,
+                        slot=slot,
+                        detail=(
+                            f"a {gen_family} generation of {needed} tokens has no judge "
+                            f"for slot {slot}: the judge pool is "
+                            f"{sorted({cfg.model_for(r)[1].family for r in cfg.routing_refs('judge')})}, "
+                            f"minus the generator's own {gen_family!r}, minus "
+                            f"{sorted(too_small_judge)} on context length, minus "
+                            f"{chosen} already used. Add one judge in a further family "
+                            f"with max_context >= {int(needed * CONTEXT_SAFETY_MARGIN)}"
+                        ),
+                        fatal=True,
+                    )
+                )
+                blocked = True
+                break
+            chosen.append(family)
+        if blocked:
+            continue
+        tiebreak = _first_family(
+            cfg, "tiebreak", {gen_family, *chosen}, too_small_tiebreak
+        )
+        if tiebreak is None:
+            gaps.append(
+                PoolGap(
+                    role="tiebreak",
+                    generator_family=gen_family,
+                    slot="tiebreak",
+                    detail=(
+                        f"a {gen_family} generation of {needed} tokens judged by "
+                        f"{chosen} has no third family left to break a tie; judge.py "
+                        f"decides on the two judges and rejects the unresolved "
+                        f"disagreement (run_event "
+                        f"tiebreak_unroutable_two_judge_decision)"
+                    ),
+                    fatal=False,
+                )
+            )
+    return gaps
 
 
 class Router:
@@ -862,8 +1150,9 @@ class Router:
           at every other provider and failing over would only hide the bug.
 
         ``params_for_ref``, when given, is called with the ref about to be
-        used and its ModelCfg, and its return value REPLACES ``params`` for
-        that attempt.  Failover is what makes this necessary: a parameter
+        used and its ModelCfg, and its return value is merged OVER ``params``
+        for that attempt (key by key - the rest of ``params`` still ships).
+        Failover is what makes this necessary: a parameter
         that is valid for the first ref (``reasoning_effort`` on a gpt-oss
         model) is an unknown field at the next one, and an unknown field is a
         400 - which this method classifies as OUR payload being broken and
@@ -884,11 +1173,14 @@ class Router:
             role, est_tokens=est_tokens, exclude_families=exclude_families, skipped=skipped
         ):
             attempted += 1
-            per_ref = (
-                dict(params_for_ref(routed.ref, routed.model_cfg))
-                if params_for_ref is not None
-                else dict(params or {})
-            )
+            # The hook OVERRIDES the call-wide params key by key; it does not
+            # replace the dict.  Dropping the whole of `params` when a hook is
+            # present is how a caller ends up believing it sent a temperature
+            # it never sent - the hook's job is per-model deviation, not
+            # re-stating everything the call already asked for.
+            per_ref = dict(params or {})
+            if params_for_ref is not None:
+                per_ref.update(params_for_ref(routed.ref, routed.model_cfg))
             req = ChatRequest(
                 messages=messages,
                 ref=routed.ref,
@@ -908,6 +1200,13 @@ class Router:
                     on_attempt=attempt_hook,
                 )
             except ProviderError as exc:
+                if exc.context_exceeded:
+                    # This model's window, not this provider's health and not
+                    # our payload: move to a larger ref and leave the breaker
+                    # alone, or a long row would cool a perfectly good
+                    # provider for everybody else.
+                    last_error = exc
+                    continue
                 if not exc.retryable and not exc.provider_dead:
                     raise
                 self.report_failure(routed.ref)
@@ -917,21 +1216,30 @@ class Router:
             return routed.ref, response
 
         if last_error is not None:
+            # If the LAST thing that happened was "too long for that window",
+            # the pass ran out of models rather than out of luck: the same
+            # prompt tomorrow gets the same answer, so this is not retryable
+            # and the caller must treat it as a fact about the row.
+            overflow = last_error.context_exceeded
             raise ProviderError(
                 f"role {role!r}: all {attempted} eligible model(s) failed; last: {last_error}",
                 status=last_error.status,
                 provider=last_error.provider,
                 model=last_error.model,
-                retryable=True,
+                retryable=not overflow,
+                context_exceeded=overflow,
             ) from last_error
         # Nothing was even tried.  Cooling and over-budget lift on their own,
         # so the caller may usefully come back; a missing key or a family
-        # exclusion will still be true in a minute, so it may not.
-        transient = sorted(skipped & _TRANSIENT_SKIPS)
+        # exclusion will still be true in a minute, so it may not.  The
+        # reasons ride along on the error: "no key set" and "this row fits
+        # nowhere" are both non-retryable and mean opposite things to a task.
+        transient = sorted(skipped & TRANSIENT_SKIPS)
         reasons = ", ".join(sorted(skipped)) if skipped else "role list is empty"
         raise ProviderError(
             f"role {role!r}: no eligible model (skipped: {reasons})",
             retryable=bool(transient),
+            skipped=frozenset(skipped),
         )
 
     async def aclose(self) -> None:

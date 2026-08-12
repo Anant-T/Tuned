@@ -518,6 +518,45 @@ def test_judgement_round_trip_and_replace(store):
     assert len(store.judgements_for(gen_id)) == 2
 
 
+def test_record_judgement_is_lease_fenced(store):
+    """Every task-STATE write is fenced; a judgement write must be too. A
+    worker that stalled past its lease has had its task legitimately
+    re-claimed, and the live holder may already have bought its own slot and
+    accepted the row - so the stale reply must not land on top of the scores
+    that decision was actually made on."""
+    _populate(store, n=1)
+    gen_id = store.record_generation(_gen_envelope("t0", 1, raw_path="a", raw_offset=0))
+    store.claim_tasks("worker-a", 1, stream="analysis")
+    assert store.record_judgement(
+        gen_id, "b", {"provider": "groq", "model": "m", "grounding": 5}, expect_worker="worker-a"
+    ) is True
+
+    # worker-a's lease expires and worker-b takes the task.
+    store.conn.execute("UPDATE task SET claimed_at = ?", (_ago(3600),))
+    store.claim_tasks("worker-b", 1, stream="analysis", state_from="generating", state_to="judging")
+    assert store.record_judgement(
+        gen_id, "b", {"provider": "groq", "model": "m", "grounding": 1}, expect_worker="worker-a"
+    ) is False
+    assert store.judgements_for(gen_id)[0]["grounding"] == 5  # untouched
+
+    # The live holder still writes, and an unfenced write is unchanged.
+    assert store.record_judgement(
+        gen_id, "b", {"provider": "groq", "model": "m", "grounding": 2}, expect_worker="worker-b"
+    ) is True
+    assert store.record_judgement(gen_id, "b", {"provider": "groq", "model": "m", "grounding": 3})
+    assert store.judgements_for(gen_id)[0]["grounding"] == 3
+
+
+def test_record_judgement_fence_refuses_an_unknown_generation(store):
+    _populate(store, n=1)
+    gen_id = store.record_generation(_gen_envelope("t0", 1, raw_path="a", raw_offset=0))
+    # Nobody holds the task at all: a fenced write has no lease to match.
+    assert store.record_judgement(
+        gen_id, "a", {"provider": "groq", "model": "m", "grounding": 4}, expect_worker="ghost"
+    ) is False
+    assert store.judgements_for(gen_id) == []
+
+
 # ------------------------------------------------------------------- 6. budget
 
 

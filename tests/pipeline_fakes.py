@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tuned.data.config import BuildConfig, ModelCfg, ModelRef, ProviderCfg, load_build_config
-from tuned.data.providers import ChatResponse, ProviderError
+from tuned.data.providers import TRANSIENT_SKIPS, ChatResponse, ProviderError
 from tuned.data.store import Store
 
 DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
@@ -149,26 +149,62 @@ class FakeRouter:
     family is not excluded, exactly as Router.eligible does, and raises
     ProviderError when nothing is left. That is what makes the family
     separation and context-routing assertions meaningful.
+
+    EVERY skip reason the real Router can report is modelled, not just
+    family exclusion: `missing_keys` (provider names with no key in the
+    environment), `cooling` and `over_budget` (ref strings, "provider/model").
+    The resulting ProviderError carries the same `skipped` set and the same
+    `retryable` classification the real Router computes, because "why was
+    nothing eligible" is what decides whether a worker re-queues the row or
+    parks it - and a double that only ever says "family-excluded" cannot
+    exercise that decision at all.
     """
 
-    def __init__(self, cfg: BuildConfig, script: dict | None = None):
+    def __init__(
+        self,
+        cfg: BuildConfig,
+        script: dict | None = None,
+        *,
+        missing_keys: set[str] | None = None,
+        cooling: set[str] | None = None,
+        over_budget: set[str] | None = None,
+    ):
         self.cfg = cfg
         self.script = {role: list(items) for role, items in (script or {}).items()}
+        self.missing_keys = set(missing_keys or ())
+        self.cooling = set(cooling or ())
+        self.over_budget = set(over_budget or ())
         self.calls: list[dict] = []
         self.closed = False
 
     # -- selection
 
-    def _eligible(self, role: str, exclude_families) -> Picked | None:
+    def _skip_reason(self, ref: ModelRef, model: ModelCfg, exclude_families) -> str | None:
+        """Same order the real Router.eligible checks in."""
+        label = f"{ref.provider}/{ref.model}"
+        if model.family in set(exclude_families or ()):
+            return "family-excluded"
+        if label in self.cooling:
+            return "cooling"
+        if ref.provider in self.missing_keys:
+            return "missing-key"
+        if label in self.over_budget:
+            return "over-budget"
+        return None
+
+    def _eligible(self, role: str, exclude_families, skipped: set | None = None) -> Picked | None:
         for ref in self.cfg.routing_refs(role):
             provider, model = self.cfg.model_for(ref)
-            if model.family in set(exclude_families or ()):
+            reason = self._skip_reason(ref, model, exclude_families)
+            if reason is not None:
+                if skipped is not None:
+                    skipped.add(reason)
                 continue
             return Picked(ref=ref, provider_cfg=provider, model_cfg=model)
         return None
 
     def pick(self, role, *, est_tokens=0, exclude_families=frozenset(), skipped=None):
-        return self._eligible(role, exclude_families)
+        return self._eligible(role, exclude_families, skipped)
 
     def _next(self, role: str):
         items = self.script.get(role)
@@ -188,7 +224,8 @@ class FakeRouter:
         exclude_families=frozenset(),
         on_attempt=None,
     ):
-        picked = self._eligible(role, exclude_families)
+        skipped: set[str] = set()
+        picked = self._eligible(role, exclude_families, skipped)
         # Same resolution order as the real Router: per-ref params win, and
         # they are resolved against the ref actually about to be called.
         sent = (
@@ -208,11 +245,15 @@ class FakeRouter:
             }
         )
         if picked is None:
-            # Structural: nothing in the pool can take this call. The real
-            # Router reports that as non-retryable when no skip reason was
-            # transient, which is what tells a worker to park.
+            # Nothing in the pool can take this call. The real Router reports
+            # WHY, and classifies the error retryable only when some reason
+            # lifts on its own - which is what tells a worker whether to park
+            # the row or hand it back to the queue.
+            reasons = ", ".join(sorted(skipped)) if skipped else "role list is empty"
             raise ProviderError(
-                f"role {role!r}: no eligible model (skipped: family-excluded)", retryable=False
+                f"role {role!r}: no eligible model (skipped: {reasons})",
+                retryable=bool(skipped & TRANSIENT_SKIPS),
+                skipped=frozenset(skipped),
             )
         item = self._next(role)
         if isinstance(item, BaseException):
@@ -272,6 +313,38 @@ def paths_for(tmp_path):
     from tuned.data.paths import build_paths
 
     return build_paths(tmp_path / "build").ensure()
+
+
+def cfg_with_fourth_judge_family(cfg: BuildConfig) -> BuildConfig:
+    """The shipped config plus the 32k+ fourth-family judge it is missing.
+
+    This is the operator-side half of the round-2 judge-pool fix, in the one
+    shape a test can hold: a large model in a family that is neither the
+    generator's nor either existing judge's, so slot B and the tiebreak have
+    somewhere to go on a long row. Used to prove that widening the pool is
+    what un-parks a row, rather than any weakening of family separation.
+    """
+    from dataclasses import replace
+
+    extra = ModelCfg(
+        id="fourth-judge",
+        family="fourth",
+        roles=("judge", "tiebreak"),
+        limits={"rpm": 30, "tpm": 8000, "max_context": 131072, "max_output": 8192},
+        params={"temperature": 0.2},
+    )
+    providers = tuple(
+        replace(p, models=p.models + (extra,)) if p.name == "groq" else p for p in cfg.providers
+    )
+    return replace(
+        cfg,
+        providers=providers,
+        routing=replace(
+            cfg.routing,
+            judge=cfg.routing.judge + ("groq/fourth-judge",),
+            tiebreak=cfg.routing.tiebreak + ("groq/fourth-judge",),
+        ),
+    )
 
 
 def temp_config(tmp_path) -> str:
