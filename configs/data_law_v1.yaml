@@ -85,9 +85,25 @@ providers:
 #
 # TODO(operator) WANTED, and the fleet REFUSES TO START without it: ONE more
 # judge model, in a FOURTH family - not mistral, not qwen, not gpt-oss - with
-# max_context >= 32768, added to BOTH routing.judge and routing.tiebreak
+# max_context >= 29661, added to BOTH routing.judge and routing.tiebreak
 # below. Config only, no code. providers.pool_gaps() names the gap at
 # startup and generate/judge exit 2 unless --allow-pool-gaps is passed.
+#
+# 29,661 is not a round number because it is not a preference: it is
+# required_context(worst-case judge call) and the preflight prints the same
+# number it enforces. In practice that means a 32k model. A 16k model is NOT
+# enough - and that is worth saying because most free-tier candidates are
+# 16k, and an under-sized judge does not fail loudly: the fleet starts, long
+# rows pass the length gate, judge A is paid for, and the row parks.
+#
+# Where the number comes from. The length gate passes a row whose prompt +
+# trace + answer is at most 8192 chars/4 tokens, i.e. 32,768 characters, and
+# the judge is shown a subset of that plus its own rubric. Sized in the
+# ROUTING currency (providers.context_estimate: per-turn template overhead,
+# and Indic script at 1.5 chars/token rather than 4) the largest judge call
+# this build can produce is 23,729 tokens, and CONTEXT_SAFETY_MARGIN turns
+# that into 29,661 of declared window. Devanagari is what makes it large,
+# and this corpus is largely Devanagari.
 #
 # Why the JUDGE pool needs it (the fatal half). A long prompt is routed past
 # the 8k cerebras generator to mistral/magistral (40k). Family separation
@@ -95,10 +111,14 @@ providers:
 # context length; slot A takes groq/qwen; and slot B has NOTHING LEFT. The
 # row parks in judge_unroutable having ALREADY PAID for judge A. The
 # arithmetic makes this the rule and not an edge case: the generator diverts
-# above ~4.2k prompt tokens and slot B dies above ~7.2k judge-prompt tokens,
-# which grounding plus a trace near think_max (3000) clears routinely.
-# Recovery today is `python -m tuned.data.tasks --reopen judge_unroutable`
-# AFTER the fourth family is added; the re-opened row re-pays only slot B.
+# to magistral at 2,555 routing tokens of prompt, and slot B dies at 5,531
+# routing tokens of judge prompt - which grounding plus a trace near
+# think_max (3000) clears routinely.
+#
+# Recovery once the model lands: `python -m tuned.data.tasks --reopen
+# judge_unroutable` (every stream by default; --reopen-stream narrows it).
+# A re-opened row re-pays only the slot it never bought, and comes back with
+# its attempt budget restored.
 #
 # Why the TIEBREAK pool needs it (the survivable half). The tiebreak pool is
 # gpt-oss (131k) plus two 8k models, so a long candidate produced by the

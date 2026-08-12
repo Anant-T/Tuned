@@ -270,7 +270,13 @@ def test_cli_refuses_to_demote_under_a_live_fleet(tmp_path, paths, cfg, index_pa
     # the per-row re-check too - otherwise the flag would run the whole sweep
     # and quietly demote nothing.
     assert verify_main(["--config", config_path, "--index", index_path, "--force"]) == 0
-    assert "demoted" in capsys.readouterr().out
+    # `"demoted" in out` matched the printed LABEL and passed at zero
+    # demotions, which is how the round-2 review found this test vacuous. The
+    # state below is the load-bearing assertion; the count is asserted as a
+    # NUMBER so the label can never stand in for it again.
+    out = capsys.readouterr().out
+    demoted = next(ln for ln in out.splitlines() if ln.startswith("demoted"))
+    assert demoted.split()[1] == "1"
     with Store.open(paths.state_db) as reopened:
         assert reopened.conn.execute("SELECT state FROM task").fetchone()[0] == "rejected"
 

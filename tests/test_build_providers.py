@@ -1653,6 +1653,61 @@ def test_pool_gaps_applies_the_routers_own_key_filter(cfg, monkeypatch):
     assert [g for g in pool_gaps(cfg, needed_tokens=4000) if g.fatal] == []
 
 
+def test_a_key_removed_mid_flight_is_still_a_missing_key(monkeypatch):
+    """The Router checked the key and the client found it gone - a narrow
+    race, but its error carried no `skipped` at all, so the worker read it as
+    a provider failure and burnt the row's attempts into `rejected`."""
+    _unset(monkeypatch, "TUNED_TEST_KEY")
+
+    def handler(request):  # pragma: no cover - the call never leaves
+        return httpx.Response(200, json=_body())
+
+    with pytest.raises(ProviderError) as excinfo:
+        _complete(_client(handler), _request())
+    assert excinfo.value.skipped == frozenset({"missing-key"})
+
+
+def test_an_empty_role_list_is_named_rather_than_silent(cfg, keys):
+    """Nothing was tried and nothing was SKIPPED, so the error carried an
+    empty reason set and the worker could not tell it from a provider that
+    refused it - the row burnt three attempts into `rejected` instead of
+    parking where --reopen can reach it."""
+    from dataclasses import replace
+
+    patched = replace(cfg, routing=replace(cfg.routing, judge=()))
+    with pytest.raises(ProviderError) as excinfo:
+        asyncio.run(_router(patched).complete("judge", [{"role": "user", "content": "hi"}]))
+    assert excinfo.value.skipped == frozenset({"empty-role-list"})
+    assert excinfo.value.retryable is False
+
+
+def _divert_point(cfg, role: str, family: str, reply_tokens: int) -> int:
+    """The prompt size at which `family` stops being routable for `role`."""
+    size = 1
+    while family not in undersized_families(cfg, role, size + reply_tokens):
+        size += 1
+    return size
+
+
+def test_the_config_todo_quotes_the_numbers_the_code_enforces(cfg):
+    """That block is the operator's spec for choosing the fourth-family judge,
+    and its arithmetic was pre-margin and ~40% high (it said ~4.2k where the
+    real divert point is 2555, and ~7.2k where slot B really dies at 5531)
+    while pool_gaps printed a third number. All three now come from here."""
+    text = DATA_CONFIG.read_text(encoding="utf-8")
+    required = required_context(worst_case_judge_tokens(cfg))
+    assert f"max_context >= {required}" in text
+    assert f"{required:,}" in text
+    # ...and the two thresholds the block explains the gap with.
+    from tuned.data.generate import max_output_tokens
+
+    assert f"{_divert_point(cfg, 'generator', 'gpt-oss', max_output_tokens(cfg)):,}" in text
+    assert f"{_divert_point(cfg, 'judge', 'glm', DEFAULT_JUDGE_REPLY_TOKENS):,}" in text
+    # The advice a 16k candidate would fail is stated, because most free-tier
+    # candidates are 16k.
+    assert "16k" in text
+
+
 def test_eligible_refs_is_the_filter_eligible_itself_uses(cfg, keys):
     """The preflight walks refs and the spender walks clients, but there is
     one filter: `eligible` is `eligible_refs` plus client construction. A

@@ -18,6 +18,7 @@ from pipeline_fakes import (
 
 from tuned.data.generate import run_workers
 from tuned.data.jsonl import read_at
+from tuned.data.providers import ProviderError
 from tuned.data.judge import (
     BORDERLINE,
     FAIL,
@@ -29,6 +30,7 @@ from tuned.data.judge import (
     JudgeScores,
     JudgeStats,
     SlotOutcome,
+    _outcome_from_row,
     decide,
     failing_rationale,
     generation_family,
@@ -899,6 +901,10 @@ def test_the_judge_logs_a_lost_lease(tmp_path, cfg, paths):
         assert store.judgements_for(gen["gen_id"]) == []
         lost = json.loads(store.events("lost_lease")[0]["detail_json"])
         assert lost["worker"] == "stale-worker"
+        # Site 1 by name: the check at the TOP of judge_task. Without it the
+        # per-slot check catches the same worker one window later, which is a
+        # different (and dearer) fact, so the site has to be pinned.
+        assert lost["wanted_state"] == "judge"
 
 
 def test_a_stale_workers_judgement_cannot_overwrite_the_live_decision(tmp_path, cfg, paths):
@@ -973,6 +979,363 @@ def test_a_lost_lease_stops_the_decision_being_logged_twice(tmp_path, cfg, paths
         assert stats.decided == 0
         assert stats.accepted == 0
         assert only_task(store)["state"] == JUDGE_STATE_TO
+
+
+# --------------------------------------------------------------------------
+# The C4 fence, per site. Deleting any ONE of the four checks used to leave
+# the suite green: `test_a_stale_workers_judgement_cannot_overwrite_the_live
+# _decision` calls store.record_judgement directly and never drives
+# judge_slot, so what the suite pinned was "some check exists somewhere".
+# Each test below steals the lease in ONE window and names the site that has
+# to catch it.
+# --------------------------------------------------------------------------
+
+class StealsTheLease:
+    """Store proxy that hands the task to another worker at a chosen call.
+
+    Everything else is delegated untouched, so the pass under test runs
+    against the real store: the point is WHEN the lease moves, not what the
+    store does about it.
+    """
+
+    def __init__(self, store, at: str, thief: str = "thief-worker", when=None):
+        self._store = store
+        self._at = at
+        self._thief = thief
+        self._when = when
+        self.stolen = False
+
+    def __getattr__(self, name):
+        attr = getattr(self._store, name)
+        if name != self._at or self.stolen:
+            return attr
+
+        def steal(*args, **kwargs):
+            if self._when is None or self._when(*args, **kwargs):
+                self.stolen = True
+                self._store.conn.execute("UPDATE task SET claimed_by = ?", (self._thief,))
+            return attr(*args, **kwargs)
+
+        return steal
+
+
+def _claimed(store, worker="worker-a"):
+    return store.claim_tasks(worker, 1, state_from=JUDGE_STATE_FROM, state_to=JUDGE_STATE_TO)[0]
+
+
+def _lost_lease_event(store):
+    return json.loads(store.events("lost_lease")[-1]["detail_json"])
+
+
+def test_a_lease_lost_mid_call_costs_the_judgement_not_the_row(tmp_path, cfg, paths):
+    """The lease moves while judge A's reply is in flight - the one window
+    holds_lease cannot close. The reply is durable in the raw log, but the
+    judgement row belongs to the live holder's pass, so the fenced write must
+    refuse it and this pass must end without deciding."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = _claimed(store)
+        gen = store.latest_generation(task["task_id"])
+
+        def steal_then_answer(ref, messages):
+            store.conn.execute("UPDATE task SET claimed_by = 'thief-worker'")
+            return judge_reply(5, 5, 5, "scored for somebody else")
+
+        router = FakeRouter(cfg, {"judge": [steal_then_answer]})
+        stats = JudgeStats()
+        ended = asyncio.run(
+            judge_task(store, cfg, router, task, paths=paths, worker_id="worker-a", stats=stats)
+        )
+
+        assert ended == "lost-lease"
+        assert store.judgements_for(gen["gen_id"]) == []
+        # Exactly one paid call: the fence stops the pass, it does not let it
+        # run on and buy slot b as well.
+        assert len(router.calls_for("judge")) == 1
+        assert store.events("judge_decision") == []
+        assert _lost_lease_event(store)["wanted_state"] == "judgement:a"
+        assert stats.lost_leases == 1
+        # ...and the scores are still on disk, under the slot they were for.
+        raw = str(next((paths.root / "raw" / "judge").rglob("judge.ndjson")))
+        assert "scored for somebody else" in open(raw, encoding="utf-8").read()
+
+
+def test_the_lease_is_checked_before_the_first_slot_is_bought(tmp_path, cfg, paths):
+    """Site 2: the per-slot check. The lease is live when judge_task starts
+    and gone by the time the slot loop reaches it, so only the check inside
+    the loop can stop this - and stopping it is the difference between a
+    wasted call and no call."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = _claimed(store)
+        proxy = StealsTheLease(store, at="judgements_for")
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
+        stats = JudgeStats()
+
+        ended = asyncio.run(
+            judge_task(proxy, cfg, router, task, paths=paths, worker_id="worker-a", stats=stats)
+        )
+
+        assert (ended, proxy.stolen) == ("lost-lease", True)
+        assert router.calls == []
+        assert _lost_lease_event(store)["wanted_state"] == "judge-slot-a"
+        assert stats.lost_leases == 1
+
+
+def test_the_lease_is_checked_before_the_tiebreak_is_bought(tmp_path, cfg, paths):
+    """Site 3: the tiebreak check. Both judge slots are reused from the table,
+    so the per-slot check never runs at all and the tiebreak is the first
+    thing this pass would spend money on."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = _claimed(store)
+        gen = store.latest_generation(task["task_id"])
+        for slot, provider, model, score in (
+            ("a", "mistral", "mistral-small-latest", 5),
+            ("b", "groq", "qwen/qwen3.6-27b", 1),
+        ):
+            store.record_judgement(
+                gen["gen_id"], slot,
+                {"provider": provider, "model": model, "grounding": score,
+                 "validity": score, "coverage": score, "rationale": "recorded"},
+            )
+        proxy = StealsTheLease(store, at="judgements_for")
+        router = FakeRouter(cfg, {"tiebreak": [judge_reply(5, 5, 5)]})
+        stats = JudgeStats()
+
+        ended = asyncio.run(
+            judge_task(proxy, cfg, router, task, paths=paths, worker_id="worker-a", stats=stats)
+        )
+
+        assert (ended, proxy.stolen) == ("lost-lease", True)
+        assert router.calls == []  # one pass/one fail is a tiebreak, and it was not bought
+        assert _lost_lease_event(store)["wanted_state"] == "judge-tiebreak"
+        assert stats.lost_leases == 1
+
+
+def test_a_lease_lost_after_the_decision_is_logged_is_not_counted(tmp_path, cfg, paths):
+    """Site 4b: the accept write itself. The decision check passed, so the
+    event is logged - and then the fence refuses the state write. What must
+    NOT happen is the batch line reporting a decision this worker did not
+    make: the counters follow the write, never the intention."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = _claimed(store)
+        gen = store.latest_generation(task["task_id"])
+        for slot, provider, model in (
+            ("a", "mistral", "mistral-small-latest"),
+            ("b", "groq", "qwen/qwen3.6-27b"),
+        ):
+            store.record_judgement(
+                gen["gen_id"], slot,
+                {"provider": provider, "model": model, "grounding": 5, "validity": 5,
+                 "coverage": 5, "rationale": "fine"},
+            )
+        # The reviewer's window, exactly: the re-claim lands INSIDE log_event,
+        # which is after the decision fence and before the state write. No
+        # holds_lease check can close it - only the fence on the write itself.
+        proxy = StealsTheLease(
+            store, at="log_event", when=lambda kind, *a, **k: kind == "judge_decision"
+        )
+        stats = JudgeStats()
+
+        ended = asyncio.run(
+            judge_task(proxy, cfg, FakeRouter(cfg), task, paths=paths,
+                       worker_id="worker-a", stats=stats)
+        )
+
+        assert (ended, proxy.stolen) == ("lost-lease", True)
+        assert only_task(store)["state"] == JUDGE_STATE_TO
+        assert only_task(store)["claimed_by"] == "thief-worker"
+        # The event is there (it was logged before the fence refused) - the
+        # COUNTERS are what must not claim it.
+        assert len(store.events("judge_decision")) == 1
+        assert (stats.decided, stats.accepted, stats.lost_leases) == (0, 0, 1)
+        assert stats.outcomes == {}
+
+
+def test_the_parse_retry_re_checks_the_lease_before_paying_again(tmp_path, cfg, paths):
+    """An unparsable reply buys one more call. That call is a purchase like
+    any other and gets the same check: the fenced write makes a stale
+    worker's SCORES harmless but cannot make its CALLS free."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = _claimed(store)
+
+        def garble_and_steal(ref, messages):
+            store.conn.execute("UPDATE task SET claimed_by = 'thief-worker'")
+            return chat_response("I will not grade this.", None)
+
+        router = FakeRouter(cfg, {"judge": [garble_and_steal, judge_reply(5, 5, 5)]})
+        stats = JudgeStats()
+        ended = asyncio.run(
+            judge_task(store, cfg, router, task, paths=paths, worker_id="worker-a", stats=stats)
+        )
+
+        assert ended == "lost-lease"
+        assert len(router.calls_for("judge")) == 1
+        assert _lost_lease_event(store)["wanted_state"] == "judge-retry:a"
+        assert stats.lost_leases == 1
+
+
+def test_the_lease_is_checked_before_the_decision_is_logged(tmp_path, cfg, paths):
+    """Site 4a. Both slots are reused, so nothing is bought and the per-slot
+    check never runs; the pass would otherwise log a second judge_decision for
+    a row somebody else already decided. The existing lost-lease test cannot
+    reach this site - it starts with the lease already gone, so the check at
+    the top of judge_task returns first."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = _claimed(store)
+        gen = store.latest_generation(task["task_id"])
+        for slot, provider, model in (
+            ("a", "mistral", "mistral-small-latest"),
+            ("b", "groq", "qwen/qwen3.6-27b"),
+        ):
+            store.record_judgement(
+                gen["gen_id"], slot,
+                {"provider": provider, "model": model, "grounding": 5, "validity": 5,
+                 "coverage": 5, "rationale": "fine"},
+            )
+        proxy = StealsTheLease(store, at="judgements_for")
+        stats = JudgeStats()
+
+        ended = asyncio.run(
+            judge_task(proxy, cfg, FakeRouter(cfg), task, paths=paths,
+                       worker_id="worker-a", stats=stats)
+        )
+
+        assert (ended, proxy.stolen) == ("lost-lease", True)
+        assert store.events("judge_decision") == []
+        assert _lost_lease_event(store)["wanted_state"] == "judge-decision"
+        assert (stats.decided, stats.accepted, stats.lost_leases) == (0, 0, 1)
+
+
+def test_a_park_the_fence_refused_is_neither_written_nor_counted(tmp_path, cfg, paths):
+    """_park's fence-rejected branch. The judge test rewrite left it
+    unreached on this side: a stale worker must not park a row the live
+    holder is working on, and must not report a park it did not make."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = _claimed(store)
+        gen = store.latest_generation(task["task_id"])
+        store.conn.execute("UPDATE generation SET think = '' WHERE gen_id = ?", (gen["gen_id"],))
+        # The lease moves between the top-of-pass check and the empty-think park.
+        proxy = StealsTheLease(store, at="latest_generation")
+        stats = JudgeStats()
+
+        ended = asyncio.run(
+            judge_task(proxy, cfg, FakeRouter(cfg), task, paths=paths,
+                       worker_id="worker-a", stats=stats)
+        )
+
+        assert (ended, proxy.stolen) == ("lost-lease", True)
+        assert only_task(store)["state"] == JUDGE_STATE_TO  # not judge_skipped
+        assert (stats.skipped, stats.lost_leases) == (0, 1)
+
+
+def test_a_recorded_slot_with_no_resolvable_ref_is_never_reused(cfg):
+    """The three ways a recorded judgement cannot stand in for a call, at the
+    unit. The ref cases collapse into one: an absent ref makes an empty
+    ModelRef, which no config resolves."""
+    live = {"provider": "mistral", "model": "mistral-small-latest",
+            "grounding": 5, "validity": 4, "coverage": 4, "rationale": "ok"}
+    assert _outcome_from_row(cfg, "a", live).family == "mistral"
+    assert _outcome_from_row(cfg, "a", {**live, "coverage": None}) is None
+    assert _outcome_from_row(cfg, "a", {**live, "model": "retired-model"}) is None
+    assert _outcome_from_row(cfg, "a", {k: v for k, v in live.items()
+                                        if k not in ("provider", "model")}) is None
+
+
+def test_a_judgement_row_that_lost_its_model_is_re_bought(tmp_path, cfg, paths):
+    """_outcome_from_row returns None when the recorded ref cannot be resolved
+    to a family - including when the row carries no ref at all. Reusing it
+    would free slot B to be the same family as slot A, which is the invariant
+    the separation exists for."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = only_task(store)
+        gen = store.latest_generation(task["task_id"])
+        store.record_judgement(
+            gen["gen_id"], "a",
+            {"grounding": 5, "validity": 5, "coverage": 5, "rationale": "no ref recorded"},
+        )
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
+        run_judge(store, cfg, router, paths)
+
+        assert store.events("judge_slot_unresolved")
+        assert store.events("judge_slot_reused") == []
+        # Slot a was bought again, so both slots cost a call this pass.
+        assert len(router.calls_for("judge")) == 2
+        assert only_task(store)["state"] == "accepted"
+
+
+def test_a_payload_400_at_the_judge_costs_one_call_not_eight(tmp_path, cfg, paths):
+    """Retiring `permanent` raised the judge's bound on a payload 400 from one
+    paid call to eight: a plain 400 is unroutable=False, so the task
+    re-queued and slot A was re-bought on every claim up to
+    MAX_JUDGE_ATTEMPTS. For a systemic payload bug that is eight times the
+    wave in paid judge calls before anything parks."""
+    payload_400 = ProviderError(
+        "mistral/mistral-small-latest: HTTP 400 (bad request, aborting the call): "
+        '{"error": "unknown parameter"}',
+        status=400, provider="mistral", model="mistral-small-latest", retryable=False,
+    )
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(cfg, {"judge": [payload_400]})
+        totals = None
+        for _ in range(MAX_JUDGE_ATTEMPTS):
+            totals = totals or run_judge(store, cfg, router, paths)
+            run_judge(store, cfg, router, paths)
+
+        assert len(router.calls_for("judge")) == 1
+        assert totals["judge_errors"] == 1
+        task = only_task(store)
+        assert task["state"] == "judge_error"
+        assert task["disposition"].startswith("judge-a-payload:")
+        # ...and it is a park, so --reopen brings it back once the bug is fixed.
+        assert reopen_tasks(store, ["judge_error"]) == {"judge_error": 1}
+
+
+def test_a_transient_judge_failure_still_spends_its_claims(tmp_path, cfg, paths):
+    """The narrower bound is for the no-progress payload case only: a 429 is
+    the ordinary weather of a free tier and must still be retried."""
+    transient = ProviderError(
+        "role 'judge': all 3 eligible model(s) failed; last: 429",
+        status=429, provider="mistral", model="mistral-small-latest", retryable=True,
+    )
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(cfg, {"judge": [transient]})
+        for _ in range(3):
+            run_judge(store, cfg, router, paths)
+        assert len(router.calls_for("judge")) == 3
+        assert only_task(store)["state"] == JUDGE_STATE_FROM
+
+
+def test_a_reopened_judge_row_gets_its_attempt_budget_back(tmp_path, cfg, paths):
+    """R3-C1 on the judge side: the same cliff at MAX_JUDGE_ATTEMPTS. A
+    re-opened row that spends its one remaining claim on a paid retry and then
+    re-parks has not been recovered, it has been charged."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task_id = only_task(store)["task_id"]
+        store.conn.execute(
+            "UPDATE task SET attempts = ? WHERE task_id = ?", (MAX_JUDGE_ATTEMPTS, task_id)
+        )
+        garbled = {"judge": [chat_response("I will not grade this.", None)]}
+        run_judge(store, cfg, FakeRouter(cfg, garbled), paths)
+        assert only_task(store)["state"] == "judge_error"
+
+        reopen_tasks(store, ["judge_error"])
+        assert only_task(store)["attempts"] == 0
+
+        run_judge(store, cfg, FakeRouter(cfg, garbled), paths)
+        task = only_task(store)
+        assert task["state"] == JUDGE_STATE_FROM
+        assert task["attempts"] == 1
+
+
+def test_a_parked_judge_error_appears_in_the_batch_line(tmp_path, cfg, paths, capsys):
+    """_park(counter=None) meant judge_error parks were in no column at all:
+    the batch line said claimed=1 and then accounted for nothing."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        store.conn.execute("UPDATE task SET attempts = ?", (MAX_JUDGE_ATTEMPTS,))
+        run_judge(store, cfg, FakeRouter(cfg, {"judge": [chat_response("no.", None)]}), paths)
+        line = next(
+            ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("judge batch")
+        )
+        assert "judge-err=1" in line
 
 
 def test_idle_judge_batches_are_announced_once(tmp_path, cfg, paths, capsys):

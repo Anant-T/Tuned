@@ -250,6 +250,13 @@ class GenResult:
     # close the task, because the key can land at any moment.
     no_eligible_model: bool = False
     route_skips: tuple[str, ...] = ()
+    # Something WAS tried and the fault was the provider's: a 5xx, a 403, a
+    # revoked key, a 429 storm the client could not ride out. Nothing about
+    # this row was tested, so exhausting on it must not spell `rejected` -
+    # which is read as "this example is wrong about the law". The payload
+    # class (a 400 with no context marker) is deliberately NOT this: that one
+    # is our bug and hiding it in a parking state hides it entirely.
+    provider_fault: bool = False
 
 
 @dataclass
@@ -258,6 +265,7 @@ class BatchStats:
     gen_ok: int = 0
     gated_out: int = 0
     errors: int = 0
+    lost_leases: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
     dispositions: dict = field(default_factory=dict)
@@ -266,9 +274,21 @@ class BatchStats:
     def tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
-    def absorb(self, result: "GenResult") -> None:
+    def absorb(self, result: "GenResult", *, landed: bool = True) -> None:
+        """Fold one result into the batch. `landed` is whether its state write
+        took effect.
+
+        The counters follow the WRITE, not the intention - the same rule
+        judge.py's decision counters follow. A worker that stalled past its
+        lease still spent the tokens (so those are always counted) but the
+        disposition it computed belongs to nobody: reporting it makes a batch
+        that lost every lease read as a batch of clean generations.
+        """
         self.prompt_tokens += result.prompt_tokens
         self.completion_tokens += result.completion_tokens
+        if not landed:
+            self.lost_leases += 1
+            return
         if result.error is not None or result.skipped is not None:
             self.errors += 1
             return
@@ -445,8 +465,10 @@ def print_preflight(cfg, roles: Sequence[str], *, allow_pool_gaps: bool = False,
     if refusals:
         print(
             "not starting: fix the above, or pass --allow-pool-gaps to run "
-            "anyway where the gap is a pool gap (a missing key is never "
-            "overridable)"
+            "anyway where the gap is a POOL gap - including one an API key "
+            "would open, since running short rows while a key is pending is a "
+            "real choice. A role with no usable key at all is never "
+            "overridable: those calls cannot be made."
         )
     return not refusals
 
@@ -961,6 +983,10 @@ async def generate_once(
         result.unroutable = bool(exc.context_exceeded) or (
             bool(skips) and skips <= ROW_SHAPED_SKIPS
         )
+        # A provider answered (or refused to answer) and the fault was on its
+        # side. Only meaningful when something was actually TRIED - with a
+        # skip set, nothing was, and no_eligible_model already carries that.
+        result.provider_fault = not skips and bool(exc.retryable or exc.provider_dead)
         store.log_event(
             "generation_error",
             {
@@ -969,6 +995,7 @@ async def generate_once(
                 "status": exc.status,
                 "retryable": exc.retryable,
                 "unroutable": result.unroutable,
+                "provider_fault": result.provider_fault,
                 "skipped": list(result.route_skips),
                 "context_exceeded": bool(exc.context_exceeded),
                 "est_tokens": est_tokens,
@@ -1088,7 +1115,17 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
                 GEN_UNROUTABLE_STATE,
                 "exhausted:unroutable:" + ",".join(result.route_skips),
             )
+        elif exhausted and result.provider_fault:
+            # Something was tried and the PROVIDER failed - an outage, a
+            # revoked key, a 403, a 429 storm. Same argument as above: the
+            # answer was never produced, let alone found wanting, so this is
+            # not a reject. It is also the one fleet-wide failure that leaves
+            # a wave looking individually rejected, row by row.
+            state, disposition = GEN_UNROUTABLE_STATE, "exhausted:provider-fault"
         elif exhausted:
+            # What is left is the payload class: a 400/413/422 with no context
+            # marker, i.e. our bug. It stays in `rejected` - parking it would
+            # file a code defect under "the pool was short".
             state, disposition = REJECTED_STATE, "exhausted:error"
         else:
             state, disposition = PENDING_STATE, None
@@ -1144,6 +1181,7 @@ def format_batch_line(batch_ix: int, stats: BatchStats, budget: Sequence[str]) -
     return (
         f"batch {batch_ix}: claimed={stats.claimed} gen-ok={stats.gen_ok} "
         f"gated-out={stats.gated_out} err={stats.errors} "
+        f"lost-lease={stats.lost_leases} "
         f"tokens={stats.tokens} [{dispositions}] | " + " | ".join(budget)
     )
 
@@ -1218,13 +1256,16 @@ async def run_workers(
                     )
                     stats.errors += 1
                     continue
-                apply_gate_disposition(store, task, result, worker_id=worker_id)
-                stats.absorb(result)
+                landed = apply_gate_disposition(
+                    store, task, result, worker_id=worker_id
+                ) != "lost-lease"
+                stats.absorb(result, landed=landed)
         batches += 1
         totals.claimed += stats.claimed
         totals.gen_ok += stats.gen_ok
         totals.gated_out += stats.gated_out
         totals.errors += stats.errors
+        totals.lost_leases += stats.lost_leases
         totals.prompt_tokens += stats.prompt_tokens
         totals.completion_tokens += stats.completion_tokens
         for key, count in stats.dispositions.items():
@@ -1246,6 +1287,7 @@ async def run_workers(
         "gen_ok": totals.gen_ok,
         "gated_out": totals.gated_out,
         "errors": totals.errors,
+        "lost_leases": totals.lost_leases,
         "prompt_tokens": totals.prompt_tokens,
         "completion_tokens": totals.completion_tokens,
         "dispositions": dict(totals.dispositions),

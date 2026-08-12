@@ -226,13 +226,14 @@ class FakeRouter:
     ):
         skipped: set[str] = set()
         picked = self._eligible(role, exclude_families, skipped)
-        # Same resolution order as the real Router: per-ref params win, and
-        # they are resolved against the ref actually about to be called.
-        sent = (
-            dict(params_for_ref(picked.ref, picked.model_cfg))
-            if params_for_ref is not None and picked is not None
-            else dict(params or {})
-        )
+        # Same resolution order as the real Router: the per-ref hook is MERGED
+        # over the call-wide params key by key, resolved against the ref
+        # actually about to be called. It does not replace them - a double
+        # that drops `params` whenever a hook is present disagrees with the
+        # real Router about the thing the hook exists to do.
+        sent = dict(params or {})
+        if params_for_ref is not None and picked is not None:
+            sent.update(params_for_ref(picked.ref, picked.model_cfg))
         self.calls.append(
             {
                 "role": role,

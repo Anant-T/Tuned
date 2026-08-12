@@ -27,6 +27,7 @@ from tuned.data.generate import (
     GENERATOR_PREFLIGHT_ROLES,
     MAX_ATTEMPTS,
     QUESTION_BY_TASK_TYPE,
+    BatchStats,
     GenResult,
     SlotError,
     append_reviewer_note,
@@ -416,14 +417,61 @@ def test_provider_failure_returns_the_task_to_the_queue(tmp_path, cfg, paths):
         assert store.events("generation_error")
 
 
+def test_a_fleet_wide_provider_fault_parks_instead_of_rejecting(tmp_path, cfg, paths):
+    """A rotated key, a 403, a 5xx outage or a 429 storm the client cannot
+    ride out arrives as retryable=True with an EMPTY skip set, so neither
+    `unroutable` nor `no_eligible_model` fires and three claims used to land
+    the row in `rejected` - terminal, not re-openable, and counted as a
+    legal-quality reject. Nothing about the answer was ever tested."""
+    outage = ProviderError(
+        "role 'generator': all 2 eligible model(s) failed; last: 503",
+        status=503, provider="cerebras", model="gpt-oss-120b", retryable=True,
+    )
+    with make_store(tmp_path) as store:
+        for _ in range(MAX_ATTEMPTS):
+            run(store, cfg, FakeRouter(cfg, {"generator": [outage]}), paths)
+        task = only_task(store)
+        assert task["state"] == GEN_UNROUTABLE_STATE
+        assert task["disposition"] == "exhausted:provider-fault"
+        assert reopen_tasks(store, [GEN_UNROUTABLE_STATE]) == {GEN_UNROUTABLE_STATE: 1}
+
+
 def test_provider_failure_at_the_cap_rejects(tmp_path, cfg, paths):
-    error = ProviderError("dead", status=500, provider="cerebras", model="gpt-oss-120b",
-                          retryable=True)
+    """The payload class keeps the old ending, and it has to: a 400 with no
+    context marker is OUR bug, it is not recoverable by re-opening the row,
+    and burying it in a parking state would hide it behind a number the
+    operator reads as "the pool was short"."""
+    error = ProviderError("bad payload", status=400, provider="cerebras",
+                          model="gpt-oss-120b", retryable=False)
     with make_store(tmp_path) as store:
         for _ in range(MAX_ATTEMPTS):
             run(store, cfg, FakeRouter(cfg, {"generator": [error]}), paths)
         assert only_task(store)["disposition"] == "exhausted:error"
         assert only_task(store)["state"] == "rejected"
+
+
+def test_a_disposition_the_fence_refused_is_not_counted_as_one(tmp_path, cfg, paths):
+    """run_workers absorbed a result's disposition whether or not the write
+    landed - the generator twin of the judge's counter bug. A batch that lost
+    every lease reported a full batch of clean generations."""
+    with make_store(tmp_path) as store:
+        task = store.claim_tasks("stale-worker", 1)[0]
+        result = asyncio.run(
+            generate_once(store, cfg, FakeRouter(cfg), task, paths=paths)
+        )
+        assert result.ok
+        store.set_task_state(task["task_id"], "pending")
+        store.claim_tasks("live-worker", 1)
+
+        stats = BatchStats()
+        assert apply_gate_disposition(
+            store, task, result, worker_id="stale-worker"
+        ) == "lost-lease"
+        stats.absorb(result, landed=False)
+        assert stats.lost_leases == 1
+        assert stats.gen_ok == 0
+        # The tokens were still spent, so they are still counted.
+        assert stats.tokens == result.prompt_tokens + result.completion_tokens
 
 
 def test_a_missing_seed_is_skipped_without_spending(tmp_path, cfg, paths):
@@ -502,7 +550,9 @@ def test_status_line_reports_the_batch_and_the_budget(tmp_path, cfg, paths, caps
     with make_store(tmp_path) as store:
         run(store, cfg, FakeRouter(cfg), paths)
         line = capsys.readouterr().out.strip().splitlines()[-1]
-        assert line.startswith("batch 1: claimed=1 gen-ok=1 gated-out=0 err=0 tokens=1700")
+        assert line.startswith(
+            "batch 1: claimed=1 gen-ok=1 gated-out=0 err=0 lost-lease=0 tokens=1700"
+        )
         assert "cerebras/gpt-oss-120b spent=1.7k" in line
 
 

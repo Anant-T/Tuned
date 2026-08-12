@@ -232,6 +232,12 @@ class SlotOutcome:
     unroutable: bool = False
     # Why the Router had nothing to try, when it had nothing to try.
     route_skips: tuple[str, ...] = ()
+    # A provider ANSWERED and refused the payload (a 400/413/422 with no
+    # context marker). Distinct from `unroutable`: something was tried, and
+    # the identical request will be refused identically on the next claim, so
+    # re-queueing buys the same call again. Never earned from `not retryable`
+    # - a missing key is not retryable either.
+    payload_error: bool = False
     # The judgement write was fenced out: this worker no longer holds the
     # task's lease, so the scores it just paid for belong to nobody and the
     # whole task must be abandoned rather than decided on.
@@ -253,6 +259,11 @@ class JudgeStats:
     # burying it in the same number hides the one that costs money.
     unroutable: int = 0
     skipped: int = 0
+    # Rows parked in judge_error - a slot that kept failing, or a payload a
+    # provider refuses. Its own column because `_park(counter=None)` put these
+    # in none at all: the batch line reported the claim and then accounted for
+    # nothing, which reads as a worker doing nothing rather than a row parking.
+    judge_errors: int = 0
     lost_leases: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -542,6 +553,21 @@ async def judge_slot(
     exclude = frozenset(exclude_families) | undersized_families(cfg, role, needed)
 
     for attempt in (1, 2):
+        # The retry is a SECOND paid call, so it gets the same check every
+        # other purchase gets. The write below is fenced either way; what
+        # this saves is the call, which the fence cannot refund.
+        if attempt > 1 and not holds_lease(store, task["task_id"], worker_id):
+            outcome.lost_lease = True
+            outcome.error = "lost-lease"
+            store.log_event(
+                "lost_lease",
+                {
+                    "task_id": task["task_id"],
+                    "worker": worker_id,
+                    "wanted_state": f"judge-retry:{slot}",
+                },
+            )
+            return outcome
         outcome.attempts = attempt
         try:
             ref, response = await router.complete(
@@ -570,6 +596,19 @@ async def judge_slot(
             outcome.unroutable = bool(exc.context_exceeded) or (
                 bool(skips) and skips <= ROW_SHAPED_SKIPS
             )
+            # A provider answered and refused the PAYLOAD. The test is a
+            # status plus the absence of every per-provider explanation -
+            # never `not retryable`, which a missing key also satisfies. It
+            # matters because such a call is bought again on every claim: the
+            # generator's equivalent is bounded at 3 attempts, and the judge's
+            # at 8, so a systemic payload bug costs eight passes over the wave.
+            outcome.payload_error = (
+                exc.status is not None
+                and not exc.retryable
+                and not exc.provider_dead
+                and not exc.context_exceeded
+                and not skips
+            )
             store.log_event(
                 "judge_route_error",
                 {
@@ -579,7 +618,9 @@ async def judge_slot(
                     "needed_tokens": needed,
                     "excluded": sorted(exclude),
                     "unroutable": outcome.unroutable,
+                    "payload_error": outcome.payload_error,
                     "skipped": list(outcome.route_skips),
+                    "status": exc.status,
                     "context_exceeded": bool(exc.context_exceeded),
                     "error": str(exc)[:500],
                 },
@@ -737,21 +778,25 @@ def _outcome_from_row(cfg, slot: str, row: Mapping) -> SlotOutcome | None:
     slot is simply bought again. Two ways to fail:
 
     * a score is missing - there is nothing to reuse;
-    * the recorded model is no longer in the config, so its FAMILY cannot be
-      resolved. That one matters more than it looks: a reused slot A with
-      family=None stops constraining slot B, and "two judges" quietly becomes
-      one family grading itself twice - which is the invariant the whole
-      separation exists for. One re-bought call is cheaper than that.
+    * the recorded ref cannot be resolved to a FAMILY, either because the
+      model has left the config or because the row carries no ref at all.
+      That one matters more than it looks: a reused slot A with family=None
+      stops constraining slot B, and "two judges" quietly becomes one family
+      grading itself twice - which is the invariant the whole separation
+      exists for. One re-bought call is cheaper than that.
     """
     values = [row.get(axis) for axis in ("grounding", "validity", "coverage")]
     if any(value is None for value in values):
         return None
-    if not (row.get("provider") and row.get("model")):
-        return None
-    ref = ModelRef(str(row["provider"]), str(row["model"]))
+    ref = ModelRef(str(row.get("provider") or ""), str(row.get("model") or ""))
     try:
         family = cfg.model_for(ref)[1].family
     except KeyError:
+        # BOTH ref failures land here, and they are the same failure. A
+        # separate `not (provider and model)` guard in front of this was
+        # unreachable-in-effect - an absent ref makes an empty ModelRef, which
+        # no config resolves either - so no mutation of it could ever fail a
+        # test. An unreachable branch reads as covered while nothing covers it.
         return None
     return SlotOutcome(
         slot=slot,
@@ -888,15 +933,26 @@ async def judge_task(
                     f"judge-{slot}-unroutable:{outcome.error}"[:200],
                     worker_id=worker_id, stats=stats, counter="unroutable",
                 )
+            if outcome.payload_error:
+                # A provider refused the request itself, so the next claim
+                # buys the identical refusal. Park at once rather than eight
+                # times: judge_error is re-openable, and the fix is a code or
+                # config change the operator has to make first.
+                return _park(
+                    store, task, ERROR_STATE,
+                    f"judge-{slot}-payload:{outcome.error}"[:200],
+                    worker_id=worker_id, stats=stats, counter="judge_errors",
+                )
             # Transient: hand the task back to the queue. The generation is
             # fine and a later pass can score it - reusing this slot's
             # judgement if it landed.
             if int(task.get("attempts") or 0) >= MAX_JUDGE_ATTEMPTS:
                 return _park(
                     store, task, ERROR_STATE, f"judge-slot-{slot}:{outcome.error}"[:200],
-                    worker_id=worker_id, stats=stats, counter=None,
+                    worker_id=worker_id, stats=stats, counter="judge_errors",
                 )
             if not _set_state(store, task_id, JUDGE_STATE_FROM, None, worker_id=worker_id):
+                stats.lost_leases += 1
                 return LOST_LEASE
             return JUDGE_STATE_FROM
 
@@ -928,12 +984,15 @@ async def judge_task(
         if tiebreak.scores is None:
             stats.slot_errors += 1
             if not tiebreak.unroutable:
-                if int(task.get("attempts") or 0) >= MAX_JUDGE_ATTEMPTS:
+                if tiebreak.payload_error or int(task.get("attempts") or 0) >= (
+                    MAX_JUDGE_ATTEMPTS
+                ):
                     return _park(
                         store, task, ERROR_STATE, f"tiebreak:{tiebreak.error}"[:200],
-                        worker_id=worker_id, stats=stats, counter=None,
+                        worker_id=worker_id, stats=stats, counter="judge_errors",
                     )
                 if not _set_state(store, task_id, JUDGE_STATE_FROM, None, worker_id=worker_id):
+                    stats.lost_leases += 1
                     return LOST_LEASE
                 return JUDGE_STATE_FROM
             # No third family can take this row (the shipped tiebreak pool is
@@ -990,26 +1049,39 @@ async def judge_task(
             "already_regenerated": already,
         },
     )
-    stats.decided += 1
-    stats.outcomes[action] = stats.outcomes.get(action, 0) + 1
 
-    # The counters follow the WRITE, not the intention. Incrementing first
-    # reports the state this worker wanted rather than the one that landed,
-    # and under lease churn the totals then over-count every outcome the
-    # fence rejected.
+    # The counters follow the WRITE, not the intention - `decided` and
+    # `outcomes` included. The fence check above is a PROBE, not a guarantee:
+    # a re-claim landing inside log_event still leaves this pass unable to
+    # write, and counting the decision here reported a decision this worker
+    # did not make (the batch line read decided=1 accepted=0 lost-lease=0
+    # beside a judge_decision event for somebody else's row).
+    def decided(outcome_action: str) -> None:
+        stats.decided += 1
+        stats.outcomes[outcome_action] = stats.outcomes.get(outcome_action, 0) + 1
+
     if action == "accept":
         if not _set_state(store, task_id, ACCEPTED_STATE, "judge:accept", worker_id=worker_id):
+            stats.lost_leases += 1
             return LOST_LEASE
+        decided(action)
         stats.accepted += 1
         return ACCEPTED_STATE
     if action == "reject":
         reason = "judge:reject-tiebreak-unroutable" if tiebreak_unroutable else "judge:reject"
         if not _set_state(store, task_id, REJECTED_STATE, reason, worker_id=worker_id):
+            stats.lost_leases += 1
             return LOST_LEASE
+        decided(action)
         stats.rejected += 1
         return REJECTED_STATE
 
     # ---- the one rationale-fed regeneration ----
+    # Counted here rather than after a write because the ACT this decision
+    # authorises is the paid call below, not a state change; if the
+    # regeneration's own disposition is fenced out, that path reports its own
+    # lost lease.
+    decided(action)
     stats.regenerated += 1
     note = failing_rationale(outcomes)
     store.log_event(
@@ -1043,8 +1115,8 @@ def format_batch_line(batch_ix: int, stats: JudgeStats) -> str:
         f"judge batch {batch_ix}: claimed={stats.claimed} decided={stats.decided} "
         f"accepted={stats.accepted} rejected={stats.rejected} tiebreaks={stats.tiebreaks} "
         f"regen={stats.regenerated} slot-err={stats.slot_errors} skipped={stats.skipped} "
-        f"unroutable={stats.unroutable} lost-lease={stats.lost_leases} "
-        f"tokens={stats.tokens} [{outcomes}]"
+        f"unroutable={stats.unroutable} judge-err={stats.judge_errors} "
+        f"lost-lease={stats.lost_leases} tokens={stats.tokens} [{outcomes}]"
     )
 
 
@@ -1111,8 +1183,8 @@ async def run_judges(
         batches += 1
         for name in (
             "claimed", "decided", "accepted", "rejected", "tiebreaks",
-            "regenerated", "slot_errors", "unroutable", "skipped", "lost_leases",
-            "prompt_tokens", "completion_tokens",
+            "regenerated", "slot_errors", "unroutable", "judge_errors", "skipped",
+            "lost_leases", "prompt_tokens", "completion_tokens",
         ):
             setattr(totals, name, getattr(totals, name) + getattr(stats, name))
         for key, count in stats.outcomes.items():
@@ -1136,6 +1208,7 @@ async def run_judges(
         "regenerated": totals.regenerated,
         "slot_errors": totals.slot_errors,
         "unroutable": totals.unroutable,
+        "judge_errors": totals.judge_errors,
         "skipped": totals.skipped,
         "lost_leases": totals.lost_leases,
         "prompt_tokens": totals.prompt_tokens,
