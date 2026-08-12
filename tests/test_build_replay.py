@@ -279,6 +279,38 @@ def test_nemotron_row_reject_license():
     assert reason == "license"
 
 
+def test_nemotron_row_reject_license_key_absent():
+    raw = _nemotron_raw()
+    del raw["license"]
+    row, reason = nemotron_row(raw, "<think>", "</think>")
+    assert row is None
+    assert reason == "license"
+
+
+def test_nemotron_row_reject_reasoning_key_absent():
+    raw = _nemotron_raw()
+    del raw["reasoning"]
+    row, reason = nemotron_row(raw, "<think>", "</think>")
+    assert row is None
+    assert reason == "not_reasoning_on"
+
+
+def test_nemotron_row_reject_non_string_license_does_not_raise():
+    raw = _nemotron_raw()
+    raw["license"] = True  # non-string truthy value - pins the str(...) hardening
+    row, reason = nemotron_row(raw, "<think>", "</think>")
+    assert row is None
+    assert reason == "license"
+
+
+def test_nemotron_row_reject_non_string_reasoning_does_not_raise():
+    raw = _nemotron_raw()
+    raw["reasoning"] = True  # non-string truthy value - pins the str(...) hardening
+    row, reason = nemotron_row(raw, "<think>", "</think>")
+    assert row is None
+    assert reason == "not_reasoning_on"
+
+
 def test_nemotron_row_reject_license_odc_by():
     row, reason = nemotron_row(_nemotron_raw(license_="ODC-BY"), "<think>", "</think>")
     assert row is None
