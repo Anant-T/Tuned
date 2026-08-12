@@ -369,6 +369,38 @@ def test_non_429_4xx_is_not_retried(monkeypatch):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("status", [401, 403, 404, 402])
+def test_credential_and_missing_model_4xx_mark_the_provider_dead(status, monkeypatch):
+    """Per-PROVIDER facts: another provider can still serve the same payload."""
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+
+    def handler(request):
+        return httpx.Response(status, text="nope")
+
+    with pytest.raises(ProviderError) as excinfo:
+        _complete(_client(handler), _request())
+
+    assert excinfo.value.retryable is False  # retrying HERE is pointless
+    assert excinfo.value.provider_dead is True  # but the Router should move on
+    assert excinfo.value.status == status
+
+
+@pytest.mark.parametrize("status", [400, 413, 422])
+def test_payload_4xx_aborts_rather_than_failing_over(status, monkeypatch):
+    """A malformed payload is malformed everywhere - surface it, don't hide it."""
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+
+    def handler(request):
+        return httpx.Response(status, text="bad request")
+
+    with pytest.raises(ProviderError) as excinfo:
+        _complete(_client(handler), _request())
+
+    assert excinfo.value.retryable is False
+    assert excinfo.value.provider_dead is False
+    assert excinfo.value.status == status
+
+
 def test_persistent_500_exhausts_retries(monkeypatch):
     monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
     clock = FakeClock()
@@ -387,6 +419,85 @@ def test_persistent_500_exhausts_retries(monkeypatch):
     assert all(0.0 <= s <= 60.0 for s in sleeper.slept)  # full jitter, capped
     assert excinfo.value.retryable is True
     assert excinfo.value.status == 500
+
+
+def test_call_deadline_stops_a_hanging_provider_before_max_retries(monkeypatch):
+    """Sleeps are bounded, but a provider can also burn the clock INSIDE an
+    attempt.  Six attempts x a 120s HTTP timeout is 12 minutes on one ref and
+    ~36 across a three-ref pass; the deadline counts attempt time too."""
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        clock.advance(120.0)  # the request "hangs" for the full HTTP timeout
+        return httpx.Response(500, text="too slow")
+
+    with pytest.raises(ProviderError) as excinfo:
+        _complete(
+            _client(
+                handler, clock=clock, sleeper=sleeper, max_retries=6, call_deadline_s=300.0
+            ),
+            _request(),
+        )
+
+    assert len(calls) == 3  # NOT the full 6 - the deadline cut it short
+    assert clock.now - 1000.0 < 400.0  # bounded near the 300s ceiling
+    assert excinfo.value.retryable is True  # the Router may try another provider
+    assert "deadline" in str(excinfo.value)
+    assert sum(sleeper.slept) < 120.0  # the sleep budget was never the binding limit
+
+
+def test_call_deadline_also_counts_time_spent_in_before_attempt(monkeypatch):
+    """A bucket wait before a retry burns the deadline just like a slow request."""
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(500, text="boom")
+
+    async def slow_bucket_wait():
+        clock.advance(200.0)  # e.g. waiting out a 1-rpm token bucket
+
+    async def run():
+        client = _client(
+            handler, clock=clock, sleeper=sleeper, max_retries=6, call_deadline_s=300.0
+        )
+        try:
+            return await client.complete(_request(), before_attempt=slow_bucket_wait)
+        finally:
+            await client.aclose()
+
+    with pytest.raises(ProviderError) as excinfo:
+        asyncio.run(run())
+
+    assert len(calls) == 2  # attempt 0, one retry, then the deadline bites
+    assert "deadline" in str(excinfo.value)
+    assert excinfo.value.retryable is True
+
+
+def test_backoff_is_full_jitter_and_not_a_constant():
+    """Pin the seeded sequence: a regression to constant backoff must fail."""
+    client = _client(lambda request: httpx.Response(200, json=_body()))
+    delays = [client._backoff(a) for a in range(5)]
+
+    assert delays == [
+        pytest.approx(0.966453535692),
+        pytest.approx(0.881465198351),
+        pytest.approx(0.029965880234),
+        pytest.approx(7.287807699593),
+        pytest.approx(15.02830395782),
+    ]
+    # Full jitter: every draw sits in [0, 2**attempt], and they are not equal.
+    for attempt, delay in enumerate(delays):
+        assert 0.0 <= delay <= min(60.0, 2**attempt)
+    assert len(set(delays)) == len(delays)
+    assert client._backoff(20) <= 60.0  # ceiling clamps the exponential
 
 
 def test_transport_error_is_retryable(monkeypatch):
@@ -506,6 +617,15 @@ def test_token_bucket_serializes_concurrent_waiters():
     assert sleeper.slept == [pytest.approx(60.0)]
 
 
+@pytest.mark.parametrize("rpm,tpm", [(0, None), (None, 0), (0, 0), (-1, None), (None, -5)])
+def test_token_bucket_rejects_non_positive_limits(rpm, tpm):
+    """0 is a typo, not a limit - and BOTH readings of it are wrong (unlimited
+    silently drops a configured cap, no-capacity wedges forever)."""
+    with pytest.raises(ValueError) as excinfo:
+        TokenBucket(rpm, tpm, clock=FakeClock())
+    assert "positive" in str(excinfo.value)
+
+
 def test_token_bucket_without_limits_never_waits():
     clock = FakeClock()
     sleeper = FakeSleeper(clock)
@@ -531,7 +651,10 @@ def keys(monkeypatch):
 
 
 def _router(cfg, **kw) -> Router:
-    kw.setdefault("clock", FakeClock())
+    clock = kw.setdefault("clock", FakeClock())
+    # Default the sleeper to the fake too: a Router built without one would
+    # fall back to real asyncio.sleep and a rate-limit wait would really sleep.
+    kw.setdefault("sleeper", FakeSleeper(clock))
 
     def handler(request):  # pragma: no cover - pick() tests never send
         return httpx.Response(200, json=_body())
@@ -589,6 +712,19 @@ def test_pick_returns_none_when_nothing_eligible(cfg, keys):
     router = _router(cfg, budget_ok=lambda provider, model, tokens: False)
     assert router.pick("judge") is None
     assert router.pick("probe", exclude_families=frozenset({"llama"})) is None
+
+
+def test_router_forwards_the_client_knobs(cfg, keys):
+    """The retry/timeout ceilings must be reachable through the Router - they
+    are useless if only a hand-built ChatClient can set them."""
+    router = _router(
+        cfg, max_retries=2, timeout=7.0, max_retry_sleep_s=11.0, call_deadline_s=13.0
+    )
+    client = router.routed(MISTRAL_JUDGE).client
+    assert client.max_retries == 2
+    assert client.max_retry_sleep_s == 11.0
+    assert client.call_deadline_s == 13.0
+    assert client._client.timeout.read == 7.0
 
 
 def test_pick_caches_routed_models(cfg, keys):
@@ -719,12 +855,137 @@ def test_complete_does_not_fail_over_on_non_retryable(cfg, keys):
     assert not router.is_cooling(MISTRAL_JUDGE)
 
 
-def test_complete_with_nothing_eligible_raises_non_retryable(cfg, keys):
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_complete_fails_over_when_a_provider_is_dead(status, cfg, keys):
+    """A revoked key or a retired preview model must not sink the whole role."""
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    seen: list[str] = []
+    router = _router(
+        cfg,
+        clock=clock,
+        sleeper=sleeper,
+        breaker_threshold=1,  # one failure cools it: proves report_failure ran
+        client_factory=_factory(clock, sleeper, seen, {"mistral": status}),
+    )
+
+    ref, response = asyncio.run(
+        router.complete("judge", [{"role": "user", "content": "grade this"}])
+    )
+
+    assert ref == GROQ_JUDGE  # moved on to the next eligible judge
+    assert response.text == "OK from groq"
+    assert seen == ["mistral", "groq"]  # dead provider tried ONCE, not retried
+    assert router.is_cooling(MISTRAL_JUDGE)  # and marked failed
+
+
+def test_complete_aborts_the_whole_call_on_a_payload_4xx(cfg, keys):
+    """400 is our bug: every provider would reject it, so do not hide it."""
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    seen: list[str] = []
+    router = _router(
+        cfg,
+        clock=clock,
+        sleeper=sleeper,
+        client_factory=_factory(clock, sleeper, seen, {"mistral": 400}),
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        asyncio.run(router.complete("judge", [{"role": "user", "content": "grade this"}]))
+
+    assert excinfo.value.retryable is False
+    assert excinfo.value.provider_dead is False
+    assert seen == ["mistral"]  # ref2 never called
+    assert not router.is_cooling(MISTRAL_JUDGE)
+
+
+def test_no_eligible_model_is_retryable_only_when_the_reason_is_transient(cfg, keys, monkeypatch):
+    """"Everything is cooling" lifts on its own; "no key set" does not."""
+    # Transient: over budget today.
     router = _router(cfg, budget_ok=lambda provider, model, tokens: False)
     with pytest.raises(ProviderError) as excinfo:
         asyncio.run(router.complete("judge", [{"role": "user", "content": "hi"}]))
+    assert excinfo.value.retryable is True
+    assert "over-budget" in str(excinfo.value)
+
+    # Transient: the whole judge pool is cooling behind the breaker.
+    clock = FakeClock()
+    cooling = _router(cfg, clock=clock, breaker_threshold=1)
+    for ref in cfg.routing_refs("judge"):
+        cooling.report_failure(ref)
+    with pytest.raises(ProviderError) as excinfo:
+        asyncio.run(cooling.complete("judge", [{"role": "user", "content": "hi"}]))
+    assert excinfo.value.retryable is True
+    assert "cooling" in str(excinfo.value)
+
+    # Structural: no keys at all - coming back in a minute changes nothing.
+    _unset(monkeypatch, "MISTRAL_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY")
+    structural = _router(cfg)
+    with pytest.raises(ProviderError) as excinfo:
+        asyncio.run(structural.complete("judge", [{"role": "user", "content": "hi"}]))
     assert excinfo.value.retryable is False
-    assert "no eligible model" in str(excinfo.value)
+    assert "missing-key" in str(excinfo.value)
+
+
+def test_pick_reports_why_it_skipped(cfg, keys):
+    router = _router(cfg, budget_ok=lambda provider, model, tokens: False)
+    skipped: set[str] = set()
+    assert router.pick("judge", skipped=skipped) is None
+    assert skipped == {"over-budget"}
+
+    router2 = _router(cfg)
+    skipped2: set[str] = set()
+    assert router2.pick("tiebreak", exclude_families=frozenset({"gpt-oss"}), skipped=skipped2)
+    assert skipped2 == {"family-excluded"}  # only reasons seen BEFORE the hit
+
+
+def test_retries_charge_the_rpm_bucket_too(cfg, keys):
+    """Every retry is a real request against the same per-minute quota."""
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    seen: list[str] = []
+    router = _router(
+        cfg,
+        clock=clock,
+        sleeper=sleeper,
+        breaker_threshold=99,  # keep it eligible; we only care about the bucket
+        client_factory=_factory(clock, sleeper, seen, {"groq": 500}, max_retries=3),
+    )
+    # Spy on the bucket rather than reading its level: the fake sleeper
+    # advances the clock during backoff, so the bucket legitimately refills
+    # mid-call and the level alone would not show the charges.
+    bucket = router.routed(GROQ_JUDGE).bucket
+    charges: list[int] = []
+    real_acquire = bucket.acquire
+
+    async def counting_acquire(est_tokens=0):
+        charges.append(est_tokens)
+        await real_acquire(est_tokens)
+
+    bucket.acquire = counting_acquire
+
+    with pytest.raises(ProviderError):
+        asyncio.run(
+            router.complete(
+                "judge",
+                [{"role": "user", "content": "hi"}],
+                exclude_families=frozenset({"mistral", "glm"}),  # isolate the groq ref
+                est_tokens=100,
+            )
+        )
+
+    assert seen == ["groq", "groq", "groq"]  # 3 real HTTP requests
+    # ...so 3 rpm charges: one from Router.complete carrying the token
+    # estimate, then one zero-token charge per RETRY via before_attempt.
+    assert charges == [100, 0, 0]
+
+
+# NOTE: an earlier test asserted that "nothing eligible" is ALWAYS
+# retryable=False.  That is superseded by
+# test_no_eligible_model_is_retryable_only_when_the_reason_is_transient,
+# which distinguishes transient causes (cooling, over-budget) from
+# structural ones (missing key, family exclusion) and covers both.
 
 
 def test_complete_charges_the_bucket_of_the_ref_it_used(cfg, keys):

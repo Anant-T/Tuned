@@ -35,7 +35,7 @@ import math
 import os
 import random
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,7 +55,23 @@ _BACKOFF_CAP_S = 60.0
 # entire reason we route across providers.  Pure full-jitter backoff at
 # max_retries=6 tops out near 31s, so this only ever bites on Retry-After.
 _MAX_RETRY_SLEEP_S = 120.0
+# Wall-clock ceiling for ONE ChatClient.complete, counting time spent INSIDE
+# attempts as well as between them.  The sleep budget alone cannot bound a
+# provider that accepts the connection and then hangs: six attempts each
+# burning the full HTTP timeout is ~12 minutes on one ref and ~36 on a
+# three-ref failover pass.  Checked before every attempt and before every
+# sleep, so a hanging provider is abandoned and the Router moves on.
+_CALL_DEADLINE_S = 300.0
 _DEFAULT_TIMEOUT_S = 120.0
+
+# How a non-429 4xx is classified.  400/413/422 are PAYLOAD-shaped: the same
+# request would fail at every provider, so the call aborts and the bug
+# surfaces.  Everything else in the 4xx range (401/403/404, and unlisted codes
+# such as 402 payment-required) is about our standing with THIS provider, so
+# the Router fails over.  Defaulting the unlisted codes to "fail over" keeps a
+# weeks-long build running; a genuine payload bug hiding in one of them still
+# surfaces, as "all N eligible model(s) failed".
+_ABORT_STATUSES = frozenset({400, 413, 422})
 
 
 # --- .env loading -----------------------------------------------------------
@@ -96,7 +112,18 @@ def load_dotenv_keys(path: Path | None = None) -> int:
 
 
 class ProviderError(RuntimeError):
-    """A call failed.  ``retryable`` says whether trying elsewhere/again helps."""
+    """A call failed.  Three outcomes the Router must be able to tell apart:
+
+    * ``retryable``     - 429/5xx/transport/timeout.  Try again, here or
+      somewhere else; the request itself was fine.
+    * ``provider_dead`` - 401/403/404 and friends.  THIS provider cannot serve
+      the call (revoked key, retired preview model) but the payload is fine,
+      so the Router marks the ref failed and fails over.  Not retryable *at
+      this ref* - retrying the same provider would just fail identically.
+    * neither           - 400/422/413.  Our payload is malformed, so it is
+      malformed everywhere; the call aborts immediately rather than making
+      the same bad request at every provider and hiding the bug.
+    """
 
     def __init__(
         self,
@@ -106,12 +133,14 @@ class ProviderError(RuntimeError):
         provider: str | None = None,
         model: str | None = None,
         retryable: bool = False,
+        provider_dead: bool = False,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.provider = provider
         self.model = model
         self.retryable = retryable
+        self.provider_dead = provider_dead
 
 
 @dataclass(frozen=True)
@@ -270,8 +299,18 @@ class TokenBucket:
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], object] = asyncio.sleep,
     ) -> None:
-        self.rpm = rpm or None
-        self.tpm = tpm or None
+        # 0 is never a sane limit and both readings of it are wrong: treating
+        # it as "unlimited" silently removes a limit the config asked for,
+        # treating it as "no capacity" wedges the bucket forever.  It is
+        # almost always a typo or a missing YAML value, so say so loudly.
+        for name, value in (("rpm", rpm), ("tpm", tpm)):
+            if value is not None and value <= 0:
+                raise ValueError(
+                    f"TokenBucket {name} must be a positive int or None "
+                    f"(None means that dimension is unlimited), got {value!r}"
+                )
+        self.rpm = rpm
+        self.tpm = tpm
         self._clock = clock
         self._sleeper = sleeper
         self._req_cap = float(self.rpm or 0)
@@ -345,6 +384,13 @@ class TokenBucket:
 # --- the one client ---------------------------------------------------------
 
 
+def _snippet(text: str, limit: int) -> str:
+    """Collapse whitespace and truncate - keeps error detail and table rows
+    to a single line.  Used by the client's error paths and by the CLI."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
 class ChatClient:
     """OpenAI-compatible chat client for ONE (provider, model), with retries.
 
@@ -365,12 +411,14 @@ class ChatClient:
         max_retries: int = 6,
         timeout: float = _DEFAULT_TIMEOUT_S,
         max_retry_sleep_s: float = _MAX_RETRY_SLEEP_S,
+        call_deadline_s: float = _CALL_DEADLINE_S,
     ) -> None:
         self.provider = provider
         self.model = model
         self.quirk = resolve_quirks(provider.quirks)
         self.max_retries = max(1, max_retries)
         self.max_retry_sleep_s = max_retry_sleep_s
+        self.call_deadline_s = call_deadline_s
         self._clock = clock
         self._sleeper = sleeper
         self._rng = rng if rng is not None else random.Random()
@@ -378,13 +426,21 @@ class ChatClient:
             base_url=provider.base_url, transport=transport, timeout=timeout
         )
 
-    def _error(self, message: str, *, status: int | None, retryable: bool) -> ProviderError:
+    def _error(
+        self,
+        message: str,
+        *,
+        status: int | None,
+        retryable: bool,
+        provider_dead: bool = False,
+    ) -> ProviderError:
         return ProviderError(
             f"{self.provider.name}/{self.model.id}: {message}",
             status=status,
             provider=self.provider.name,
             model=self.model.id,
             retryable=retryable,
+            provider_dead=provider_dead,
         )
 
     def build_payload(self, req: ChatRequest) -> dict:
@@ -404,7 +460,34 @@ class ChatClient:
         ceiling = min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2**attempt))
         return self._rng.uniform(0.0, ceiling)
 
-    async def complete(self, req: ChatRequest) -> ChatResponse:
+    def _check_deadline(
+        self, call_started: float, attempt: int, last_status: int | None, last_detail: str
+    ) -> None:
+        """Raise if this call has already outlived its wall-clock ceiling."""
+        elapsed = self._clock() - call_started
+        if elapsed >= self.call_deadline_s:
+            raise self._error(
+                f"call deadline: {elapsed:.0f}s elapsed exceeds the "
+                f"{self.call_deadline_s:.0f}s ceiling after {attempt} attempt(s) "
+                f"- failing over instead of waiting; last: {last_detail}",
+                status=last_status,
+                retryable=True,
+            )
+
+    async def complete(
+        self,
+        req: ChatRequest,
+        *,
+        before_attempt: Callable[[], Awaitable[None]] | None = None,
+    ) -> ChatResponse:
+        """Send ``req``, retrying transient failures within two ceilings.
+
+        ``before_attempt`` is awaited before every attempt AFTER the first.
+        The Router uses it to charge the rate-limit bucket for retries: it
+        acquires a slot for attempt 0 itself, but every retry is another real
+        request against the same per-minute quota, and without this hook a
+        flapping provider silently overruns its own rpm limit.
+        """
         key = os.environ.get(self.provider.api_key_env)
         if not key:
             raise self._error(
@@ -416,7 +499,19 @@ class ChatClient:
         last_status: int | None = None
         last_detail = "no attempt made"
         slept_total = 0.0
+        call_started = self._clock()
         for attempt in range(self.max_retries):
+            if attempt:
+                # Guards what the sleep budget cannot see: time burnt INSIDE
+                # attempts (an HTTP timeout) or inside before_attempt (a
+                # bucket wait) rather than between them.  Checked on BOTH
+                # sides of before_attempt - once so we do not start a long
+                # wait we have no time for, once because the wait itself may
+                # have pushed us over.
+                self._check_deadline(call_started, attempt, last_status, last_detail)
+                if before_attempt is not None:
+                    await before_attempt()
+                    self._check_deadline(call_started, attempt, last_status, last_detail)
             retry_after: float | None = None
             started = self._clock()
             try:
@@ -439,22 +534,38 @@ class ChatClient:
                     last_status = status
                     last_detail = _snippet(response.text, 200) or f"HTTP {status}"
                     if 400 <= status < 500 and status != 429:
+                        dead = status not in _ABORT_STATUSES
+                        kind = (
+                            "provider unusable, failing over"
+                            if dead
+                            else "bad request, aborting the call"
+                        )
                         raise self._error(
-                            f"HTTP {status} (not retryable): {last_detail}",
+                            f"HTTP {status} ({kind}): {last_detail}",
                             status=status,
                             retryable=False,
+                            provider_dead=dead,
                         )
                     retry_after = self.quirk.retry_after(response)
 
             if attempt == self.max_retries - 1:
                 break
             delay = max(self._backoff(attempt), retry_after or 0.0)
-            if slept_total + delay > self.max_retry_sleep_s:
+            elapsed = self._clock() - call_started
+            over_sleep = slept_total + delay > self.max_retry_sleep_s
+            over_deadline = elapsed + delay > self.call_deadline_s
+            if over_sleep or over_deadline:
                 asked = f", Retry-After {retry_after:.0f}s" if retry_after else ""
+                bound = (
+                    f"sleep budget ({slept_total:.0f}s slept + {delay:.0f}s more "
+                    f"> {self.max_retry_sleep_s:.0f}s cap)"
+                    if over_sleep
+                    else f"call deadline ({elapsed:.0f}s elapsed + {delay:.0f}s more "
+                    f"> {self.call_deadline_s:.0f}s ceiling)"
+                )
                 raise self._error(
-                    f"retry sleep budget spent: {slept_total:.0f}s slept + {delay:.0f}s more "
-                    f"exceeds the {self.max_retry_sleep_s:.0f}s cap{asked} "
-                    f"- failing over instead of waiting; last: {last_detail}",
+                    f"{bound} would be exceeded{asked} - failing over instead of "
+                    f"waiting; last: {last_detail}",
                     status=last_status,
                     retryable=True,
                 )
@@ -505,6 +616,12 @@ class _BreakerState:
     cooling_until: float = 0.0
 
 
+# Skip reasons that lift on their own: a caller that got nothing because of
+# these may usefully try again shortly.  "missing-key" and "family-excluded"
+# are structural - they will still hold in a minute.
+_TRANSIENT_SKIPS = frozenset({"cooling", "over-budget"})
+
+
 class Router:
     """Role -> model selection with call-time family separation and a breaker.
 
@@ -514,6 +631,13 @@ class Router:
     static config check cannot know which generator produced the row), not
     cooling behind the circuit breaker, key present in the environment, and
     within the injected daily budget.
+
+    NOTE that failover is only as wide as the role's list.  ``routing.probe``
+    is a SINGLE-ref role in the shipped config, so ``complete("probe", ...)``
+    has nowhere to fail over to: if that one ref is cooling, out of budget or
+    simply broken, the call raises.  The Router deliberately does not loop or
+    wait for a cooldown to expire - callers that need probe to survive a blip
+    must retry at their own level, where they can decide what a stall costs.
     """
 
     def __init__(
@@ -528,6 +652,9 @@ class Router:
         sleeper: Callable[[float], object] = asyncio.sleep,
         rng: random.Random | None = None,
         max_retries: int = 6,
+        timeout: float = _DEFAULT_TIMEOUT_S,
+        max_retry_sleep_s: float = _MAX_RETRY_SLEEP_S,
+        call_deadline_s: float = _CALL_DEADLINE_S,
         client_factory: Callable[[ProviderCfg, ModelCfg], ChatClient] | None = None,
     ) -> None:
         self.cfg = cfg
@@ -539,6 +666,9 @@ class Router:
         self._rng = rng
         self._transport = transport
         self._max_retries = max_retries
+        self._timeout = timeout
+        self._max_retry_sleep_s = max_retry_sleep_s
+        self._call_deadline_s = call_deadline_s
         self._client_factory = client_factory
         self._routed: dict[ModelRef, RoutedModel] = {}
         self._breakers: dict[ModelRef, _BreakerState] = {}
@@ -556,6 +686,9 @@ class Router:
             sleeper=self._sleeper,
             rng=self._rng,
             max_retries=self._max_retries,
+            timeout=self._timeout,
+            max_retry_sleep_s=self._max_retry_sleep_s,
+            call_deadline_s=self._call_deadline_s,
         )
 
     def routed(self, ref: ModelRef) -> RoutedModel:
@@ -604,22 +737,35 @@ class Router:
         *,
         est_tokens: int = 0,
         exclude_families: frozenset[str] = frozenset(),
+        skipped: set[str] | None = None,
     ) -> Iterator[RoutedModel]:
         """Yield eligible refs in preference order, re-checking state each step.
 
         Re-checking matters for ``complete``: a ref that trips the breaker
         part-way through a failover pass must not be re-offered later in the
         same pass.
+
+        ``skipped``, if given, collects the REASONS refs were passed over.
+        That is what lets a caller tell "nothing is eligible because the whole
+        pool is cooling" (transient - try again in a minute) from "nothing is
+        eligible because no key is set" (structural - trying again is futile).
+        Because this is a generator, a caller that stops at the first hit sees
+        only the reasons encountered before it.
         """
         for ref in self.cfg.routing_refs(role):
             provider, model = self.cfg.model_for(ref)
+            reason: str | None = None
             if model.family in exclude_families:
-                continue
-            if self.is_cooling(ref):
-                continue
-            if not os.environ.get(provider.api_key_env):
-                continue
-            if not self.budget_ok(ref.provider, ref.model, est_tokens):
+                reason = "family-excluded"
+            elif self.is_cooling(ref):
+                reason = "cooling"
+            elif not os.environ.get(provider.api_key_env):
+                reason = "missing-key"
+            elif not self.budget_ok(ref.provider, ref.model, est_tokens):
+                reason = "over-budget"
+            if reason is not None:
+                if skipped is not None:
+                    skipped.add(reason)
                 continue
             yield self.routed(ref)
 
@@ -629,9 +775,16 @@ class Router:
         *,
         est_tokens: int = 0,
         exclude_families: frozenset[str] = frozenset(),
+        skipped: set[str] | None = None,
     ) -> RoutedModel | None:
         return next(
-            self.eligible(role, est_tokens=est_tokens, exclude_families=exclude_families), None
+            self.eligible(
+                role,
+                est_tokens=est_tokens,
+                exclude_families=exclude_families,
+                skipped=skipped,
+            ),
+            None,
         )
 
     async def complete(
@@ -646,17 +799,24 @@ class Router:
     ) -> tuple[ModelRef, ChatResponse]:
         """One pass down the role's preference list; returns (ref, response).
 
-        A *retryable* failure (429/5xx/transport, after the client's own
-        in-provider retries) trips ``report_failure`` and moves to the next
-        eligible ref.  A non-retryable failure (400/401/403 - our payload or
-        our credentials) is raised straight through: failing over would just
-        make the same bad call somewhere else and hide the bug.
+        Three failure shapes, three behaviours:
+
+        * *retryable* (429/5xx/transport, after the client's own in-provider
+          retries) - ``report_failure`` and move to the next eligible ref.
+        * *provider_dead* (401/403/404 - revoked key, retired preview model)
+          - also ``report_failure`` and move on.  These are PER-PROVIDER
+          facts: qwen3.6-27b is a preview model that may 404 out of existence
+          any day, and that must not take the whole judge role down.
+        * anything else non-retryable (400/422/413 - our payload) - raised
+          straight through, because the same request would fail identically
+          at every other provider and failing over would only hide the bug.
         """
         messages = tuple(dict(m) for m in req_messages)
         last_error: ProviderError | None = None
         attempted = 0
+        skipped: set[str] = set()
         for routed in self.eligible(
-            role, est_tokens=est_tokens, exclude_families=exclude_families
+            role, est_tokens=est_tokens, exclude_families=exclude_families, skipped=skipped
         ):
             attempted += 1
             req = ChatRequest(
@@ -667,9 +827,11 @@ class Router:
             )
             await routed.bucket.acquire(est_tokens)
             try:
-                response = await routed.client.complete(req)
+                response = await routed.client.complete(
+                    req, before_attempt=lambda bucket=routed.bucket: bucket.acquire(0)
+                )
             except ProviderError as exc:
-                if not exc.retryable:
+                if not exc.retryable and not exc.provider_dead:
                     raise
                 self.report_failure(routed.ref)
                 last_error = exc
@@ -685,10 +847,14 @@ class Router:
                 model=last_error.model,
                 retryable=True,
             ) from last_error
+        # Nothing was even tried.  Cooling and over-budget lift on their own,
+        # so the caller may usefully come back; a missing key or a family
+        # exclusion will still be true in a minute, so it may not.
+        transient = sorted(skipped & _TRANSIENT_SKIPS)
+        reasons = ", ".join(sorted(skipped)) if skipped else "role list is empty"
         raise ProviderError(
-            f"role {role!r}: no eligible model (family-excluded, cooling, missing key, "
-            f"or out of daily budget)",
-            retryable=False,
+            f"role {role!r}: no eligible model (skipped: {reasons})",
+            retryable=bool(transient),
         )
 
     async def aclose(self) -> None:
@@ -715,11 +881,6 @@ class CheckResult:
     @property
     def ok(self) -> bool:
         return self.error is None and self.status is not None and 200 <= self.status < 300
-
-
-def _snippet(text: str, limit: int) -> str:
-    flat = " ".join((text or "").split())
-    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
 
 
 def build_check_request(ref: ModelRef, *, max_tokens: int = 32) -> ChatRequest:
