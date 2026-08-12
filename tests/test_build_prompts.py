@@ -26,6 +26,7 @@ an unnoticed prompt change silently makes two runs incomparable.
 import difflib
 import hashlib
 import itertools
+import json
 import re
 from collections import Counter
 
@@ -43,22 +44,22 @@ from tuned.data.gates import BANNED_META, VERIFICATION_CUES
 #   .venv/Scripts/python.exe -c "from tuned.data.prompt_registry import all_ids, load; [print(f'    {i!r}: {load(i).sha!r},') for i in all_ids()]"
 # --------------------------------------------------------------------------
 EXPECTED_SHAS = {
-    'gen_drafting_v1': '5553e7e82c7d',
-    'gen_drafting_v2': '827e1ab90466',
-    'gen_irac_analysis_v1': '143a35a01d3f',
-    'gen_irac_analysis_v2': 'cb8461054db0',
-    'gen_irac_analysis_v3': '72ab826bc18e',
-    'gen_irac_analysis_v4': '6245b3c46c63',
-    'gen_statute_qa_v1': '014706e18c12',
-    'gen_statute_qa_v2': 'b3dcabe4740a',
-    'gen_statute_qa_v3': '9c63591e0f26',
-    'gen_statute_qa_v4': '6a4c1b6d06af',
-    'gen_summarization_v1': '2b39b9000d03',
-    'gen_summarization_v2': '8353d0e11c5b',
-    'gen_transition_v1': '0792acf9f34f',
-    'gen_transition_v2': '8daf00a7f855',
-    'judge_pointwise_v1': '3825edfc4d4a',
-    'judge_tiebreak_v1': 'b539ef67f22d',
+    'gen_drafting_v1': '8a854db2da39',
+    'gen_drafting_v2': 'f6bdff5f1951',
+    'gen_irac_analysis_v1': '5551447f22a7',
+    'gen_irac_analysis_v2': '903494d4d4bd',
+    'gen_irac_analysis_v3': 'e05ffaeb7b3a',
+    'gen_irac_analysis_v4': '3fa2a003355e',
+    'gen_statute_qa_v1': '086eefeda2ba',
+    'gen_statute_qa_v2': 'c40d7d7aa866',
+    'gen_statute_qa_v3': '8acefa9f0292',
+    'gen_statute_qa_v4': '461412164297',
+    'gen_summarization_v1': '11ed9c4b52f8',
+    'gen_summarization_v2': '4449b2b828ff',
+    'gen_transition_v1': 'c5759555c75d',
+    'gen_transition_v2': '8ab7e82fec1f',
+    'judge_pointwise_v1': '591d080c5b77',
+    'judge_tiebreak_v1': 'a34456f4918b',
     'probe_answer_v1': '8370e47920ee',
 }
 
@@ -113,6 +114,57 @@ GROUNDING_SENTENCE = (
 IRAC_PLACEMENT_CLAUSE = "never inside your reasoning"
 
 ANSWER_LENGTH_CLAUSE = "250 to 450 words"
+
+# The soft floor on the trace. gates.check_length_band enforces think_min=500
+# ESTIMATED tokens on every reasoning row, so a well-behaved teacher that
+# answers a short seed in three crisp sentences fails the band and burns a
+# regeneration. Behavioural, never structural: it says think properly, not
+# think in N parts.
+REASONING_FLOOR_CLAUSE = "a few hundred words of deliberation is normal"
+
+# A "defuser" is the clause that stops an instruction from reading as a
+# script. Two families, defending different failure modes, and both are
+# accepted-phrasing lists rather than free text so the property cannot drift
+# back out of a template during an edit.
+#
+#   ORDER: attaches to a multi-item enumeration in the reasoning instruction
+#   ("what relief is sought, which provision founds it, ...") and says the
+#   items are not a sequence to walk. Without it the enumeration IS a think
+#   outline, which is the MSLR failure the whole design avoids.
+#
+#   RITUAL: attaches to the self-check and says the double-check is a move,
+#   not a section - otherwise the teacher appends a tidy "Verification"
+#   paragraph, which is a scripted trace wearing a cue's clothing.
+ORDER_DEFUSERS = ("in whatever order", "in no fixed order", "as they arise")
+RITUAL_DEFUSERS = (
+    "not a heading",
+    "not as a heading",
+    "never a heading",
+    "never as a heading",
+    "not a ritual",
+    "not as a ritual",
+    "never as a ritual",
+    "as a closing ritual",
+    "as a closing formality",
+    "not as a set-piece",
+    "not a section of it",
+    "not a part of the advice",
+    "saving it for the end",
+)
+
+# What an enumeration ITEM looks like: an interrogative opening a list item,
+# i.e. one introduced by the colon/dash that opens the list or by the comma
+# between items. Anchoring on that punctuation is what separates a checklist
+# ("...: what relief is sought, which provision founds it, what has to be
+# averred...") from ordinary prose that merely uses the same words ("any
+# instinct about what must by now have replaced what"). Three items is the
+# threshold; two reads as a sentence.
+_ENUM_ITEM_RE = re.compile(
+    r"[:,—–-]\s+(?:and\s+|or\s+|on\s+|by\s+|to\s+|for\s+|of\s+)?"
+    r"(?:what|which|how|where)\b",
+    re.IGNORECASE,
+)
+_ENUM_THRESHOLD = 3
 
 # Numbered-step heuristic, deliberately simple and slightly over-broad: any
 # line that OPENS with "Step 3", "3." or "3)" is treated as a think-block
@@ -275,6 +327,46 @@ def test_generator_states_the_irac_answer_contract(prompt_id):
     # IRAC in the answer only - the other half of gates.check_irac_placement.
     assert IRAC_PLACEMENT_CLAUSE in rendered
     assert ANSWER_LENGTH_CLAUSE in rendered
+    assert REASONING_FLOOR_CLAUSE in rendered
+
+
+def _reasoning_paragraphs(prompt_id: str) -> list[str]:
+    """Every paragraph EXCEPT the answer contract.
+
+    The answer contract is excluded because its four-part structure is the one
+    structure this design wants: IRAC in the answer is mandatory, so its
+    "under the first ..., under the third ..." enumeration is a feature. It is
+    identified by the placement clause it must already carry, which every
+    generator is separately asserted to have."""
+    return [
+        block
+        for block in reg.load(prompt_id).user.split("\n\n")
+        if IRAC_PLACEMENT_CLAUSE not in block
+    ]
+
+
+@pytest.mark.parametrize("prompt_id", GEN_IDS)
+def test_generator_self_check_carries_a_ritual_defuser(prompt_id):
+    lowered = _rendered(prompt_id).lower()
+    assert any(phrase in lowered for phrase in RITUAL_DEFUSERS), (
+        f"{prompt_id} asks for a double-check without saying it is a move rather "
+        f"than a section - that is how a cue becomes a scripted heading"
+    )
+
+
+@pytest.mark.parametrize("prompt_id", GEN_IDS)
+def test_generator_enumeration_carries_an_order_defuser(prompt_id):
+    """A multi-item enumeration inside a REASONING instruction must say it is
+    not a sequence. Paragraphs without such an enumeration are unaffected."""
+    for paragraph in _reasoning_paragraphs(prompt_id):
+        items = len(_ENUM_ITEM_RE.findall(paragraph))
+        if items < _ENUM_THRESHOLD:
+            continue
+        assert any(phrase in paragraph.lower() for phrase in ORDER_DEFUSERS), (
+            f"{prompt_id} lists {items} things to work through and never says "
+            f"the order is not fixed - that reads as a think outline: "
+            f"{paragraph[:120]!r}"
+        )
 
 
 @pytest.mark.parametrize("prompt_id", GEN_IDS)
@@ -339,15 +431,27 @@ def test_judge_scores_exactly_the_three_axes(prompt_id):
 
 @pytest.mark.parametrize("prompt_id", JUDGE_IDS)
 def test_judge_output_contract_is_strict_json(prompt_id):
+    """The exemplar the judge is asked to imitate must itself parse. A judge
+    shown `{"grounding": n}` is being shown invalid JSON and asked to emit
+    valid JSON, and the worker parses what comes back with json.loads."""
     rendered = _rendered(prompt_id)
     assert "JSON" in rendered
-    line = next(line for line in rendered.splitlines() if '"grounding"' in line)
-    for key in ('"grounding"', '"validity"', '"coverage"', '"rationale"'):
-        assert key in line, key
     # Escaped in the file as {{...}}; a single brace pair after rendering.
-    assert line.strip().startswith("{") and line.strip().endswith("}")
     assert "{{" not in rendered
+    line = next(line for line in rendered.splitlines() if '"grounding"' in line).strip()
+    payload = json.loads(line)
+
+    assert set(payload) == {"grounding", "validity", "coverage", "rationale"}
+    for axis in ("grounding", "validity", "coverage"):
+        assert isinstance(payload[axis], int) and 1 <= payload[axis] <= 5, axis
+    assert isinstance(payload["rationale"], str) and payload["rationale"].strip()
+    assert len(payload["rationale"].split()) <= 80
     assert "80 words" in rendered
+
+    # A concrete exemplar anchors; mixed values plus an explicit disclaimer are
+    # what keep it a shape rather than a suggested score.
+    assert len({payload["grounding"], payload["validity"], payload["coverage"]}) > 1
+    assert "illustration" in rendered.lower()
 
 
 @pytest.mark.parametrize("prompt_id", JUDGE_IDS)

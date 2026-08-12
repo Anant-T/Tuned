@@ -34,6 +34,38 @@ the SAME prompt for the same task, so a task_id that was already generated
 under one paraphrase is never quietly re-run under another - the resumed row
 stays comparable with the one it replaces. Difficulty and area
 randomization belong to the task layer; templates carry neither.
+
+CONTRACTS THE CALLERS MUST HONOUR. None of these can be enforced from here,
+and each one silently corrupts a different downstream number if it is missed:
+
+  1. GROUNDING TEXT IS THE UNION OF EVERY GROUNDING SLOT. gates.GateContext
+     .source_text - and the judge's own {source} slot - must be the
+     concatenation of EVERY slot the generator was shown as material:
+     {source} plus, as applicable, {section_text}, {old_section_text},
+     {new_section_text}, {savings_text}. Pass {source} alone and a teacher
+     that correctly cites the very section it was handed is scored as having
+     invented it: check_citations sees a citation absent from source_text,
+     which is a PERMANENT reject (the seed is burned, never retried). The
+     statute_qa and transition streams are the ones this destroys, and they
+     are exactly the streams whose whole point is citing the provision.
+
+  2. THE JUDGE PROMPT IS THE LONGEST PROMPT IN THE PIPELINE. It carries the
+     same materials the generator saw PLUS the candidate's trace and answer,
+     so it can be twice the generator's prompt. Two judge-pool models are
+     8k-context (cerebras/zai-glm-4.7, cerebras/gemma-4-31b); the judge
+     worker must budget-check materials+candidate before dispatch and route
+     anything that does not fit to a 32k+ judge (groq/qwen/qwen3.6-27b,
+     mistral/mistral-small-latest). Silently truncating a judge prompt scores
+     a partially-read answer, which is worse than not judging it.
+
+  3. THE TRANSITION SLOT SPLIT IS SEMANTIC. {source} is the papers (facts,
+     parties, what has happened); {scenario} is the posture and the DATES -
+     when the offence is alleged, when the proceeding started, what stage it
+     has reached. The templates label both, but nothing here enforces the
+     split: put the dates only in {source} and the prompts still read
+     correctly while the "which date decides it" instruction loses its
+     anchor, and check_temporal's undecidable channel (fatal on this stream)
+     is what will report it, one wave later.
 """
 
 import hashlib

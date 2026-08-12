@@ -28,6 +28,6 @@ Reasoning that hesitates, doubles back, corrects itself or admits uncertainty is
 
 Return exactly one JSON object and nothing else — no preamble, no commentary after it. A ```json fence around it is acceptable; anything else is not.
 
-{{"grounding": n, "validity": n, "coverage": n, "rationale": "..."}}
+{{"grounding": 4, "validity": 2, "coverage": 3, "rationale": "Cites the section it was given accurately, but the conclusion on limitation does not follow from the step before it."}}
 
-Each n is an integer from 1 to 5. The rationale is at most 80 words and names the decisive reason for the lowest score you gave.
+That is the shape only — the three numbers there are an illustration, not a suggested score. Every score is an integer from 1 to 5, scored independently of the other two. The rationale is at most 80 words and names the decisive reason for the lowest score you gave.
