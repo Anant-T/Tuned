@@ -1,5 +1,7 @@
+import copy
 import itertools
 import json
+import pickle
 import time
 from datetime import date
 
@@ -436,10 +438,27 @@ def test_extraction_stays_linear_on_degenerate_whitespace():
     for text in (
         "Section 302" + " " * 16000 + "IPC",
         "u/s 302, 307" + " " * 16000 + "IPC",
+        "Section 302" + " " * 65536 + "IPC",
     ):
         start = time.perf_counter()
         extract_sections(text)
         assert time.perf_counter() - start < 1.0
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Section 302 of the\n            IPC", [("IPC", "302")]),
+        (
+            "u/s 302,\n    307 and 34\n    IPC",
+            [("IPC", "302"), ("IPC", "307"), ("IPC", "34")],
+        ),
+        ("charged under Section 103(2)\n\n        of the Bharatiya Nyaya Sanhita", [("BNS", "103(2)")]),
+        ("read with\n        Section 34\n        IPC", [("IPC", "34")]),
+    ],
+)
+def test_wrapped_and_indented_citations_still_extract(text, expected):
+    assert [(r.code, r.number) for r in extract_sections(text)] == expected
 
 
 # --------------------------------------------------------------------------
@@ -481,6 +500,17 @@ def test_cross_code_flags_is_the_flags_channel_of_the_review():
     assert cross_code_flags(text, kind_dates=OLD_OFFENCE) == cross_code_review(
         text, kind_dates=OLD_OFFENCE
     )[0]
+
+
+@pytest.mark.parametrize("clone", [copy.copy, copy.deepcopy, lambda f: pickle.loads(pickle.dumps(f))])
+def test_code_flags_survive_copy_and_pickle(clone):
+    """A str subclass with a 2-argument __new__ needs __getnewargs__, or every
+    copy/deepcopy/pickle of a gate result blows up."""
+    flags, _ = cross_code_review("liable under Section 103 BNS", kind_dates=OLD_OFFENCE)
+    cloned = clone(flags[0])
+    assert cloned == FLAG_NEW_FOR_OLD
+    assert cloned.ref == SectionRef("BNS", "103")
+    assert isinstance(cloned, type(flags[0]))
 
 
 def test_flags_name_the_offending_section():

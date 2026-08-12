@@ -34,6 +34,7 @@ force ON 2024-07-01, and s.531(2)(a) saves only what was pending
 *immediately before* that date.
 """
 
+import copy
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -217,8 +218,10 @@ _NUM = r"(?<!\d)(?P<number>\d{1,3}[A-Za-z]{0,2}" + _SUB + r")"
 # Every whitespace run here is BOUNDED. With \s* the optional groups make the
 # gap ambiguous, and a degenerate whitespace run costs O(n^2) - a 64KB run of
 # spaces from a broken generation stalled the gate for ~78s. Bounded runs make
-# each start position constant-cost, so the scan stays linear.
-_GAP = r"\s{0,6}"
+# each start position constant-cost, so the scan stays linear. The bound is
+# generous (a wrapped, indented "Section 302 of the\n            IPC" is one
+# citation, not two) - 16 is still a constant.
+_GAP = r"\s{0,16}"
 _JOIN = _GAP + r"(?:,)?" + _GAP + r"(?:of\s{1,4}|under\s{1,4}|in\s{1,4})?(?:the\s{1,4})?[(\[]?" + _GAP
 
 _STATUTE_RE = re.compile(_PREFIX + _GAP + _NUM + _JOIN + _CODE, re.IGNORECASE)
@@ -329,6 +332,17 @@ class CodeFlag(str):
         obj = super().__new__(cls, flag)
         obj.ref = ref
         return obj
+
+    def __getnewargs__(self) -> tuple[str, "SectionRef"]:
+        # str's default __getnewargs__ returns a 1-tuple, which would call our
+        # 2-argument __new__ with no ref and blow up on copy/deepcopy/pickle.
+        return (str(self), self.ref)
+
+    def __deepcopy__(self, memo: dict) -> "CodeFlag":
+        return CodeFlag(str(self), copy.deepcopy(self.ref, memo))
+
+    def __repr__(self) -> str:
+        return f"CodeFlag({str(self)!r}, {self.ref!r})"
 
 
 def cross_code_review(text: str, *, kind_dates: dict) -> tuple[list[str], list[SectionRef]]:

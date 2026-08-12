@@ -46,9 +46,12 @@ _FORBIDDEN_COLUMNS = ("headnote_text",)
 # undotted ("S.C.C." == "SCC"). Recall here is a SAFETY property: a citation
 # this module fails to extract is a citation the existence gate never checks,
 # so an unmatched fabrication passes silently. Every whitespace run is bounded
-# rather than \s* to keep matching linear on degenerate input.
-_YEAR = r"(?:\(\s{0,2}(?P<year>\d{4})\s{0,2}\)\s{0,4}|(?<!\d)(?P<year_bare>\d{4})\s{1,4})"
-_VOL = r"(?:\(\s{0,2}(?P<vol>\d{1,3})\s{0,2}\)|(?P<vol_bare>\d{1,3}))\s{0,4}"
+# rather than \s* to keep matching linear on degenerate input - but generously,
+# because citations wrap across indented lines ("(2008) 1 SCC\n        77").
+_G = r"\s{0,12}"
+_G1 = r"\s{1,12}"
+_YEAR = r"(?:\(\s{0,2}(?P<year>\d{4})\s{0,2}\)" + _G + r"|(?<!\d)(?P<year_bare>\d{4})" + _G1 + r")"
+_VOL = r"(?:\(\s{0,2}(?P<vol>\d{1,3})\s{0,2}\)|(?P<vol_bare>\d{1,3}))" + _G
 
 
 def _dotted(letters: str, *, guard: bool = True) -> str:
@@ -57,9 +60,24 @@ def _dotted(letters: str, *, guard: bool = True) -> str:
     return r"\.?\s{0,2}".join(letters) + r"\.?" + (r"(?![A-Za-z])" if guard else "")
 
 
+# AIR court names. A multi-word court is only accepted when it is a name we
+# recognise ("SUPREME COURT", "<name> HIGH COURT") - a free-form multi-word
+# token turned "reported in AIR 1973 at page 1461" into the phantom key
+# "AIR 1973 AT PAGE 1461", which then failed the existence gate and rejected a
+# perfectly good example.
+_AIR_COURT = (
+    r"(?P<court>"
+    r"Supreme" + _G1 + r"Court(?:" + _G1 + r"of" + _G1 + r"India)?"
+    r"|[A-Za-z][A-Za-z.&]{0,14}" + _G1 + r"High" + _G1 + r"Court"
+    r"|[A-Za-z][A-Za-z.&]{0,11}"
+    r")"
+)
+
 CITATION_PATTERNS: dict[str, re.Pattern] = {
     # Supreme Court neutral citation: 2023 INSC 45
-    "insc": re.compile(r"(?<!\d)(?P<year>\d{4})\s{1,4}INSC\s{1,4}(?P<num>\d{1,6})(?!\d)", re.IGNORECASE),
+    "insc": re.compile(
+        r"(?<!\d)(?P<year>\d{4})" + _G1 + r"INSC" + _G1 + r"(?P<num>\d{1,6})(?!\d)", re.IGNORECASE
+    ),
     # High Court neutral citation: 2023:DHC:2720, 2023:DHC:2720-DB, 2024:KER:12345
     "hc_neutral": re.compile(
         r"(?<![\w:])(?P<year>\d{4}):(?P<court>[A-Za-z]{2,10}):(?P<num>\d{1,7})"
@@ -69,25 +87,31 @@ CITATION_PATTERNS: dict[str, re.Pattern] = {
     # SCC OnLine: 2019 SCC OnLine SC 4321, (2019) SCC Online Del 12
     # Must precede "scc": it starts the same way but has no volume.
     "scc_online": re.compile(
-        _YEAR + _dotted("SCC", guard=False) + r"\s{0,4}On\s{0,2}-?\s{0,2}Line\s{0,4}"
-        r"(?P<court>[A-Za-z]{2,12})\s{0,4}(?P<num>\d{1,6})(?!\d)",
+        _YEAR + _dotted("SCC", guard=False) + _G + r"On\s{0,2}-?\s{0,2}Line" + _G
+        + r"(?P<court>[A-Za-z]{2,12})" + _G + r"(?P<num>\d{1,6})(?!\d)",
         re.IGNORECASE,
     ),
     # Supreme Court Cases: (2008) 1 SCC 1, 2008 (1) SCC 77, (2008) 1 S.C.C. 55
-    "scc": re.compile(_YEAR + _VOL + _dotted("SCC") + r"\s{0,4}(?P<page>\d{1,5})(?!\d)", re.IGNORECASE),
-    # All India Reporter: AIR 1973 SC 1461, AIR 2019 SUPREME COURT 9999
+    "scc": re.compile(
+        _YEAR + _VOL + _dotted("SCC") + _G + r"(?P<page>\d{1,5})(?!\d)", re.IGNORECASE
+    ),
+    # All India Reporter: AIR 1973 SC 1461, AIR 2019 SUPREME COURT 9999.
+    # (?-i:AIR) - the reporter token is case-SENSITIVE even though the rest of
+    # the pattern is not, so "clean air 2019 standards mandate 45 units" is not
+    # a citation.
     "air": re.compile(
-        r"\bAIR\s{1,4}(?P<year>\d{4})\s{1,4}"
-        r"(?P<court>[A-Za-z][A-Za-z.&]{0,11}(?:\s{1,2}[A-Za-z][A-Za-z.&]{0,11}){0,2})"
-        r"\s{1,4}(?P<page>\d{1,5})(?!\d)",
+        r"\b(?-i:AIR)" + _G1 + r"(?P<year>\d{4})" + _G1 + _AIR_COURT
+        + _G1 + r"(?P<page>\d{1,5})(?!\d)",
         re.IGNORECASE,
     ),
     # Supreme Court Reports: (1974) 2 SCR 348, 1974 (2) S.C.R. 348
-    "scr": re.compile(_YEAR + _VOL + _dotted("SCR") + r"\s{0,4}(?P<page>\d{1,5})(?!\d)", re.IGNORECASE),
+    "scr": re.compile(
+        _YEAR + _VOL + _dotted("SCR") + _G + r"(?P<page>\d{1,5})(?!\d)", re.IGNORECASE
+    ),
     # Criminal Law Journal: 1980 Cri LJ 1440, 1980 CriLJ 1440, 1999 Cr.L.J. 12
     "crilj": re.compile(
         _YEAR + r"(?:" + _VOL + r")?" + r"Cri?" + r"\.?\s{0,2}L\.?\s{0,2}J\.?(?![A-Za-z])"
-        r"\s{0,4}(?P<page>\d{1,6})(?!\d)",
+        + _G + r"(?P<page>\d{1,6})(?!\d)",
         re.IGNORECASE,
     ),
 }
@@ -222,10 +246,10 @@ def extract_citations(text: str) -> list[str]:
 # reporter word must start with a capital, which is what keeps ordinary prose
 # ("in 2023 the court awarded 5 crore") out.
 _SUSPECT_RE = re.compile(
-    r"(?<!\d)(?:\(\s{0,2}\d{4}\s{0,2}\)|\d{4})\s{0,4}"
-    r"(?:(?:\(\s{0,2}\d{1,3}\s{0,2}\)|\d{1,3})\s{0,4})?"
-    r"(?P<reporter>[A-Z][A-Za-z.&]{0,11}(?:\s{1,2}[A-Z][A-Za-z.&]{0,11}){0,3})\s{0,4}"
-    r"(?P<page>\d{1,6})(?!\d)"
+    r"(?<!\d)(?:\(\s{0,2}\d{4}\s{0,2}\)|\d{4})" + _G
+    + r"(?:(?:\(\s{0,2}\d{1,3}\s{0,2}\)|\d{1,3})" + _G + r")?"
+    r"(?P<reporter>[A-Z][A-Za-z.&]{0,11}(?:\s{1,2}[A-Z][A-Za-z.&]{0,11}){0,3})" + _G
+    + r"(?P<page>\d{1,6})(?!\d)"
 )
 _TWO_CAPS_RE = re.compile(r"[A-Z]{2}")
 
@@ -242,7 +266,14 @@ def suspect_citations(text: str) -> list[str]:
     suspect_citations(context) first, since a suspect that came in with the
     grounding passage is not the model's invention).
 
-    Returns normalized (opaque) keys, order-preserving and deduped.
+    Returns OPAQUE keys - normalize()'s unknown-format path, i.e. whitespace-
+    collapsed and upper-cased source text. They are only reliably comparable
+    to OTHER suspect keys: never pass one to CitationIndex.contains(), because
+    the index holds canonical reporter forms and an opaque key will miss
+    against it for spelling reasons rather than existence reasons. Compare
+    suspects against suspect_citations(context), nothing else.
+
+    Order-preserving and deduped.
     """
     if not text:
         return []

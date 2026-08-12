@@ -40,9 +40,10 @@ CITATIONS_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "citat
         ("(2008)   1   SCC   1", "(2008) 1 SCC 1"),
         ("( 2008 ) 1 scc 1", "(2008) 1 SCC 1"),
         ("2008 1 SCC 1", "(2008) 1 SCC 1"),
-        # AIR - court token case and dots
+        # AIR - court token case and dots (the AIR token itself is
+        # case-SENSITIVE, so "clean air 2019 ..." is not a citation)
         ("AIR 1973 SC 1461", "AIR 1973 SC 1461"),
-        ("air  1973  s.c.  1461", "AIR 1973 SC 1461"),
+        ("AIR  1973  s.c.  1461", "AIR 1973 SC 1461"),
         ("AIR 1973 Del 1461", "AIR 1973 DEL 1461"),
         # SCR - parenthesised and bare year both canonicalise with parens
         ("(1974) 2 SCR 348", "(1974) 2 SCR 348"),
@@ -76,7 +77,7 @@ def test_normalize_unknown_format_is_an_opaque_key():
         "2023 INSC 0045",
         "2023:dhc:02720",
         "2008 1 SCC 1",
-        "air 1973 s.c. 1461",
+        "AIR 1973 s.c. 1461",
         "1974 2 SCR 348",
         "Some Unknown  Case",
     ],
@@ -371,6 +372,59 @@ def test_suspect_citations_negatives(text):
 def test_suspect_citations_order_and_dedup():
     text = "see 2011 (2) KLT 123, then 2005 (3) MhLJ 45, then 2011 (2) KLT 123 again"
     assert suspect_citations(text) == ["2011 (2) KLT 123", "2005 (3) MHLJ 45"]
+
+
+# --------------------------------------------------------------------------
+# Review fix N1: the widened AIR court token must not eat prose. A phantom
+# key ("AIR 1973 AT PAGE 1461") fails the existence gate and rejects a good
+# example, so this is a false-REJECT bug, not a cosmetic one.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "reported in AIR 1973 at page 1461",
+        "clean air 2019 standards mandate 45 units",  # AIR is case-sensitive
+        "the air 2019 quality index fell 45 points",
+        "see AIR 1973 see also 1461",
+        "AIR 1973 of the report 1461",
+    ],
+)
+def test_air_pattern_does_not_eat_prose(text):
+    assert extract_citations(text) == []
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("AIR 1973 SC 1461", "AIR 1973 SC 1461"),
+        ("AIR 2019 SUPREME COURT 9999", "AIR 2019 SC 9999"),
+        ("AIR 2019 Supreme Court 9999", "AIR 2019 SC 9999"),
+        ("AIR 2019 Supreme Court of India 9999", "AIR 2019 SC 9999"),
+        ("AIR 2003 ALLAHABAD 12", "AIR 2003 ALLAHABAD 12"),
+        ("AIR 2003 Allahabad High Court 12", "AIR 2003 ALLAHABAD HIGH COURT 12"),
+    ],
+)
+def test_air_recognised_court_names_still_extract(raw, expected):
+    assert normalize(raw) == expected
+    assert extract_citations(f"followed in {raw}, at para 4") == [expected]
+
+
+# --------------------------------------------------------------------------
+# Review fix N3: citations wrap across indented lines.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("(2008) 1 SCC\n          77", ["(2008) 1 SCC 77"]),
+        ("AIR\n   1973 SC 1461", ["AIR 1973 SC 1461"]),
+        ("2023\n        INSC 45", ["2023 INSC 45"]),
+        ("1980 Cri LJ\n        1440", ["1980 CRI LJ 1440"]),
+    ],
+)
+def test_wrapped_citations_still_extract(text, expected):
+    assert extract_citations(text) == expected
 
 
 def test_extraction_stays_linear_on_degenerate_whitespace():
