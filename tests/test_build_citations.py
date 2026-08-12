@@ -1,4 +1,5 @@
 import ast
+import time
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from tuned.data.citations import (
     extract_citations,
     normalize,
     novel_citations,
+    suspect_citations,
 )
 
 CITATIONS_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "citations.py"
@@ -89,7 +91,12 @@ def test_normalize_is_idempotent(raw):
 # --------------------------------------------------------------------------
 
 def test_pattern_keys():
-    assert set(CITATION_PATTERNS) == {"insc", "hc_neutral", "scc", "air", "scr"}
+    # the five briefed formats, plus the two the review added because their
+    # absence made fabrications in those formats invisible to the gate
+    assert {"insc", "hc_neutral", "scc", "air", "scr"} <= set(CITATION_PATTERNS)
+    assert set(CITATION_PATTERNS) == {
+        "insc", "hc_neutral", "scc_online", "scc", "air", "scr", "crilj"
+    }
 
 
 def test_extract_all_formats_in_order_deduped():
@@ -253,6 +260,125 @@ def test_headnote_column_is_declared_forbidden_and_never_ingested():
 
     assert "headnote_text" in citations._FORBIDDEN_COLUMNS
     assert "headnote_text" not in citations._CITATION_COLUMNS
+
+
+# --------------------------------------------------------------------------
+# Review fix 1: recall holes. A citation this module cannot parse is a
+# citation the index is never asked about, so an unmatched fabrication used
+# to pass the hard gate in silence.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # volume in parentheses
+        ("2008 (1) SCC 77", "(2008) 1 SCC 77"),
+        ("2008 ( 1 ) SCC 77", "(2008) 1 SCC 77"),
+        ("1974 (2) SCR 348", "(1974) 2 SCR 348"),
+        # dotted reporter tokens
+        ("(2008) 1 S.C.C. 55", "(2008) 1 SCC 55"),
+        ("(2008) 1 S. C. C. 55", "(2008) 1 SCC 55"),
+        ("1974 (2) S.C.R. 348", "(1974) 2 SCR 348"),
+        # long AIR court token
+        ("AIR 2019 SUPREME COURT 9999", "AIR 2019 SC 9999"),
+        ("AIR 2019 Supreme Court 9999", "AIR 2019 SC 9999"),
+        ("AIR 2003 ALLAHABAD 12", "AIR 2003 ALLAHABAD 12"),
+        # SCC OnLine
+        ("2019 SCC OnLine SC 4321", "2019 SCC ONLINE SC 4321"),
+        ("2019 SCC Online Del 12", "2019 SCC ONLINE DEL 12"),
+        ("(2019) SCC OnLine Bom 7", "2019 SCC ONLINE BOM 7"),
+        # Criminal Law Journal
+        ("1980 Cri LJ 1440", "1980 CRI LJ 1440"),
+        ("1980 CriLJ 1440", "1980 CRI LJ 1440"),
+        ("1999 Cr.L.J. 12", "1999 CRI LJ 12"),
+        ("2003 (2) Cri LJ 45", "2003 2 CRI LJ 45"),
+    ],
+)
+def test_normalize_formats_added_by_review(raw, expected):
+    assert normalize(raw) == expected
+    assert extract_citations(f"as held in {raw}, the appeal fails") == [expected]
+
+
+def test_review_added_formats_share_keys_with_their_plain_spellings():
+    assert normalize("2008 (1) SCC 77") == normalize("(2008) 1 SCC 77")
+    assert normalize("(2008) 1 S.C.C. 55") == normalize("(2008) 1 SCC 55")
+    assert normalize("AIR 2019 SUPREME COURT 9999") == normalize("AIR 2019 SC 9999")
+    assert normalize("1980 CrLJ 1440") == normalize("1980 Cri LJ 1440")
+    assert normalize("1974 (2) S.C.R. 348") == normalize("(1974) 2 SCR 348")
+
+
+# Six fabricated authorities in the formats that used to slip through. Every
+# one must now be caught by ONE of the two channels: extracted (and killed on
+# an index miss) or surfaced as citation-shaped-but-unparseable.
+FABRICATIONS = [
+    "2008 (1) SCC 77",
+    "(2008) 1 S.C.C. 55",
+    "AIR 2019 SUPREME COURT 9999",
+    "2019 SCC OnLine SC 4321",
+    "1980 Cri LJ 1440",
+    "2011 (2) KLT 123",
+]
+
+
+@pytest.mark.parametrize("fabrication", FABRICATIONS)
+def test_every_fabrication_is_caught_by_one_of_the_two_channels(tmp_path, fabrication):
+    index = CitationIndex.build(["2023 INSC 45"], tmp_path / "index.txt")
+    text = f"The proposition is settled by {fabrication}."
+    caught = novel_citations(text, "", index) + suspect_citations(text)
+    assert caught, f"{fabrication!r} passed the gate in silence"
+
+
+def test_fabrications_in_the_index_or_context_are_still_allowed(tmp_path):
+    index = CitationIndex.build(["2008 (1) SCC 77"], tmp_path / "index.txt")
+    # same case, other spelling - normalization makes it one key
+    assert novel_citations("see (2008) 1 SCC 77", "", index) == []
+    assert novel_citations("see 1980 Cri LJ 1440", "source: 1980 CrLJ 1440", index) == []
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("reported at 2011 (2) KLT 123 today", ["2011 (2) KLT 123"]),
+        ("see 2005 (3) MhLJ 45", ["2005 (3) MHLJ 45"]),
+        ("(2003) 2 Bom CR 456 was followed", ["(2003) 2 BOM CR 456"]),
+        ("2019 ALL MR 234 is on all fours", ["2019 ALL MR 234"]),
+    ],
+)
+def test_suspect_citations_surfaces_unmodelled_reporters(text, expected):
+    assert suspect_citations(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "In 2023 the court awarded 5 crore to the family",
+        "In 2023, 45 IPC cases were filed",
+        "the appeal of 2023 was decided in 45 days",
+        "Kesavananda Bharati v. State of Kerala",
+        "Criminal Appeal No. 1234 of 2023 decided on 15.03.2023",
+        # already parsed by a known pattern - not a suspect
+        "(2008) 1 SCC 1 and AIR 1973 SC 1461",
+        "2023 INSC 45",
+        "para 12 of 2019 SCC OnLine SC 4321",
+        "2023:DHC:2720",
+    ],
+)
+def test_suspect_citations_negatives(text):
+    assert suspect_citations(text) == []
+
+
+def test_suspect_citations_order_and_dedup():
+    text = "see 2011 (2) KLT 123, then 2005 (3) MhLJ 45, then 2011 (2) KLT 123 again"
+    assert suspect_citations(text) == ["2011 (2) KLT 123", "2005 (3) MHLJ 45"]
+
+
+def test_extraction_stays_linear_on_degenerate_whitespace():
+    text = "(2008) 1 SCC" + " " * 16000 + "77"
+    start = time.perf_counter()
+    extract_citations(text)
+    suspect_citations(text)
+    assert time.perf_counter() - start < 1.0
 
 
 def test_no_module_level_dataset_import():

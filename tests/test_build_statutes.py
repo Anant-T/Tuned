@@ -1,5 +1,6 @@
 import itertools
 import json
+import time
 from datetime import date
 
 import pytest
@@ -19,6 +20,7 @@ from tuned.data.statutes import (
     SectionRef,
     SectionRegistry,
     cross_code_flags,
+    cross_code_review,
     extract_sections,
     governing_family,
     normalize_number,
@@ -348,6 +350,146 @@ def test_flags_are_deduped_and_undecidable_citations_are_skipped():
     assert cross_code_flags(text, kind_dates=OLD_OFFENCE) == [FLAG_NEW_FOR_OLD]
     # no dates at all: a substantive citation cannot be judged, so nothing is guessed
     assert cross_code_flags(text, kind_dates={"offence_date": None, "proceeding_started": None}) == []
+
+
+# --------------------------------------------------------------------------
+# Review fix 2: the s.358 suppression is code-aware. IPC 358, CrPC 358 and
+# BNSS 358 are real, routinely cited sections - only BNS 358 is the savings
+# clause, and a bare "section 358" attributed to another code must not disarm
+# a genuine flag.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The accused is liable under Section 103 BNS. Compensation was sought under Section 358 CrPC.",
+        "Section 103 BNS applies. See also Section 358 IPC on grave provocation.",
+        "Section 103 BNS applies; Section 358 BNSS governs the appeal.",
+    ],
+)
+def test_section_358_of_another_code_does_not_suppress(text):
+    assert cross_code_flags(text, kind_dates=OLD_OFFENCE) == [FLAG_NEW_FOR_OLD]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Section 103 BNS now covers murder, but section 358 BNS saves the repealed IPC.",
+        "Section 103 BNS is irrelevant here: see s. 358 BNS.",
+        "Section 103 BNS applies, though the section 358 savings clause preserves the IPC.",
+        "Section 103 BNS, but section 358 of the Bharatiya Nyaya Sanhita saves the IPC.",
+    ],
+)
+def test_genuine_savings_clause_still_suppresses(text):
+    assert cross_code_flags(text, kind_dates=OLD_OFFENCE) == []
+
+
+# --------------------------------------------------------------------------
+# Review fix 3: "with" is only a citation lead-in in fixed legal collocations.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "with 20 IPC provisions dropped",
+        "compared with 511 IPC sections",
+        "dealt with 45 CrPC applications",
+        "with 358 BNS sections renumbered",
+        "the file was tagged with 34 IPC entries",
+        "we begin with 302 IPC-era jurisprudence",
+        "dispensed with 173 BNSS formalities",
+        "told us 302 IPC applies",  # the u-s abbreviation needs its slash or dot
+    ],
+)
+def test_bare_with_and_bare_us_are_not_citation_lead_ins(text):
+    assert extract_sections(text) == []
+
+
+def test_with_false_positive_cannot_disarm_the_savings_check():
+    text = "Section 103 BNS applies, with 358 BNS sections renumbered by the new code."
+    assert cross_code_flags(text, kind_dates=OLD_OFFENCE) == [FLAG_NEW_FOR_OLD]
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("read with 34 IPC", [("IPC", "34")]),
+        ("charged with 420 IPC", [("IPC", "420")]),
+        ("punishable with 302 IPC", [("IPC", "302")]),
+        ("along with 149 IPC", [("IPC", "149")]),
+        ("u/s 420 IPC", [("IPC", "420")]),
+        ("u/ss 420 and 34 IPC", [("IPC", "420"), ("IPC", "34")]),
+        # the canonical charge-sheet form: the code is stated once, at the end
+        ("convicted under Section 302 read with Section 34 IPC", [("IPC", "302"), ("IPC", "34")]),
+    ],
+)
+def test_legal_collocations_still_extract(text, expected):
+    assert [(r.code, r.number) for r in extract_sections(text)] == expected
+
+
+# --------------------------------------------------------------------------
+# Review fix 4: bounded whitespace runs - degenerate model output must not
+# stall the gate (this input took ~78s before the fix).
+# --------------------------------------------------------------------------
+
+def test_extraction_stays_linear_on_degenerate_whitespace():
+    for text in (
+        "Section 302" + " " * 16000 + "IPC",
+        "u/s 302, 307" + " " * 16000 + "IPC",
+    ):
+        start = time.perf_counter()
+        extract_sections(text)
+        assert time.perf_counter() - start < 1.0
+
+
+# --------------------------------------------------------------------------
+# Review fix 5: undecidable must be distinguishable from clean.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "kind_dates",
+    [
+        {"offence_date": None, "proceeding_started": None},
+        {},
+        {"offence_date": None, "proceeding_started": date(2024, 8, 1)},
+    ],
+)
+def test_undecidable_substantive_citations_are_reported_not_swallowed(kind_dates):
+    flags, undecidable = cross_code_review("Section 103 BNS applies.", kind_dates=kind_dates)
+    assert flags == []
+    assert undecidable == [SectionRef("BNS", "103")]
+
+
+def test_decidable_text_reports_nothing_undecidable():
+    flags, undecidable = cross_code_review("Section 302 IPC applies.", kind_dates=OLD_OFFENCE)
+    assert (flags, undecidable) == ([], [])
+
+
+def test_undecidable_and_flagged_can_coexist():
+    # no offence date: the substantive cite is undecidable, while the
+    # procedural one is decided by the proceeding date and is wrong
+    dates = {"offence_date": None, "proceeding_started": date(2024, 8, 1)}
+    flags, undecidable = cross_code_review(
+        "Charged under Section 302 IPC; the appeal lies under Section 374 CrPC.", kind_dates=dates
+    )
+    assert flags == [FLAG_OLD_FOR_NEW]
+    assert undecidable == [SectionRef("IPC", "302")]
+
+
+def test_cross_code_flags_is_the_flags_channel_of_the_review():
+    text = "Section 103 BNS applies."
+    assert cross_code_flags(text, kind_dates=OLD_OFFENCE) == cross_code_review(
+        text, kind_dates=OLD_OFFENCE
+    )[0]
+
+
+def test_flags_name_the_offending_section():
+    flags, _ = cross_code_review(
+        "The accused is liable under Section 103 BNS.", kind_dates=OLD_OFFENCE
+    )
+    assert flags == [FLAG_NEW_FOR_OLD]  # still a plain string to every caller
+    assert isinstance(flags[0], str)
+    assert flags[0].ref == SectionRef("BNS", "103")
 
 
 # --------------------------------------------------------------------------

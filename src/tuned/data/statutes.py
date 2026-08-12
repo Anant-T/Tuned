@@ -182,18 +182,29 @@ _CODE = (
 )
 
 # "Section", "Sections", "Sec.", "S.", "SS.", "u/s", "u/ss", "§", "§§", plus
-# the two marker-less lead-ins Indian pleadings use constantly ("punishable
-# under 302 IPC", "read with 34 IPC").
-# The single-letter form REQUIRES its dot ("S. 302") - a bare "s" is too
-# common in prose to use as a citation marker - and a bare number REQUIRES
-# one of these lead-ins, so "In 2023, 45 IPC cases were filed" and
-# "Chapter 5 IPC" yield nothing.
-_PREFIX = r"(?:§{1,2}|\bu/?ss?\.?|\bsec(?:tion|t)?s?\.?|\bss?\.|\bunder|\b(?:read\s+)?with)"
+# the marker-less lead-ins Indian pleadings use constantly ("punishable under
+# 302 IPC", "read with 34 IPC").
+#
+# Three deliberate tightenings, each of which was a live false-positive:
+#  - the single-letter form REQUIRES its dot ("S. 302"); a bare "s" is too
+#    common in prose to use as a citation marker,
+#  - the u-s abbreviation REQUIRES its slash or dot ("u/s", "u/ss", "us."),
+#    otherwise the word "us" introduces phantom sections,
+#  - "with" is only a lead-in in fixed legal collocations. A bare "with"
+#    turns "compared with 511 IPC sections", "dealt with 45 CrPC
+#    applications" and "with 358 BNS sections" into citations - the last of
+#    which would also disarm the s.358 savings check.
+# A bare number always needs one of these lead-ins, so "In 2023, 45 IPC cases
+# were filed" and "Chapter 5 IPC" yield nothing.
+_WITH = r"(?:read|along|charged|punishable|together)\s{1,4}with|r/w"
+_PREFIX = (
+    r"(?:§{1,2}|\bu(?:/ss?\.?|ss?\.)|\bsec(?:tion|t)?s?\.?|\bss?\.|\bunder|\b(?:" + _WITH + r"))"
+)
 
 # Subsection contents are digits, one/two letters, or a roman numeral - never
 # three arbitrary letters, otherwise "Section 302 (IPC)" parses as number
 # "302(IPC)".
-_SUB = r"(?:\s*\(\s*(?:\d{1,3}[a-z]?|[a-z]{1,2}|[ivx]{1,4})\s*\)){0,3}"
+_SUB = r"(?:\s{0,2}\(\s{0,2}(?:\d{1,3}[a-z]?|[a-z]{1,2}|[ivx]{1,4})\s{0,2}\)){0,3}"
 # (?<!\d) so a section number is never carved out of a longer number: the
 # "1860" in "the Indian Penal Code, 1860 (IPC)" must not read as section 860.
 _NUM_BARE = r"(?<!\d)\d{1,3}[A-Za-z]{0,2}" + _SUB
@@ -202,17 +213,28 @@ _NUM = r"(?<!\d)(?P<number>\d{1,3}[A-Za-z]{0,2}" + _SUB + r")"
 # Between number and code: an optional comma, an optional "of/under/in", an
 # optional "the", an optional opening bracket - "302 IPC", "302 of the IPC",
 # "302, IPC", "302 (IPC)".
-_JOIN = r"(?:\s*,)?\s*(?:of\s+|under\s+|in\s+)?(?:the\s+)?[(\[]?\s*"
+#
+# Every whitespace run here is BOUNDED. With \s* the optional groups make the
+# gap ambiguous, and a degenerate whitespace run costs O(n^2) - a 64KB run of
+# spaces from a broken generation stalled the gate for ~78s. Bounded runs make
+# each start position constant-cost, so the scan stays linear.
+_GAP = r"\s{0,6}"
+_JOIN = _GAP + r"(?:,)?" + _GAP + r"(?:of\s{1,4}|under\s{1,4}|in\s{1,4})?(?:the\s{1,4})?[(\[]?" + _GAP
 
-_STATUTE_RE = re.compile(_PREFIX + r"\s*" + _NUM + _JOIN + _CODE, re.IGNORECASE)
+_STATUTE_RE = re.compile(_PREFIX + _GAP + _NUM + _JOIN + _CODE, re.IGNORECASE)
 
 # Indian pleadings cite lists constantly - "u/s 302, 307 and 34 IPC",
 # "Sections 302/34 IPC", "S. 302 r/w 149 IPC" - and the code appears only
 # once, at the end. Without this the FIRST numbers of every such list would
 # be invisible to the temporal gate.
-_SEP = r"(?:\s*(?:,|/|&|and|r/?w|read\s+with)\s*)"
+# The separator may be followed by a second section marker - "Section 302 read
+# with Section 34 IPC" is the canonical charge-sheet form, and without this the
+# 302 (whose code is only stated at the end) is never seen.
+_SEP = (
+    r"(?:" + _GAP + r"(?:,|/|&|and|r/?w|read\s{1,4}with)" + _GAP + r"(?:" + _PREFIX + _GAP + r")?)"
+)
 _SECTION_LIST_RE = re.compile(
-    _PREFIX + r"\s*(?P<numbers>" + _NUM_BARE + r"(?:" + _SEP + _NUM_BARE + r"){1,9})" + _JOIN + _CODE,
+    _PREFIX + _GAP + r"(?P<numbers>" + _NUM_BARE + r"(?:" + _SEP + _NUM_BARE + r"){1,9})" + _JOIN + _CODE,
     re.IGNORECASE,
 )
 _SEP_SPLIT_RE = re.compile(_SEP, re.IGNORECASE)
@@ -275,25 +297,58 @@ _SAVINGS_PHRASE_RE = re.compile(r"\bsection\s+358\b", re.IGNORECASE)
 
 def _cites_savings_clause(text: str, refs: list[SectionRef]) -> bool:
     """BNS s.358 is the repeal-and-savings clause itself. Text that discusses
-    it is explaining WHY the IPC still applies to a pre-transition offence,
-    so its BNS reference is legitimate, not a temporal error."""
+    it is explaining WHY the IPC still applies to a pre-transition offence, so
+    its BNS reference is legitimate, not a temporal error.
+
+    The suppression is CODE-AWARE, because "358" alone is not the savings
+    clause: IPC s.358 (assault on grave provocation), CrPC s.358 (compensation
+    for groundless arrest) and BNSS s.358 are real, routinely cited sections.
+    A bare "section 358" therefore only counts while nothing in the text
+    attributes 358 to some other code - otherwise "Section 358 CrPC" would
+    silently disarm a genuine bns-cited-for-old-offence flag.
+    """
     if any(ref.code == "BNS" and ref.base_number == "358" for ref in refs):
         return True
-    return bool(_SAVINGS_PHRASE_RE.search(text))
+    if not _SAVINGS_PHRASE_RE.search(text):
+        return False
+    return not any(ref.base_number == "358" and ref.code != "BNS" for ref in refs)
 
 
-def cross_code_flags(text: str, *, kind_dates: dict) -> list[str]:
-    """THE TEMPORAL GATE PRIMITIVE. Every cited section is checked against the
-    family that governs ITS OWN kind on these dates; [] means clean.
+class CodeFlag(str):
+    """A flag string that also remembers which citation produced it.
 
-    Per-kind evaluation is the whole point: for a 2023 offence with an FIR
-    registered in August 2024, "IPC s.302 read with BNSS s.173" is correct on
-    both halves and must not be flagged, while "BNS s.103" in the same text
-    must be.
+    It IS a str (equality, hashing, json, sorting all behave), so callers that
+    only care about the vocabulary keep working; `.ref` is there so a rejected
+    example can say WHICH section was wrong instead of just that something
+    was.
+    """
+
+    __slots__ = ("ref",)
+
+    def __new__(cls, flag: str, ref: "SectionRef") -> "CodeFlag":
+        obj = super().__new__(cls, flag)
+        obj.ref = ref
+        return obj
+
+
+def cross_code_review(text: str, *, kind_dates: dict) -> tuple[list[str], list[SectionRef]]:
+    """THE TEMPORAL GATE PRIMITIVE. Returns (flags, undecidable).
+
+    Every cited section is checked against the family that governs ITS OWN
+    kind on these dates. Per-kind evaluation is the whole point: for a 2023
+    offence with an FIR registered in August 2024, "IPC s.302 read with BNSS
+    s.173" is correct on both halves and must not be flagged, while "BNS
+    s.103" in the same text must be.
 
     kind_dates = {"offence_date": date|None, "proceeding_started": date|None}.
-    A citation whose family cannot be decided on the dates given (e.g. a
-    substantive cite with no offence_date) is skipped, not guessed at.
+
+    The second channel exists because a gate that returns [] for "clean" AND
+    for "I could not tell" is a gate that silently passes everything it does
+    not understand. A citation whose family cannot be decided on the dates
+    given (a substantive cite with no offence_date, an empty kind_dates) is
+    NEVER guessed at - it lands in `undecidable`, and the caller has to
+    decide what that means. Flags are CodeFlag instances, so each one names
+    its offending SectionRef.
     """
     offence_date = kind_dates.get("offence_date")
     proceeding_started = kind_dates.get("proceeding_started")
@@ -302,6 +357,8 @@ def cross_code_flags(text: str, *, kind_dates: dict) -> list[str]:
     savings = _cites_savings_clause(text, refs)
 
     flags: list[str] = []
+    seen: set[str] = set()
+    undecidable: list[SectionRef] = []
     for ref in refs:
         kind = CODE_KIND.get(ref.code)
         if kind is None:
@@ -311,6 +368,7 @@ def cross_code_flags(text: str, *, kind_dates: dict) -> list[str]:
                 kind, offence_date=offence_date, proceeding_started=proceeding_started
             )
         except ValueError:
+            undecidable.append(ref)
             continue
         cited = "old" if ref.code in OLD_CODES else "new"
         if cited == expected:
@@ -321,9 +379,17 @@ def cross_code_flags(text: str, *, kind_dates: dict) -> list[str]:
             flag = FLAG_NEW_FOR_OLD
         else:
             flag = FLAG_OLD_FOR_NEW
-        if flag not in flags:
-            flags.append(flag)
-    return flags
+        if flag not in seen:
+            seen.add(flag)
+            flags.append(CodeFlag(flag, ref))
+    return flags, undecidable
+
+
+def cross_code_flags(text: str, *, kind_dates: dict) -> list[str]:
+    """Flags channel of cross_code_review; [] means "no flag", which is NOT
+    the same as "decidable and clean" - a gate that must not miss anything
+    should call cross_code_review and handle `undecidable` too."""
+    return cross_code_review(text, kind_dates=kind_dates)[0]
 
 
 # --------------------------------------------------------------------------

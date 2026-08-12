@@ -40,31 +40,63 @@ _FORBIDDEN_COLUMNS = ("headnote_text",)
 # "2023 INSC 4512" yields 4512 (not 45), and "12023 INSC 45" yields nothing.
 # --------------------------------------------------------------------------
 
-# Reporter citations come with or without parentheses around the year -
-# "(1974) 2 SCR 348" and "1974 2 SCR 348" are the same case. The bare branch
-# demands whitespace after the year so "20081 SCC 1" cannot be read as
-# year 2008 + volume 1; the parenthesised branch does not need it.
-_YEAR = r"(?:\(\s*(?P<year>\d{4})\s*\)\s*|(?<!\d)(?P<year_bare>\d{4})\s+)"
+# Reporter citations come with or without parentheses around the year AND
+# around the volume - "(1974) 2 SCR 348", "1974 2 SCR 348" and
+# "1974 (2) SCR 348" are one case - and reporter tokens are written dotted or
+# undotted ("S.C.C." == "SCC"). Recall here is a SAFETY property: a citation
+# this module fails to extract is a citation the existence gate never checks,
+# so an unmatched fabrication passes silently. Every whitespace run is bounded
+# rather than \s* to keep matching linear on degenerate input.
+_YEAR = r"(?:\(\s{0,2}(?P<year>\d{4})\s{0,2}\)\s{0,4}|(?<!\d)(?P<year_bare>\d{4})\s{1,4})"
+_VOL = r"(?:\(\s{0,2}(?P<vol>\d{1,3})\s{0,2}\)|(?P<vol_bare>\d{1,3}))\s{0,4}"
+
+
+def _dotted(letters: str, *, guard: bool = True) -> str:
+    """"SCC" -> a pattern matching SCC, S.C.C., S. C. C. The guard stops the
+    token running into a longer word (SCCX)."""
+    return r"\.?\s{0,2}".join(letters) + r"\.?" + (r"(?![A-Za-z])" if guard else "")
+
 
 CITATION_PATTERNS: dict[str, re.Pattern] = {
     # Supreme Court neutral citation: 2023 INSC 45
-    "insc": re.compile(r"(?<!\d)(?P<year>\d{4})\s+INSC\s+(?P<num>\d{1,6})(?!\d)", re.IGNORECASE),
+    "insc": re.compile(r"(?<!\d)(?P<year>\d{4})\s{1,4}INSC\s{1,4}(?P<num>\d{1,6})(?!\d)", re.IGNORECASE),
     # High Court neutral citation: 2023:DHC:2720, 2023:DHC:2720-DB, 2024:KER:12345
     "hc_neutral": re.compile(
         r"(?<![\w:])(?P<year>\d{4}):(?P<court>[A-Za-z]{2,10}):(?P<num>\d{1,7})"
         r"(?:[-:](?P<suffix>[A-Za-z0-9]{1,10}))?(?![\w:])",
         re.IGNORECASE,
     ),
-    # Supreme Court Cases: (2008) 1 SCC 1
-    "scc": re.compile(_YEAR + r"(?P<vol>\d{1,3})\s*SCC\s*(?P<page>\d{1,5})(?!\d)", re.IGNORECASE),
-    # All India Reporter: AIR 1973 SC 1461
-    "air": re.compile(
-        r"\bAIR\s+(?P<year>\d{4})\s+(?P<court>[A-Za-z][A-Za-z.&]{0,7})\s+(?P<page>\d{1,5})(?!\d)",
+    # SCC OnLine: 2019 SCC OnLine SC 4321, (2019) SCC Online Del 12
+    # Must precede "scc": it starts the same way but has no volume.
+    "scc_online": re.compile(
+        _YEAR + _dotted("SCC", guard=False) + r"\s{0,4}On\s{0,2}-?\s{0,2}Line\s{0,4}"
+        r"(?P<court>[A-Za-z]{2,12})\s{0,4}(?P<num>\d{1,6})(?!\d)",
         re.IGNORECASE,
     ),
-    # Supreme Court Reports: (1974) 2 SCR 348
-    "scr": re.compile(_YEAR + r"(?P<vol>\d{1,3})\s*SCR\s*(?P<page>\d{1,5})(?!\d)", re.IGNORECASE),
+    # Supreme Court Cases: (2008) 1 SCC 1, 2008 (1) SCC 77, (2008) 1 S.C.C. 55
+    "scc": re.compile(_YEAR + _VOL + _dotted("SCC") + r"\s{0,4}(?P<page>\d{1,5})(?!\d)", re.IGNORECASE),
+    # All India Reporter: AIR 1973 SC 1461, AIR 2019 SUPREME COURT 9999
+    "air": re.compile(
+        r"\bAIR\s{1,4}(?P<year>\d{4})\s{1,4}"
+        r"(?P<court>[A-Za-z][A-Za-z.&]{0,11}(?:\s{1,2}[A-Za-z][A-Za-z.&]{0,11}){0,2})"
+        r"\s{1,4}(?P<page>\d{1,5})(?!\d)",
+        re.IGNORECASE,
+    ),
+    # Supreme Court Reports: (1974) 2 SCR 348, 1974 (2) S.C.R. 348
+    "scr": re.compile(_YEAR + _VOL + _dotted("SCR") + r"\s{0,4}(?P<page>\d{1,5})(?!\d)", re.IGNORECASE),
+    # Criminal Law Journal: 1980 Cri LJ 1440, 1980 CriLJ 1440, 1999 Cr.L.J. 12
+    "crilj": re.compile(
+        _YEAR + r"(?:" + _VOL + r")?" + r"Cri?" + r"\.?\s{0,2}L\.?\s{0,2}J\.?(?![A-Za-z])"
+        r"\s{0,4}(?P<page>\d{1,6})(?!\d)",
+        re.IGNORECASE,
+    ),
 }
+
+# Long-form AIR court names that are the SAME court as the abbreviation the
+# index is built from - without this "AIR 2019 SUPREME COURT 9999" and
+# "AIR 2019 SC 9999" would be two different keys. Everything else keeps the
+# court name as written (upper-cased, de-dotted, whitespace-collapsed).
+_AIR_COURT_ALIASES = {"SUPREME COURT": "SC", "SUPREME COURT OF INDIA": "SC"}
 
 
 def _num(raw: str) -> str:
@@ -74,6 +106,10 @@ def _num(raw: str) -> str:
 
 def _year_of(m: re.Match) -> str:
     return m.group("year") or m.group("year_bare")
+
+
+def _vol_of(m: re.Match) -> str | None:
+    return m.group("vol") or m.group("vol_bare")
 
 
 def _canon_insc(m: re.Match) -> str:
@@ -89,24 +125,38 @@ def _canon_hc(m: re.Match) -> str:
 
 
 def _canon_scc(m: re.Match) -> str:
-    return f"({_year_of(m)}) {_num(m.group('vol'))} SCC {_num(m.group('page'))}"
+    return f"({_year_of(m)}) {_num(_vol_of(m))} SCC {_num(m.group('page'))}"
+
+
+def _canon_scc_online(m: re.Match) -> str:
+    return f"{_year_of(m)} SCC ONLINE {m.group('court').upper()} {_num(m.group('num'))}"
 
 
 def _canon_air(m: re.Match) -> str:
-    court = m.group("court").replace(".", "").upper()
-    return f"AIR {m.group('year')} {court} {_num(m.group('page'))}"
+    court = " ".join(m.group("court").replace(".", "").upper().split())
+    return f"AIR {m.group('year')} {_AIR_COURT_ALIASES.get(court, court)} {_num(m.group('page'))}"
 
 
 def _canon_scr(m: re.Match) -> str:
-    return f"({_year_of(m)}) {_num(m.group('vol'))} SCR {_num(m.group('page'))}"
+    return f"({_year_of(m)}) {_num(_vol_of(m))} SCR {_num(m.group('page'))}"
+
+
+def _canon_crilj(m: re.Match) -> str:
+    # "Cri LJ" and "CrLJ" are the same reporter (Criminal Law Journal); the
+    # volume is optional and only appears in the key when the citation has one.
+    vol = _vol_of(m)
+    volume = f"{_num(vol)} " if vol else ""
+    return f"{_year_of(m)} {volume}CRI LJ {_num(m.group('page'))}"
 
 
 _CANON = {
     "insc": _canon_insc,
     "hc_neutral": _canon_hc,
+    "scc_online": _canon_scc_online,
     "scc": _canon_scc,
     "air": _canon_air,
     "scr": _canon_scr,
+    "crilj": _canon_crilj,
 }
 
 
@@ -130,12 +180,10 @@ def normalize(raw: str) -> str:
     return s.upper()
 
 
-def extract_citations(text: str) -> list[str]:
-    """Every citation in `text`, normalized, in order of first appearance,
-    deduped. Overlapping matches (one pattern eating another's span) are
-    resolved leftmost-longest so a span is only ever counted once."""
-    if not text:
-        return []
+def _known_spans(text: str) -> list[tuple[int, int, str, re.Match]]:
+    """Non-overlapping (start, end, key, match) for every known format, in
+    text order. Overlaps between patterns are resolved leftmost-longest so a
+    span is only ever counted once."""
     spans: list[tuple[int, int, int, str, re.Match]] = []
     seq = 0
     for key, pattern in CITATION_PATTERNS.items():
@@ -144,14 +192,72 @@ def extract_citations(text: str) -> list[str]:
             seq += 1
     spans.sort(key=lambda t: (t[0], t[1], t[2]))
 
-    out: list[str] = []
-    seen: set[str] = set()
+    kept: list[tuple[int, int, str, re.Match]] = []
     last_end = -1
     for start, _neg_len, _seq, key, m in spans:
         if start < last_end:
             continue
         last_end = m.end()
+        kept.append((start, m.end(), key, m))
+    return kept
+
+
+def extract_citations(text: str) -> list[str]:
+    """Every citation in `text`, normalized, in order of first appearance,
+    deduped."""
+    if not text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for _start, _end, key, m in _known_spans(text):
         value = _CANON[key](m)
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+# A citation-SHAPED string: year, optional volume, a reporter-looking run of
+# capitalised tokens, then a page. Deliberately NOT re.IGNORECASE - every
+# reporter word must start with a capital, which is what keeps ordinary prose
+# ("in 2023 the court awarded 5 crore") out.
+_SUSPECT_RE = re.compile(
+    r"(?<!\d)(?:\(\s{0,2}\d{4}\s{0,2}\)|\d{4})\s{0,4}"
+    r"(?:(?:\(\s{0,2}\d{1,3}\s{0,2}\)|\d{1,3})\s{0,4})?"
+    r"(?P<reporter>[A-Z][A-Za-z.&]{0,11}(?:\s{1,2}[A-Z][A-Za-z.&]{0,11}){0,3})\s{0,4}"
+    r"(?P<page>\d{1,6})(?!\d)"
+)
+_TWO_CAPS_RE = re.compile(r"[A-Z]{2}")
+
+
+def suspect_citations(text: str) -> list[str]:
+    """Citation-SHAPED strings that no known pattern matched - unmodelled
+    reporters (KLT, MhLJ, Bom CR, ...) and invented ones.
+
+    This is the SECOND channel of the existence gate and it exists because
+    silence is dangerous: a string extract_citations() cannot parse is a
+    string the index is never asked about, so a fabrication in an unknown
+    format would otherwise pass the hard gate untouched. The gate layer is
+    expected to reject-on-unknown (optionally diffing against
+    suspect_citations(context) first, since a suspect that came in with the
+    grounding passage is not the model's invention).
+
+    Returns normalized (opaque) keys, order-preserving and deduped.
+    """
+    if not text:
+        return []
+    taken = [(start, end) for start, end, _key, _m in _known_spans(text)]
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _SUSPECT_RE.finditer(text):
+        if any(m.start() < end and start < m.end() for start, end in taken):
+            continue
+        reporter = m.group("reporter").replace(".", "").replace(" ", "")
+        # A reporter abbreviation always carries an all-caps run somewhere
+        # (LJ, SCC, CR, KLT, MhLJ); "Delhi High Court" style prose does not.
+        if not _TWO_CAPS_RE.search(reporter):
+            continue
+        value = normalize(m.group(0))
         if value not in seen:
             seen.add(value)
             out.append(value)
