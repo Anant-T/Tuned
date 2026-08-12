@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pipeline_fakes import (
+    TRANSITION_META,
     FakeRouter,
     build_cfg,
     chat_response,
@@ -27,6 +28,7 @@ from tuned.data.judge import (
     decide,
     failing_rationale,
     generation_family,
+    judge_task,
     parse_judge_reply,
     run_judges,
     thresholds_active,
@@ -595,6 +597,195 @@ def test_default_claim_behaviour_is_unchanged(tmp_path, cfg):
         claimed = store.claim_tasks("gen-1", 2)
         assert {row["state"] for row in claimed} == {"generating"}
         assert {row["attempts"] for row in claimed} == {1}
+
+
+# --------------------------------------------------------------------------
+# When the pool runs out (CRITICAL 1: separation + context can empty a role).
+# --------------------------------------------------------------------------
+
+def _lengthen(store, task_id, words):
+    gen = store.latest_generation(task_id)
+    store.conn.execute(
+        "UPDATE generation SET think = ? WHERE gen_id = ?", ("word " * words, gen["gen_id"])
+    )
+    return gen
+
+
+def test_an_unroutable_judge_parks_instead_of_re_queueing(tmp_path, cfg, paths):
+    """Past every judge's context window there is no eligible model at all.
+    Re-queueing would re-pay whichever slots did answer and meet the same
+    wall tomorrow, so the row parks with a diagnostic."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        _lengthen(store, only_task(store)["task_id"], 200000)
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
+        totals = run_judge(store, cfg, router, paths)
+        task = only_task(store)
+        assert task["state"] == "judge_unroutable"
+        assert task["disposition"].startswith("judge-a-unroutable:")
+        assert totals["decided"] == 0
+        # One routing attempt, no reply, nothing paid for.
+        assert len(router.calls_for("judge")) == 1
+        assert router.calls_for("judge")[0]["ref"] is None
+        event = json.loads(store.events("judge_route_error")[0]["detail_json"])
+        assert event["unroutable"] is True
+        assert {"glm", "mistral", "qwen"} <= set(event["excluded"])
+        # And it stays parked: a second sweep does not re-claim it.
+        assert run_judge(store, cfg, router, paths)["claimed"] == 0
+
+
+def test_a_recorded_slot_is_never_bought_twice(tmp_path, cfg, paths):
+    """Judge A answers, judge B garbles, the task goes back to the queue.
+    The retry must re-buy B only - A's judgement is already in the table."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        first = FakeRouter(
+            cfg,
+            {
+                "judge": [
+                    judge_reply(5, 5, 5, "a says fine"),
+                    chat_response("I refuse to grade this.", None),
+                ]
+            },
+        )
+        run_judge(store, cfg, first, paths)
+        gen = store.latest_generation(only_task(store)["task_id"])
+        assert [j["judge_slot"] for j in store.judgements_for(gen["gen_id"])] == ["a"]
+        assert only_task(store)["state"] == JUDGE_STATE_FROM
+        assert len(first.calls_for("judge")) == 3  # a once, b twice (parse retry)
+
+        second = FakeRouter(cfg, {"judge": [judge_reply(4, 4, 4, "b agrees")]})
+        run_judge(store, cfg, second, paths)
+        # Exactly one call this pass: slot b. Slot a came from the table.
+        assert len(second.calls_for("judge")) == 1
+        reuse = json.loads(store.events("judge_slot_reused")[0]["detail_json"])
+        assert reuse["slot"] == "a"
+        # Family separation survives the reuse: b still excludes a's family.
+        assert {"gpt-oss", "mistral"} <= second.calls_for("judge")[0]["exclude_families"]
+        assert only_task(store)["state"] == "accepted"
+        judgements = store.judgements_for(gen["gen_id"])
+        assert [j["judge_slot"] for j in judgements] == ["a", "b"]
+        assert judgements[0]["rationale"] == "a says fine"
+
+
+def test_an_unroutable_tiebreak_decides_on_the_two_judges(tmp_path, cfg, paths):
+    """The shipped tiebreak pool is gpt-oss + two 8k models, so a long
+    candidate from the gpt-oss generator has no third family. The
+    disagreement then stands unresolved - which is not an accept."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        _lengthen(store, only_task(store)["task_id"], 5000)  # ~6k tokens: 8k judges out
+        router = FakeRouter(
+            cfg, {"judge": [judge_reply(5, 5, 5), judge_reply(2, 2, 2)]}
+        )
+        totals = run_judge(store, cfg, router, paths)
+        assert totals["tiebreaks"] == 1
+        assert totals["rejected"] == 1
+        assert router.calls_for("tiebreak")[0]["ref"] is None
+        task = only_task(store)
+        assert task["state"] == "rejected"
+        assert task["disposition"] == "judge:reject-tiebreak-unroutable"
+        fallback = json.loads(
+            store.events("tiebreak_unroutable_two_judge_decision")[0]["detail_json"]
+        )
+        assert fallback["verdicts"] == ["pass", "fail"]
+        decision = json.loads(store.events("judge_decision")[0]["detail_json"])
+        assert decision["tiebreak_unroutable"] is True
+        assert decision["action"] == "reject"
+
+
+def test_a_transient_tiebreak_failure_still_re_queues(tmp_path, cfg, paths):
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(
+            cfg,
+            {
+                "judge": [judge_reply(5, 5, 5), judge_reply(2, 2, 2)],
+                "tiebreak": [chat_response("nope", None)],
+            },
+        )
+        run_judge(store, cfg, router, paths)
+        assert only_task(store)["state"] == JUDGE_STATE_FROM
+        assert store.events("judge_parse_error")
+
+
+# --------------------------------------------------------------------------
+# The transition stream's judge view (the scenario carries the dates).
+# --------------------------------------------------------------------------
+
+def test_the_judge_sees_the_scenario_on_the_transition_stream(tmp_path, cfg, paths):
+    store = open_store(tmp_path, n_seeds=1, meta=TRANSITION_META)
+    plan_wave(store, cfg, "transition", 1, task_type_mix={"transition": 1.0})
+    with store:
+        asyncio.run(
+            run_workers(
+                store, cfg, FakeRouter(cfg), paths=paths, streams=["transition"],
+                n_workers=1, max_batches=1,
+            )
+        )
+        assert only_task(store)["state"] == "judging"
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
+        run_judge(store, cfg, router, paths, streams=["transition"])
+        prompt = router.calls_for("judge")[0]["messages"][-1]["content"]
+        # The dates that decide which enactment governs are in front of it.
+        assert TRANSITION_META["scenario"] in prompt
+        assert "1 July 2024" in prompt
+        assert TRANSITION_META["savings_text"] in prompt
+        # But the gates' allow-list did not widen: the scenario is not part
+        # of what a citation may be checked against.
+        gen = store.latest_generation(only_task(store)["task_id"])
+        record = read_at(gen["raw_path"], gen["raw_offset"])
+        assert TRANSITION_META["scenario"] in record["messages"][-1]["content"]
+        assert only_task(store)["state"] == "accepted"
+
+
+# --------------------------------------------------------------------------
+# Loop robustness and lease hygiene.
+# --------------------------------------------------------------------------
+
+def test_a_poisoned_task_does_not_kill_the_judge_batch(tmp_path, cfg, paths):
+    with judged_store(tmp_path, paths, cfg, n=2) as store:
+        router = FakeRouter(cfg, {"judge": [RuntimeError("boom"), judge_reply(5, 5, 5)]})
+        totals = run_judge(store, cfg, router, paths)
+        assert totals["claimed"] == 2
+        assert totals["accepted"] == 1
+        event = json.loads(store.events("worker_task_error")[0]["detail_json"])
+        assert event["error"].startswith("RuntimeError: boom")
+        assert store.task_counts()["accepted"] == 1
+
+
+def test_the_judge_logs_a_lost_lease(tmp_path, cfg, paths):
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = only_task(store)
+        # Claim it as somebody else, then hand the stale worker's verdict in.
+        store.claim_tasks(
+            "other-worker", 1, state_from=JUDGE_STATE_FROM, state_to=JUDGE_STATE_TO
+        )
+        asyncio.run(
+            judge_task(
+                store, cfg, FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]}), task,
+                paths=paths, worker_id="stale-worker",
+            )
+        )
+        assert only_task(store)["state"] == JUDGE_STATE_TO
+        assert only_task(store)["claimed_by"] == "other-worker"
+        lost = json.loads(store.events("lost_lease")[0]["detail_json"])
+        assert lost["worker"] == "stale-worker"
+        assert lost["wanted_state"] == "accepted"
+
+
+def test_idle_judge_batches_are_announced_once(tmp_path, cfg, paths, capsys):
+    slept: list[float] = []
+
+    async def sleeper(delay):
+        slept.append(delay)
+
+    with open_store(tmp_path, n_seeds=0) as store:
+        asyncio.run(
+            run_judges(
+                store, cfg, FakeRouter(cfg), paths=paths, streams=["synthesis"],
+                n_workers=1, forever=True, max_batches=3, sleeper=sleeper, idle_sleep_s=0.01,
+            )
+        )
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("judge batch")]
+        assert len(lines) == 1
+        assert len(slept) == 3
 
 
 def test_judge_batch_line(tmp_path, cfg, paths, capsys):

@@ -36,6 +36,7 @@ from tuned.data.providers import (  # noqa: E402
     format_check_row,
     load_dotenv_keys,
     resolve_quirks,
+    undersized_families,
 )
 
 DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
@@ -1026,6 +1027,171 @@ def test_complete_forwards_params_and_max_tokens(cfg, keys):
     assert payloads[0]["temperature"] == 0.0
     assert payloads[0]["max_tokens"] == 256
     assert payloads[0]["model"] == "mistral-small-latest"
+
+
+# --- 10b. per-ref params, attempt reporting, context sizing -----------------
+
+
+def test_on_attempt_reports_every_http_attempt_including_retries(monkeypatch):
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+    """The client's internal retries are invisible in the return value: five
+    429s and a success look like one call. A daily ledger fed only by the
+    response therefore under-counts requests exactly when a provider is
+    rate-limiting hardest."""
+    clock = FakeClock()
+    seen: list[tuple[int | None, dict | None]] = []
+    statuses = iter([429, 500, 200])
+
+    def handler(request):
+        status = next(statuses)
+        if status == 200:
+            return httpx.Response(200, json=_body(prompt=13, completion=5))
+        return httpx.Response(status, text="nope")
+
+    client = _client(handler, clock=clock, sleeper=FakeSleeper(clock), max_retries=4)
+
+    async def run():
+        try:
+            return await client.complete(
+                _request(), on_attempt=lambda status, usage: seen.append((status, usage))
+            )
+        finally:
+            await client.aclose()
+
+    response = asyncio.run(run())
+    assert response.status == 200
+    assert [status for status, _ in seen] == [429, 500, 200]
+    assert seen[0][1] is None and seen[1][1] is None
+    assert seen[2][1]["prompt_tokens"] == 13
+
+
+def test_on_attempt_reports_a_transport_failure_as_no_status(monkeypatch):
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+    clock = FakeClock()
+    seen: list[tuple[int | None, dict | None]] = []
+
+    def handler(request):
+        raise httpx.ConnectError("down")
+
+    client = _client(handler, clock=clock, sleeper=FakeSleeper(clock), max_retries=1)
+
+    async def run():
+        try:
+            await client.complete(
+                _request(), on_attempt=lambda status, usage: seen.append((status, usage))
+            )
+        finally:
+            await client.aclose()
+
+    with pytest.raises(ProviderError):
+        asyncio.run(run())
+    assert seen == [(None, None)]
+
+
+def test_router_on_attempt_carries_the_ref_across_a_failover(cfg, keys):
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    seen: list[tuple[str, int | None]] = []
+    router = _router(
+        cfg,
+        clock=clock,
+        sleeper=sleeper,
+        client_factory=_factory(clock, sleeper, [], {"mistral": 500}, max_retries=1),
+    )
+    ref, _ = asyncio.run(
+        router.complete(
+            "judge",
+            [{"role": "user", "content": "grade"}],
+            on_attempt=lambda ref, status, usage: seen.append((ref.provider, status)),
+        )
+    )
+    assert ref.provider == "groq"
+    # The failed provider's attempt is reported under ITS ref, not the winner's.
+    assert seen == [("mistral", 500), ("groq", 200)]
+
+
+def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys):
+    """reasoning_effort is a gpt-oss parameter. Sent to magistral it is an
+    unknown field, i.e. a 400, which Router.complete raises straight through
+    instead of failing over - so per-call params must be chosen per REF."""
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    payloads: list[dict] = []
+
+    def factory(provider, model):
+        def handler(request):
+            payloads.append(json.loads(request.content))
+            if provider.name == "cerebras":
+                return httpx.Response(500, text="down")
+            return httpx.Response(200, json=_body())
+
+        return ChatClient(
+            provider, model, transport=httpx.MockTransport(handler),
+            clock=clock, sleeper=sleeper, rng=random.Random(3), max_retries=1,
+        )
+
+    router = _router(cfg, clock=clock, sleeper=sleeper, client_factory=factory)
+
+    def params_for_ref(ref, model_cfg):
+        return (
+            {"reasoning_effort": "high"}
+            if "reasoning_effort" in (model_cfg.params or {})
+            else {}
+        )
+
+    ref, _ = asyncio.run(
+        router.complete(
+            "generator", [{"role": "user", "content": "go"}], params_for_ref=params_for_ref
+        )
+    )
+    assert ref == ModelRef("mistral", "magistral-small-latest")
+    assert payloads[0]["reasoning_effort"] == "high"      # cerebras/gpt-oss-120b
+    assert "reasoning_effort" not in payloads[1]          # mistral/magistral
+
+
+def test_params_for_ref_overrides_params(cfg, keys):
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    payloads: list[dict] = []
+
+    def factory(provider, model):
+        def handler(request):
+            payloads.append(json.loads(request.content))
+            return httpx.Response(200, json=_body())
+
+        return ChatClient(
+            provider, model, transport=httpx.MockTransport(handler),
+            clock=clock, sleeper=sleeper, rng=random.Random(3), max_retries=1,
+        )
+
+    router = _router(cfg, clock=clock, sleeper=sleeper, client_factory=factory)
+    asyncio.run(
+        router.complete(
+            "judge", [{"role": "user", "content": "go"}],
+            params={"temperature": 0.9},
+            params_for_ref=lambda ref, model_cfg: {"temperature": 0.1},
+        )
+    )
+    assert payloads[0]["temperature"] == 0.1
+
+
+def test_undersized_families_over_the_real_pool(cfg):
+    # Nothing is too small for a short prompt.
+    assert undersized_families(cfg, "judge", 4000) == frozenset()
+    # The 8k judge drops out first, then the 32k one.
+    assert undersized_families(cfg, "judge", 20000) == frozenset({"glm"})
+    assert undersized_families(cfg, "judge", 40000) == frozenset({"glm", "mistral"})
+    # The generator pool: cerebras/gpt-oss-120b is 8k, magistral is 40k.
+    assert undersized_families(cfg, "generator", 4000) == frozenset()
+    assert undersized_families(cfg, "generator", 20000) == frozenset({"gpt-oss"})
+    assert undersized_families(cfg, "generator", 60000) == frozenset({"gpt-oss", "mistral"})
+
+
+def test_undersized_families_keeps_a_mixed_family_with_one_large_model(cfg):
+    # groq's tiebreak gpt-oss model is 131k; a family is excluded only when
+    # EVERY one of its role models is too small.
+    assert "gpt-oss" not in undersized_families(cfg, "tiebreak", 100000)
+    assert undersized_families(cfg, "tiebreak", 100000) == frozenset({"gemma", "glm"})
 
 
 # --- 11. .env ---------------------------------------------------------------

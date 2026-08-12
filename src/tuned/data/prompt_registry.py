@@ -49,6 +49,18 @@ and each one silently corrupts a different downstream number if it is missed:
      statute_qa and transition streams are the ones this destroys, and they
      are exactly the streams whose whole point is citing the provision.
 
+     ONE ASYMMETRY, ADDED DELIBERATELY (generate.judge_source_text): on the
+     TRANSITION stream the judge's {source} also carries {scenario}, because
+     which enactment governs is decided by the dates and a judge that cannot
+     see them is scoring an axis it has no access to. GateContext.source_text
+     does NOT get it: that string is the citation allow-list, and a scenario
+     mentioning a section number would quietly authorise citing it. Grounding
+     and judge-source are therefore the same string everywhere except there.
+     Duplicate slot values are also collapsed - the pilot's statute_qa
+     fallback fills {source} and {section_text} from the same seed text, and
+     concatenating both would double every judge prompt for no added
+     grounding.
+
   2. THE JUDGE PROMPT IS THE LONGEST PROMPT IN THE PIPELINE. It carries the
      same materials the generator saw PLUS the candidate's trace and answer,
      so it can be twice the generator's prompt. Two judge-pool models are

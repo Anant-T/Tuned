@@ -479,6 +479,7 @@ class ChatClient:
         req: ChatRequest,
         *,
         before_attempt: Callable[[], Awaitable[None]] | None = None,
+        on_attempt: Callable[[int | None, dict | None], None] | None = None,
     ) -> ChatResponse:
         """Send ``req``, retrying transient failures within two ceilings.
 
@@ -487,6 +488,16 @@ class ChatClient:
         acquires a slot for attempt 0 itself, but every retry is another real
         request against the same per-minute quota, and without this hook a
         flapping provider silently overruns its own rpm limit.
+
+        ``on_attempt`` is called AFTER every attempt with
+        ``(status, usage_or_None)`` - the HTTP status this attempt actually
+        got (None for a transport failure that never reached the provider)
+        and the response's usage block when there was one.  It exists because
+        the retries in here are invisible from the outside: five 429s
+        followed by a success look like one call to the caller, so a daily
+        ledger fed only by the return value under-counts requests exactly
+        when the provider is under the most pressure.  Never swallowed - a
+        raising callback is a broken ledger and must surface.
         """
         key = os.environ.get(self.provider.api_key_env)
         if not key:
@@ -519,6 +530,8 @@ class ChatClient:
             except httpx.HTTPError as exc:
                 last_status = None
                 last_detail = f"transport error {type(exc).__name__}: {exc}"
+                if on_attempt is not None:
+                    on_attempt(None, None)
             else:
                 status = response.status_code
                 if 200 <= status < 300:
@@ -528,11 +541,17 @@ class ChatClient:
                     except ValueError as exc:
                         last_status = status
                         last_detail = f"malformed JSON body: {exc}"
+                        if on_attempt is not None:
+                            on_attempt(status, None)
                     else:
+                        if on_attempt is not None:
+                            on_attempt(status, data.get("usage") or None)
                         return self._to_response(data, status=status, latency_ms=latency_ms)
                 else:
                     last_status = status
                     last_detail = _snippet(response.text, 200) or f"HTTP {status}"
+                    if on_attempt is not None:
+                        on_attempt(status, None)
                     if 400 <= status < 500 and status != 429:
                         dead = status not in _ABORT_STATUSES
                         kind = (
@@ -620,6 +639,35 @@ class _BreakerState:
 # these may usefully try again shortly.  "missing-key" and "family-excluded"
 # are structural - they will still hold in a minute.
 _TRANSIENT_SKIPS = frozenset({"cooling", "over-budget"})
+
+
+def undersized_families(cfg: BuildConfig, role: str, needed_tokens: int) -> frozenset[str]:
+    """Families that cannot hold ``needed_tokens`` in ANY of their ``role`` models.
+
+    Context length is not something ``eligible`` can filter on - the Router
+    routes by role and family, and a model's ``max_context`` is a property of
+    the PROMPT, not of the pool.  Turning "too small for this prompt" into a
+    family exclusion is what lets a caller express it with the filter the
+    Router does have.
+
+    A family is excluded only when EVERY one of its models in that role is
+    too small, so a mixed-size family keeps its large model and the
+    preference order still decides between them.  A model that declares no
+    ``max_context`` is assumed to fit: an absent limit is unknown, and
+    guessing "too small" would silently remove a working provider.
+
+    Callers on both sides of a generation need this - the generator because
+    an over-long prompt at an 8k model is a 400 that does not fail over, the
+    judge because its prompt carries the same materials PLUS the candidate
+    and is the longest in the pipeline.
+    """
+    fits_by_family: dict[str, bool] = {}
+    for ref in cfg.routing_refs(role):
+        _, model = cfg.model_for(ref)
+        cap = model.limits.get("max_context")
+        fits = cap is None or int(cap) >= needed_tokens
+        fits_by_family[model.family] = fits_by_family.get(model.family, False) or fits
+    return frozenset(family for family, fits in fits_by_family.items() if not fits)
 
 
 class Router:
@@ -793,9 +841,11 @@ class Router:
         req_messages: Sequence[Mapping],
         *,
         params: dict | None = None,
+        params_for_ref: Callable[[ModelRef, ModelCfg], Mapping] | None = None,
         max_tokens: int | None = None,
         est_tokens: int = 0,
         exclude_families: frozenset[str] = frozenset(),
+        on_attempt: Callable[[ModelRef, int | None, dict | None], None] | None = None,
     ) -> tuple[ModelRef, ChatResponse]:
         """One pass down the role's preference list; returns (ref, response).
 
@@ -810,6 +860,21 @@ class Router:
         * anything else non-retryable (400/422/413 - our payload) - raised
           straight through, because the same request would fail identically
           at every other provider and failing over would only hide the bug.
+
+        ``params_for_ref``, when given, is called with the ref about to be
+        used and its ModelCfg, and its return value REPLACES ``params`` for
+        that attempt.  Failover is what makes this necessary: a parameter
+        that is valid for the first ref (``reasoning_effort`` on a gpt-oss
+        model) is an unknown field at the next one, and an unknown field is a
+        400 - which this method classifies as OUR payload being broken and
+        raises straight through instead of failing over.  A caller that sends
+        model-specific parameters must therefore choose them per ref, not per
+        call.
+
+        ``on_attempt`` is called after EVERY HTTP attempt, including the
+        client's internal retries and every failover, with
+        ``(ref, status, usage_or_None)``.  It is how a caller keeps a daily
+        request/token ledger that matches what the providers actually saw.
         """
         messages = tuple(dict(m) for m in req_messages)
         last_error: ProviderError | None = None
@@ -819,16 +884,28 @@ class Router:
             role, est_tokens=est_tokens, exclude_families=exclude_families, skipped=skipped
         ):
             attempted += 1
+            per_ref = (
+                dict(params_for_ref(routed.ref, routed.model_cfg))
+                if params_for_ref is not None
+                else dict(params or {})
+            )
             req = ChatRequest(
                 messages=messages,
                 ref=routed.ref,
-                params=dict(params or {}),
+                params=per_ref,
                 max_tokens=max_tokens,
+            )
+            attempt_hook = (
+                None
+                if on_attempt is None
+                else (lambda status, usage, ref=routed.ref: on_attempt(ref, status, usage))
             )
             await routed.bucket.acquire(est_tokens)
             try:
                 response = await routed.client.complete(
-                    req, before_attempt=lambda bucket=routed.bucket: bucket.acquire(0)
+                    req,
+                    before_attempt=lambda bucket=routed.bucket: bucket.acquire(0),
+                    on_attempt=attempt_hook,
                 )
             except ProviderError as exc:
                 if not exc.retryable and not exc.provider_dead:

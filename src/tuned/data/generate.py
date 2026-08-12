@@ -58,7 +58,7 @@ from tuned.data import gates, prompt_registry
 from tuned.data.config import ModelRef
 from tuned.data.gates import GateContext, split_think
 from tuned.data.jsonl import append_ndjson
-from tuned.data.providers import ProviderError
+from tuned.data.providers import ProviderError, undersized_families
 from tuned.data.store import utcday, utcnow
 
 # Task states this module owns. 'judging' is the hand-off to judge.py.
@@ -145,8 +145,13 @@ class SlotError(ValueError):
 class PromptBundle:
     messages: list[dict]
     # CONTRACT: every grounding slot, concatenated. GateContext.source_text
-    # and the judge's {source} are both THIS string and nothing else.
+    # is THIS string and nothing else - it is the citation allow-list, and
+    # widening it would let an invented authority in.
     grounding: str
+    # What the JUDGE is shown as {source}. Identical to `grounding` on every
+    # stream but transition, where it also carries {scenario} - see
+    # judge_source_text.
+    judge_source: str
     slots: dict
     prompt_est_tokens: int
 
@@ -165,6 +170,11 @@ class GenResult:
     error: str | None = None
     skipped: str | None = None
     state: str | None = None
+    # The call failed for a reason another identical claim cannot fix: no
+    # eligible model at all (every family excluded, no key), or a payload the
+    # provider refuses. Re-queueing burns two more claims for the same
+    # failure, so the task is closed out instead.
+    permanent: bool = False
 
 
 @dataclass
@@ -233,21 +243,33 @@ def worker_name(prefix: str = "gen") -> str:
     return f"{prefix}-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 
 
-def record_usage(store, ref: ModelRef, response=None, *, is_429: bool = False, day=None) -> None:
-    """Ledger every response, including the failures (contract 7).
+def usage_recorder(store, day: str | None = None):
+    """The Router's on_attempt hook, wired to the daily ledger (contract 7).
 
-    A 429 costs no tokens but it IS a request against the daily quota and,
-    more importantly, the count of them is how the operator sees a provider
-    turning hostile before the wave stalls.
+    Every HTTP attempt is ledgered, not just the one that returned: the
+    client retries a 429 up to six times internally and the Router then fails
+    over, so a ledger fed only by the successful response counts one request
+    where the providers saw seven - and under-counts hardest exactly when the
+    pool is under pressure and the operator most needs the number.
+
+    A transport failure (status None) never reached the provider, so it is
+    not a request against anybody's quota and is skipped.
     """
-    store.record_usage(
-        ref.provider,
-        ref.model,
-        prompt_tokens=getattr(response, "prompt_tokens", 0) or 0,
-        completion_tokens=getattr(response, "completion_tokens", 0) or 0,
-        is_429=is_429,
-        day=day,
-    )
+
+    def on_attempt(ref: ModelRef, status: int | None, usage: dict | None) -> None:
+        if status is None:
+            return
+        usage = usage or {}
+        store.record_usage(
+            ref.provider,
+            ref.model,
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            completion_tokens=int(usage.get("completion_tokens") or 0),
+            is_429=(status == 429),
+            day=day,
+        )
+
+    return on_attempt
 
 
 # --------------------------------------------------------------------------
@@ -286,6 +308,25 @@ def _require(meta: Mapping, name: str, task_type: str, seed_id: str) -> str:
     return str(value)
 
 
+def _require_date(seed: Mapping, meta: Mapping, name: str, task_type: str, seed_id: str) -> date:
+    """A date the TRANSITION gates cannot run without.
+
+    check_temporal's undecidable channel is FATAL on this stream, and fatal
+    means a PERMANENT reject - after the generation has been paid for. A
+    transition seed missing its dates is therefore refused here, unspent,
+    rather than bought and thrown away.
+    """
+    parsed = _parse_date(seed.get(name) or meta.get(name))
+    if parsed is None:
+        raise SlotError(
+            f"seed {seed_id!r} carries no usable {name!r} (ISO yyyy-mm-dd), which the "
+            f"{task_type!r} stream needs before it can be gated: without it "
+            f"check_temporal cannot decide which code governs and rejects the row "
+            f"permanently after paying for it"
+        )
+    return parsed
+
+
 def build_slots(cfg, task: Mapping, seed: Mapping) -> dict:
     """Slot values for this task's template, from the seed row.
 
@@ -300,10 +341,13 @@ def build_slots(cfg, task: Mapping, seed: Mapping) -> dict:
       corpus in P7 replaces.
     * irac_analysis - {focus_issue} falls back to the seed's case_type.
     * drafting - {document_kind}/{party_context} fall back to neutral phrases.
-    * transition - NO fallbacks. Its slots are the old/new provision texts,
+    * transition - NO fallbacks, and the DATES are required too even though
+      no template slot holds them. Its slots are the old/new provision texts,
       the savings clause and the dated posture; inventing any of them would
-      manufacture the very thing the stream exists to test. A transition seed
-      without them raises SlotError and the task is rejected unspent.
+      manufacture the very thing the stream exists to test, and a missing
+      offence/proceeding date makes check_temporal fatal-undecidable, i.e. a
+      permanent reject of an answer already paid for. Either way the task is
+      refused here, unspent.
     """
     meta = seed_meta(seed)
     task_type = task["task_type"]
@@ -334,18 +378,55 @@ def build_slots(cfg, task: Mapping, seed: Mapping) -> dict:
     elif task_type == "transition":
         for name in ("scenario", "old_section_text", "new_section_text", "savings_text"):
             slots[name] = _require(meta, name, task_type, seed_id)
+        # Not template slots - gate inputs. Validated here so the refusal
+        # costs nothing; gate_context reads them from the same places.
+        for name in ("offence_date", "proceeding_started"):
+            _require_date(seed, meta, name, task_type, seed_id)
     return slots
 
 
 def grounding_text(slots: Mapping) -> str:
-    """The union of the grounding slots, in GROUNDING_SLOTS order.
+    """The union of the grounding slots, in GROUNDING_SLOTS order, deduped.
 
-    This string is the citation allow-list, the verbatim-scan corpus and the
-    judge's view of the materials. See the module docstring: anything less
-    turns a correct citation into a permanent reject.
+    This string is the citation allow-list and the verbatim-scan corpus. See
+    the module docstring: anything less turns a correct citation into a
+    permanent reject.
+
+    Deduped because a slot is often filled from another slot - the pilot's
+    statute_qa fallback puts the seed text in both {source} and
+    {section_text}, and concatenating them would double every judge prompt
+    and every context-length estimate for no added grounding at all. A part
+    already carried (as normalized text) by one that was kept is dropped.
     """
-    parts = [str(slots[name]) for name in GROUNDING_SLOTS if slots.get(name)]
+    parts: list[str] = []
+    kept: list[str] = []
+    for name in GROUNDING_SLOTS:
+        value = slots.get(name)
+        if not value:
+            continue
+        text = str(value)
+        normalized = " ".join(text.split())
+        if any(normalized in seen for seen in kept):
+            continue
+        parts.append(text)
+        kept.append(normalized)
     return "\n\n".join(parts)
+
+
+def judge_source_text(task: Mapping, slots: Mapping, grounding: str) -> str:
+    """What the judge is shown as {source}.
+
+    Same as the gates' grounding everywhere except the TRANSITION stream,
+    where {scenario} - the posture and the DATES - is appended. Which
+    enactment governs is decided by those dates and by nothing else, so a
+    judge without them is scoring the one axis it cannot see. It is
+    deliberately NOT folded into `grounding`: that string is the citation
+    allow-list, and a scenario naming a section would quietly authorise it.
+    """
+    scenario = slots.get("scenario")
+    if task.get("stream") != gates.TRANSITION_STREAM or not scenario:
+        return grounding
+    return f"{grounding}\n\n{scenario}"
 
 
 def build_prompt(cfg, task: Mapping, seed: Mapping, *, reviewer_note: str | None = None) -> PromptBundle:
@@ -354,9 +435,11 @@ def build_prompt(cfg, task: Mapping, seed: Mapping, *, reviewer_note: str | None
     if reviewer_note:
         messages = append_reviewer_note(messages, reviewer_note)
     est = sum(len(m.get("content") or "") for m in messages) // 4
+    grounding = grounding_text(slots)
     return PromptBundle(
         messages=messages,
-        grounding=grounding_text(slots),
+        grounding=grounding,
+        judge_source=judge_source_text(task, slots, grounding),
         slots=slots,
         prompt_est_tokens=est,
     )
@@ -471,24 +554,29 @@ def effort_for_attempt(attempt: int, base: str = DEFAULT_EFFORT) -> str:
     return EFFORT_LADDER[min(start + max(0, attempt - 1), len(EFFORT_LADDER) - 1)]
 
 
-def generator_params(router, cfg, attempt: int, est_tokens: int) -> dict:
-    """Per-request param overrides for this attempt.
+def effort_params_for_ref(attempt: int):
+    """Build the Router's per-ref params hook for this attempt.
 
-    Attempt 1 sends nothing and the model's configured defaults stand. A
-    retry asks for more reasoning effort - but ONLY if the model the router
-    would pick declares reasoning_effort in its config. Sending an unknown
-    parameter earns a 400 at several providers, and providers.py classifies
-    400 as a payload bug: the call aborts instead of failing over, so a
-    well-meant bump would kill the task outright.
+    Attempt 1 sends nothing and every model's configured defaults stand. A
+    retry asks for more reasoning effort - but the parameter is chosen for
+    the ref the Router is ABOUT TO CALL, not for the one it would have
+    picked first. That distinction is the whole point: reasoning_effort is a
+    gpt-oss parameter, magistral does not declare it, and an unknown field
+    earns a 400 - which providers.py classifies as our payload being broken
+    everywhere and raises straight through WITHOUT failing over. Choosing the
+    params before the failover decision would therefore turn every
+    second-attempt failover into a dead task.
     """
-    if attempt <= 1:
-        return {}
-    routed = router.pick("generator", est_tokens=est_tokens)
-    model_cfg = getattr(routed, "model_cfg", None)
-    params = dict(getattr(model_cfg, "params", None) or {})
-    if "reasoning_effort" not in params:
-        return {}
-    return {"reasoning_effort": effort_for_attempt(attempt, str(params["reasoning_effort"]))}
+
+    def params_for_ref(ref: ModelRef, model_cfg) -> dict:
+        if attempt <= 1:
+            return {}
+        declared = dict(getattr(model_cfg, "params", None) or {})
+        if "reasoning_effort" not in declared:
+            return {}
+        return {"reasoning_effort": effort_for_attempt(attempt, str(declared["reasoning_effort"]))}
+
+    return params_for_ref
 
 
 def next_attempt(store, task: Mapping) -> int:
@@ -602,28 +690,32 @@ async def generate_once(
 
     max_tokens = max_output_tokens(cfg)
     est_tokens = bundle.prompt_est_tokens + max_tokens
-    params = generator_params(router, cfg, attempt, est_tokens)
-    if params:
-        store.log_event(
-            "effort_bump",
-            {"task_id": task["task_id"], "attempt": attempt, "params": params},
-        )
+    # CONTEXT ROUTING. cerebras/gpt-oss-120b is an 8k-context model and the
+    # first generator in the preference list; a long seed makes
+    # prompt + max_tokens exceed that, which is a 400 - and a 400 does not
+    # fail over (providers.py treats it as our payload being wrong
+    # everywhere), so the task would burn its whole attempt budget on three
+    # identical refusals and the pilot's pass rates would be computed over
+    # short seeds only. Excluding the families that cannot hold this prompt
+    # routes it to magistral (40k) instead.
+    too_small = undersized_families(cfg, "generator", est_tokens)
+    params_for_ref = effort_params_for_ref(attempt)
 
     try:
         ref, response = await router.complete(
             "generator",
             bundle.messages,
-            params=params,
+            params_for_ref=params_for_ref,
             max_tokens=max_tokens,
             est_tokens=est_tokens,
+            exclude_families=too_small,
+            on_attempt=usage_recorder(store, day),
         )
     except ProviderError as exc:
-        # A 429 that survived the client's own retries still consumed a
-        # request slot at the provider; ledger it so the operator sees the
-        # pressure. Nothing else is known about the failed call.
-        if exc.status == 429 and exc.provider and exc.model:
-            record_usage(store, ModelRef(exc.provider, exc.model), is_429=True, day=day)
+        # Every attempt this call made is already ledgered by on_attempt,
+        # including the 429s the client retried through.
         result.error = str(exc)
+        result.permanent = not exc.retryable
         store.log_event(
             "generation_error",
             {
@@ -631,17 +723,32 @@ async def generate_once(
                 "attempt": attempt,
                 "status": exc.status,
                 "retryable": exc.retryable,
+                "permanent": result.permanent,
+                "est_tokens": est_tokens,
+                "excluded_families": sorted(too_small),
                 "error": str(exc)[:500],
             },
         )
         return result
 
-    record_usage(store, ref, response, day=day)
     result.ref = ref
     result.prompt_tokens = int(response.prompt_tokens or 0)
     result.completion_tokens = int(response.completion_tokens or 0)
 
     _, model_cfg = cfg.model_for(ref)
+    # What was actually sent - resolved against the ref that answered, which
+    # after a failover need not be the one the params were first shaped for.
+    params = dict(params_for_ref(ref, model_cfg))
+    if params:
+        store.log_event(
+            "effort_bump",
+            {
+                "task_id": task["task_id"],
+                "attempt": attempt,
+                "ref": f"{ref.provider}/{ref.model}",
+                "params": params,
+            },
+        )
     content, think, answer = assemble_content(cfg, response)
     envelope = _gen_envelope(
         task, attempt, ref, model_cfg.family, response, content, think, answer,
@@ -694,12 +801,17 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
 
     * clean            -> judging (judge.py's queue)
     * regenerate       -> pending while attempts remain, else rejected. The
-                          next claim bumps reasoning_effort (generator_params).
+                          next claim bumps reasoning_effort
+                          (effort_params_for_ref).
     * reject           -> rejected. A permanent gate means the example is
                           wrong about the law; the seed is burned, never
                           retried.
     * no generation    -> pending while attempts remain (a provider outage is
-                          not the task's fault), else rejected.
+                          not the task's fault), else rejected. But a
+                          PERMANENT routing/payload failure closes the task
+                          immediately: nothing about the next claim would be
+                          different, so re-queueing only spends two more
+                          claims arriving at the same refusal.
 
     Every write is lease-fenced: if this worker lost its lease while the call
     was in flight, the task already belongs to somebody else and this result
@@ -714,6 +826,8 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
             # A missing seed or an unrenderable slot set is permanent: the
             # next attempt would hit the identical wall, unspent.
             state, disposition = REJECTED_STATE, f"skip:{result.skipped}"
+        elif result.permanent:
+            state, disposition = REJECTED_STATE, "unroutable:generator"
         elif exhausted:
             state, disposition = REJECTED_STATE, "exhausted:error"
         else:
@@ -807,6 +921,7 @@ async def run_workers(
     worker_id = worker_id or worker_name("gen")
     totals = BatchStats()
     batches = 0
+    idle_announced = False
 
     while max_batches is None or batches < max_batches:
         stats = BatchStats()
@@ -815,6 +930,10 @@ async def run_workers(
             stats.claimed += len(claimed)
             if not claimed:
                 continue
+            # return_exceptions: one task that raises something nobody
+            # anticipated must not take the other n-1 paid calls in this
+            # batch down with it. Its lease simply expires and it is
+            # re-claimed later; the batch reports and carries on.
             results = await asyncio.gather(
                 *(
                     generate_once(
@@ -822,9 +941,23 @@ async def run_workers(
                         paths=paths, citation_index=citation_index, day=day,
                     )
                     for task in claimed
-                )
+                ),
+                return_exceptions=True,
             )
             for task, result in zip(claimed, results):
+                if isinstance(result, BaseException):
+                    if isinstance(result, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                        raise result
+                    store.log_event(
+                        "worker_task_error",
+                        {
+                            "task_id": task["task_id"],
+                            "worker": worker_id,
+                            "error": f"{type(result).__name__}: {result}"[:500],
+                        },
+                    )
+                    stats.errors += 1
+                    continue
                 apply_gate_disposition(store, task, result, worker_id=worker_id)
                 stats.absorb(result)
         batches += 1
@@ -836,7 +969,12 @@ async def run_workers(
         totals.completion_tokens += stats.completion_tokens
         for key, count in stats.dispositions.items():
             totals.dispositions[key] = totals.dispositions.get(key, 0) + count
-        print(format_batch_line(batches, stats, budget_lines(store, cfg, day=day)))
+        # An idle --forever worker polls every few seconds for hours; printing
+        # each empty tick buries the batches that did something. Say "idle"
+        # once, then stay quiet until the queue produces work again.
+        if stats.claimed or not idle_announced:
+            print(format_batch_line(batches, stats, budget_lines(store, cfg, day=day)))
+        idle_announced = stats.claimed == 0
         if stats.claimed == 0:
             if not forever:
                 break

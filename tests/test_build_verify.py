@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -13,12 +14,15 @@ from pipeline_fakes import (
     chat_response,
     open_store,
     paths_for,
+    temp_config,
 )
 
 from tuned.data.citations import CitationIndex
 from tuned.data.generate import run_workers
 from tuned.data.tasks import plan_wave
-from tuned.data.verify import content_for, latest_generations, rerun_gates
+from tuned.data.verify import content_for, latest_generations, live_leases
+from tuned.data.verify import main as verify_main
+from tuned.data.verify import rerun_gates
 
 # The grounding text cites this one, so it is never "novel"; the index holds
 # it as well, which is the realistic shape.
@@ -42,9 +46,10 @@ def index_path(tmp_path):
 
 
 def generated_store(
-    tmp_path, paths, cfg, *, answer=CLEAN_ANSWER, reasoning=CLEAN_THINK, state="accepted"
+    tmp_path, paths, cfg, *, answer=CLEAN_ANSWER, reasoning=CLEAN_THINK, state="accepted",
+    db_path=None,
 ):
-    store = open_store(tmp_path, n_seeds=1)
+    store = open_store(tmp_path, n_seeds=1, db_path=db_path)
     plan_wave(store, cfg, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
     router = FakeRouter(cfg, {"generator": [chat_response(answer, reasoning)]})
     asyncio.run(
@@ -227,6 +232,35 @@ def test_a_run_without_an_index_is_marked_unverified(tmp_path, paths, cfg):
         assert gate_detail(store, store.latest_generation(task_id)["gen_id"], "citations")[
             "novel_skipped"
         ] == "no-index"
+
+
+def test_live_leases_counts_only_held_tasks(tmp_path, paths, cfg):
+    store, task_id = generated_store(tmp_path, paths, cfg, state="pending")
+    with store:
+        assert live_leases(store) == 0
+        store.claim_tasks("gen-1", 1)
+        assert live_leases(store) == 1
+        # An expired lease is not a live one.
+        stale = (datetime.now(UTC) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        store.conn.execute("UPDATE task SET claimed_at = ?", (stale,))
+        assert live_leases(store) == 0
+
+
+def test_cli_refuses_to_demote_under_a_live_fleet(tmp_path, paths, cfg, index_path, capsys):
+    """rerun_gates writes task states without holding a lease of its own, so
+    running it against live workers can overwrite a decision in flight."""
+    config_path = temp_config(tmp_path)
+    store, task_id = generated_store(
+        tmp_path, paths, cfg, answer=NOVEL_ANSWER, state="pending", db_path=paths.state_db
+    )
+    with store:
+        store.claim_tasks("gen-1", 1)
+    # The CLI opens its own handle on the same workdir.
+    assert verify_main(["--config", config_path, "--index", index_path]) == 2
+    out = capsys.readouterr().out
+    assert "REFUSING" in out and "--force" in out
+    assert verify_main(["--config", config_path, "--index", index_path, "--force"]) == 0
+    assert "demoted" in capsys.readouterr().out
 
 
 def test_a_missing_seed_is_counted_not_raised(tmp_path, paths, cfg, index_path):

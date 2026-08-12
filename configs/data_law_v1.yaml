@@ -82,6 +82,15 @@ providers:
 # fallbacks. Model refs in routing are "provider/model-id" strings - note
 # that "groq/qwen/qwen3.6-27b" contains TWO slashes, so refs are split on the
 # FIRST slash only (provider="groq", model="qwen/qwen3.6-27b").
+#
+# WANTED: a 32k+ THIRD-FAMILY tiebreak model. The tiebreak pool below is
+# gpt-oss (131k) plus two 8k models, so a long candidate produced by the
+# gpt-oss generator has NO eligible tiebreak at all: family separation
+# removes gpt-oss and the context check removes gemma and glm. judge.py
+# handles that by deciding on the two judges it has and rejecting the
+# unresolved disagreement (run_event tiebreak_unroutable_two_judge_decision,
+# which is the metric to watch), but the real fix is one more large
+# non-gpt-oss, non-mistral, non-qwen judge here - config only, no code.
 routing:
   generator: [cerebras/gpt-oss-120b, mistral/magistral-small-latest]
   judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b, cerebras/zai-glm-4.7]

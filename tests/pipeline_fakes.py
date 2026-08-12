@@ -182,16 +182,25 @@ class FakeRouter:
         messages,
         *,
         params=None,
+        params_for_ref=None,
         max_tokens=None,
         est_tokens=0,
         exclude_families=frozenset(),
+        on_attempt=None,
     ):
         picked = self._eligible(role, exclude_families)
+        # Same resolution order as the real Router: per-ref params win, and
+        # they are resolved against the ref actually about to be called.
+        sent = (
+            dict(params_for_ref(picked.ref, picked.model_cfg))
+            if params_for_ref is not None and picked is not None
+            else dict(params or {})
+        )
         self.calls.append(
             {
                 "role": role,
                 "messages": [dict(m) for m in messages],
-                "params": dict(params or {}),
+                "params": sent,
                 "max_tokens": max_tokens,
                 "est_tokens": est_tokens,
                 "exclude_families": frozenset(exclude_families or ()),
@@ -199,14 +208,22 @@ class FakeRouter:
             }
         )
         if picked is None:
+            # Structural: nothing in the pool can take this call. The real
+            # Router reports that as non-retryable when no skip reason was
+            # transient, which is what tells a worker to park.
             raise ProviderError(
                 f"role {role!r}: no eligible model (skipped: family-excluded)", retryable=False
             )
         item = self._next(role)
         if isinstance(item, BaseException):
+            # Report the attempt the way the client would before failing.
+            if on_attempt is not None and getattr(item, "status", None) is not None:
+                on_attempt(picked.ref, item.status, None)
             raise item
         if callable(item):
             item = item(picked.ref, messages)
+        if on_attempt is not None:
+            on_attempt(picked.ref, item.status, (item.raw or {}).get("usage"))
         return picked.ref, item
 
     async def aclose(self):
@@ -241,8 +258,10 @@ def seed_rows(n: int, *, text: str = SEED_TEXT, meta=None, case_type="criminal")
     ]
 
 
-def open_store(tmp_path, *, n_seeds: int = 4, **seed_kwargs) -> Store:
-    store = Store.open(tmp_path / "state" / "law_v1.sqlite3")
+def open_store(tmp_path, *, n_seeds: int = 4, db_path=None, **seed_kwargs) -> Store:
+    """A seeded store. `db_path` puts it where a CLI under test will look
+    (build_paths(workdir).state_db) instead of beside tmp_path."""
+    store = Store.open(db_path or (tmp_path / "state" / "law_v1.sqlite3"))
     store.upsert_source(SOURCE_ID, "Apache-2.0", url="https://example.test")
     if n_seeds:
         store.upsert_seeds(seed_rows(n_seeds, **seed_kwargs))
@@ -253,3 +272,53 @@ def paths_for(tmp_path):
     from tuned.data.paths import build_paths
 
     return build_paths(tmp_path / "build").ensure()
+
+
+def temp_config(tmp_path) -> str:
+    """The real build config with its workdir redirected into tmp_path.
+
+    For the CLI tests: `main()` resolves its own paths from the config, and
+    the shipped one points at the operator's live data/build.
+    """
+    raw = DATA_CONFIG.read_text(encoding="utf-8")
+    redirected = raw.replace("workdir: data/build", f"workdir: {(tmp_path / 'build').as_posix()}")
+    assert redirected != raw
+    path = tmp_path / "cfg.yaml"
+    path.write_text(redirected, encoding="utf-8")
+    return str(path)
+
+
+# Long enough that prompt + max_tokens passes 8k (so the cerebras generator
+# and the glm judge cannot hold it) while the prompt + trace + answer still
+# fit the 8192-token length band - the routing has to move without the
+# length gate firing and masking the result.
+LONG_SEED_TEXT = (SEED_TEXT + " ") * 60
+
+# Everything a transition seed must carry: the four template slots AND the
+# two dates, without which check_temporal is fatally undecidable on this
+# stream. The scenario names dates and posture only - no section numbers, so
+# that keeping it out of the citation allow-list costs nothing.
+TRANSITION_META = {
+    "scenario": (
+        "The offence is alleged to have been committed on 12 March 2024. The first "
+        "information was recorded on 20 March 2024 and the charge-sheet was filed on "
+        "4 September 2024, after the appointed day of 1 July 2024. The matter is at "
+        "the stage of framing of charge."
+    ),
+    "old_section_text": (
+        "Whoever commits theft shall be punished with imprisonment of either "
+        "description for a term which may extend to three years, or with fine, or with both."
+    ),
+    "new_section_text": (
+        "Whoever commits theft shall be punished with imprisonment of either "
+        "description for a term which may extend to three years, or with fine, or with "
+        "both, and in a case of second or subsequent conviction, with rigorous imprisonment."
+    ),
+    "savings_text": (
+        "The repeal shall not affect any investigation, inquiry, trial or proceeding "
+        "pending immediately before the appointed day, which shall be continued as if "
+        "this enactment had not come into force."
+    ),
+    "offence_date": "2024-03-12",
+    "proceeding_started": "2024-09-04",
+}

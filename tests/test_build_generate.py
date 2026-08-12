@@ -7,12 +7,15 @@ from pipeline_fakes import (
     CLEAN_THINK,
     FABRICATED_ANSWER,
     FABRICATED_SUSPECT,
+    LONG_SEED_TEXT,
     SEED_TEXT,
+    TRANSITION_META,
     FakeRouter,
     build_cfg,
     chat_response,
     open_store,
     paths_for,
+    seed_rows,
 )
 
 from tuned.data import gates
@@ -50,8 +53,9 @@ def paths(tmp_path):
     return paths_for(tmp_path)
 
 
-def make_store(tmp_path, *, n_seeds=1, n_tasks=1, mix=None, meta=None, stream="synthesis"):
-    store = open_store(tmp_path, n_seeds=n_seeds, meta=meta)
+def make_store(tmp_path, *, n_seeds=1, n_tasks=1, mix=None, meta=None, stream="synthesis",
+               text=SEED_TEXT):
+    store = open_store(tmp_path, n_seeds=n_seeds, meta=meta, text=text)
     plan_wave(
         store, build_cfg(), stream, n_tasks,
         task_type_mix=mix or {"irac_analysis": 1.0},
@@ -503,6 +507,196 @@ def test_streams_are_claimed_separately(tmp_path, cfg, paths):
         counts = store.task_counts()
         assert counts["judging"] == 2
         assert counts["pending"] == 2
+
+
+# --------------------------------------------------------------------------
+# Context routing for the GENERATOR (an 8k model is first in the list).
+# --------------------------------------------------------------------------
+
+def test_a_long_prompt_is_routed_past_the_8k_generator(tmp_path, cfg, paths):
+    with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
+        router = FakeRouter(cfg)
+        run(store, cfg, router, paths)
+        call = router.calls_for("generator")[0]
+        assert call["est_tokens"] > 8192
+        # cerebras/gpt-oss-120b is 8k and first in the preference list; an
+        # over-long prompt there is a 400, and a 400 does NOT fail over.
+        assert "gpt-oss" in call["exclude_families"]
+        assert call["ref"] == ModelRef("mistral", "magistral-small-latest")
+        assert only_task(store)["state"] == "judging"
+
+
+def test_a_short_prompt_excludes_no_generator(tmp_path, cfg, paths):
+    with make_store(tmp_path) as store:
+        router = FakeRouter(cfg)
+        run(store, cfg, router, paths)
+        call = router.calls_for("generator")[0]
+        assert call["est_tokens"] <= 8192
+        assert call["exclude_families"] == frozenset()
+        assert call["ref"] == ModelRef("cerebras", "gpt-oss-120b")
+
+
+def test_the_effort_bump_is_chosen_for_the_ref_that_answers(tmp_path, cfg, paths):
+    """reasoning_effort is a gpt-oss parameter. On a long prompt the call
+    lands on magistral, which does not declare it - and an unknown parameter
+    is a 400 that never fails over."""
+    with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
+        router = FakeRouter(cfg)
+        task = only_task(store)
+        asyncio.run(generate_once(store, cfg, router, task, paths=paths, attempt=2))
+        call = router.calls_for("generator")[0]
+        assert call["ref"].provider == "mistral"
+        assert call["params"] == {}
+        assert store.events("effort_bump") == []
+
+    with make_store(tmp_path / "short") as store:
+        router = FakeRouter(cfg)
+        task = only_task(store)
+        asyncio.run(generate_once(store, cfg, router, task, paths=paths, attempt=2))
+        call = router.calls_for("generator")[0]
+        assert call["ref"].provider == "cerebras"
+        assert call["params"] == {"reasoning_effort": "high"}
+        assert json.loads(store.events("effort_bump")[0]["detail_json"])["ref"] == (
+            "cerebras/gpt-oss-120b"
+        )
+
+
+def test_an_unroutable_generator_closes_the_task_at_once(tmp_path, cfg, paths):
+    """No eligible model is a fact about the row, not the moment: three more
+    claims would meet the same wall, so the task is closed with a diagnostic
+    instead of cycling."""
+    with make_store(tmp_path) as store:
+        # A seed longer than every generator's context window.
+        store.upsert_seeds(
+            [{**seed_rows(1)[0], "text": "word " * 60000}]
+        )
+        task = only_task(store)
+        router = FakeRouter(cfg)
+        result = asyncio.run(generate_once(store, cfg, router, task, paths=paths))
+        assert result.ok is False
+        assert result.permanent is True
+        assert apply_gate_disposition(store, task, result, worker_id=None) == "rejected"
+        assert only_task(store)["disposition"] == "unroutable:generator"
+        event = json.loads(store.events("generation_error")[0]["detail_json"])
+        assert event["permanent"] is True
+        assert set(event["excluded_families"]) == {"gpt-oss", "mistral"}
+
+
+# --------------------------------------------------------------------------
+# Grounding hygiene and the transition stream's date requirement.
+# --------------------------------------------------------------------------
+
+def test_grounding_collapses_a_duplicated_slot(tmp_path, cfg):
+    """The pilot's statute_qa fallback puts the seed text in {source} AND
+    {section_text}; concatenating both doubles every judge prompt and every
+    context estimate for no added grounding."""
+    with make_store(tmp_path, mix={"statute_qa": 1.0}) as store:
+        task = only_task(store)
+        bundle = build_prompt(cfg, task, store.get_seed(task["seed_id"]))
+        assert bundle.grounding == SEED_TEXT
+        assert bundle.grounding.count(SEED_TEXT) == 1
+
+
+def test_grounding_keeps_a_distinct_section_text(tmp_path, cfg):
+    meta = {"section_text": "Section 9. A distinct provision, not the seed text."}
+    with make_store(tmp_path, meta=meta, mix={"statute_qa": 1.0}) as store:
+        task = only_task(store)
+        bundle = build_prompt(cfg, task, store.get_seed(task["seed_id"]))
+        assert bundle.grounding == f"{SEED_TEXT}\n\n{meta['section_text']}"
+
+
+def test_transition_refuses_a_seed_without_its_dates(tmp_path, cfg, paths):
+    slots_only = {k: v for k, v in TRANSITION_META.items() if not k.endswith("date")}
+    slots_only.pop("proceeding_started")
+    with make_store(
+        tmp_path, stream="transition", mix={"transition": 1.0}, meta=slots_only
+    ) as store:
+        task = only_task(store)
+        with pytest.raises(SlotError, match="offence_date"):
+            build_slots(cfg, task, store.get_seed(task["seed_id"]))
+        # And the worker refuses it unspent rather than paying for a row the
+        # temporal gate will permanently reject.
+        router = FakeRouter(cfg)
+        result = asyncio.run(generate_once(store, cfg, router, task, paths=paths))
+        assert result.skipped == "slots"
+        assert router.calls == []
+
+
+def test_transition_renders_once_the_dates_are_there(tmp_path, cfg):
+    with make_store(
+        tmp_path, stream="transition", mix={"transition": 1.0}, meta=TRANSITION_META
+    ) as store:
+        task = only_task(store)
+        seed = store.get_seed(task["seed_id"])
+        bundle = build_prompt(cfg, task, seed)
+        # The scenario is judge-visible but NOT part of the citation allow-list.
+        assert TRANSITION_META["scenario"] not in bundle.grounding
+        assert TRANSITION_META["scenario"] in bundle.judge_source
+        assert bundle.judge_source.startswith(bundle.grounding)
+        assert TRANSITION_META["old_section_text"] in bundle.grounding
+        assert TRANSITION_META["savings_text"] in bundle.grounding
+        ctx = gate_context(cfg, task, seed, bundle.grounding)
+        assert ctx.source_text == bundle.grounding
+        assert ctx.offence_date.isoformat() == "2024-03-12"
+        assert ctx.proceeding_started.isoformat() == "2024-09-04"
+
+
+def test_judge_source_equals_grounding_off_the_transition_stream(tmp_path, cfg):
+    with make_store(tmp_path) as store:
+        task = only_task(store)
+        bundle = build_prompt(cfg, task, store.get_seed(task["seed_id"]))
+        assert bundle.judge_source == bundle.grounding
+
+
+# --------------------------------------------------------------------------
+# Ledger and loop robustness.
+# --------------------------------------------------------------------------
+
+def test_every_attempt_is_ledgered_including_the_429(tmp_path, cfg, paths):
+    error = ProviderError(
+        "rate limited", status=429, provider="cerebras", model="gpt-oss-120b", retryable=True
+    )
+    with make_store(tmp_path) as store:
+        run(store, cfg, FakeRouter(cfg, {"generator": [error]}), paths)
+        used = store.usage_today("cerebras", "gpt-oss-120b")
+        assert used["requests"] == 1
+        assert used["errors_429"] == 1
+        assert used["prompt_tokens"] == 0
+
+
+def test_a_poisoned_task_does_not_kill_the_batch(tmp_path, cfg, paths):
+    with make_store(tmp_path, n_seeds=2, n_tasks=2) as store:
+        # The first task's call blows up with something nobody anticipated.
+        router = FakeRouter(cfg, {"generator": [RuntimeError("boom"), chat_response()]})
+        totals = run(store, cfg, router, paths, n_workers=2)
+        assert totals["errors"] == 1
+        assert totals["gen_ok"] == 1
+        event = json.loads(store.events("worker_task_error")[0]["detail_json"])
+        assert event["error"].startswith("RuntimeError: boom")
+        # The survivor still went through; the poisoned one keeps its lease
+        # and is recovered when it expires.
+        counts = store.task_counts()
+        assert counts["judging"] == 1
+        assert counts["generating"] == 1
+
+
+def test_idle_batches_are_announced_once(tmp_path, cfg, paths, capsys):
+    slept: list[float] = []
+
+    async def sleeper(delay):
+        slept.append(delay)
+
+    with make_store(tmp_path, n_seeds=0, n_tasks=0) as store:
+        asyncio.run(
+            run_workers(
+                store, cfg, FakeRouter(cfg), paths=paths, streams=["synthesis"],
+                n_workers=1, forever=True, max_batches=4, sleeper=sleeper, idle_sleep_s=0.01,
+            )
+        )
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("batch")]
+        assert len(lines) == 1
+        assert "claimed=0" in lines[0]
+        assert len(slept) == 4
 
 
 def test_gate_context_is_built_from_the_seed(tmp_path, cfg):

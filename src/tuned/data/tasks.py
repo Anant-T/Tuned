@@ -358,7 +358,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         for row in rows:
             by_type[row["task_type"]] = by_type.get(row["task_type"], 0) + 1
         print(f"stream={args.stream} arm={args.arm or '-'} target={args.n}")
-        print(f"planned {created}  skipped {args.n - created}  (rows derived {len(rows)})")
+        if not rows:
+            # "skipped N" reads as "N tasks were dropped"; the truth is that
+            # the queue is already at (or past) the target, or every eligible
+            # seed is at the per-seed cap.
+            existing = _existing_in_queue(store, args.stream, args.arm)
+            reason = (
+                "already at target"
+                if existing >= args.n
+                else "no seeds under the per-seed cap"
+            )
+            print(f"planned 0  ({reason}: queue holds {existing}, target {args.n})")
+        else:
+            print(f"planned {created}  collided {len(rows) - created}  (rows derived {len(rows)})")
         for task_type, count in sorted(by_type.items()):
             print(f"  {task_type:<18}{count:>6}")
         counts = store.task_counts()

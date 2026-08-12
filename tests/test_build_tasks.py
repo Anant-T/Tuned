@@ -1,9 +1,10 @@
 import hashlib
 
 import pytest
-from pipeline_fakes import build_cfg, open_store, seed_rows
+from pipeline_fakes import build_cfg, open_store, paths_for, seed_rows, temp_config
 
 from tuned.data import prompt_registry
+from tuned.data.tasks import main as tasks_main
 from tuned.data.tasks import (
     CURATED_C2_MIX,
     PER_SEED_CAP,
@@ -236,6 +237,36 @@ def test_wave_planned_event_is_logged(store, cfg):
     events = store.events("wave_planned")
     assert len(events) == 1
     assert '"created": 5' in events[0]["detail_json"]
+
+
+def test_cli_reports_a_topped_up_queue_rather_than_phantom_skips(tmp_path, cfg, capsys):
+    """"skipped 8" reads as "8 tasks were dropped"; the truth is that the
+    queue is already at the target."""
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=12, db_path=paths.state_db):
+        pass
+
+    assert tasks_main(["--config", config_path, "--stream", "synthesis", "--n", "8"]) == 0
+    first = capsys.readouterr().out
+    assert "planned 8  collided 0" in first
+    assert "irac_analysis" in first
+
+    assert tasks_main(["--config", config_path, "--stream", "synthesis", "--n", "8"]) == 0
+    second = capsys.readouterr().out
+    assert "planned 0  (already at target: queue holds 8, target 8)" in second
+    assert "skipped" not in second
+
+
+def test_cli_names_the_per_seed_cap_when_that_is_what_stopped_it(tmp_path, cfg, capsys):
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=1, db_path=paths.state_db):
+        pass
+    tasks_main(["--config", config_path, "--stream", "synthesis", "--n", "20"])
+    capsys.readouterr()
+    tasks_main(["--config", config_path, "--stream", "synthesis", "--n", "20"])
+    assert "no seeds under the per-seed cap" in capsys.readouterr().out
 
 
 def test_rows_carry_pending_state_after_creation(store, cfg):

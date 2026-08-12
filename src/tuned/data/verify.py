@@ -43,6 +43,7 @@ Run:  python -m tuned.data.verify --config configs/data_law_v1.yaml
 
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 
 from tuned.data import gates
 from tuned.data.generate import SlotError, build_prompt, gate_context
@@ -50,10 +51,31 @@ from tuned.data.jsonl import read_at
 
 REJECTED_STATE = "rejected"
 
+# Matches store.claim_tasks' default lease.
+DEFAULT_LEASE_S = 900
+_TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
 # Failing one of these means the row is wrong about the law. gates.py owns
 # the list; it is re-exported here so the demotion rule and the gate
 # semantics can never drift apart.
 PERMANENT_GATES = gates.PERMANENT_GATES
+
+
+def live_leases(store, lease_s: int = DEFAULT_LEASE_S) -> int:
+    """Tasks a worker is holding RIGHT NOW (claimed inside the lease window).
+
+    This pass writes task states without holding a lease of its own - it
+    never claimed anything - so running it against a live fleet can overwrite
+    a decision a judge worker is in the middle of making. Counting the live
+    leases is how the CLI refuses to do that by accident.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(seconds=lease_s)).strftime(_TS_FMT)
+    return int(
+        store.conn.execute(
+            "SELECT COUNT(*) FROM task WHERE claimed_at IS NOT NULL AND claimed_at >= ?",
+            (cutoff,),
+        ).fetchone()[0]
+    )
 
 
 def load_index(path):
@@ -214,12 +236,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", default="configs/data_law_v1.yaml")
     parser.add_argument("--index", default=None, help="path to the citation index")
     parser.add_argument("--state", default=None, help="only re-gate tasks in this state")
+    parser.add_argument(
+        "--force", action="store_true", help="run even while workers hold live leases"
+    )
     args = parser.parse_args(argv)
 
     cfg = load_build_config(args.config)
     paths = build_paths(cfg.build.workdir).ensure()
     store = Store.open(paths.state_db)
     try:
+        live = live_leases(store)
+        if live and not args.force:
+            print(
+                f"REFUSING: {live} task(s) are under a live worker lease. This pass "
+                f"writes task states without holding one, so it can overwrite a "
+                f"decision a worker is making right now. Stop the fleet (or wait "
+                f"{DEFAULT_LEASE_S}s for the leases to expire), or pass --force."
+            )
+            return 2
         counts = rerun_gates(
             store, cfg, where_state=args.state, citation_index_path=args.index
         )
