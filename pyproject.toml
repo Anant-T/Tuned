@@ -18,6 +18,19 @@ packages = ["src/tuned"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Dataset-curation deps. Deliberately UNPINNED and never installed on Kaggle:
+# the build runs locally, the trainer never imports any of this, and pinning
+# here would drag heavyweight resolves into the training env.
+build = [
+    "httpx>=0.27",
+    "datasets",
+    "pyarrow",
+    "boto3",
+    "datasketch",
+    "semhash",
+    "pymupdf4llm",
+    "huggingface_hub",
+]
 train = [
     # Pinned: the resolver silently bumped unsloth 2026.8.3 -> 2026.8.4 between
     # otherwise-identical Kaggle runs. Every training dep that can drift is fixed.
