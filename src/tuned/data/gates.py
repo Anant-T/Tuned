@@ -22,6 +22,16 @@ the IPC/CrPC/IEA -> BNS/BNSS/BSA transition rules live in statutes.py
 lives in replay.py (`empty_think`). This module only composes them and
 records WHY something failed.
 
+MANDATORY FOLLOW-UP, and it is not optional: a GateContext built with
+citation_index=None runs only the SUSPECT half of the citation gate (the
+unmodelled-reporter channel, which needs no index). The existence half is
+skipped and the detail says so - {"novel": None, "novel_skipped": "no-index"}.
+A row that passed the gates in that mode has NEVER had its citations checked
+against the corpus. verify.py (not built yet - this is a recorded dependency)
+MUST re-run run_all with the real index before any such row is promoted into
+the dataset, and a stored gate_result carrying novel_skipped must be read as
+"unverified", never as "passed".
+
 Instrumentation is the second job, and it shapes the API: `run_all` never
 short-circuits. Per-gate pass rates over the pilot are how the prompt gets
 fixed, so every gate runs on every generation and returns a GateResult even
@@ -52,9 +62,7 @@ from tuned.data.statutes import (
     resolve_code,
 )
 
-# Stream vocabulary (task.stream in the store). Two of them change gate
-# behaviour and are therefore named constants rather than literals.
-STREAMS = ("synthesis", "curated_c2", "transition", "replay")
+# The two task.stream values that change gate behaviour.
 TRANSITION_STREAM = "transition"
 REPLAY_STREAM = "replay"
 
@@ -113,16 +121,18 @@ IRAC_SECTIONS = ("issue", "rule", "application", "conclusion")
 IRAC_REQUIRED = ("issue", "conclusion")
 
 # A line-initial IRAC heading, tolerant of markdown (`## Issue`, `**Issue:**`,
-# `1. Issue`, `- Rule -`) and of the plural forms. The trailing terminator is
-# what keeps ordinary prose out: the heading word must be followed by a
-# colon, an emphasis/dash marker, or the end of the line, so "Issues of fact
-# remain open" (line-initial, but running straight into prose) is not a
-# heading. \r is tolerated so CRLF generations behave like LF ones.
+# `1. Issue`, `- Rule -`, `**Conclusion.**`) and of the plural forms. The
+# alternation is built FROM IRAC_SECTIONS so the two can never drift. The
+# trailing terminator is what keeps ordinary prose out: the heading word must
+# be followed by a colon, a full stop, an emphasis/dash marker, or the end of
+# the line, so "Issues of fact remain open" (line-initial, but running
+# straight into prose) is not a heading. \r is tolerated so CRLF generations
+# behave like LF ones.
 _IRAC_HEADING_RE = re.compile(
     r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:[-*+•][ \t]+|\d{1,2}[.)][ \t]*)?"
     r"(?:\*{1,3}|_{1,3})?[ \t]*"
-    r"(?P<word>issue|rule|application|conclusion)(?:s|\(s\))?"
-    r"[ \t\r]*(?::|\*|_|-|–|—|$)",
+    r"(?P<word>" + "|".join(IRAC_SECTIONS) + r")(?:s|\(s\))?"
+    r"[ \t\r]*(?:[:*_.–—-]|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -191,10 +201,11 @@ def _norm_ws(text: str | None) -> str:
 
 def _as_int(value) -> int:
     """Estimated-token counts arrive from callers (chars//4, or a provider's
-    usage block, which occasionally ships None). A gate never raises."""
+    usage block, which occasionally ships None, and float("inf") on a bad
+    division). A gate never raises."""
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -316,6 +327,13 @@ def check_think_format(content: str, ctx: GateContext) -> GateResult:
     nested inside it - makes a count != 1 and fails here.
     """
     text = content or ""
+    if not ctx.think_open or not ctx.think_close:
+        # An empty tag string matches at every offset, which turns the scan
+        # quadratic on a long generation; there is also nothing to verify.
+        return GateResult(
+            "think_format", False, {"reason": "no-think-tags-configured"}
+        )
+
     opens, closes = _tag_positions(text, ctx.think_open, ctx.think_close)
     detail: dict = {
         "open_count": len(opens),
@@ -398,16 +416,25 @@ def check_citations(content: str, ctx: GateContext) -> GateResult:
     unmodelled reporter would otherwise sail through untouched. Suspects
     carried IN by the grounding text are not the model's invention, so the
     output's suspects are diffed against the source's.
-    """
-    if ctx.citation_index is None:
-        return GateResult("citations", True, {"skipped": "no-index"})
 
+    Without an index the SUSPECT channel still runs - its verdict never
+    depended on the index, and rejecting an invented KLT cite during the pilot
+    saves the teacher spend a later verify.py pass cannot refund. Only the
+    existence half is skipped, and it says so in the detail. READ THE MODULE
+    DOCSTRING: a pass carrying novel_skipped means "not yet checked", and
+    verify.py must re-run this gate with the real index before the row is
+    promoted.
+    """
     text = content or ""
     source = ctx.source_text or ""
-    novel = novel_citations(text, source, ctx.citation_index)
     grounded_suspects = set(suspect_citations(source))
     suspects = [c for c in suspect_citations(text) if c not in grounded_suspects]
 
+    if ctx.citation_index is None:
+        detail = {"novel": None, "novel_skipped": "no-index", "suspect": suspects}
+        return GateResult("citations", not suspects, detail)
+
+    novel = novel_citations(text, source, ctx.citation_index)
     detail = {"novel": novel, "suspect": suspects}
     return GateResult("citations", not novel and not suspects, detail)
 
@@ -465,6 +492,14 @@ def check_irac_placement(think: str | None, answer: str, ctx: GateContext) -> Ga
         return GateResult("irac_placement", True, {"skipped": "no-reasoning-expected"})
     if ctx.stream == REPLAY_STREAM:
         return GateResult("irac_placement", True, {"skipped": "stream-replay"})
+    if think is None:
+        # split_think could not parse the content, so `answer` is the whole
+        # generation and the think/answer boundary this gate is ABOUT does not
+        # exist: the tripwire cannot fire and the heading requirement would be
+        # scored against the wrong text. check_think_format has already failed
+        # (a None think implies it), so the row is retried regardless - say
+        # "not evaluated" rather than banking a meaningless pass.
+        return GateResult("irac_placement", True, {"skipped": "unparsed-format"})
 
     in_answer = irac_headings(answer)
     in_think = irac_headings(think)
@@ -523,8 +558,11 @@ def _wanted_sections(entries) -> tuple[list[tuple[str, str]], list[str]]:
         if not isinstance(entry, dict):
             malformed.append(repr(entry))
             continue
-        raw_code = entry.get("code")
-        code = resolve_code(raw_code) or str(raw_code or "").strip().upper()
+        # An unresolvable code is MALFORMED, not a code named literally: a
+        # typo'd forbidden entry ("BNSS " for "BNS") would otherwise resolve to
+        # a string extract_sections can never emit, so the entry would sit
+        # there never firing - a silent false negative on a permanent gate.
+        code = resolve_code(entry.get("code"))
         number = normalize_number(entry.get("number"))
         if not code or not number:
             malformed.append(repr(entry))
@@ -534,13 +572,22 @@ def _wanted_sections(entries) -> tuple[list[tuple[str, str]], list[str]]:
 
 
 def _ref_matches(ref: SectionRef, code: str, number: str) -> bool:
-    """Section identity at BASE-number granularity: BNS 103 and BNS 103(2) are
-    the same section for gate purposes, so an answer key may name either. The
-    letter suffix is never stripped (SectionRef.base_number guarantees that),
-    so IPC 304B never matches IPC 304."""
+    """Does a cited section satisfy an answer-key entry?
+
+    The key decides the granularity. A key that names a bare section ("103")
+    is satisfied by any subsection of it ("103(2)") - the key did not care.
+    A key that PINS a subsection ("103(2)") requires that exact number,
+    because sibling subsections are different offences: BNS 103(1) is murder
+    and BNS 103(2) is mob lynching, and treating one as the other is exactly
+    the error this gate is supposed to catch. Letter suffixes are never
+    stripped either way (SectionRef.base_number guarantees it), so IPC 304B
+    never matches IPC 304.
+    """
     if ref.code != code:
         return False
-    return ref.number == number or ref.base_number == number.split("(", 1)[0]
+    if "(" in number:
+        return ref.number == number
+    return ref.base_number == number
 
 
 def _mentions_savings(answer: str, refs: list[SectionRef]) -> bool:
@@ -549,17 +596,27 @@ def _mentions_savings(answer: str, refs: list[SectionRef]) -> bool:
     return bool(_SAVINGS_RE.search(answer or ""))
 
 
-def check_answer_key(answer: str, ctx: GateContext) -> GateResult:
+def check_answer_key(
+    answer: str, ctx: GateContext, *, think: str | None = ""
+) -> GateResult:
     """Transition-stream answers are checked against a known-good key: the
     stream exists precisely because the old/new-code answer is decidable in
     advance, and a generation that gets it wrong is wrong about the law
     (PERMANENT). Every other stream skips.
 
-    A malformed key entry FAILS rather than being skipped. It is an operator
-    bug, but silently skipping it means the transition example is never
-    actually checked - and shipping an unchecked transition row is the exact
-    outcome this gate exists to prevent, so it fails loudly and shows up in
-    the per-gate counts immediately.
+    `think` is the split_think verdict, NOT text this gate reads: None means
+    the content did not parse, so `answer` is the whole generation, trace
+    included. Judging that against the key would score the model's private
+    reasoning as if it were its answer - and a trace that says "the successor
+    provision WOULD be s.103 BNS, but it does not apply here" would then trip
+    forbidden_sections and escalate a formatting retry into a permanent
+    reject. A None think implies check_think_format has already failed, so the
+    row can never be promoted on this pass; skipping here costs no safety and
+    the retry gets fully gated. Callers that did not split pass nothing.
+
+    A malformed key still FAILS rather than skipping: that one is an operator
+    bug in a hand-authored key, and a key nobody can parse means the row was
+    never really checked.
 
     governing_family is recorded, not enforced: what the answer may cite is
     already pinned by expected/forbidden sections, and demanding a single
@@ -572,6 +629,12 @@ def check_answer_key(answer: str, ctx: GateContext) -> GateResult:
     key = ctx.answer_key
     if not key:
         return GateResult("answer_key", True, {"skipped": "no-answer-key"})
+    if think is None:
+        return GateResult("answer_key", True, {"skipped": "unparsed-format"})
+    if not isinstance(key, dict):
+        return GateResult(
+            "answer_key", False, {"malformed_key": repr(key)[:200]}
+        )
 
     text = answer or ""
     refs = extract_sections(text)
@@ -600,8 +663,10 @@ def check_answer_key(answer: str, ctx: GateContext) -> GateResult:
     )
     both_ok = ({"old", "new"} <= set(families)) if both_required else True
 
+    family = key.get("governing_family")
     detail = {
-        "governing_family": key.get("governing_family"),
+        # Coerced: the key is hand-authored and detail must survive json.dumps.
+        "governing_family": None if family is None else str(family),
         "cited": [str(ref) for ref in refs],
         "expected": [f"{code} {number}" for code, number in expected],
         "missing": missing,
@@ -644,7 +709,7 @@ def run_all(content: str, prompt_est_tokens: int, ctx: GateContext) -> list[Gate
         check_irac_placement(think, answer, ctx),
         check_verbatim_overlap(think, ctx),
         check_banned_meta(think, ctx),
-        check_answer_key(answer, ctx),
+        check_answer_key(answer, ctx, think=think),
     ]
 
 

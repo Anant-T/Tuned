@@ -181,6 +181,17 @@ def _good_content():
     return _content(GOOD_THINK, GOOD_ANSWER)
 
 
+# A trace that reasons ABOUT the forbidden successor provision and correctly
+# rules it out - legitimate in the trace, and absent from the answer. The
+# savings reference is what keeps the temporal gate quiet.
+TRANSITION_THINK = GOOD_THINK + (
+    "\n\nOne last note on the successor provision: Section 103 BNS would be "
+    "the modern analogue of this charge, but Section 358 BNS preserves the "
+    "liability incurred under the repealed code, so it is not the charging "
+    "provision here."
+)
+
+
 # --------------------------------------------------------------------------
 # Module constants.
 # --------------------------------------------------------------------------
@@ -337,6 +348,14 @@ def test_think_format_close_before_open_fails():
     assert result.detail["reason"] == "close-before-open"
 
 
+def test_think_format_without_configured_tags_fails_fast():
+    # Empty tag strings match at every offset; the guard keeps the scan out of
+    # its quadratic path and there is nothing to verify anyway.
+    result = check_think_format("a" * 20000, _ctx(think_open="", think_close=""))
+    assert not result.passed
+    assert result.detail == {"reason": "no-think-tags-configured"}
+
+
 def test_think_format_records_a_preamble_without_failing():
     think_open, think_close = _tags()
     result = check_think_format(f"Here goes.{think_open}trace{think_close}answer", _ctx())
@@ -410,6 +429,12 @@ def test_length_band_coerces_junk_counts_instead_of_raising():
     assert result.detail["think_est"] == 200
 
 
+def test_length_band_survives_an_infinite_count():
+    result = check_length_band(float("inf"), 200, 300, _ctx())
+    assert result.detail["prompt_est"] == 0
+    assert json.loads(json.dumps(result.detail)) == result.detail
+
+
 def test_length_band_against_the_real_config_band():
     band = _cfg().build.length_band
     ctx = _ctx(band=band)
@@ -422,10 +447,24 @@ def test_length_band_against_the_real_config_band():
 # check_citations
 # --------------------------------------------------------------------------
 
-def test_citations_skipped_without_an_index():
-    result = check_citations("cites (2019) 4 SCC 999", _ctx())
+def test_citations_without_an_index_still_runs_the_suspect_channel():
+    # The suspect verdict never depended on the index, so an invented cite in
+    # an unmodelled reporter is rejected during the pilot rather than paid for
+    # twice.
+    result = check_citations("Relying on 2011 (2) KLT 123, the court agreed.", _ctx())
+    assert not result.passed
+    assert result.detail["suspect"] == ["2011 (2) KLT 123"]
+    assert result.detail["novel"] is None
+    assert result.detail["novel_skipped"] == "no-index"
+
+
+def test_citations_without_an_index_passes_but_records_the_unchecked_half():
+    # A fabricated citation in a MODELLED format is invisible until the index
+    # exists: this pass means "suspect-clean", not "citations verified", and
+    # verify.py must re-run the gate before the row is promoted.
+    result = check_citations("Following (2019) 4 SCC 999 the appeal fails.", _ctx())
     assert result.passed
-    assert result.detail == {"skipped": "no-index"}
+    assert result.detail == {"novel": None, "novel_skipped": "no-index", "suspect": []}
 
 
 def test_citations_fabricated_citation_fails_and_is_a_permanent_reject(index):
@@ -611,6 +650,23 @@ def test_irac_placement_heading_inside_the_trace_fails_even_with_a_good_answer()
     assert not result.passed
     assert result.detail["think_headings"] == ["issue"]
     assert disposition([result]) == "regenerate"
+
+
+def test_irac_headings_accept_a_full_stop_terminator():
+    assert irac_headings("**Conclusion.**\nThe appeal fails.") == {"conclusion"}
+    # Same terminator on the tripwire side: a scripted trace cannot dodge the
+    # gate by punctuating its headings with a full stop.
+    result = check_irac_placement("Rule.\nThe test is settled.", GOOD_ANSWER, _ctx())
+    assert not result.passed
+    assert result.detail["think_headings"] == ["rule"]
+
+
+def test_irac_placement_skipped_on_an_unparsed_row():
+    # think is None => split_think failed => `answer` is the whole generation,
+    # so neither half of this gate is measuring what it claims to.
+    result = check_irac_placement(None, "no headings anywhere", _ctx())
+    assert result.passed
+    assert result.detail == {"skipped": "unparsed-format"}
 
 
 def test_irac_placement_skipped_on_the_replay_stream():
@@ -843,6 +899,59 @@ def test_answer_key_never_strips_a_letter_suffix():
     assert check_answer_key("Charged under Section 304B IPC.", ctx).passed
 
 
+def test_answer_key_pinned_subsection_is_not_satisfied_by_a_sibling():
+    # BNS 103(1) is murder and BNS 103(2) is mob lynching. A key that pins the
+    # subsection means it; the superset direction (bare key, subsectioned
+    # cite) is the one that stays tolerant.
+    ctx = _transition_ctx(
+        answer_key=_key(expected_sections=[{"code": "BNS", "number": "103(2)"}],
+                        forbidden_sections=[]),
+    )
+    assert check_answer_key("Punishable under Section 103(2) BNS.", ctx).passed
+    assert not check_answer_key("Punishable under Section 103(1) BNS.", ctx).passed
+    assert not check_answer_key("Punishable under Section 103 BNS.", ctx).passed
+
+
+def test_answer_key_pinned_forbidden_subsection_does_not_fire_on_a_sibling():
+    ctx = _transition_ctx(
+        answer_key=_key(expected_sections=[],
+                        forbidden_sections=[{"code": "BNS", "number": "103(2)"}]),
+    )
+    assert check_answer_key("Punishable under Section 103(1) BNS.", ctx).passed
+    assert not check_answer_key("Punishable under Section 103(2) BNS.", ctx).passed
+
+
+def test_answer_key_unresolvable_code_is_malformed_not_a_silent_no_op():
+    # A typo'd forbidden code must not sit there never firing.
+    entry = {"code": "BNSX", "number": "103"}
+    ctx = _transition_ctx(answer_key=_key(forbidden_sections=[entry]))
+    result = check_answer_key("Charged under Section 103 BNS.", ctx)
+    assert not result.passed
+    assert result.detail["malformed_key_entries"] == [repr(entry)]
+
+
+def test_answer_key_non_dict_key_fails_without_raising():
+    ctx = _ctx(stream="transition", answer_key=["IPC 302"])
+    result = check_answer_key("Charged under Section 302 IPC.", ctx)
+    assert not result.passed
+    assert "IPC 302" in result.detail["malformed_key"]
+
+
+def test_answer_key_skipped_on_an_unparsed_row():
+    ctx = _transition_ctx()
+    assert check_answer_key("Charged under Section 302 IPC.", ctx, think=None).passed
+    assert check_answer_key("anything", ctx, think=None).detail == {
+        "skipped": "unparsed-format"
+    }
+
+
+def test_answer_key_governing_family_is_coerced_for_json():
+    ctx = _transition_ctx(answer_key=_key(governing_family=BEFORE))
+    result = check_answer_key("Charged under Section 302 IPC.", ctx)
+    assert result.detail["governing_family"] == "2023-05-04"
+    assert json.loads(json.dumps(result.detail)) == result.detail
+
+
 def test_answer_key_savings_mention_required_and_present_as_a_section():
     ctx = _transition_ctx(answer_key=_key(requires_savings_mention=True, forbidden_sections=[]))
     answer = "Section 302 IPC still governs; Section 358 BNS preserves the liability."
@@ -1008,6 +1117,28 @@ def test_gates_never_raise_on_weird_content(index, content):
         for result in results:
             assert json.loads(json.dumps(result.detail)) == result.detail
         assert disposition(results) in (None, "reject", "regenerate")
+
+
+def test_a_malformed_row_is_regenerated_not_permanently_rejected(index):
+    # Identical words, one stray close tag apart. The trace rules OUT the
+    # forbidden section, which is exactly the reasoning a transition example
+    # should contain - scoring the trace as the answer would escalate a
+    # formatting retry into a permanent reject and burn the seed.
+    ctx = _ctx(citation_index=index, stream="transition", answer_key=_key())
+
+    well_formed = _content(TRANSITION_THINK, GOOD_ANSWER)
+    clean = run_all(well_formed, 100, ctx)
+    assert [(r.gate, r.detail) for r in clean if not r.passed] == []
+    assert disposition(clean) is None
+
+    malformed = well_formed + _tags()[1]
+    results = {r.gate: r for r in run_all(malformed, 100, ctx)}
+    assert not results["think_format"].passed
+    assert results["answer_key"].detail == {"skipped": "unparsed-format"}
+    assert results["irac_placement"].detail == {"skipped": "unparsed-format"}
+    failed = {gate for gate, r in results.items() if not r.passed}
+    assert not (failed & PERMANENT_GATES)
+    assert disposition(list(results.values())) == "regenerate"
 
 
 def test_disposition_mapping():
