@@ -881,7 +881,17 @@ class PoolGap:
 
     @property
     def key_shaped(self) -> bool:
-        """A key that has not arrived is among the reasons this slot is empty."""
+        """A key that has not arrived is among the reasons this slot is empty.
+
+        DIAGNOSTIC ONLY, and deliberately so: the remedy text is built from
+        ``key_envs`` and the override rule branches on ``unservable``, so
+        nothing in the production path reads this.  It is the classification
+        the round-4 brief asked for, kept because it is the fact a human
+        reading a gap wants first ("is this a key or a window?") - and it is
+        NOT a substitute for ``unservable``, which it under-reports: a family
+        that is both unkeyed AND too small is filtered out of ``key_envs``,
+        so this reads False while no row size is servable.
+        """
         return bool(self.key_envs)
 
 
@@ -926,15 +936,29 @@ def _first_family(router: "Router", role: str, exclude: frozenset[str]) -> str |
     return None
 
 
-def _fillable_at_any_size(router: "Router", gen_family: str, slots: Sequence[str]) -> bool:
-    """Could these judge slots be filled if no row were too long for anything?
+def _fillable_at_any_size(
+    router: "Router",
+    gen_family: str,
+    slots: Sequence[str],
+    too_small_at_floor: frozenset[str] = frozenset(),
+) -> bool:
+    """Could these judge slots be filled by the SMALLEST row the build makes?
 
     Context length is the ONLY part of the exclusion a shorter row lifts:
     family separation and a missing key hold identically at every size.  So
-    the same walk with the size exclusion removed answers the question
+    the same walk with the size exclusion relaxed answers the question
     ``--allow-pool-gaps`` depends on - "are the short rows still servable?" -
     and answers it in the Router's own filter rather than by reasoning about
     which reason emptied the slot.
+
+    Relaxed, not REMOVED.  Dropping the filter entirely asks the question at
+    size ZERO, which no row can be: every judge call carries the judge
+    template and asks for a reply, so the smallest one this build can make is
+    already thousands of tokens.  A model below that floor serves no row at
+    any length while reading here as a filled slot - and reading as filled is
+    what lets ``--allow-pool-gaps`` clear the refusal.  The caller passes the
+    floor (``pool_gaps(servable_floor_tokens=)``) because the sizing lives
+    with the renderer, the same reason ``needed_tokens`` is injected.
 
     Every slot is walked, not only the one that failed: a row is servable only
     if BOTH judges can be found for it, and a pool that fills slot A at 2k
@@ -943,7 +967,9 @@ def _fillable_at_any_size(router: "Router", gen_family: str, slots: Sequence[str
     """
     chosen: list[str] = []
     for _ in slots:
-        family = _first_family(router, "judge", frozenset({gen_family, *chosen}))
+        family = _first_family(
+            router, "judge", frozenset({gen_family, *chosen}) | too_small_at_floor
+        )
         if family is None:
             return False
         chosen.append(family)
@@ -1040,6 +1066,7 @@ def pool_gaps(
     needed_tokens: int,
     tiebreak_needed_tokens: int | None = None,
     needed_for_window: "Callable[[int | None, str], int] | None" = None,
+    servable_floor_tokens: int = 0,
 ) -> list[PoolGap]:
     """Every judge/tiebreak slot the pool cannot fill for the LONGEST row.
 
@@ -1066,10 +1093,27 @@ def pool_gaps(
     judge slots at that length invents a refusal.  Given the hook, each family
     is checked at what its own window permits (never above the flat number).
 
+    ``servable_floor_tokens`` is the smallest judge call the build can make.
+    It bounds the "is ANY row size servable" walk behind ``PoolGap
+    .unservable``; at the default 0 that walk asks the question at a size no
+    row can be.  See ``_fillable_at_any_size``.
+
     The advice every gap prints is the LARGEST window any gap in this config
     needs, not each gap's own: the operator adds ONE model to both routing
     lists, and a number that closes the judge gap while leaving a tiebreak
     warning behind is a number that sent them shopping twice.
+
+    It also never falls BELOW ``required_context(needed_tokens)``, whatever
+    the per-family sizing found.  The per-family bound exists to suppress
+    refusals about rows a family cannot produce, and that is a fine reason to
+    check a slot at a smaller size - but the advice is a purchase.  Which
+    generator families are eligible depends on which API keys happen to be set
+    that minute, so an advice derived from the surviving families alone tells
+    the operator a different number on Tuesday than on Wednesday: with
+    MISTRAL_API_KEY pending the shipped config advised 18,880, and the moment
+    the key landed the same config wanted 29,661 and refused to start.  Being
+    told to buy a bigger model costs nothing; being told to buy 18,880 and
+    discovering the fleet then refuses costs a purchase.
 
     Deliberately NOT a fallback: reusing a family when the pool runs out
     would put a model's own family in front of its own prose, which is the
@@ -1086,6 +1130,7 @@ def pool_gaps(
     router = Router(cfg)
     tiebreak_flat = needed_tokens if tiebreak_needed_tokens is None else tiebreak_needed_tokens
     judge_families = sorted({cfg.model_for(r)[1].family for r in cfg.routing_refs("judge")})
+    too_small_at_floor = undersized_families(cfg, "judge", servable_floor_tokens)
     # (detail-builder, PoolGap fields, the window this gap needs closed)
     pending: list[tuple[Callable[..., str], dict, int]] = []
 
@@ -1101,7 +1146,9 @@ def pool_gaps(
             family = _first_family(router, "judge", exclude)
             if family is None:
                 envs = _blocking_key_envs(cfg, "judge", exclude)
-                unservable = not _fillable_at_any_size(router, gen_family, ("a", "b"))
+                unservable = not _fillable_at_any_size(
+                    router, gen_family, ("a", "b"), too_small_at_floor
+                )
                 pending.append(
                     (
                         partial(
@@ -1157,7 +1204,12 @@ def pool_gaps(
                 )
             )
 
-    advice = max((required for _, _, required in pending), default=0)
+    # The floor is the flat worst case, not the largest NARROWED gap: see the
+    # docstring. A stable over-estimate is the safe direction for a number the
+    # operator spends money against.
+    advice = max(
+        [required_context(needed_tokens), *(required for _, _, required in pending)]
+    )
     return [PoolGap(detail=detail(advice=advice), **fields) for detail, fields, _ in pending]
 
 

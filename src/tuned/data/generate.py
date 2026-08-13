@@ -390,7 +390,12 @@ def judge_tokens_for_generator_window(
       max_output) <= window`, which is what `undersized_families` enforces
       before the call is made;
     * the candidate (trace + answer) is what the call produced, so it is at
-      most `max_output_tokens(cfg)` tokens of reply.
+      most `max_output_tokens(cfg)` tokens of reply. That premise is ENFORCED,
+      not assumed: `reply_over_budget` fails a longer candidate into a
+      regeneration in `generate_once`. It used to rest on nothing -
+      `check_length_band` bounds `prompt + think + answer` in chars/4 and a
+      short prompt leaves room for a reply of twice this budget, at which
+      point the number below is no narrowing at all.
 
     Converting the reply back into characters is the one step that is not a
     rearrangement of numbers the code already enforces: it charges every reply
@@ -410,6 +415,41 @@ def judge_tokens_for_generator_window(
     return judge_needed_tokens(
         judge_messages(WORST_CASE_CHAR * chars, "", "", prompt_id=prompt_id),
         reply_tokens=reply_tokens,
+    )
+
+
+def min_judge_tokens(
+    cfg,
+    *,
+    reply_tokens: int = DEFAULT_JUDGE_REPLY_TOKENS,
+    prompt_id: str = JUDGE_PROMPT_ID,
+) -> int:
+    """The SMALLEST judge call this build can make - a floor, not an estimate.
+
+    Three terms, every one of them present in every judge call: the judge
+    template, the reply allowance, and the least candidate the length band
+    lets through. `check_length_band` fails a trace under `think_min` and an
+    answer under `answer_min`, and every judgeable stream expects a trace
+    (`expects_reasoning` is false only for replay, which `judge.py` never
+    judges), so no judged row carries less than that.
+
+    Deliberately UNDER-stated at each step, because its only job is to stop a
+    model that can serve nothing from reading as a filled slot - over-stating
+    it would invent gaps. The {source} is taken as empty (a real row always
+    has grounding), and the candidate's characters are counted as LATIN, the
+    script that gives the fewest tokens per character.
+
+    `providers.pool_gaps` takes it as `servable_floor_tokens`, which is what
+    `PoolGap.unservable` is asked at. Without it the question is asked at size
+    ZERO - a size the length band cannot produce - so a judge too small for
+    any row at all reads as servable, and `--allow-pool-gaps` then clears the
+    refusal on the grounds that the short rows still run.
+    """
+    band = cfg.build.length_band
+    think = "a" * int(band.think_min * CHARS_PER_TOKEN_LATIN)
+    answer = "a" * int(band.answer_min * CHARS_PER_TOKEN_LATIN)
+    return judge_needed_tokens(
+        judge_messages("", think, answer, prompt_id=prompt_id), reply_tokens=reply_tokens
     )
 
 
@@ -492,7 +532,9 @@ def preflight_messages(
     skipped at every size - has no short rows to run: every row pays judge A
     and parks, which is the failure the key filter was added to prevent. Those
     stay refusals whatever the flag says, and `PoolGap.unservable` is the fact
-    that decides it.
+    that decides it - asked at `min_judge_tokens()`, the smallest call this
+    build can make, because a judge under that window serves no row at all and
+    asking at size zero would let it read as a slot the short rows can use.
 
     The tiebreak's own gap is a warning, never a refusal: judge.py has a
     defined, unpaid fallback for it (decide on the two judges, reject the
@@ -518,6 +560,7 @@ def preflight_messages(
             cfg, reply_tokens=judge_reply_tokens, prompt_id=TIEBREAK_PROMPT_ID
         ),
         needed_for_window=judge_sizer(cfg, reply_tokens=judge_reply_tokens),
+        servable_floor_tokens=min_judge_tokens(cfg, reply_tokens=judge_reply_tokens),
     )
     for gap in gaps:
         line = f"routing.{gap.role} slot {gap.slot}: {gap.detail}"
@@ -874,6 +917,56 @@ def max_output_tokens(cfg) -> int:
     return int(band.think_max + ANSWER_TOKEN_ALLOWANCE)
 
 
+# The name the reply-budget breach travels under in a disposition string. It
+# is NOT a gates.py gate: gates.run_all is re-run offline by verify.py over
+# the stored bytes and its result set is a fixed vocabulary, while this is a
+# statement about the CALL that produced them (what max_tokens was asked for),
+# which the stored row does not carry.
+REPLY_BUDGET_GATE = "reply_budget"
+
+
+def reply_budget_chars(cfg) -> int:
+    """The most characters one generation call can physically return.
+
+    `generate_once` sends `max_tokens=max_output_tokens(cfg)`, which bounds
+    the reply in TOKENS, and CHARS_PER_TOKEN_LATIN is the loosest
+    chars-per-token this module models - no tokenizer here gives a token more
+    characters than that. So a well-behaved provider cannot produce a reply
+    longer than this, and the bound over-states rather than under-states.
+    """
+    return int(max_output_tokens(cfg) * CHARS_PER_TOKEN_LATIN)
+
+
+def reply_over_budget(cfg, think: str | None, answer: str | None) -> int:
+    """Characters this candidate is OVER the reply budget; 0 when inside it.
+
+    This enforces the premise `judge_tokens_for_generator_window` rests on -
+    "the candidate is at most `max_output_tokens(cfg)` tokens of reply" - and
+    it has to be enforced here because nothing else does. `check_length_band`
+    tests `prompt + think + answer <= total_max` and `think <= think_max`, in
+    chars/4; on the shipped config a row whose prompt is short can spend that
+    remainder on a reply of 32,760 characters, twice this budget, and pass
+    every gate. The per-family judge sizing would then have cleared a judge
+    that cannot hold the row: the whole 23,729 -> 15,104 narrowing IS this
+    assumption, and the window contributes almost nothing beside it.
+
+    On a well-behaved provider this never fires - which is the point of
+    picking a bound that is a physical fact about the call rather than a
+    taste judgement about the answer. What it does catch is the case nothing
+    here has met yet: `assemble_content` reads `response.reasoning`, a
+    SEPARATE API field, and a provider that does not bill its reasoning
+    channel against `max_tokens` can return the gate's full 12,000-character
+    trace ON TOP OF a full-length answer. That row passes every gate today.
+
+    Disposition is `regenerate`, not `reject`: an over-long reply is a badly
+    shaped answer, not a false statement about the law, and the seed is worth
+    asking again. A SYSTEMIC breach therefore shows up first as a run of
+    `reply_over_budget` events with the same provider on them, before it
+    costs any row its attempt cap.
+    """
+    return max(0, len(think or "") + len(answer or "") - reply_budget_chars(cfg))
+
+
 def effort_for_attempt(attempt: int, base: str = DEFAULT_EFFORT) -> str:
     """One rung up the ladder per retry, saturating at the top."""
     try:
@@ -1152,6 +1245,34 @@ async def generate_once(
     store.record_gates(gen_id, [g.as_row() for g in gate_results])
     result.disposition = gates.disposition(gate_results)
     result.failed_gates = tuple(g.gate for g in gate_results if not g.passed)
+
+    # The premise the judge-pool sizing rests on, made true by construction.
+    # See reply_over_budget: `max_tokens` was sent, so a well-behaved provider
+    # cannot breach this, and the one shape that can (a reasoning channel not
+    # billed against max_tokens) is exactly what the preflight's per-family
+    # narrowing would then be wrong about. Recorded as an EVENT rather than a
+    # gate row because verify.py re-runs the gates over the stored bytes and
+    # would have no way to re-derive the max_tokens this call was made with.
+    over = reply_over_budget(cfg, think, answer)
+    if over:
+        store.log_event(
+            "reply_over_budget",
+            {
+                "task_id": task["task_id"],
+                "attempt": attempt,
+                "gen_id": gen_id,
+                "ref": f"{ref.provider}/{ref.model}",
+                "reply_chars": len(think or "") + len(answer or ""),
+                "budget_chars": reply_budget_chars(cfg),
+                "over_by": over,
+                "finish_reason": response.finish_reason,
+            },
+        )
+        result.failed_gates = result.failed_gates + (REPLY_BUDGET_GATE,)
+        # A permanent gate already burned the seed; nothing here promotes a
+        # reject back to a retry.
+        if result.disposition is None:
+            result.disposition = "regenerate"
     return result
 
 

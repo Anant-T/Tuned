@@ -481,8 +481,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="configs/data_law_v1.yaml")
-    # No default, so that "was it passed?" is answerable: --stream is the
-    # PLANNING stream and --reopen ignores it, which read as a silent filter.
+    # No default, so that "was it passed?" is answerable: --stream is honoured
+    # by the PLANNER and ignored by the re-open, and a --reopen-only command
+    # that names one is asking for a filter it will not get.
     parser.add_argument("--stream", default=None, help=f"planning stream (default {DEFAULT_STREAM})")
     parser.add_argument("--n", type=int, default=None, help="target task count for the queue")
     parser.add_argument("--arm", default=None, help="A/B label, e.g. unscripted|scripted")
@@ -511,15 +512,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.n is None and not args.reopen:
         parser.error("nothing to do: pass --n (plan a wave) or --reopen STATE")
-    if args.reopen and args.stream is not None:
-        # --stream belongs to the PLANNER. Accepting it here silently
-        # re-opened every stream while the operator watched a command that
-        # named one, which is the same class of mistake as --reopen defaulting
-        # to synthesis (round 3, I6).
+    if args.reopen and args.stream is not None and args.n is None:
+        # --stream is honoured by the PLANNER and ignored by the re-open, so
+        # it is meaningful in this command exactly when this command also
+        # plans - i.e. when --n is present. `--reopen X --n 3 --stream
+        # transition` re-opens every stream and then plans 3 transition rows,
+        # which is a real (and previously working) thing to want.
+        #
+        # Without --n nothing plans, so the only reading left is "filter the
+        # re-open", which it does not do: the operator watched a command that
+        # named a stream re-open every one of them. That is the same class of
+        # mistake as --reopen defaulting to synthesis (round 3, I6), and it is
+        # the only case this refuses.
         parser.error(
             "--stream is the planning stream and does not filter --reopen; "
-            "use --reopen-stream to narrow the re-open, and plan the wave in "
-            "a separate command"
+            "use --reopen-stream to narrow the re-open, or add --n to plan a "
+            "wave on this stream in the same command"
         )
     stream = args.stream or DEFAULT_STREAM
 
@@ -539,9 +547,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             counts = reopen_tasks(store, states, stream=args.reopen_stream)
             # Only a FILTER can leave a residue - an unfiltered re-open moves
             # every row in those states - so only a filtered run looks for
-            # one. It printed "STILL PARKED (not in --reopen-stream None)"
-            # before, i.e. told the operator their unfiltered command had a
-            # filter, on a line that exists to say what was left behind.
+            # one. NOT a bug fix, and it is not claimed as one: with
+            # stream=None every row moves, so the unfiltered branch was
+            # already returning {} and printed nothing. What it fixes is the
+            # LINE, which said "STILL PARKED (not in --reopen-stream None)"
+            # whenever it could have printed at all - telling the operator
+            # their unfiltered command had a filter.
             residue = (
                 parked_by_stream(store, states) if args.reopen_stream is not None else {}
             )

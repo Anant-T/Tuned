@@ -30,6 +30,7 @@ from tuned.data.generate import (
     GENERATOR_PREFLIGHT_ROLES,
     MAX_ATTEMPTS,
     QUESTION_BY_TASK_TYPE,
+    REPLY_BUDGET_GATE,
     BatchStats,
     GenResult,
     SlotError,
@@ -44,8 +45,11 @@ from tuned.data.generate import (
     generate_once,
     grounding_text,
     judge_sizer,
+    max_output_tokens,
     next_attempt,
     preflight_messages,
+    reply_budget_chars,
+    reply_over_budget,
     run_workers,
 )
 from tuned.data.generate import main as generate_main
@@ -353,6 +357,79 @@ def test_a_fabricated_citation_is_a_permanent_reject(tmp_path, cfg, paths):
         assert "citations" in task["disposition"]
         gen = store.latest_generation(task["task_id"])
         assert store.gates_for(gen["gen_id"])["citations"] is False
+
+
+# The shape the length band cannot see: a trace at the band's own think_max
+# and an answer built from the remainder. Every gate passes and the reply is
+# still more than twice the max_tokens the call asked for - which is the
+# premise the per-generator-window judge sizing rests on.
+OVERSIZE_THINK = (CLEAN_THINK * 5)[:11_900]
+OVERSIZE_ANSWER = CLEAN_ANSWER + " " + (
+    "The gap in the chain is the point to press, and it is the point on which this turns. " * 190
+)
+
+
+def test_the_reply_budget_is_the_max_tokens_the_call_actually_sent(cfg):
+    """A bound on a physical fact about the call, not a taste judgement: the
+    worker sends max_tokens=max_output_tokens(cfg), and CHARS_PER_TOKEN_LATIN
+    is the loosest chars-per-token this module models, so a well-behaved
+    provider cannot exceed it."""
+    budget = reply_budget_chars(cfg)
+    assert budget == max_output_tokens(cfg) * 4
+    assert reply_over_budget(cfg, "a" * budget, "") == 0
+    assert reply_over_budget(cfg, "a" * (budget - 1), "b") == 0
+    assert reply_over_budget(cfg, "a" * budget, "b") == 1
+    # ...and a normal candidate is nowhere near it, which is why enforcing it
+    # is a no-op on every well-behaved provider.
+    assert reply_over_budget(cfg, CLEAN_THINK, CLEAN_ANSWER) == 0
+
+
+def test_a_reply_the_gates_pass_can_still_break_the_judge_sizing_premise(tmp_path, cfg, paths):
+    """The premise behind judge_tokens_for_generator_window - "the candidate is
+    at most max_output_tokens of reply" - is not something check_length_band
+    tests. It bounds prompt + think + answer in chars/4 and the trace on its
+    own; a short prompt leaves the whole remainder for the reply. This row
+    passes all nine gates with a reply of more than twice the budget, and it is
+    exactly the shape a provider that does not bill its reasoning channel
+    against max_tokens would return. It goes back for a regeneration."""
+    with make_store(tmp_path) as store:
+        router = FakeRouter(cfg, {"generator": [chat_response(OVERSIZE_ANSWER, OVERSIZE_THINK)]})
+        run(store, cfg, router, paths)
+        task = only_task(store)
+        gen = store.latest_generation(task["task_id"])
+
+        # The gates - all of them - are happy with it.
+        assert store.gates_for(gen["gen_id"]) == {gate: True for gate in gates.GATE_ORDER}
+        # ...and the reply is most of the way to twice what was asked for. The
+        # headroom is structural, not a fixture trick: the band's ceiling on
+        # prompt + think + answer is total_max * 4 characters, and the reply
+        # budget is a fraction of it, so any row with a short prompt has room
+        # to spare.
+        reply_chars = len(gen["think"]) + len(gen["answer"])
+        assert reply_chars > 1.5 * reply_budget_chars(cfg)
+        assert cfg.build.length_band.total_max * 4 > 2 * reply_budget_chars(cfg)
+        over = reply_over_budget(cfg, gen["think"], gen["answer"])
+
+        assert task["state"] == "pending"
+        assert task["disposition"] == f"regenerate:{REPLY_BUDGET_GATE}"
+        event = json.loads(store.events("reply_over_budget")[0]["detail_json"])
+        assert event["over_by"] == over
+        assert event["budget_chars"] == reply_budget_chars(cfg)
+        assert event["ref"] == "cerebras/gpt-oss-120b"
+
+
+def test_a_permanent_gate_still_decides_an_over_budget_reply(tmp_path, cfg, paths):
+    """An over-long reply is a shape problem and asks for a regeneration; a
+    fabricated citation is a statement about the law and burns the seed.
+    Nothing here promotes the second back into a retry."""
+    with make_store(tmp_path) as store:
+        long_fabrication = FABRICATED_ANSWER + " " + OVERSIZE_ANSWER
+        router = FakeRouter(cfg, {"generator": [chat_response(long_fabrication, OVERSIZE_THINK)]})
+        run(store, cfg, router, paths)
+        task = only_task(store)
+        assert task["state"] == "rejected"
+        assert task["disposition"].startswith("reject:citations")
+        assert REPLY_BUDGET_GATE in task["disposition"]
 
 
 def test_a_missing_trace_is_a_regeneration_not_a_reject(tmp_path, cfg, paths):

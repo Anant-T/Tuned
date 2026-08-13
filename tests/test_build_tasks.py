@@ -409,6 +409,37 @@ def test_reopen_refuses_a_planning_stream_rather_than_ignoring_it(tmp_path, cfg,
     assert "--reopen-stream" in capsys.readouterr().err
 
 
+def test_reopen_and_plan_a_named_stream_in_one_command(tmp_path, cfg, capsys):
+    """--stream is honoured by the PLANNER and ignored by the re-open, so a
+    command that does BOTH is unambiguous: re-open every parked row, then plan
+    this stream. `--reopen judge_unroutable --n 3 --stream transition` did
+    exactly that until the round-4 guard refused it, and there is otherwise no
+    way to re-open and plan a non-default stream in one command. The guard is
+    for the case where --stream can only be read as a filter it does not
+    apply: a re-open with nothing to plan."""
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=6, db_path=paths.state_db) as store:
+        plan_wave(store, cfg, "synthesis", 2)
+        store.conn.execute("UPDATE task SET state = 'judge_unroutable'")
+
+    argv = ["--config", config_path, "--reopen", "judge_unroutable", "--n", "3",
+            "--stream", "transition"]
+    assert tasks_main(argv) == 0
+    out = capsys.readouterr().out
+    assert "re-opened 2" in out
+    assert "stream=transition" in out
+
+    with open_store(tmp_path, n_seeds=0, db_path=paths.state_db) as store:
+        # The two synthesis rows came back to the judge queue and three
+        # transition rows were planned - neither half swallowed the other.
+        assert store.task_counts() == {"judging": 2, "pending": 3}
+        streams = dict(
+            store.conn.execute("SELECT stream, COUNT(*) FROM task GROUP BY stream").fetchall()
+        )
+        assert streams == {"synthesis": 2, "transition": 3}
+
+
 def test_an_unfiltered_reopen_does_not_report_a_filter_it_did_not_have(tmp_path, cfg, capsys):
     """"STILL PARKED (not in --reopen-stream None)" told the operator their
     unfiltered command had a filter. Only a filter can leave a residue."""

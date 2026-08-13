@@ -16,6 +16,8 @@ import pytest
 
 httpx = pytest.importorskip("httpx")
 
+from pipeline_fakes import cfg_with_context, cfg_with_split_pools  # noqa: E402
+
 from tuned.data.config import (  # noqa: E402
     ModelCfg,
     ModelRef,
@@ -30,6 +32,8 @@ from tuned.data.generate import (  # noqa: E402
     judge_sizer,
     judge_tokens_for_generator_window,
     max_output_tokens,
+    min_judge_tokens,
+    preflight_messages,
     worst_case_judge_tokens,
 )
 from tuned.data.providers import (  # noqa: E402
@@ -46,6 +50,7 @@ from tuned.data.providers import (  # noqa: E402
     Router,
     TokenBucket,
     _blocking_key_envs,
+    _generator_windows,
     build_check_request,
     check_refs,
     context_estimate,
@@ -1564,7 +1569,13 @@ def test_pool_gaps_finds_the_judge_hole_the_shipped_config_still_has(cfg, keys):
     judge_gaps = [g for g in gaps if g.role == "judge"]
     assert [(g.generator_family, g.slot) for g in judge_gaps] == [("mistral", "b")]
     assert judge_gaps[0].fatal is True
-    assert "mistral" in judge_gaps[0].detail
+    # The two CONDITIONAL halves of the detail: whose row it is, and which
+    # family slot A already spent on it. (`"mistral" in detail` was the sixth
+    # vacuous assertion in this family - every judge family is listed
+    # unconditionally by the "the judge pool is [...]" segment of the same
+    # f-string, mistral among them, so it held for any gap in this config.)
+    assert "a mistral generation of" in judge_gaps[0].detail
+    assert "minus ['qwen'] already used" in judge_gaps[0].detail
     # The tiebreak hole is the one round 1 documented and gave a defined,
     # unpaid fallback for, so it is reported but not fatal.
     tiebreak_gaps = [g for g in gaps if g.role == "tiebreak"]
@@ -1647,7 +1658,11 @@ def test_a_16k_fourth_family_judge_is_a_fatal_pool_gap(cfg, keys):
     # f-string, present whether or not any family is undersized.)
     assert (fatal[0].key_shaped, fatal[0].key_envs) == (False, ())
     assert fatal[0].unservable is False
-    assert "'fourth'" in fatal[0].detail  # named as the family that is too small
+    # Named as a family that is TOO SMALL, which is the conditional half of
+    # the sentence. `"'fourth'" in detail` was not: every judge family is
+    # listed unconditionally by the "the judge pool is [...]" segment of the
+    # same f-string, so it held whether or not 'fourth' was undersized.
+    assert "minus ['fourth', 'glm'] on context length" in fatal[0].detail
     # The old preflight sized this pool in the gates' currency and advised
     # exactly this, so a 16k model read as comfortably large and the fleet
     # started; what is enforced now is above it.
@@ -1733,6 +1748,133 @@ def test_the_advice_the_preflight_prints_is_the_threshold_it_enforces(cfg, keys)
     assert remaining(advice - 1) != []
 
 
+def _advice(config, **kw):
+    gaps = pool_gaps(
+        config,
+        needed_tokens=worst_case_judge_tokens(config),
+        tiebreak_needed_tokens=worst_case_judge_tokens(config, prompt_id=TIEBREAK_PROMPT_ID),
+        needed_for_window=judge_sizer(config),
+        servable_floor_tokens=min_judge_tokens(config),
+        **kw,
+    )
+    return {int(g.detail.split("max_context >= ")[1].split()[0]) for g in gaps}
+
+
+def test_the_advice_never_falls_below_the_flat_worst_case(cfg, monkeypatch):
+    """The advice is a PURCHASE, and the per-family narrowing made it a
+    function of which keys happened to be set that minute. With MISTRAL_API_KEY
+    pending, the 40k generator is not eligible and the only family left is the
+    8k one, whose judge check is narrowed to 15,104 - so the shipped config
+    asked for 18,880. The operator buys exactly that, adds it, the fleet
+    starts; the key lands, the 40k generator becomes eligible, and the same
+    config now wants 29,661 and refuses. Being told to buy a bigger model
+    costs nothing; being sent shopping twice costs a purchase."""
+    flat = required_context(worst_case_judge_tokens(cfg))
+
+    def advice_with(*set_envs):
+        _unset(monkeypatch, "CEREBRAS_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY")
+        for env in set_envs:
+            monkeypatch.setenv(env, "sk-test")
+        return _advice(cfg)
+
+    fully_keyed = advice_with("CEREBRAS_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY")
+    assert fully_keyed == {flat}
+    # The pending-key state: a real gap, narrowed to a real 15,104 check
+    # (which is right - that IS the largest row an 8k generator can make) and
+    # still advising the number that survives the key landing.
+    pending = advice_with("CEREBRAS_API_KEY", "GROQ_API_KEY")
+    assert judge_sizer(cfg)(8192, "judge") < worst_case_judge_tokens(cfg)
+    assert pending == fully_keyed
+    # ...in every other partially-keyed state too. Whichever keys are set, the
+    # operator is told one number.
+    for envs in (("CEREBRAS_API_KEY",), ("MISTRAL_API_KEY",),
+                 ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"),
+                 ("GROQ_API_KEY", "MISTRAL_API_KEY")):
+        assert advice_with(*envs) == fully_keyed, envs
+
+
+def test_unservable_is_asked_at_the_smallest_call_this_build_can_make(cfg, keys):
+    """`unservable` is the one fact --allow-pool-gaps cannot override, and it
+    was asked with the context filter removed ENTIRELY - i.e. at size zero, a
+    size the length band cannot produce. Every judge call renders the judge
+    template and asks for a reply, and a judged row carries at least
+    think_min + answer_min on top, so a judge under that floor serves no row
+    at any length while reading here as the slot the short rows would use."""
+    floor = min_judge_tokens(cfg)
+    tiny = 3000
+    assert tiny < required_context(floor), "the fixture has to be under the real floor"
+    patched = cfg_with_context(cfg, family="glm", role="judge", max_context=tiny)
+
+    def mistral_gap(config):
+        gaps = pool_gaps(
+            config,
+            needed_tokens=worst_case_judge_tokens(config),
+            servable_floor_tokens=floor,
+        )
+        return next(g for g in gaps if (g.generator_family, g.slot) == ("mistral", "b"))
+
+    gap = mistral_gap(patched)
+    assert gap.unservable is True
+    assert "no row size is servable" in gap.detail
+    # The floor is what decides it: glm at 8,192 really can serve the short
+    # rows, and that gap stays overridable.
+    assert mistral_gap(cfg).unservable is False
+
+    # ...and the consequence, at the flag: an unservable gap is a refusal
+    # whatever --allow-pool-gaps says, so the fleet cannot be started against
+    # a judge pool with nothing in it for any row.
+    refusals, _ = preflight_messages(patched, ("judge",), allow_pool_gaps=True)
+    assert any("no row size is servable" in line for line in refusals)
+
+
+def _with_tiebreak_family(cfg, *, api_key_env: str, max_context: int = 131072):
+    """The shipped config plus a fifth-family TIEBREAK behind its own key."""
+    from dataclasses import replace
+
+    model = ModelCfg(
+        id="fifth-tiebreak",
+        family="fifth",
+        roles=("tiebreak",),
+        limits={"rpm": 30, "tpm": 8000, "max_context": max_context, "max_output": 4096},
+        params={},
+    )
+    provider = ProviderCfg(
+        name="fifthparty",
+        base_url="https://example.test/v1",
+        api_key_env=api_key_env,
+        quirks=(),
+        models=(model,),
+    )
+    return replace(
+        cfg,
+        providers=cfg.providers + (provider,),
+        routing=replace(
+            cfg.routing, tiebreak=cfg.routing.tiebreak + ("fifthparty/fifth-tiebreak",)
+        ),
+    )
+
+
+def test_a_tiebreak_gap_names_the_key_that_would_fill_it(cfg, keys, monkeypatch):
+    """The judge side of this is pinned; the tiebreak side was not, so the
+    remedy could quietly stop naming the key that would close the gap and go
+    on advising a purchase the operator does not need to make."""
+    patched = _with_tiebreak_family(cfg, api_key_env="FIFTHPARTY_API_KEY")
+    _unset(monkeypatch, "FIFTHPARTY_API_KEY")
+    gap = next(
+        g
+        for g in pool_gaps(patched, needed_tokens=worst_case_judge_tokens(patched))
+        if g.role == "tiebreak"
+    )
+    assert gap.key_envs == ("FIFTHPARTY_API_KEY",)
+    assert "set FIFTHPARTY_API_KEY, or add one tiebreak" in gap.detail
+    # ...and the key landing is what closes it, not a purchase.
+    monkeypatch.setenv("FIFTHPARTY_API_KEY", "sk-test")
+    assert [
+        g for g in pool_gaps(patched, needed_tokens=worst_case_judge_tokens(patched))
+        if g.role == "tiebreak"
+    ] == []
+
+
 def _with_extra_generator(cfg, *, family: str, api_key_env: str, max_context: int = 131072):
     """The shipped config plus a generator family behind its own API key."""
     from dataclasses import replace
@@ -1781,23 +1923,6 @@ def _with_judge_model(cfg, *, family: str, model_id: str, max_context: int | Non
     )
 
 
-def _with_judge_context(cfg, *, family: str, max_context: int):
-    """The shipped config with one judge family's window rewritten."""
-    from dataclasses import replace
-
-    def patch(model):
-        if model.family != family or "judge" not in model.roles:
-            return model
-        return replace(model, limits={**model.limits, "max_context": max_context})
-
-    return replace(
-        cfg,
-        providers=tuple(
-            replace(p, models=tuple(patch(m) for m in p.models)) for p in cfg.providers
-        ),
-    )
-
-
 def test_pool_gaps_walks_the_generator_role_through_the_routers_own_filter(cfg, keys, monkeypatch):
     """The R3 unification was one-sided: judge and tiebreak went through
     Router.eligible_refs while the generator role stayed a raw cfg.routing_refs
@@ -1828,7 +1953,7 @@ def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg
     judge slots at that length invents a gap. Sized at what its own window
     permits the same pool serves it, while the 40k generator, which really can
     produce that row, still has the gap the config TODO is about."""
-    patched = _with_judge_context(cfg, family="qwen", max_context=20000)
+    patched = cfg_with_context(cfg, family="qwen", role="judge", max_context=20000)
     flat = worst_case_judge_tokens(patched)
     sizer = judge_sizer(patched)
     assert sizer(8192, "judge") < flat == sizer(None, "judge")
@@ -1869,43 +1994,6 @@ def test_the_family_window_bound_never_sizes_above_the_flat_worst_case(cfg, keys
     )
 
 
-def _with_split_pools(cfg, *, judge_context: int, tiebreak_context: int):
-    """A pool whose judge role is complete and whose tiebreak role is not.
-
-    One fourth-family model in the JUDGE list only (so every judge slot fills)
-    and one fifth-family model in the TIEBREAK list only, at a size the caller
-    chooses - which is how a test can put a threshold between the judge
-    prompt's requirement and the tiebreak prompt's.
-    """
-    from dataclasses import replace
-
-    def model(model_id, family, role, max_context):
-        return ModelCfg(
-            id=model_id,
-            family=family,
-            roles=(role,),
-            limits={"rpm": 30, "tpm": 8000, "max_context": max_context, "max_output": 8192},
-            params={"temperature": 0.2},
-        )
-
-    extra = (
-        model("fourth-judge", "fourth", "judge", judge_context),
-        model("fifth-tiebreak", "fifth", "tiebreak", tiebreak_context),
-    )
-    providers = tuple(
-        replace(p, models=p.models + extra) if p.name == "groq" else p for p in cfg.providers
-    )
-    return replace(
-        cfg,
-        providers=providers,
-        routing=replace(
-            cfg.routing,
-            judge=cfg.routing.judge + ("groq/fourth-judge",),
-            tiebreak=cfg.routing.tiebreak + ("groq/fifth-tiebreak",),
-        ),
-    )
-
-
 def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     """`tiebreak_needed_tokens` defaults to the judge's number, and the two
     prompts are not the same prompt. The difference is four tokens on this
@@ -1915,7 +2003,7 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     tiebreak_needed = worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
     assert required_context(judge_needed) < required_context(tiebreak_needed)
 
-    patched = _with_split_pools(
+    patched = cfg_with_split_pools(
         cfg, judge_context=131072, tiebreak_context=required_context(tiebreak_needed) - 1
     )
     sized = pool_gaps(
@@ -1925,7 +2013,7 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     # Sized by the JUDGE's number instead, that same model reads as big enough.
     assert pool_gaps(patched, needed_tokens=judge_needed) == []
     # ...and one token more really does close it.
-    opened = _with_split_pools(
+    opened = cfg_with_split_pools(
         cfg, judge_context=131072, tiebreak_context=required_context(tiebreak_needed)
     )
     assert pool_gaps(
@@ -1968,6 +2056,95 @@ def test_a_judge_that_declares_no_context_limit_is_assumed_to_fit(cfg):
     "fits" costs one 400 that providers.py fails over."""
     unknown = _with_judge_model(cfg, family="glm", model_id="glm-unknown", max_context=None)
     assert "glm" not in undersized_families(unknown, "judge", 10**6)
+
+
+def _with_generator_models(cfg, *, caps, family: str = "extra"):
+    """The shipped config plus `len(caps)` generators in one family.
+
+    In the order given, because that is the order `_generator_windows` walks
+    and the rule has to hold whichever size the operator happens to add first.
+    A cap of None declares no `max_context` at all.
+    """
+    from dataclasses import replace
+
+    def model(ix, cap):
+        limits = {"rpm": 30, "tpm": 8000, "max_output": 4096}
+        if cap is not None:
+            limits["max_context"] = cap
+        return ModelCfg(
+            id=f"gen-{family}-{ix}", family=family, roles=("generator",), limits=limits, params={}
+        )
+
+    extra = tuple(model(ix, cap) for ix, cap in enumerate(caps))
+    providers = tuple(
+        replace(p, models=p.models + extra) if p.name == "cerebras" else p for p in cfg.providers
+    )
+    return replace(
+        cfg,
+        providers=providers,
+        routing=replace(
+            cfg.routing,
+            generator=cfg.routing.generator + tuple(f"cerebras/{m.id}" for m in extra),
+        ),
+    )
+
+
+def test_a_generator_familys_window_is_the_largest_model_it_offers(cfg, keys):
+    """The twin of the EVERY-vs-ANY rule above, and the INPUT to the narrowed
+    judge check: `pool_gaps` sizes each generator family's judge slots at one
+    window, and `undersized_families` excludes a family only when EVERY model
+    in it is too small - so the window that decides the check has to be the
+    LARGEST the family offers, or the check is sized for a row the family can
+    still be handed.
+
+    Invisible on today's config (no generator family has two models) and the
+    config TODO asks the operator to ADD models, which is when it decides."""
+
+    def window(*caps):
+        patched = _with_generator_models(cfg, caps=caps)
+        return _generator_windows(patched, Router(patched))["extra"]
+
+    # Two declared windows: the largest, and the order they were configured
+    # in cannot matter.
+    assert window(8192, 131072) == 131072
+    assert window(131072, 8192) == 131072
+    # An undeclared limit is UNKNOWN, not small - `undersized_families` lets
+    # that model through at every size, so the family has no ceiling to cap
+    # its check with. Again in both orders: a later uncapped model has to
+    # CLEAR a cap an earlier one set, not be swallowed by it.
+    assert window(8192, None) is None
+    assert window(None, 8192) is None
+    # ...and alone it is None, never 0. Zero is a real window here: it would
+    # size the family's judge check at the reply allowance alone and clear a
+    # judge that cannot hold a single one of its rows.
+    assert window(None) is None
+
+
+def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_checked_at(cfg, keys):
+    """What the rule above costs when it is wrong, at the only place it is
+    spent. The operator adds a 128k variant beside the 8k one in an existing
+    generator family; the family can now produce the longest row the band
+    permits, so its judges must be checked at that length. Sized at the
+    SMALLEST model instead, the check runs at 15,104 (required 18,880), a 20k
+    judge clears, and the long row routes to the 128k generator and parks at
+    slot B having already paid for judge A."""
+    small = cfg_with_context(cfg, family="qwen", role="judge", max_context=20000)
+    sizer, flat = judge_sizer(small), worst_case_judge_tokens(small)
+
+    def fatal(config):
+        return {
+            (g.generator_family, g.slot)
+            for g in pool_gaps(config, needed_tokens=flat, needed_for_window=sizer)
+            if g.fatal
+        }
+
+    # As shipped, the gpt-oss family really is 8k-only and the narrowing is
+    # right: at 15,104 the 20k judge holds every row it can produce.
+    assert required_context(sizer(8192, "judge")) < 20000 < required_context(flat)
+    assert ("gpt-oss", "b") not in fatal(small)
+    # Add the big sibling and the same pool no longer serves that family.
+    mixed = _with_generator_models(small, caps=(131072,), family="gpt-oss")
+    assert ("gpt-oss", "b") in fatal(mixed)
 
 
 def test_pool_gaps_applies_the_routers_own_key_filter(cfg, monkeypatch):
