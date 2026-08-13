@@ -403,6 +403,37 @@ def test_a_marker_on_line_one_strips_nothing_and_is_not_a_successful_strip():
     assert headnote_signals(front[:RESIDUE_WINDOW]) == ()
 
 
+def test_a_cut_between_two_held_points_is_caught_at_the_seam_though_the_names_match():
+    # THE CASE THE COMPARISON CANNOT SEE, and the reason the seam window is
+    # still there beside it. The marker fires in the MIDDLE of the HELD
+    # block: `held` is on the removed side too, so the comparison is
+    # satisfied by name while the second half of the publisher's holding sits
+    # directly under the cut. Only a rule that fires on the evidence AT THE
+    # SEAM, regardless of what was removed, refuses this document - which is
+    # why the check is a union of the two and not a replacement of one by the
+    # other.
+    front = (
+        _CAPTION
+        + "HELD: 1. The seniority of a promotee is reckoned from the date of regular\n"
+        "appointment and not from the date on which ad hoc officiation began.\n"
+        "ORDER\n\n"
+        "HELD: 2. The High Court was in error in reading rule 7 as conferring a right\n"
+        "to count officiation towards seniority.\n"
+    )
+    result = extract_text([front + _pad(BODY, 2600)])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # THE PREMISE: the comparison really is satisfied here - the same
+    # signature name stands on both sides of the cut - so the seam window is
+    # the only rule that can be doing the refusing.
+    cut = front.index("ORDER")
+    assert find_judgment_start(front).offset == cut
+    assert "held" in headnote_signals(front[:cut])
+    assert "held" in headnote_signals(front[cut:][:RESIDUE_WINDOW])
+
+
 def test_an_emitted_document_reports_every_signature_it_still_carries():
     # THE FIRST-RUN TELL, as a property rather than as advice. Because a
     # document is emitted only when the removed side accounts for every
@@ -1608,7 +1639,9 @@ def test_the_audit_opens_with_the_check_that_settles_whether_the_guard_can_read_
     # above the sample.
     key = _key()
     _, paths = _corpus(tmp_path, [key], store=store)
-    reader = FakeReader({paths[key]: scr_pages()})
+    # A judgment with no headnote at all - the document that legitimately
+    # prints `none`, and therefore the one the tell has to be read against.
+    reader = FakeReader({paths[key]: [_pad(BODY, 2600)]})
     extract_corpus(
         store, [_selection(key)], index=pdf_index(store), text_root=tmp_path / "text",
         reader=reader,
@@ -1617,9 +1650,13 @@ def test_the_audit_opens_with_the_check_that_settles_whether_the_guard_can_read_
     report = audit_report(store, 1, index=pdf_index(store), reader=reader)
 
     assert "READ THIS FIRST" in report
-    assert "headnote signals: none" in report.split("---")[0]
-    # It is the HEAD of the report, before the first document.
+    # It is the HEAD of the report, above the first document.
     assert report.index("READ THIS FIRST") < report.index(key)
+    # ... and it quotes the line the operator will actually read, verbatim -
+    # once in the tell and once against this document. A tell that named a
+    # string the report does not print would be worse than no tell: the
+    # operator would scan for it, not find it, and conclude nothing is wrong.
+    assert report.count("headnote signals: none") == 2
 
 
 def test_the_audit_says_when_the_rules_no_longer_reproduce_what_the_corpus_holds(
@@ -1743,11 +1780,10 @@ def test_the_reader_pins_the_options_that_decide_what_the_text_contains(monkeypa
     assert seen["table_strategy"] == "lines_strict"
     assert seen["show_progress"] is False
     # THE PREMISE, without which "margins == 0" is a test of nothing: the
-    # library's own default is a crop, so passing nothing is a decision too.
-    assert Library.to_markdown.__defaults__ is None
+    # library's own default is a CROP, so passing nothing is a decision too.
     import inspect
 
-    assert inspect.signature(Library.to_markdown).parameters["margins"].default != 0
+    assert inspect.signature(Library.to_markdown).parameters["margins"].default == (0, 50, 0, 50)
 
 
 def test_a_reader_that_cannot_take_the_pinned_options_is_refused_not_silently_defaulted(
