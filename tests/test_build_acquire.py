@@ -344,7 +344,7 @@ def test_an_acquisition_lands_the_bytes_then_indexes_them(store, tmp_path):
     src = store.conn.execute(
         "SELECT license, url FROM source WHERE source_id = ?", (SC_SOURCE_ID,)
     ).fetchone()
-    assert src["license"] == SC_LICENSE
+    assert src["license"] == SC_LICENSE == "CC-BY-4.0"
     assert SC_BUCKET in src["url"]
 
 
@@ -648,7 +648,8 @@ def test_cli_acquires_pdfs_into_the_build_corpus(tmp_path, capsys):
     paths = build_paths(cfg.build.workdir)
     for key, body in objects.items():
         assert (paths.corpus_dir / "sc" / key).read_bytes() == body
-    assert "fetched" in capsys.readouterr().out
+    # A count, not the word "fetched": the header prints that either way.
+    assert "artifacts indexed -> 2" in capsys.readouterr().out
 
     with Store.open(paths.state_db) as opened:
         assert opened.artifact_count(SC_SOURCE_ID) == 2

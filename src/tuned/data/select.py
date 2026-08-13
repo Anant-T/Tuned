@@ -118,7 +118,13 @@ _VERSUS = re.compile(r"\b(?:vs?|versus)\b\.?", re.IGNORECASE)
 _YEAR_IN_TEXT = re.compile(r"(?<!\d)(1[89]\d{2}|20\d{2})(?!\d)")
 # "[2020] 7 S.C.R. 941" -> volume 7, page 941 of the 2020 reports, which is
 # also how the english PDFs are named ({year}_{vol}_{start}_{end}_EN.pdf).
-_SCR = re.compile(r"\[?(\d{4})\]?\s+(\d{1,3})\s+S\.?\s*C\.?\s*R\.?\s+(\d{1,4})", re.IGNORECASE)
+# The year bracket is [square] by S.C.R. convention and (round) by several
+# other reporters', so it is not what distinguishes them - the reporter
+# name is, and matching the bracket instead would quietly accept an SCC
+# citation as an S.C.R. page reference.
+_SCR = re.compile(
+    r"[\[(]?(\d{4})[\])]?\s+(\d{1,3})\s+S\.?\s*C\.?\s*R\.?\s+(\d{1,4})", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)

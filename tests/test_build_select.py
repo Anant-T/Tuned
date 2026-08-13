@@ -141,8 +141,10 @@ def test_an_author_absent_from_the_bench_string_is_still_a_judge():
 
 
 def test_a_list_valued_judge_field_is_read_as_a_list():
-    row = _meta_row(judge=["A.K. Sikri", "Ashok Bhushan", "R.K. Agrawal"], author_judge=None)
-    assert coram_size(row) == 3
+    # Surname-first entries carry their own commas, so a list stringified
+    # and then split on commas reads as four judges rather than two.
+    row = _meta_row(judge=["Sikri, A.K.", "Bhushan, Ashok"], author_judge=None)
+    assert coram_size(row) == 2
 
 
 def test_judges_are_returned_readable_not_normalised():
@@ -282,7 +284,11 @@ def test_the_scr_citation_gives_the_pdf_filename_prefix():
     # and that is S.C.R. pagination, so the citation addresses the file.
     assert scr_prefix("[2020] 7 S.C.R. 941") == "2020_7_941_"
     assert scr_prefix("2020 7 SCR 941") == "2020_7_941_"
-    assert scr_prefix("(2008) 1 SCC 1") is None  # a different reporter
+    # The bracket is NOT what tells the reporters apart - only the name is,
+    # so the negative case has to differ in the name alone.
+    assert scr_prefix("(2020) 7 SCR 941") == "2020_7_941_"
+    assert scr_prefix("(2008) 1 SCC 1") is None
+    assert scr_prefix("[2008] 1 SCC 1") is None
     assert scr_prefix(None) is None
 
 
@@ -449,7 +455,11 @@ def test_cli_writes_the_selection_and_records_the_run(tmp_path, capsys):
         events = opened.events("corpus_selection")
         assert len(events) == 1
         assert '"selected": 3' in events[0]["detail_json"]
-    assert "no_significance_signal" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "no_significance_signal" in out
+    # The pair with the next test is what makes the degraded banner mean
+    # something: it is absent exactly when the landmark list was there.
+    assert "DEGRADED" not in out
 
 
 def test_cli_says_loudly_when_it_ran_without_the_landmark_list(tmp_path, capsys):
