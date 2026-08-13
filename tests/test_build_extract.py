@@ -18,17 +18,22 @@ from tuned.data.extract import (
     MAX_STRIP_FRACTION,
     MIN_BODY_CHARS,
     MIN_DOC_CHARS,
+    MIN_LATIN_RATIO,
     Q_BODY_TOO_SHORT,
     Q_HEADNOTE_RESIDUE,
     Q_LOW_TEXT_QUALITY,
     Q_NO_JUDGMENT_START,
     Q_NO_TEXT,
     Q_STRIP_TOO_LARGE,
+    RESIDUE_WINDOW,
+    RUNNING_DIGIT_BLIND_CHARS,
+    RUNNING_MAX_CHARS,
     clean_pages,
     demote_markdown,
     extract_text,
     find_judgment_start,
     headnote_signals,
+    latin_ratio,
     page_span_from_key,
     reportable_flag,
 )
@@ -172,6 +177,48 @@ def test_a_cut_inside_the_headnote_is_caught_by_the_residue_check():
     assert find_judgment_start(headnote).marker == "judgment_heading"
 
 
+def test_the_residue_check_sees_the_sectioned_front_matter_too():
+    # The newer S.C.R. volumes lay the front matter out as named sections
+    # rather than one HELD block, so the early-cut hazard exists in two
+    # shapes and the check has to see both. Second test on the same rule
+    # deliberately: it is the only thing standing between a mis-cut and a
+    # corpus that looks fine.
+    front = (
+        "KALYANI SHARMA v. STATE OF MAHARASHTRA AND OTHERS\n"
+        "ORDER\n"
+        "Issue for Consideration\n"
+        "Whether the period of ad hoc officiation counts towards seniority.\n"
+        "List of Acts\n"
+        "Bombay Engineering Service (Recruitment) Rules, 1978.\n"
+    )
+    result = extract_text([front + _pad(BODY, 2000)])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # The premise: that "ORDER" really is taken as the boundary.
+    assert find_judgment_start(front).marker == "judgment_heading"
+
+
+def test_an_editorial_phrase_far_past_the_seam_is_not_treated_as_residue():
+    # The window is finite on purpose. A headnote leaks AT the seam; a
+    # judgment quoting an earlier report's "HELD:" a page later is ordinary
+    # legal writing, and refusing those documents would cost more than the
+    # check is worth.
+    quotation = "HELD: 1. The seniority of a promotee is reckoned from regular appointment.\n"
+    # BOUNDED, so that a mutant widening the window cannot make this fixture
+    # allocate its way out of failing (the harness note from Task 10: a test
+    # parametrised by the value under mutation thrashes instead of dying).
+    body = _paras(1, min(RESIDUE_WINDOW, 20_000) + 800) + quotation
+    result = extract_text(["The Judgment of the Court was delivered by\nNAVIN SINHA, J.\n" + body])
+
+    assert result.ok, result.reason
+    assert "HELD:" in result.text
+    # ... and the premise that makes this test about the WINDOW: the phrase
+    # really is past it.
+    assert result.text.index("HELD:") > RESIDUE_WINDOW
+
+
 def test_a_boundary_that_would_discard_most_of_the_document_is_quarantined():
     front = _pad(HEADNOTE, 20000)
     body = _pad(BODY, 2000)
@@ -212,25 +259,34 @@ def test_a_garbled_text_layer_is_quarantined_before_the_boundary_is_blamed():
     # A broken font map extracts as (cid:NN) soup. It is long enough to
     # pass the empty check and it carries a real marker, so "no text" and
     # "no judgment start" would both misdiagnose it.
-    soup = "(cid:24)(cid:37)(cid:12)(cid:3)(cid:55)(cid:82) " * 200
-    page = "The Judgment of the Court was delivered by\n" + soup
+    page = "The Judgment of the Court was delivered by\n" + _paras(1, 2000).replace(
+        "the record", "the (cid:24)(cid:37)(cid:12)"
+    )
     result = extract_text([page])
 
     assert not result.ok
     assert result.reason == Q_LOW_TEXT_QUALITY
-    # Both of the other refusals would be a misdiagnosis of this document,
-    # and each is ruled out by a fact about the fixture rather than by the
-    # reason string this test already asserts.
+    # Each of the other three readings of this document is ruled out by a
+    # fact about the fixture, not by the reason string already asserted.
+    # The last one matters most: a PARTIALLY broken font map leaves plenty
+    # of real prose, so the letter ratio stays healthy and the (cid:NN)
+    # count is the only thing that can see it.
     assert len(page) > MIN_DOC_CHARS
     assert find_judgment_start(page) is not None
+    assert latin_ratio(page) > MIN_LATIN_RATIO
 
 
 def test_a_regional_text_layer_is_quarantined():
     devanagari = "यह निर्णय हिंदी में है और यह अंग्रेजी उपसर्ग के अंतर्गत नहीं होना चाहिए। " * 40
-    result = extract_text(["The Judgment of the Court was delivered by\n" + devanagari])
+    page = "The Judgment of the Court was delivered by\n" + devanagari
+    result = extract_text([page])
 
     assert not result.ok
     assert result.reason == Q_LOW_TEXT_QUALITY
+    # The OTHER limb: nothing here is a broken font map, so the letter
+    # ratio is the only check that can refuse this document.
+    assert "(cid:" not in page
+    assert latin_ratio(page) < MIN_LATIN_RATIO
 
 
 def test_a_page_break_in_the_middle_of_a_sentence_does_not_become_a_paragraph_break():
@@ -324,6 +380,14 @@ def test_headnote_signals_name_the_editorial_furniture_and_not_ordinary_prose():
     # otherwise every judgment quoting an earlier holding is quarantined.
     assert headnote_signals("This Court held that the appeal must fail.") == ()
     assert headnote_signals("The submission is that the cases referred by counsel.") == ()
+    # And the reason HELD is matched CASE-SENSITIVELY. The text is hard
+    # wrapped, so a line boundary lands wherever the column ended: "...the
+    # High Court / held: that the suit was barred" puts an ordinary verb at
+    # the start of a line, and a case-blind rule would read the judgment's
+    # own quotation of an order as the reporter's headnote and refuse the
+    # document. Prose is never in capitals; the reprint's HELD always is.
+    assert headnote_signals("held: that the suit was barred by limitation.") == ()
+    assert headnote_signals("Held: that the suit was barred by limitation.") == ()
 
 
 # --------------------------------------------------------------------------
@@ -352,7 +416,9 @@ def test_a_digital_signature_side_stamp_is_removed_but_dated_prose_survives():
     # time inside a sentence are facts of the case, not furniture.
     assert "occurred on 12.03.2019 at about 21:30:00 hours" in text
     assert "2. The trial court convicted the appellant." in text
-    assert stats["signature"] >= 5
+    # All six lines of the block, not "most of them": a stamp half removed
+    # leaves a signer's name loose in the middle of a judgment.
+    assert stats["signature"] == 6
 
 
 def test_the_signer_name_is_dropped_only_after_a_bare_stamp_header():
@@ -374,8 +440,7 @@ def test_running_headers_page_numbers_and_watermarks_go_but_body_lines_stay():
         pages.append(
             f"{RUNNING_HEADER}\n"
             "www.example-watermark.in\n"
-            f"{i + 1}. Paragraph {i + 1} of the judgment, which appears on one page only "
-            f"and differs from its neighbours in nothing but the number it carries.\n"
+            f"{i + 1}. Paragraph {i + 1} of the judgment is on this page and on no other page at all.\n"
             + ("A short repeated aside.\n" if i < 2 else "")
             + f"{941 + i}\n"
         )
@@ -389,9 +454,15 @@ def test_running_headers_page_numbers_and_watermarks_go_but_body_lines_stay():
     # the digit-blind key that catches the printed page number reads all six
     # as one repeated line. If it is applied to lines of prose, the body of
     # every judgment whose pages open with a numbered paragraph is deleted
-    # as furniture - and the deletion is silent.
+    # as furniture - and the deletion is silent. They are deliberately SHORT
+    # enough to be running-line candidates (under RUNNING_MAX_CHARS), so the
+    # length cap cannot be what saves them and the digit-blind guard is the
+    # only thing standing between them and deletion.
     for i in range(6):
-        assert f"Paragraph {i + 1} of the judgment" in joined
+        line = f"{i + 1}. Paragraph {i + 1} of the judgment is on this page and on no other page at all."
+        assert len(line) <= RUNNING_MAX_CHARS
+        assert len(line) > RUNNING_DIGIT_BLIND_CHARS
+        assert line in joined
     # 2 of 6 pages is below the threshold: a line has to be furniture on
     # MOST pages before it is treated as furniture at all.
     assert "A short repeated aside." in joined
@@ -458,6 +529,24 @@ def test_a_numbered_paragraph_at_the_foot_of_a_page_is_never_taken_for_a_footnot
     assert cleaned[0].rstrip().endswith(tail.strip())
 
 
+def test_a_paragraph_below_the_footnote_block_keeps_the_whole_block_in_place():
+    # Reading order is not always print order: pymupdf4llm can put the foot
+    # of the page before the last text block on it. Taking everything from
+    # the first footnote marker to the end of the page would then carry a
+    # numbered PARAGRAPH out of the body with it - and nothing downstream
+    # would ever see that it had gone.
+    page = (
+        f"12. The question is whether the delay stands explained. {_PAGE_FILLER}\n"
+        "1 State of Punjab v. Gurmit Singh, (1996) 2 SCC 384, at paragraph 21.\n"
+        "13. We turn to the evidence bearing on it, and record our conclusion.\n"
+    )
+    cleaned, stats = clean_pages([page])
+
+    assert stats["footnote"] == 0
+    assert "13. We turn to the evidence" in cleaned[0]
+    assert "Gurmit Singh" in cleaned[0]
+
+
 def test_footnotes_from_the_headnote_pages_do_not_survive_the_strip():
     # Footnotes are moved to the END of the document, which carries them
     # ACROSS the headnote boundary - so the editorial front matter's own
@@ -513,6 +602,10 @@ def test_the_page_span_comes_out_of_the_object_key():
     assert page_span_from_key("data/pdf/year=2020/english/2020_7_941_EN.pdf") is None
     assert page_span_from_key("data/pdf/year=2020/regional/2020_hi_7_941_960.pdf") is None
     assert page_span_from_key("metadata/parquet/year=2020/part-0.parquet") is None
+    # _EN is REQUIRED, not decoration. v1 is english-only (the prefix is the
+    # language ground truth), and a regional object that happens to share
+    # the numeric convention must not be read as one of ours.
+    assert page_span_from_key("data/pdf/year=2020/regional/2020_7_941_960_HI.pdf") is None
 
 
 def test_markdown_decoration_is_demoted_without_eating_the_filename_underscores():
@@ -552,6 +645,7 @@ from tuned.data.extract import (
     main,
     pdf_index,
     resolve_pdf,
+    spread,
     text_path_for,
     write_manifest,
     write_text,
@@ -1012,6 +1106,17 @@ def test_the_audit_prints_the_seam_on_both_sides_of_the_cut(tmp_path, store):
     assert "The Judgment of the Court was delivered by" in report
     assert "judgment_delivered_by" in report
     assert key in report
+
+
+def test_the_audit_sample_walks_the_corpus_instead_of_reading_the_first_n():
+    # Object keys sort by year, so a sample taken along them is a walk
+    # across 2010-2025. Taking the head of the list would show the operator
+    # sixteen years of corpus through one year of it - and the first year is
+    # also the year most likely to have been extracted before a rule change.
+    assert spread(list(range(100)), 4) == [0, 25, 50, 75]
+    assert spread(list(range(100)), 1) == [0]
+    assert spread(list(range(10)), 0) == []
+    assert spread([1, 2], 5) == [1, 2]
 
 
 def test_the_audit_shows_quarantined_documents_and_why(tmp_path, store):

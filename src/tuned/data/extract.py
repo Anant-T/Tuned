@@ -609,8 +609,14 @@ def reportable_flag(page_one: str) -> str | None:
     """"REPORTABLE" / "NON-REPORTABLE" / None, from the head of page one."""
     for line in page_one.split("\n")[:REPORTABLE_LINES]:
         flat = _flat(line)
-        # NON- first: a substring search for "REPORTABLE" reads
-        # "NON-REPORTABLE" as its own opposite.
+        # Reading "NON-REPORTABLE" as its own opposite is the trap here, and
+        # THREE things independently prevent it: this ordering, the `^` in
+        # _REPORTABLE, and `.match` rather than `.search`. Any one of them
+        # suffices, which is why no single-point mutation of the three can
+        # fail the test that names the trap - only removing all three does
+        # (verified: each alone SURVIVES, the three together are CAUGHT).
+        # Recorded rather than thinned out: the cost is two lines, and the
+        # comment now names the real mechanism rather than one third of it.
         if _NON_REPORTABLE.match(flat):
             return "NON-REPORTABLE"
         if _REPORTABLE.match(flat):
@@ -1313,7 +1319,15 @@ def main(argv: Sequence[str] | None = None, *, reader=None) -> int:
                 "manifest_rows": written,
             },
         )
-        print(f"documents indexed -> {store.document_count(SC_SOURCE_ID)} ({paths.state_db})")
+        # STANDING totals, not this pass's: a resumed run does no work and
+        # would otherwise print zeros over a finished corpus, and the split
+        # is what says how large the refusal set has grown.
+        print(
+            f"documents indexed -> {store.document_count(SC_SOURCE_ID)}"
+            f" ({store.document_count(SC_SOURCE_ID, status=STATUS_OK)} emitted /"
+            f" {store.document_count(SC_SOURCE_ID, status=STATUS_QUARANTINED)} quarantined)"
+            f"  ({paths.state_db})"
+        )
         if stats["considered"] and not joined:
             # Every selected judgment failing to find a PDF is not a corpus,
             # it is a wrong assumption about keys - either acquire has not
