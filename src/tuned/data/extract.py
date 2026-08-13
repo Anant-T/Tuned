@@ -683,8 +683,10 @@ def extract_text(pages: Sequence[str]) -> Extraction:
     as a bad cut rather than as a thin document.
     """
     n_pages = len(pages)
-    reportable = reportable_flag(demote_markdown(pages[0])) if pages else None
+    reportable = reportable_flag(demote_markdown(pages[0] or "")) if pages else None
     cleaned, stats = clean_pages(pages)
+    # Popped, not carried: the moved lines are TEXT, and `stats` becomes the
+    # document row's meta_json. Only the count belongs in the database.
     footnote_lines = stats.pop("footnote_lines", ())
 
     offsets: list[int] = []
@@ -753,6 +755,9 @@ def extract_text(pages: Sequence[str]) -> Extraction:
         marker=boundary.marker,
         pages=n_pages,
         boundary_page=boundary_page,
+        # Signals of what was REMOVED - "this document had a headnote and it
+        # is gone". A quarantine reports the signals of the WHOLE document
+        # instead, because there the question is what is in the file at all.
         signals=headnote_signals(joined[: boundary.offset]),
         reportable=reportable,
         footnotes=len(kept),
