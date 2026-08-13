@@ -29,10 +29,12 @@ from tuned.data.extract import (
     Q_NO_TEXT,
     Q_STRIP_TOO_LARGE,
     RESIDUE_WINDOW,
+    SEAM_ENUM_WINDOW,
     RUNNING_DIGIT_BLIND_CHARS,
     RUNNING_MAX_CHARS,
     _despace,
     _despace_pairs,
+    _ENUM_ITEM,
     _MD_TABLE_ROW,
     _SIGNATURES,
     clean_pages,
@@ -43,6 +45,7 @@ from tuned.data.extract import (
     latin_ratio,
     page_span_from_key,
     reportable_flag,
+    seam_continues_an_enumeration,
 )
 
 # --------------------------------------------------------------------------
@@ -618,17 +621,21 @@ def test_the_seam_window_alone_carries_a_cut_that_lands_between_two_holdings():
         "HELD: The High Court was in error in reading rule 7 as conferring a right\n"
         "to count officiation towards seniority.\n"
     )
-    result = extract_text([front + _pad(BODY, 2600)])
+    document = front + _pad(BODY, 2600)
+    result = extract_text([document])
 
     assert not result.ok
     assert result.reason == Q_HEADNOTE_RESIDUE
     assert result.text == ""
-    # THE PREMISES, one per silenced branch.
+    # THE PREMISES, one per silenced branch. Branch 4 is asked THE RULE rather
+    # than a line-anchored proxy for it: `_ENUM_ITEM` also reads the item
+    # standing behind a label (`HELD: 1.`), which no such proxy can see, so a
+    # proxy would keep passing on a fixture where branch 4 in fact fires.
     cut = front.index("ORDER")
     assert find_judgment_start(front).offset == cut
     assert "held" in headnote_signals(front[:cut])                  # comparison satisfied
     assert front[:cut].endswith("\n\n")                             # the cut begins a block
-    assert re.search(r"^\s{0,3}\(?\d{1,3}[.)]\s", front, re.M) is None   # nothing enumerated
+    assert not seam_continues_an_enumeration(document[:cut], document[cut:])
     # ... and the seam window is the one thing that does see it.
     assert "held" in headnote_signals(front[cut:][:RESIDUE_WINDOW])
 
@@ -734,7 +741,7 @@ def test_a_cut_that_does_not_begin_a_block_is_refused_when_furniture_was_removed
     assert find_judgment_start(front).offset == cut
     assert headnote_signals(document[cut:][:RESIDUE_WINDOW]) == ()           # branch 1 silent
     assert set(headnote_signals(document)) <= set(headnote_signals(front[:cut]))  # branch 2 silent
-    assert re.search(r"^\s{0,3}\(?\d{1,3}[.)]\s", front, re.M) is None       # branch 4 silent
+    assert not seam_continues_an_enumeration(document[:cut], document[cut:])  # branch 4 silent
     # THE CONTROL: the same cut in the same words with no furniture removed is
     # emitted, so the seam break only ever fires on a cut through furniture.
     control = extract_text([front.replace("HELD: ", "") + _pad(BODY, 2600)])
@@ -779,7 +786,7 @@ def test_a_cut_that_continues_the_removed_headnotes_numbering_is_refused():
     assert front[:cut].endswith("\n\n")                                      # branch 3 silent
     # ... and the premise the three points exist for: the head reached 3, so
     # only a rule reading the LAST item can meet the body's 4.
-    assert re.findall(r"^(?:HELD: )?(\d)\.", front[:cut], re.M) == ["1", "2", "3"]
+    assert _ENUM_ITEM.findall(front[:cut]) == ["1", "2", "3"]
     # THE CONTROL: the same document whose body opens at ITS OWN first
     # paragraph instead of the headnote's next one is emitted.
     control = extract_text([front.replace("\n4. The seniority list", "\n1. The seniority list")
@@ -815,7 +822,7 @@ def test_a_headnote_that_has_paragraph_breaks_earlier_does_not_excuse_the_cut():
     assert not front[:cut].endswith("\n\n")
     assert headnote_signals(document[cut:][:RESIDUE_WINDOW]) == ()
     assert set(headnote_signals(document)) <= set(headnote_signals(front[:cut]))
-    assert re.search(r"^\s{0,3}\(?\d{1,3}[.)]\s", front, re.M) is None
+    assert not seam_continues_an_enumeration(document[:cut], document[cut:])
 
 
 def test_a_cut_after_a_single_holding_point_still_reads_the_number_behind_the_label():
@@ -872,6 +879,47 @@ def test_a_judgment_that_restarts_its_own_numbering_is_not_read_as_a_continuatio
     # really does open at 1, so branch 4 had something to compare.
     assert "3. The seniority list" in front
     assert re.search(r"^1\.", result.text, re.M) is not None
+
+
+def test_a_body_numbered_past_the_headnotes_last_point_is_not_a_continuation():
+    # THE OTHER RECALL SIDE of branch 4, and the side the suite did not have a
+    # case for: the comparison is EXACT-SUCCESSOR, so it reads only the body
+    # that counts up by ONE from the point the removed head reached. The test
+    # above pins the body that counts DOWN (a judgment restarting at its own
+    # `1.`) and says nothing about this one, so a rule loosened to refuse every
+    # body whose first number merely EXCEEDS the head's last passes it.
+    #
+    # That loosening would refuse THIS document, which is a judgment whose
+    # opening paragraphs the reader dropped, or which numbers from a base of
+    # its own. Nothing inside the file separates it from a headnote continuing
+    # except the GAP, and the gap is what the exact comparison reads.
+    front = (
+        _CAPTION
+        + "HELD: 1. The seniority of a promotee is reckoned from regular appointment.\n"
+        "2. The High Court was in error in reading rule 7.\n"
+        "\n"
+        "ORDER\n"
+        "\n"
+    )
+    document = front + _paras(5, 2600)
+    result = extract_text([document])
+
+    assert result.ok, result.reason
+    # THE PREMISES: every other branch is silent, the head really reached 2 and
+    # the body really opens at 5 - so the GAP is the only thing emitting this.
+    cut = front.index("ORDER\n")
+    assert find_judgment_start(document).offset == cut
+    assert headnote_signals(document[cut:][:RESIDUE_WINDOW]) == ()
+    assert set(headnote_signals(document)) <= set(headnote_signals(document[:cut]))
+    assert document[:cut].endswith("\n\n")
+    assert _ENUM_ITEM.findall(document[:cut])[-1] == "2"
+    assert _ENUM_ITEM.search(document[cut:][:SEAM_ENUM_WINDOW]).group(1) == "5"
+    assert not seam_continues_an_enumeration(document[:cut], document[cut:])
+    # THE CONTROL: close the gap to exactly one - same words, same cut, same
+    # furniture removed - and the identical document is refused.
+    control = extract_text([front + _paras(3, 2600)])
+    assert not control.ok
+    assert control.reason == Q_HEADNOTE_RESIDUE
 
 
 def test_an_emitted_document_reports_every_signature_it_still_carries():

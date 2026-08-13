@@ -60,11 +60,18 @@ signature rules at once - the name is accounted for on the removed side and
 nothing repeats the label past the cut - and the document is emitted with
 the publisher's holding on top of it.
 
-The residual is what is left when all four are silent: an unnumbered
-publisher's paragraph continuing past a properly set-off cut, with no
-signature anywhere after it. That case is still EMITTED, and `signals` will
-name the furniture that WAS removed, so the first-run tell below does not
-fire on it. It is this module's sharpest known residual.
+The residual is what is left when all four are silent: an editorial
+continuation none of the four rules can read - unnumbered, LETTERED (`(a)`),
+ROMAN (`(ii)`), or numbered NON-CONSECUTIVELY, or whose next number falls
+past SEAM_ENUM_WINDOW - running on past a properly set-off cut with no
+signature anywhere after it. Rule 4 is EXACT-SUCCESSOR, so it reads only the
+one continuation that counts up by one, and the width of that residual is
+the deliberate price: a rule refusing every body whose first number merely
+EXCEEDS the head's last would also refuse the judgment whose opening
+paragraphs the reader dropped, or which numbers from a different base. The
+whole family is still EMITTED, and `signals` will name the furniture that
+WAS removed, so the first-run tell below does not fire on any of it. It is
+this module's sharpest known residual.
 
 The guard also reads the furniture in every rendering the PDF reader can
 produce (a table bar, a blockquote marker, a bullet, a heading hash,
