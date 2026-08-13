@@ -648,7 +648,12 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
     token = os.environ.get("HF_TOKEN")
     code = 0
     try:
-        print(f"years {years[0]}-{years[-1]}  root {corpus}" + ("  [DRY RUN]" if args.dry_run else ""))
+        # min/max, not first/last: --years takes a comma list, and printing
+        # "2020-2011" for "2020,2010-2011" would misdescribe the run.
+        print(
+            f"years {min(years)}-{max(years)} ({len(years)} partitions)  root {corpus}"
+            + ("  [DRY RUN]" if args.dry_run else "")
+        )
         for kind in kinds:
             if kind == "hf":
                 for key in args.hf_source or sorted(HF_SOURCES):

@@ -579,6 +579,15 @@ def main(argv: Sequence[str] | None = None, *, rows=None, landmarks=_UNSET) -> i
                 f"the title join is the thing to check before trusting this run."
             )
         print(f"wrote {written} rows -> {out_path}")
+        if stats["total"] and not stats["selected"]:
+            # Every judgment failing all three signals is not a plausible
+            # corpus, it is a column name that did not match. Exiting 0 here
+            # would hand extraction an empty selection and look successful.
+            print(
+                "  NOTHING SELECTED from a non-empty metadata read - check the "
+                "field coverage above against the parquet's real column names"
+            )
+            return 1
     finally:
         store.close()
     return 0

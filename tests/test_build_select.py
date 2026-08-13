@@ -470,5 +470,15 @@ def test_cli_says_loudly_when_it_ran_without_the_landmark_list(tmp_path, capsys)
     assert "opennyaiorg/InJudgements_dataset" in out
 
 
+def test_cli_fails_when_a_non_empty_read_selected_nothing(tmp_path, capsys):
+    # The parquet column names are the one thing that cannot be checked
+    # offline, and a wrong one produces exactly this: rows read, none kept.
+    # Exiting 0 would hand extraction an empty corpus and look successful.
+    rows = [{"mystery_column": "x", "year": 2015} for _ in range(3)]
+    code = main(["--config", temp_config(tmp_path)], rows=rows, landmarks=frozenset())
+    assert code == 1
+    assert "NOTHING SELECTED" in capsys.readouterr().out
+
+
 def test_cli_hard_exits_after_success():
     assert "os._exit(" in SELECT_SRC.read_text(encoding="utf-8")
