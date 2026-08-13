@@ -74,6 +74,7 @@ Build:  python -m tuned.data.extract --config configs/data_law_v1.yaml
 """
 
 import hashlib
+import json
 import os
 import re
 import unicodedata
@@ -135,7 +136,13 @@ MIN_LATIN_RATIO = 0.5
 # a different thing and is not this check's business.
 RESIDUE_WINDOW = 3000
 
-PAGE_SEPARATOR = "\n\n"
+# A page break is joined with a plain newline, NOT a blank line. A judgment
+# runs on across pages, so a blank line there would announce a paragraph
+# break in the middle of a sentence at every page boundary - and the Tier-3
+# packer downstream reads blank lines. Inside a page the text is already
+# hard-wrapped, so a page break now looks exactly like the line breaks
+# around it.
+PAGE_SEPARATOR = "\n"
 
 
 class ExtractionError(RuntimeError):
@@ -766,3 +773,575 @@ def read_pdf_pages(path: str | Path) -> list[str]:
         ) from exc
     chunks = pymupdf4llm.to_markdown(str(path), page_chunks=True)
     return [chunk["text"] if isinstance(chunk, dict) else str(chunk) for chunk in chunks]
+
+
+# --------------------------------------------------------------------------
+# Joining the selection to the PDFs on disk.
+# --------------------------------------------------------------------------
+
+ROUTE_PDF_KEY = "pdf_key"
+ROUTE_SCR_PREFIX = "scr_prefix"
+ROUTE_AMBIGUOUS = "ambiguous"
+ROUTE_UNMATCHED = "unmatched"
+JOIN_ROUTES = (ROUTE_PDF_KEY, ROUTE_SCR_PREFIX, ROUTE_AMBIGUOUS, ROUTE_UNMATCHED)
+
+
+@dataclass(frozen=True)
+class PdfIndex:
+    """The acquired PDFs, addressed both ways the selection can address them."""
+
+    by_key: dict[str, str]
+    by_prefix: dict[str, tuple[str, ...]]
+
+    def __len__(self) -> int:
+        return len(self.by_key)
+
+
+def pdf_index(store, source_id: str = SC_SOURCE_ID) -> PdfIndex:
+    """Build the join index from the artifact table, in one read.
+
+    Driven off the artifact index rather than a directory walk, for select.py's
+    reason: a PDF can only be read out of a file the store says is complete.
+    """
+    by_key: dict[str, str] = {}
+    by_prefix: dict[str, list[str]] = {}
+    for key, artifact in store.artifact_index(source_id).items():
+        if not key.lower().endswith(".pdf"):
+            continue
+        by_key[key] = artifact["local_path"]
+        span = page_span_from_key(key)
+        if span is not None:
+            by_prefix.setdefault(f"{span.year}_{span.volume}_{span.start}_", []).append(key)
+    return PdfIndex(by_key, {k: tuple(sorted(v)) for k, v in by_prefix.items()})
+
+
+def resolve_pdf(row: dict, index: PdfIndex) -> tuple[str | None, str]:
+    """Which acquired PDF is this selection row's, and by which route.
+
+    `pdf_key` first (the metadata's own link, when the schema carries one),
+    then `scr_prefix` - select.py's inference that "[2020] 7 S.C.R. 941"
+    addresses `2020_7_941_*`, which is the ONLY join available if no link
+    column exists. Both routes are counted at run level, because which one
+    carried the corpus is a fact no offline test can settle.
+
+    A `pdf_key` naming an object that is not indexed falls THROUGH to the
+    prefix rather than failing: an interrupted or `--limit`ed acquire leaves
+    exactly that state, and stranding those rows would be a self-inflicted
+    hole in the corpus.
+
+    An ambiguous prefix resolves to nothing. Taking "whichever sorts first"
+    would attach a judgment to another judgment's citation, and nothing
+    downstream could see it.
+    """
+    key = row.get("pdf_key")
+    if key and key in index.by_key:
+        return key, ROUTE_PDF_KEY
+    prefix = row.get("scr_prefix")
+    if prefix:
+        matches = index.by_prefix.get(prefix, ())
+        if len(matches) == 1:
+            return matches[0], ROUTE_SCR_PREFIX
+        if len(matches) > 1:
+            return None, ROUTE_AMBIGUOUS
+    return None, ROUTE_UNMATCHED
+
+
+# --------------------------------------------------------------------------
+# Where the text goes, and the resume decision.
+# --------------------------------------------------------------------------
+
+def text_path_for(root: str | Path, object_key: str) -> Path:
+    """`data/pdf/year=2015/english/x_EN.pdf` -> `<root>/.../x_EN.txt`.
+
+    The bucket layout is mirrored (acquire.local_path_for does the refusing:
+    the key comes off a remote listing and must not choose where this
+    process writes), so the object key alone finds the text again.
+    """
+    return local_path_for(root, object_key).with_suffix(".txt")
+
+
+def extract_decision(indexed: dict | None, text_path: str | Path, *, force: bool = False) -> str:
+    """"extract" or "skip" for one document - the whole resume policy.
+
+    Four ways to be out of date and one way to be current:
+
+      * no row at all - including the crash window where the text landed and
+        the row did not, which is why there is no "adopt";
+      * a row written under different rules (`extract_version`);
+      * a row that says `ok` and points at text that is not there;
+      * `--force`, which re-reads everything.
+
+    A QUARANTINE at the current version is a SKIP: the rules are
+    deterministic and the bytes have not changed, so re-reading it would
+    spend the run's time on the documents that cannot be used. Changing the
+    rules is what re-opens them, and that is what the version is for.
+    """
+    if force or indexed is None:
+        return "extract"
+    if indexed.get("extract_version") != EXTRACT_VERSION:
+        return "extract"
+    if indexed.get("status") == STATUS_OK and not Path(text_path).exists():
+        return "extract"
+    return "skip"
+
+
+def write_text(path: str | Path, text: str) -> tuple[int, str]:
+    """Write one judgment durably; returns (chars, sha256).
+
+    Same rule as acquire.download_object and for the same reason: written to
+    a sibling `.part` and renamed, so `path` is either absent or the whole
+    document. A reader that finds a prefix of a judgment has no way to know.
+    """
+    path = Path(path)
+    part = path.with_name(path.name + PART_SUFFIX)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = text.encode("utf-8")
+    try:
+        with part.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(part, path)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    return len(text), hashlib.sha256(payload).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# The run.
+# --------------------------------------------------------------------------
+
+DEFAULT_MAX_FAILURES = 25
+# Above this share of refusals the run is not a corpus with some bad
+# documents in it - something about the rules or the source is wrong.
+QUARANTINE_ALARM = 0.25
+
+
+def extract_corpus(
+    store,
+    rows: Iterable[dict],
+    *,
+    index: PdfIndex,
+    text_root: str | Path,
+    reader=read_pdf_pages,
+    source_id: str = SC_SOURCE_ID,
+    limit: int | None = None,
+    force: bool = False,
+    max_failures: int = DEFAULT_MAX_FAILURES,
+) -> dict:
+    """Extract the selection, in the order it is given, resumably.
+
+    THE ORDER IS THE SELECTION FILE'S and is never re-sorted. Task 11 made
+    selection.jsonl a stratified SPREAD rather than the top N by priority
+    precisely so that an interrupted extraction fails over the whole corpus
+    shape instead of over one case type; re-ranking here would undo it.
+
+    `limit` caps WORK - documents extracted, quarantined or failed - not
+    rows examined, so a resumed run advances instead of spending the cap on
+    the documents it already has (acquire.py's lesson, same words).
+
+    A per-document failure is counted and the run continues; `max_failures`
+    stops a run whose fault is not in the documents. A failure to write the
+    INDEX is deliberately not caught - that is the database, not a PDF.
+    """
+    text_root = Path(text_root)
+    stats: dict = {
+        "considered": 0,
+        "extracted": 0,
+        "quarantined": 0,
+        "skipped": 0,
+        "failed": 0,
+        "chars": 0,
+        "routes": dict.fromkeys(JOIN_ROUTES, 0),
+        "reasons": {},
+        "failures": [],
+    }
+    indexed = store.document_index(source_id)
+
+    for row in rows:
+        if limit is not None and (
+            stats["extracted"] + stats["quarantined"] + stats["failed"] >= limit
+        ):
+            break
+        stats["considered"] += 1
+        key, route = resolve_pdf(row, index)
+        stats["routes"][route] += 1
+        if key is None:
+            continue
+
+        try:
+            dest = text_path_for(text_root, key)
+            if extract_decision(indexed.get(key), dest, force=force) == "skip":
+                stats["skipped"] += 1
+                continue
+            result = extract_text(reader(index.by_key[key]))
+        except Exception as exc:
+            stats["failed"] += 1
+            detail = {"key": key, "error": f"{type(exc).__name__}: {exc}"}
+            stats["failures"].append(detail)
+            store.log_event("extract_failed", {"source_id": source_id, **detail})
+            if stats["failed"] >= max_failures:
+                raise ExtractionError(
+                    f"extract: stopping after {stats['failed']} failures "
+                    f"(last {key!r}) - at this rate the fault is not in the documents"
+                ) from exc
+            continue
+
+        span = page_span_from_key(key)
+        record = {
+            "status": STATUS_OK if result.ok else STATUS_QUARANTINED,
+            "reason": result.reason,
+            "case_id": row.get("case_id"),
+            "citation": row.get("citation"),
+            "year": row.get("year"),
+            "pages": result.pages,
+            "page_start": span.start if span else None,
+            "page_end": span.end if span else None,
+            "marker": result.marker,
+            "extract_version": EXTRACT_VERSION,
+            "meta": result.meta(),
+        }
+        if result.ok:
+            chars, digest = write_text(dest, result.text)
+            record.update(text_path=str(dest), chars=chars, headnote_chars=result.headnote_chars,
+                          sha256=digest)
+            stats["extracted"] += 1
+            stats["chars"] += chars
+        else:
+            # BEFORE the row, and in this order on purpose. A document that
+            # was emitted under older rules and is refused under these ones
+            # must not leave readable text behind: a consumer that globs the
+            # text tree instead of reading the manifest would pick up a
+            # judgment the index says does not exist. Unlinking first is
+            # also the self-healing order - a crash here leaves a row saying
+            # `ok` and no file, which the next run re-extracts.
+            dest.unlink(missing_ok=True)
+            record.update(text_path=None, headnote_chars=result.headnote_chars)
+            stats["quarantined"] += 1
+            stats["reasons"][result.reason] = stats["reasons"].get(result.reason, 0) + 1
+
+        # The text is durable from here; the row may now claim it exists.
+        store.record_document(source_id, key, record)
+        indexed[key] = {
+            "object_key": key,
+            "status": record["status"],
+            "reason": record["reason"],
+            "text_path": record["text_path"],
+            "extract_version": EXTRACT_VERSION,
+        }
+    return stats
+
+
+# --------------------------------------------------------------------------
+# The manifest.
+# --------------------------------------------------------------------------
+
+MANIFEST_FIELDS = (
+    "doc_id", "case_id", "title", "citation", "year", "court", "coram",
+    "case_type", "priority", "object_key", "text_path", "chars", "pages",
+    "page_start", "page_end", "marker", "reportable", "source_id",
+)
+
+
+def manifest_rows(store, rows: Iterable[dict], *, index: PdfIndex, source_id: str) -> Iterator[dict]:
+    """One row per EMITTED judgment: the selection row plus what came out.
+
+    Derived state, regenerable from (selection.jsonl + the document table) at
+    any time, which is why an interrupted run losing it costs nothing. Only
+    documents with text: listing a quarantined judgment would hand the
+    segmenter a path that is not there.
+    """
+    documents = {row["object_key"]: row for row in store.documents(source_id, status=STATUS_OK)}
+    for row in rows:
+        key, _ = resolve_pdf(row, index)
+        document = documents.get(key) if key else None
+        if document is None:
+            continue
+        meta = json.loads(document["meta_json"] or "{}")
+        merged = {
+            **{field: row.get(field) for field in MANIFEST_FIELDS},
+            "doc_id": Path(key).stem,
+            "object_key": key,
+            "text_path": document["text_path"],
+            "chars": document["chars"],
+            "pages": document["pages"],
+            "page_start": document["page_start"],
+            "page_end": document["page_end"],
+            "marker": document["marker"],
+            "reportable": meta.get("reportable"),
+            "source_id": source_id,
+        }
+        yield merged
+
+
+def write_manifest(
+    store, rows: Iterable[dict], path: str | Path, *, index: PdfIndex,
+    source_id: str = SC_SOURCE_ID,
+) -> int:
+    from tuned.data.jsonl import write_jsonl
+
+    return write_jsonl(path, manifest_rows(store, rows, index=index, source_id=source_id))
+
+
+# --------------------------------------------------------------------------
+# --audit: the operator's only window into extraction quality.
+# --------------------------------------------------------------------------
+
+AUDIT_REMOVED_CHARS = 400
+AUDIT_KEPT_CHARS = 600
+
+
+def spread(items: Sequence, n: int) -> list:
+    """`n` items evenly spaced along `items` - deterministic, not random.
+
+    Along object_key order, which is year order for this corpus, so the
+    sample is a walk across the scope rather than a look at whatever the
+    extractor happened to reach first.
+    """
+    if n <= 0 or not items:
+        return []
+    if n >= len(items):
+        return list(items)
+    step = len(items) / n
+    return [items[int(i * step)] for i in range(n)]
+
+
+def audit_sample(store, n: int, *, source_id: str = SC_SOURCE_ID) -> list[dict]:
+    """Documents to read, half of them refusals where there are any.
+
+    The refusals are the reason the audit exists, and they are a minority by
+    construction, so an even sample over the whole table would rarely show
+    one.
+    """
+    quarantined = store.documents(source_id, status=STATUS_QUARANTINED)
+    emitted = store.documents(source_id, status=STATUS_OK)
+    want_bad = min(len(quarantined), n // 2) if quarantined else 0
+    picked = spread(emitted, n - want_bad) + spread(quarantined, want_bad)
+    return sorted(picked, key=lambda row: row["object_key"])
+
+
+def _indent(text: str, prefix: str = "      ") -> str:
+    return "\n".join(prefix + line for line in text.strip().splitlines()) or prefix + "(nothing)"
+
+
+def audit_report(
+    store, n: int, *, index: PdfIndex, reader=read_pdf_pages, source_id: str = SC_SOURCE_ID
+) -> str:
+    """Re-read `n` sampled documents and show the seam, both sides of it.
+
+    RE-EXTRACTED rather than read back from disk, for two reasons: the text
+    that was thrown away is not kept anywhere (the store holds the judgment,
+    not the publisher's headnote), and re-running is also a check that the
+    rules still produce what the corpus holds.
+    """
+    lines = [
+        f"AUDIT of {store.document_count(source_id, status=STATUS_OK)} emitted and "
+        f"{store.document_count(source_id, status=STATUS_QUARANTINED)} quarantined documents"
+        f"  (extract_version {EXTRACT_VERSION})",
+    ]
+    for row in audit_sample(store, n, source_id=source_id):
+        key = row["object_key"]
+        lines.append("")
+        lines.append(f"--- {key}")
+        local = index.by_key.get(key)
+        head = f"    {row['citation'] or '?'}   {row['case_id'] or '?'}   "
+        if row["page_start"] is not None:
+            head += f"S.C.R. pp. {row['page_start']}-{row['page_end']}   "
+        head += f"{row['pages']} PDF pages"
+        lines.append(head)
+        if local is None:
+            lines.append("    THE PDF IS NO LONGER INDEXED - cannot re-read it")
+            continue
+        try:
+            pages = reader(local)
+        except Exception as exc:
+            lines.append(f"    UNREADABLE NOW: {type(exc).__name__}: {exc}")
+            continue
+        cleaned, stats = clean_pages(pages)
+        joined = PAGE_SEPARATOR.join(cleaned)
+        result = extract_text(pages)
+        boundary = find_judgment_start(joined)
+
+        if not result.ok:
+            lines.append(f"    QUARANTINED {result.reason}")
+            lines.append(f"    headnote signals: {', '.join(result.signals) or 'none'}")
+            if result.author_hint is not None:
+                lines.append(
+                    f"    an author line ('NAME, J.') sits at {result.author_hint:.1%} of the "
+                    f"document - a hint, deliberately not a boundary"
+                )
+            lines.append("    FIRST OF WHAT IS THERE:")
+            lines.append(_indent(joined[:AUDIT_KEPT_CHARS]))
+            continue
+
+        share = result.headnote_chars / max(1, len(joined))
+        lines.append(
+            f"    boundary: {result.marker} on page {result.boundary_page + 1} of "
+            f"{result.pages}, {result.headnote_chars:,} chars removed ({share:.1%})"
+        )
+        lines.append(
+            f"    headnote signals: {', '.join(result.signals) or 'none'}   "
+            f"reportable: {result.reportable or '-'}   "
+            f"dropped: {stats['signature']} signature / {stats['margin_letter']} margin / "
+            f"{stats['running']} running / {stats['footnote']} footnote"
+        )
+        lines.append("    LAST OF WHAT WAS REMOVED (must be the reporter's editorial matter):")
+        lines.append(_indent(joined[max(0, boundary.offset - AUDIT_REMOVED_CHARS): boundary.offset]))
+        lines.append("    FIRST OF WHAT WAS KEPT (must be the court's own words):")
+        lines.append(_indent(result.text[:AUDIT_KEPT_CHARS]))
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# CLI.
+# --------------------------------------------------------------------------
+
+def _fmt_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"  # pragma: no cover - loop returns first
+
+
+def main(argv: Sequence[str] | None = None, *, reader=None) -> int:
+    import argparse
+
+    from tuned.data.config import load_build_config
+    from tuned.data.jsonl import read_jsonl
+    from tuned.data.paths import build_paths
+    from tuned.data.store import Store
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--selection", default=None, help=f"default corpus/{SELECTION_FILENAME}")
+    parser.add_argument("--out", default=None, help=f"default corpus/{EXTRACTION_FILENAME}")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="stop after N documents extracted, quarantined or FAILED; documents "
+        "already done are skipped without spending the cap, so a resumed run advances",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="re-extract documents the index already has, at this version",
+    )
+    parser.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
+    parser.add_argument(
+        "--audit",
+        type=int,
+        default=0,
+        metavar="N",
+        help="after the pass, re-read N documents and print the boundary in context "
+        "(half of them refusals). A fully-resumed run does no work and goes straight "
+        "to the audit, which is how an existing extraction is audited",
+    )
+    args = parser.parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        parser.error(f"--limit must be at least 1, got {args.limit}")
+
+    cfg = load_build_config(args.config)
+    paths = build_paths(cfg.build.workdir).ensure()
+    selection = Path(args.selection) if args.selection else paths.corpus_dir / SELECTION_FILENAME
+    out_path = Path(args.out) if args.out else paths.corpus_dir / EXTRACTION_FILENAME
+    text_root = paths.corpus_dir / TEXT_DIRNAME
+    if not selection.exists():
+        print(
+            f"no selection at {selection}\n"
+            f"  run: python -m tuned.data.select --config {args.config}\n"
+            f"  (and before that, python -m tuned.data.acquire --kind all)"
+        )
+        return 2
+
+    store = Store.open(paths.state_db)
+    code = 0
+    try:
+        index = pdf_index(store)
+        print(
+            f"selection {selection}  ->  {text_root}  "
+            f"({len(index)} PDFs indexed, extract_version {EXTRACT_VERSION})"
+        )
+        stats = extract_corpus(
+            store,
+            read_jsonl(selection),
+            index=index,
+            text_root=text_root,
+            reader=reader if reader is not None else read_pdf_pages,
+            limit=args.limit,
+            force=args.force,
+            max_failures=args.max_failures,
+        )
+        joined = stats["routes"][ROUTE_PDF_KEY] + stats["routes"][ROUTE_SCR_PREFIX]
+        print(
+            "  join      "
+            + "  ".join(f"{route} {stats['routes'][route]}" for route in JOIN_ROUTES)
+        )
+        print(
+            f"  extracted {stats['extracted']}  quarantined {stats['quarantined']}  "
+            f"skipped {stats['skipped']}  failed {stats['failed']}  "
+            f"{_fmt_bytes(stats['chars'])} of text"
+        )
+        for reason, count in sorted(stats["reasons"].items()):
+            print(f"    quarantine[{reason}]: {count}")
+        decided = stats["extracted"] + stats["quarantined"]
+        if decided and stats["quarantined"] / decided > QUARANTINE_ALARM:
+            print(
+                f"  HIGH QUARANTINE RATE {stats['quarantined'] / decided:.1%} - read "
+                f"`--audit 20` before trusting this run. The refusals are supposed to be "
+                f"a minority; at this rate the boundary rules and the source are what to "
+                f"check, not the individual documents."
+            )
+        for failure in stats["failures"]:
+            print(f"    failed {failure['key']}: {failure['error']}")
+        if stats["failed"]:
+            code = max(code, 1)
+
+        written = write_manifest(store, read_jsonl(selection), out_path, index=index)
+        print(f"wrote {written} rows -> {out_path}")
+        store.log_event(
+            "corpus_extraction",
+            {
+                **{k: v for k, v in stats.items() if k != "failures"},
+                "failures": len(stats["failures"]),
+                "selection": str(selection),
+                "out_path": str(out_path),
+                "extract_version": EXTRACT_VERSION,
+                "manifest_rows": written,
+            },
+        )
+        print(f"documents indexed -> {store.document_count(SC_SOURCE_ID)} ({paths.state_db})")
+        if stats["considered"] and not joined:
+            # Every selected judgment failing to find a PDF is not a corpus,
+            # it is a wrong assumption about keys - either acquire has not
+            # run, or the metadata link column and the S.C.R. filename
+            # inference are both wrong. Exiting 0 would report an empty
+            # extraction as a finished one.
+            print(
+                "  NOTHING JOINED: not one selected judgment matched an acquired PDF. "
+                "Check that `acquire --kind pdf` has run, and compare the join counts "
+                "above against the pdf_key coverage select.py printed."
+            )
+            code = max(code, 1)
+        if args.audit:
+            print()
+            print(audit_report(store, args.audit, index=index,
+                               reader=reader if reader is not None else read_pdf_pages))
+    finally:
+        store.close()
+    return code
+
+
+if __name__ == "__main__":
+    import sys
+
+    exit_code = main()
+    # Same reasoning as acquire.py/select.py: pymupdf/pyarrow can leave
+    # non-daemon threads that wedge interpreter shutdown after all output is
+    # written. Skip shutdown entirely.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)

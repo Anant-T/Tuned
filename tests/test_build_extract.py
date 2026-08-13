@@ -233,6 +233,22 @@ def test_a_regional_text_layer_is_quarantined():
     assert result.reason == Q_LOW_TEXT_QUALITY
 
 
+def test_a_page_break_in_the_middle_of_a_sentence_does_not_become_a_paragraph_break():
+    # Judgments run on across pages. A blank line at every page boundary
+    # announces a paragraph break in the middle of a sentence, and the
+    # Tier-3 packer downstream reads blank lines.
+    pages = [
+        "The Judgment of the Court was delivered by\nNAVIN SINHA, J.\n"
+        + _paras(1, 1600)
+        + "9. The question is whether the delay stands explained on this record, and",
+        "we turn to the evidence bearing on it, which begins with the deposition.\n",
+    ]
+    result = extract_text(pages)
+
+    assert result.ok, result.reason
+    assert "explained on this record, and\nwe turn to the evidence" in result.text
+
+
 def test_a_judgment_with_no_headnote_at_all_is_kept_whole():
     # Not every object in the bucket need be a reprint; a plain judgment has
     # nothing to strip and must not be quarantined for it.
@@ -507,3 +523,584 @@ def test_markdown_decoration_is_demoted_without_eating_the_filename_underscores(
     # which an italic rule written as a bare "_" strip would not leave it.
     assert demote_markdown("2020_7_941_960_EN.pdf") == "2020_7_941_960_EN.pdf"
     assert demote_markdown("-----") == ""
+
+
+# --------------------------------------------------------------------------
+# The join, the resume decision, and the run.
+# --------------------------------------------------------------------------
+
+import json
+import os
+from pathlib import Path
+
+from pipeline_fakes import temp_config
+
+from tuned.data.acquire import SC_LICENSE, SC_SOURCE_ID
+from tuned.data.extract import (
+    EXTRACT_VERSION,
+    PART_SUFFIX,
+    ROUTE_AMBIGUOUS,
+    ROUTE_PDF_KEY,
+    ROUTE_SCR_PREFIX,
+    ROUTE_UNMATCHED,
+    STATUS_OK,
+    STATUS_QUARANTINED,
+    ExtractionError,
+    audit_report,
+    extract_corpus,
+    extract_decision,
+    main,
+    pdf_index,
+    resolve_pdf,
+    text_path_for,
+    write_manifest,
+    write_text,
+)
+from tuned.data.store import Store
+
+EXTRACT_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "extract.py"
+
+
+class FakeReader:
+    """Stands in for pymupdf4llm: path -> pages, and it remembers the order."""
+
+    def __init__(self, docs: dict, *, fail: tuple = ()):
+        self.docs = {str(k): v for k, v in docs.items()}
+        self.fail = {str(f) for f in fail}
+        self.read: list[str] = []
+
+    def __call__(self, path):
+        path = str(path)
+        self.read.append(path)
+        if path in self.fail:
+            raise ExtractionError(f"cannot parse {path}")
+        return self.docs[path]
+
+
+class DocumentIndexFailsAt:
+    """Store proxy whose Nth record_document raises - the process dying
+    between the text landing and the row that points at it."""
+
+    def __init__(self, store, at: int = 1):
+        self._store = store
+        self._at = at
+        self.calls = 0
+
+    def __getattr__(self, name):
+        attr = getattr(self._store, name)
+        if name != "record_document":
+            return attr
+
+        def recording(*args, **kwargs):
+            self.calls += 1
+            if self.calls >= self._at:
+                raise RuntimeError("index write died")
+            return attr(*args, **kwargs)
+
+        return recording
+
+
+def _key(year=2015, volume=1, start=1, end=20) -> str:
+    return f"data/pdf/year={year}/english/{year}_{volume}_{start}_{end}_EN.pdf"
+
+
+def _selection(key=None, **over) -> dict:
+    row = {
+        "case_id": "C.A. 3221/2018",
+        "title": "Kalyani Sharma v. State of Maharashtra",
+        "citation": "[2015] 1 S.C.R. 1",
+        "year": 2015,
+        "court": "Supreme Court of India",
+        "coram": 3,
+        "case_type": "civil",
+        "signals": ["citation"],
+        "priority": 4,
+        "scr_prefix": "2015_1_1_",
+        "pdf_key": key,
+        "source_id": SC_SOURCE_ID,
+    }
+    row.update(over)
+    return row
+
+
+def _corpus(tmp_path, keys, *, store=None):
+    """A store whose artifact index holds `keys`, with a PDF on disk for each."""
+    store = store or Store.open(tmp_path / "state" / "law_v1.sqlite3")
+    store.upsert_source(SC_SOURCE_ID, SC_LICENSE)
+    paths = {}
+    for key in keys:
+        local = tmp_path / "corpus" / "sc" / key
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(b"%PDF-1.7 not really")
+        store.record_artifact(
+            SC_SOURCE_ID, key, local_path=local, size_bytes=local.stat().st_size, sha256="aa"
+        )
+        paths[key] = str(local)
+    return store, paths
+
+
+@pytest.fixture
+def store(tmp_path):
+    with Store.open(tmp_path / "state" / "law_v1.sqlite3") as s:
+        yield s
+
+
+# ------------------------------------------------------------------ the join
+
+def test_the_join_prefers_the_metadata_link_and_falls_back_to_the_citation_prefix(
+    tmp_path, store
+):
+    linked, inferred = _key(start=1), _key(start=101, end=140)
+    _corpus(tmp_path, [linked, inferred], store=store)
+    index = pdf_index(store)
+
+    # Route 1: the metadata carried a PDF link and acquire fetched it.
+    assert resolve_pdf(_selection(linked), index) == (linked, ROUTE_PDF_KEY)
+    # Route 2: no link, but the S.C.R. citation addresses the filename -
+    # which is the only join available if the metadata has no link column.
+    by_citation = _selection(None, scr_prefix="2015_1_101_")
+    assert resolve_pdf(by_citation, index) == (inferred, ROUTE_SCR_PREFIX)
+    # And the prefix really is doing the work: it picks the OTHER file.
+    assert inferred != linked
+
+
+def test_a_link_to_an_object_that_was_never_fetched_falls_back_to_the_prefix(
+    tmp_path, store
+):
+    # A --limit'ed or interrupted acquire leaves rows whose metadata link
+    # points at an object that is not on disk. Failing there would strand
+    # every such judgment even when the citation prefix finds it.
+    present = _key(start=101, end=140)
+    _corpus(tmp_path, [present], store=store)
+    index = pdf_index(store)
+
+    row = _selection(
+        "data/pdf/year=2015/english/2015_1_9999_9999_EN.pdf", scr_prefix="2015_1_101_"
+    )
+    assert resolve_pdf(row, index) == (present, ROUTE_SCR_PREFIX)
+
+
+def test_a_row_with_no_usable_join_is_reported_not_guessed(tmp_path, store):
+    _corpus(tmp_path, [_key()], store=store)
+    index = pdf_index(store)
+
+    assert resolve_pdf(_selection(None, scr_prefix=None), index) == (None, ROUTE_UNMATCHED)
+    assert resolve_pdf(_selection(None, scr_prefix="2015_9_9_"), index) == (
+        None,
+        ROUTE_UNMATCHED,
+    )
+
+
+def test_an_ambiguous_prefix_resolves_to_nothing(tmp_path, store):
+    # Two objects addressed by one citation prefix: extracting "whichever
+    # sorts first" would attach a judgment to the wrong citation, and the
+    # error would be invisible from here on.
+    a, b = _key(start=1, end=20), _key(start=1, end=40)
+    _corpus(tmp_path, [a, b], store=store)
+
+    assert resolve_pdf(_selection(None), pdf_index(store)) == (None, ROUTE_AMBIGUOUS)
+
+
+# ------------------------------------------------------- the resume decision
+
+def test_a_document_already_extracted_at_this_version_is_skipped(tmp_path):
+    text = tmp_path / "a.txt"
+    text.write_text("body", encoding="utf-8")
+    row = {"status": STATUS_OK, "text_path": str(text), "extract_version": EXTRACT_VERSION}
+    assert extract_decision(row, text) == "skip"
+    assert extract_decision(row, text, force=True) == "extract"
+
+
+def test_a_document_with_no_row_is_extracted(tmp_path):
+    assert extract_decision(None, tmp_path / "absent.txt") == "extract"
+
+
+def test_a_document_whose_text_file_vanished_is_extracted_again(tmp_path):
+    # The crash window: the row landed, the file did not (or was deleted).
+    row = {"status": STATUS_OK, "text_path": "gone.txt", "extract_version": EXTRACT_VERSION}
+    assert extract_decision(row, tmp_path / "gone.txt") == "extract"
+
+
+def test_a_document_extracted_under_older_rules_is_extracted_again(tmp_path):
+    text = tmp_path / "a.txt"
+    text.write_text("body", encoding="utf-8")
+    row = {"status": STATUS_OK, "text_path": str(text), "extract_version": EXTRACT_VERSION - 1}
+    assert extract_decision(row, text) == "extract"
+
+
+def test_a_quarantined_document_is_not_re_attempted_at_the_same_version(tmp_path):
+    # Deterministic rules over unchanged bytes give the same refusal, so
+    # re-reading it every run would spend the whole corpus's time on the
+    # documents that cannot be used.
+    row = {"status": STATUS_QUARANTINED, "text_path": None, "extract_version": EXTRACT_VERSION}
+    assert extract_decision(row, tmp_path / "never.txt") == "skip"
+    assert extract_decision(row, tmp_path / "never.txt", force=True) == "extract"
+    older = dict(row, extract_version=EXTRACT_VERSION - 1)
+    assert extract_decision(older, tmp_path / "never.txt") == "extract"
+
+
+# --------------------------------------------------------------- durability
+
+def test_the_text_file_is_whole_or_absent_never_a_prefix(tmp_path, monkeypatch):
+    dest = tmp_path / "out" / "a.txt"
+
+    def dying_replace(src, dst):
+        raise OSError("killed between the write and the rename")
+
+    monkeypatch.setattr(os, "replace", dying_replace)
+    with pytest.raises(OSError):
+        write_text(dest, "the judgment text")
+
+    assert not dest.exists()
+    # ... and the partial does not survive its own failure, where a later
+    # run could find it beside the real name.
+    assert list(dest.parent.glob("*" + PART_SUFFIX)) == []
+
+
+def test_the_index_row_is_written_after_the_text_so_a_crash_costs_no_work(tmp_path, store):
+    key = _key()
+    _, paths = _corpus(tmp_path, [key], store=store)
+    reader = FakeReader({paths[key]: scr_pages()})
+    proxy = DocumentIndexFailsAt(store, at=1)
+
+    with pytest.raises(RuntimeError):
+        extract_corpus(
+            proxy,
+            [_selection(key)],
+            index=pdf_index(store),
+            text_root=tmp_path / "text",
+            reader=reader,
+        )
+
+    # The text is durable even though nothing points at it yet.
+    dest = text_path_for(tmp_path / "text", key)
+    assert dest.read_text(encoding="utf-8").startswith("The Judgment of the Court")
+    assert store.document(SC_SOURCE_ID, key) is None
+    # The next run finds a key with no row and does the work again - which
+    # is why there is no adopt path here.
+    assert extract_decision(store.document_index(SC_SOURCE_ID).get(key), dest) == "extract"
+
+
+def test_a_document_that_becomes_quarantined_loses_its_stale_text(tmp_path, store):
+    key = _key()
+    _, paths = _corpus(tmp_path, [key], store=store)
+    dest = text_path_for(tmp_path / "text", key)
+
+    good = FakeReader({paths[key]: scr_pages()})
+    extract_corpus(
+        store,
+        [_selection(key)],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=good,
+    )
+    assert dest.exists()
+
+    # Same object, rules that now refuse it (here: the marker line gone).
+    unsegmentable = FakeReader({paths[key]: scr_pages(body=BODY.split("\n", 1)[1])})
+    stats = extract_corpus(
+        store,
+        [_selection(key)],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=unsegmentable,
+        force=True,
+    )
+
+    assert stats["quarantined"] == 1
+    assert store.document(SC_SOURCE_ID, key)["status"] == STATUS_QUARANTINED
+    # THE POINT: a consumer that globs the text tree instead of reading the
+    # manifest must not find a file the index says does not exist.
+    assert not dest.exists()
+
+
+# --------------------------------------------------------------------- runs
+
+def test_extraction_follows_the_selection_file_order(tmp_path, store):
+    # Task 11's contract: selection.jsonl is a STRATIFIED SPREAD, not the
+    # top N by priority, and an interrupted extraction is meant to fail over
+    # the whole corpus shape. Re-sorting here would throw that away.
+    keys = [_key(start=1, end=20), _key(start=101, end=140), _key(start=201, end=260)]
+    _, paths = _corpus(tmp_path, keys, store=store)
+    rows = [
+        _selection(keys[0], priority=1, case_type="civil"),
+        _selection(keys[1], priority=7, case_type="criminal"),
+        _selection(keys[2], priority=4, case_type="constitutional"),
+    ]
+    reader = FakeReader({path: scr_pages() for path in paths.values()})
+
+    extract_corpus(
+        store, rows, index=pdf_index(store), text_root=tmp_path / "text", reader=reader
+    )
+
+    assert reader.read == [paths[k] for k in keys]
+    # The fixture's file order really does disagree with priority order, so
+    # a "strongest first" sort would be visible above.
+    assert [row["priority"] for row in rows] != sorted(
+        (row["priority"] for row in rows), reverse=True
+    )
+
+
+def test_limit_counts_work_and_not_rows_examined(tmp_path, store):
+    keys = [_key(start=s, end=s + 19) for s in (1, 101, 201, 301)]
+    _, paths = _corpus(tmp_path, keys, store=store)
+    rows = [_selection(k) for k in keys]
+    reader = FakeReader({path: scr_pages() for path in paths.values()})
+
+    first = extract_corpus(
+        store,
+        rows,
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+        limit=2,
+    )
+    assert first["extracted"] == 2
+
+    # A resumed run must ADVANCE. Counting examined rows would spend the
+    # whole cap re-deciding the two already done, forever.
+    second = extract_corpus(
+        store,
+        rows,
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+        limit=2,
+    )
+    assert second["extracted"] == 2
+    assert second["skipped"] == 2
+    assert store.document_count(SC_SOURCE_ID, status=STATUS_OK) == 4
+
+
+def test_one_unreadable_pdf_does_not_cost_the_rest_of_the_run(tmp_path, store):
+    keys = [_key(start=s, end=s + 19) for s in (1, 101, 201)]
+    _, paths = _corpus(tmp_path, keys, store=store)
+    reader = FakeReader({path: scr_pages() for path in paths.values()}, fail=(paths[keys[1]],))
+
+    stats = extract_corpus(
+        store,
+        [_selection(k) for k in keys],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+    )
+
+    assert stats["failed"] == 1
+    assert stats["extracted"] == 2
+    assert keys[1] in stats["failures"][0]["key"]
+    assert store.document_count(SC_SOURCE_ID, status=STATUS_OK) == 2
+
+
+def test_enough_failures_stop_the_run_because_the_fault_is_not_in_the_objects(
+    tmp_path, store
+):
+    keys = [_key(start=s, end=s + 19) for s in (1, 101, 201, 301)]
+    _, paths = _corpus(tmp_path, keys, store=store)
+    reader = FakeReader({}, fail=tuple(paths.values()))
+
+    with pytest.raises(ExtractionError, match="stopping after"):
+        extract_corpus(
+            store,
+            [_selection(k) for k in keys],
+            index=pdf_index(store),
+            text_root=tmp_path / "text",
+            reader=reader,
+            max_failures=2,
+        )
+    assert len(reader.read) == 2
+
+
+def test_the_run_reports_a_quarantine_breakdown_by_reason(tmp_path, store):
+    ok_key, blind_key, scan_key = (_key(start=s, end=s + 19) for s in (1, 101, 201))
+    _, paths = _corpus(tmp_path, [ok_key, blind_key, scan_key], store=store)
+    reader = FakeReader(
+        {
+            paths[ok_key]: scr_pages(),
+            paths[blind_key]: scr_pages(body=BODY.split("\n", 1)[1]),
+            paths[scan_key]: ["", "", ""],
+        }
+    )
+
+    stats = extract_corpus(
+        store,
+        [_selection(k) for k in (ok_key, blind_key, scan_key)],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+    )
+
+    assert stats["extracted"] == 1
+    assert stats["quarantined"] == 2
+    assert stats["reasons"] == {Q_NO_JUDGMENT_START: 1, Q_NO_TEXT: 1}
+    assert store.document(SC_SOURCE_ID, scan_key)["reason"] == Q_NO_TEXT
+
+
+def test_the_recorded_document_carries_the_span_and_the_selection_identity(tmp_path, store):
+    key = _key(year=2020, volume=7, start=941, end=960)
+    _, paths = _corpus(tmp_path, [key], store=store)
+    reader = FakeReader({paths[key]: scr_pages()})
+
+    extract_corpus(
+        store,
+        [_selection(key, year=2020, scr_prefix="2020_7_941_")],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+    )
+
+    row = store.document(SC_SOURCE_ID, key)
+    assert (row["page_start"], row["page_end"]) == (941, 960)
+    # The PDF's own page count is a DIFFERENT number from the printed span,
+    # and keeping both is what makes their disagreement visible.
+    assert row["pages"] == 6
+    assert row["citation"] == "[2015] 1 S.C.R. 1"
+    assert row["case_id"] == "C.A. 3221/2018"
+    assert row["chars"] > 0
+    assert json.loads(row["meta_json"])["signals"] == ["held", "case_law_reference"]
+
+
+# ----------------------------------------------------------------- manifest
+
+def test_the_manifest_joins_the_selection_row_to_the_extraction_facts(tmp_path, store):
+    ok_key, bad_key = _key(start=1, end=20), _key(start=101, end=140)
+    _, paths = _corpus(tmp_path, [ok_key, bad_key], store=store)
+    rows = [_selection(ok_key), _selection(bad_key, case_id="C.A. 99/2019")]
+    reader = FakeReader(
+        {paths[ok_key]: scr_pages(), paths[bad_key]: scr_pages(body=BODY.split("\n", 1)[1])}
+    )
+    extract_corpus(
+        store, rows, index=pdf_index(store), text_root=tmp_path / "text", reader=reader
+    )
+
+    out = tmp_path / "extraction.jsonl"
+    written = write_manifest(store, rows, out, index=pdf_index(store))
+
+    manifest = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert written == 1
+    # Only what was EMITTED: a quarantined judgment has no text to point at,
+    # and listing it would hand the segmenter a path that is not there.
+    assert [row["case_id"] for row in manifest] == ["C.A. 3221/2018"]
+    row = manifest[0]
+    assert row["case_type"] == "civil"  # from the selection row
+    assert row["priority"] == 4
+    assert row["page_start"] == 1  # ... and from the extraction
+    assert row["chars"] > 0
+    assert Path(row["text_path"]).read_text(encoding="utf-8").startswith("The Judgment")
+    assert row["doc_id"] == "2015_1_1_20_EN"
+
+
+# -------------------------------------------------------------------- audit
+
+def test_the_audit_prints_the_seam_on_both_sides_of_the_cut(tmp_path, store):
+    key = _key()
+    _, paths = _corpus(tmp_path, [key], store=store)
+    reader = FakeReader({paths[key]: scr_pages()})
+    extract_corpus(
+        store,
+        [_selection(key)],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+    )
+
+    report = audit_report(store, 1, index=pdf_index(store), reader=reader)
+
+    # The operator's whole job here is to check the boundary, so the report
+    # has to show the last of what was thrown away next to the first of what
+    # was kept. Either half alone proves nothing.
+    assert "Case Law Reference" in report
+    assert "The Judgment of the Court was delivered by" in report
+    assert "judgment_delivered_by" in report
+    assert key in report
+
+
+def test_the_audit_shows_quarantined_documents_and_why(tmp_path, store):
+    ok_key, bad_key = _key(start=1, end=20), _key(start=101, end=140)
+    _, paths = _corpus(tmp_path, [ok_key, bad_key], store=store)
+    reader = FakeReader(
+        {paths[ok_key]: scr_pages(), paths[bad_key]: scr_pages(body=BODY.split("\n", 1)[1])}
+    )
+    extract_corpus(
+        store,
+        [_selection(ok_key), _selection(bad_key)],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+    )
+
+    report = audit_report(store, 2, index=pdf_index(store), reader=reader)
+
+    assert Q_NO_JUDGMENT_START in report
+    assert bad_key in report
+    # The refusals are the reason the audit exists, so they are sampled
+    # ALONGSIDE the successes rather than being crowded out by them.
+    assert ok_key in report
+
+
+# ---------------------------------------------------------------------- CLI
+
+def test_cli_hard_exits_after_success():
+    assert "os._exit(" in EXTRACT_SRC.read_text(encoding="utf-8")
+
+
+def _write_selection(paths_obj, rows):
+    from tuned.data.jsonl import write_jsonl
+    from tuned.data.select import SELECTION_FILENAME
+
+    out = paths_obj.corpus_dir / SELECTION_FILENAME
+    write_jsonl(out, rows)
+    return out
+
+
+def _build_paths(config):
+    from tuned.data.config import load_build_config
+    from tuned.data.paths import build_paths
+
+    return build_paths(load_build_config(config, allow_unpinned=True).build.workdir).ensure()
+
+
+def test_cli_extracts_the_selection_into_the_build_corpus(tmp_path, capsys):
+    config = temp_config(tmp_path)
+    paths = _build_paths(config)
+    key = _key()
+    store, local = _corpus(tmp_path, [key], store=Store.open(paths.state_db))
+    store.close()
+    _write_selection(paths, [_selection(key)])
+    reader = FakeReader({local[key]: scr_pages()})
+
+    assert main(["--config", config], reader=reader) == 0
+
+    out = capsys.readouterr().out
+    assert "documents indexed -> 1" in out
+    text = paths.corpus_dir / "text" / key.replace(".pdf", ".txt")
+    body = text.read_text(encoding="utf-8")
+    assert body.startswith("The Judgment of the Court")
+    assert "HELD:" not in body
+    manifest = (paths.corpus_dir / "extraction.jsonl").read_text(encoding="utf-8")
+    assert json.loads(manifest.splitlines()[0])["object_key"] == key
+
+
+def test_cli_refuses_a_run_in_which_nothing_could_be_joined_to_a_pdf(tmp_path, capsys):
+    # Same reasoning as select.py's NOTHING SELECTED backstop: a full
+    # selection that joins to zero PDFs is a wrong assumption about keys,
+    # not a corpus, and exiting 0 would report an empty extraction as done.
+    config = temp_config(tmp_path)
+    paths = _build_paths(config)
+    store, _ = _corpus(tmp_path, [_key()], store=Store.open(paths.state_db))
+    store.close()
+    _write_selection(paths, [_selection(None, scr_prefix="1999_9_9_")])
+
+    code = main(["--config", config], reader=FakeReader({}))
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "NOTHING JOINED" in out
+
+
+def test_cli_says_what_to_run_when_the_selection_is_missing(tmp_path, capsys):
+    config = temp_config(tmp_path)
+    _build_paths(config)
+
+    code = main(["--config", config], reader=FakeReader({}))
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "tuned.data.select" in out
