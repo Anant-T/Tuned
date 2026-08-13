@@ -602,6 +602,19 @@ async def judge_slot(
             # matters because such a call is bought again on every claim: the
             # generator's equivalent is bounded at 3 attempts, and the judge's
             # at 8, so a systemic payload bug costs eight passes over the wave.
+            #
+            # Two of the five clauses are DEFENCE IN DEPTH and unpinnable by
+            # construction, which is stated here rather than left for the next
+            # reader to rediscover: through Router.complete a provider_dead
+            # error is never re-raised (it fails over, and the aggregate does
+            # not carry the flag), and a `skipped` set only ever arrives on
+            # the "nothing was tried" error, which has no status. Neither can
+            # be reached with the first clause true, so no test can fail on
+            # their removal - they are kept because each names a distinct fact
+            # a future error shape could carry, and they are NOT counted in
+            # any mutation-verified claim about this file. `context_exceeded`
+            # IS reachable (overflow at every ref aggregates that way) and is
+            # pinned on the logged event below.
             outcome.payload_error = (
                 exc.status is not None
                 and not exc.retryable
@@ -736,12 +749,17 @@ def _park(
     and increments `counter` only when the fenced write LANDED. Counting the
     intention instead is how batch totals come to over-report every outcome
     the fence rejected.
+
+    The EVENT follows the write for the same reason the counter does: a stale
+    worker that logged `judge_parked` for a row it did not park put a park in
+    the event log that no state change ever matched, and this log is what P5
+    calibration reads. Same fix as the second `judge_decision`.
     """
-    store.log_event("judge_parked", {"task_id": task["task_id"], "state": state, "reason": reason})
     if not _set_state(store, task["task_id"], state, reason, worker_id=worker_id):
         if stats is not None:
             stats.lost_leases += 1
         return LOST_LEASE
+    store.log_event("judge_parked", {"task_id": task["task_id"], "state": state, "reason": reason})
     if stats is not None and counter is not None:
         setattr(stats, counter, getattr(stats, counter) + 1)
     return state
@@ -946,6 +964,15 @@ async def judge_task(
             # Transient: hand the task back to the queue. The generation is
             # fine and a later pass can score it - reusing this slot's
             # judgement if it landed.
+            #
+            # LEDGER'D, not fixed (round 4): there is no provider_fault
+            # equivalent here. generate.py parks a fleet-wide outage after 3
+            # claims with `exhausted:provider-fault`; the judge spends all 8
+            # discovering the same outage and then parks in judge_error. Both
+            # end re-openable and neither ends in `rejected`, so the cost is
+            # five extra claims per row during an outage - real, bounded, and
+            # cheaper to pay than a second classification of "the provider is
+            # down" that could disagree with the generator's.
             if int(task.get("attempts") or 0) >= MAX_JUDGE_ATTEMPTS:
                 return _park(
                     store, task, ERROR_STATE, f"judge-slot-{slot}:{outcome.error}"[:200],

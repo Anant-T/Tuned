@@ -98,6 +98,11 @@ STREAM_MIX: dict[str, dict[str, float]] = {
 # generated, and never enter this table.
 PLANNABLE_STREAMS = tuple(STREAM_MIX)
 
+# What `--stream` means when it is not passed. The flag itself defaults to
+# None so the CLI can tell "not passed" from "passed synthesis" - --reopen
+# ignores --stream, and it has to say so rather than act on it.
+DEFAULT_STREAM = "synthesis"
+
 # Parking state -> the queue state it belongs back in. These are the states a
 # worker uses when the failure is about the POOL rather than about the answer
 # (see reopen_tasks); each one goes back to the queue whose worker parked it,
@@ -476,7 +481,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="configs/data_law_v1.yaml")
-    parser.add_argument("--stream", default="synthesis")
+    # No default, so that "was it passed?" is answerable: --stream is the
+    # PLANNING stream and --reopen ignores it, which read as a silent filter.
+    parser.add_argument("--stream", default=None, help=f"planning stream (default {DEFAULT_STREAM})")
     parser.add_argument("--n", type=int, default=None, help="target task count for the queue")
     parser.add_argument("--arm", default=None, help="A/B label, e.g. unscripted|scripted")
     parser.add_argument("--mix", default=None, help="task_type=weight,... (overrides the default)")
@@ -504,6 +511,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.n is None and not args.reopen:
         parser.error("nothing to do: pass --n (plan a wave) or --reopen STATE")
+    if args.reopen and args.stream is not None:
+        # --stream belongs to the PLANNER. Accepting it here silently
+        # re-opened every stream while the operator watched a command that
+        # named one, which is the same class of mistake as --reopen defaulting
+        # to synthesis (round 3, I6).
+        parser.error(
+            "--stream is the planning stream and does not filter --reopen; "
+            "use --reopen-stream to narrow the re-open, and plan the wave in "
+            "a separate command"
+        )
+    stream = args.stream or DEFAULT_STREAM
 
     cfg = load_build_config(args.config)
     paths = build_paths(cfg.build.workdir).ensure()
@@ -519,7 +537,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             # otherwise invisible until the wave comes up short.
             touched = parked_by_stream(store, states, stream=args.reopen_stream)
             counts = reopen_tasks(store, states, stream=args.reopen_stream)
-            residue = parked_by_stream(store, states)
+            # Only a FILTER can leave a residue - an unfiltered re-open moves
+            # every row in those states - so only a filtered run looks for
+            # one. It printed "STILL PARKED (not in --reopen-stream None)"
+            # before, i.e. told the operator their unfiltered command had a
+            # filter, on a line that exists to say what was left behind.
+            residue = (
+                parked_by_stream(store, states) if args.reopen_stream is not None else {}
+            )
             print(f"re-opened {sum(counts.values())}")
             for state in states:
                 print(f"  {state} -> {REOPEN_STATES[state]:<12}{counts[state]:>6}")
@@ -527,7 +552,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"  stream {name:<14}{count:>6}")
             if residue:
                 left = ", ".join(f"{name}={count}" for name, count in sorted(residue.items()))
-                print(f"  STILL PARKED (not in --reopen-stream {args.reopen_stream!r}): {left}")
+                print(
+                    f"  STILL PARKED (not in --reopen-stream "
+                    f"{args.reopen_stream!r}): {left}"
+                )
             print(
                 "task states: "
                 + ", ".join(f"{k}={v}" for k, v in sorted(store.task_counts().items()))
@@ -536,18 +564,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
         mix = parse_mix(args.mix) if args.mix else None
         rows = plan_rows(
-            store, cfg, args.stream, args.n, task_type_mix=mix, arm=args.arm, sources=args.source
+            store, cfg, stream, args.n, task_type_mix=mix, arm=args.arm, sources=args.source
         )
-        created = commit_rows(store, rows, stream=args.stream, arm=args.arm, target=args.n)
+        created = commit_rows(store, rows, stream=stream, arm=args.arm, target=args.n)
         by_type: dict[str, int] = {}
         for row in rows:
             by_type[row["task_type"]] = by_type.get(row["task_type"], 0) + 1
-        print(f"stream={args.stream} arm={args.arm or '-'} target={args.n}")
+        print(f"stream={stream} arm={args.arm or '-'} target={args.n}")
         if not rows:
             # "skipped N" reads as "N tasks were dropped"; the truth is that
             # the queue is already at (or past) the target, or every eligible
             # seed is at the per-seed cap.
-            existing = _existing_in_queue(store, args.stream, args.arm)
+            existing = _existing_in_queue(store, stream, args.arm)
             reason = (
                 "already at target"
                 if existing >= args.n

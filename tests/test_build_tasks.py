@@ -396,6 +396,48 @@ def test_reopen_covers_every_stream_unless_one_is_named(store, cfg):
     assert store.task_counts() == {"judging": 1, "judge_unroutable": 1}
 
 
+def test_reopen_refuses_a_planning_stream_rather_than_ignoring_it(tmp_path, cfg, capsys):
+    """`--reopen judge_unroutable --stream transition` re-opened EVERY stream
+    while naming one. --stream is the planner's; the filter is
+    --reopen-stream, and the CLI now says so instead of acting on neither."""
+    config_path = temp_config(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        tasks_main(
+            ["--config", config_path, "--reopen", "judge_unroutable", "--stream", "transition"]
+        )
+    assert excinfo.value.code == 2
+    assert "--reopen-stream" in capsys.readouterr().err
+
+
+def test_an_unfiltered_reopen_does_not_report_a_filter_it_did_not_have(tmp_path, cfg, capsys):
+    """"STILL PARKED (not in --reopen-stream None)" told the operator their
+    unfiltered command had a filter. Only a filter can leave a residue."""
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=6, db_path=paths.state_db) as store:
+        plan_wave(store, cfg, "synthesis", 2)
+        plan_wave(store, cfg, "transition", 1)
+        store.conn.execute("UPDATE task SET state = 'judge_unroutable'")
+
+    assert tasks_main(["--config", config_path, "--reopen", "judge_unroutable"]) == 0
+    assert "STILL PARKED" not in capsys.readouterr().out
+
+    # ...and a filtered one names the filter and the rows it left behind.
+    with open_store(tmp_path, n_seeds=0, db_path=paths.state_db) as store:
+        store.conn.execute("UPDATE task SET state = 'judge_unroutable'")
+    assert (
+        tasks_main(
+            [
+                "--config", config_path, "--reopen", "judge_unroutable",
+                "--reopen-stream", "synthesis",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "STILL PARKED (not in --reopen-stream 'synthesis'): transition=1" in out
+
+
 def test_reopen_cli_names_the_streams_it_touched(tmp_path, cfg, capsys):
     config_path = temp_config(tmp_path)
     paths = paths_for(tmp_path)

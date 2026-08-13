@@ -24,13 +24,16 @@ from tuned.data.config import (  # noqa: E402
 )
 from tuned.data.generate import (  # noqa: E402
     TIEBREAK_PROMPT_ID,
+    WORST_CASE_CHAR,
     judge_messages,
     judge_needed_tokens,
     judge_sizer,
     judge_tokens_for_generator_window,
+    max_output_tokens,
     worst_case_judge_tokens,
 )
 from tuned.data.providers import (  # noqa: E402
+    CHARS_PER_TOKEN_LATIN,
     CONTEXT_SAFETY_MARGIN,
     DEFAULT_JUDGE_REPLY_TOKENS,
     QUIRKS,
@@ -1847,9 +1850,12 @@ def test_the_family_window_bound_never_sizes_above_the_flat_worst_case(cfg, keys
     preflight checks behind the operator's back."""
     huge = judge_tokens_for_generator_window(cfg, 10**9)
     assert huge == worst_case_judge_tokens(cfg)
-    # A window smaller than the reply allowance leaves the reply, not a
-    # negative number, and never zero.
-    assert judge_tokens_for_generator_window(cfg, 1) > DEFAULT_JUDGE_REPLY_TOKENS
+    # A window too small to hold the reply allowance contributes NO material -
+    # the term clamps at zero rather than going negative and quietly buying
+    # back some of the candidate's budget.
+    reply_chars = max_output_tokens(cfg) * CHARS_PER_TOKEN_LATIN
+    reply_only = judge_needed_tokens(judge_messages(WORST_CASE_CHAR * int(reply_chars), "", ""))
+    assert judge_tokens_for_generator_window(cfg, max_output_tokens(cfg)) == reply_only
     # ...and a hook that answers nonsense narrows nothing: the gap set is the
     # flat one, not a wider check nobody asked for.
     flat = pool_gaps(cfg, needed_tokens=worst_case_judge_tokens(cfg))

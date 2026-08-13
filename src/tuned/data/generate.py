@@ -1064,6 +1064,13 @@ async def generate_once(
         # A provider answered (or refused to answer) and the fault was on its
         # side. Only meaningful when something was actually TRIED - with a
         # skip set, nothing was, and no_eligible_model already carries that.
+        #
+        # `not skips` is DEFENCE IN DEPTH and unpinnable by construction: the
+        # only error carrying a skip set is the "nothing was tried" one, and
+        # apply_gate_disposition consults no_eligible_model before it consults
+        # provider_fault, so no mutation of this clause can change a task's
+        # state. Kept because the two facts are different facts; never counted
+        # as mutation-verified.
         result.provider_fault = not skips and bool(exc.retryable or exc.provider_dead)
         store.log_event(
             "generation_error",
@@ -1204,6 +1211,16 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
             # What is left is the payload class: a 400/413/422 with no context
             # marker, i.e. our bug. It stays in `rejected` - parking it would
             # file a code defect under "the pool was short".
+            #
+            # LEDGER'D, not fixed (round 4): `rejected` is terminal and not
+            # re-openable, so a SYSTEMIC payload bug costs the whole wave -
+            # every row rejected, and the per-seed slots spent with it. The
+            # remedy would be `--reopen rejected --disposition exhausted:error`
+            # (a re-open guarded on the disposition, so a gate decision can
+            # never come back through it), which is a tasks.py change with its
+            # own review; the reason for leaving it here is that this state is
+            # what makes a code defect visible AS a code defect, and the wave
+            # is re-plannable through the per-seed cap either way.
             state, disposition = REJECTED_STATE, "exhausted:error"
         else:
             state, disposition = PENDING_STATE, None

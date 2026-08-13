@@ -1198,6 +1198,24 @@ def test_a_park_the_fence_refused_is_neither_written_nor_counted(tmp_path, cfg, 
         assert (ended, proxy.stolen) == ("lost-lease", True)
         assert only_task(store)["state"] == JUDGE_STATE_TO  # not judge_skipped
         assert (stats.skipped, stats.lost_leases) == (0, 1)
+        # ...and no `judge_parked` event either. It was logged BEFORE the
+        # fence, so a stale worker announced a park that never happened - in
+        # the log P5 calibration reads, and with no state change to contradict
+        # it. Same shape as the second `judge_decision`.
+        assert store.events("judge_parked") == []
+
+
+def test_a_park_that_landed_is_announced(tmp_path, cfg, paths):
+    """The other side of moving that log after the fence: a park that DID
+    happen still says so, with the state and the reason on it."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        gen = store.latest_generation(only_task(store)["task_id"])
+        store.conn.execute("UPDATE generation SET think = '' WHERE gen_id = ?", (gen["gen_id"],))
+        run_judge(store, cfg, FakeRouter(cfg), paths)
+
+        assert only_task(store)["state"] == "judge_skipped"
+        parked = json.loads(store.events("judge_parked")[-1]["detail_json"])
+        assert (parked["state"], parked["reason"]) == ("judge_skipped", "empty-think")
 
 
 def test_a_reject_the_fence_refused_is_not_counted_as_a_decision(tmp_path, cfg, paths):
@@ -1370,6 +1388,25 @@ def test_the_tiebreak_parks_at_the_attempt_cap_not_one_claim_past_it(tmp_path, c
         # ...and the parked row is invisible to the next sweep.
         run_judge(store, cfg, router, paths)
         assert len(router.calls_for("tiebreak")) == 1
+
+
+def test_a_context_overflow_at_the_judge_is_not_logged_as_our_payload_bug(tmp_path, cfg, paths):
+    """Overflow at every ref aggregates as status=400, retryable=False,
+    context_exceeded=True - which is what `payload_error`'s context clause is
+    there for. The row parks as unroutable either way, so the fact this
+    protects is the DIAGNOSTIC: `payload_error: true` would file a
+    pool-shaped failure as a code defect, in the log P5 calibration reads."""
+    overflow = ProviderError(
+        "role 'judge': all 3 eligible model(s) failed; last: 400",
+        status=400, provider="mistral", model="mistral-small-latest",
+        retryable=False, context_exceeded=True,
+    )
+    with judged_store(tmp_path, paths, cfg) as store:
+        run_judge(store, cfg, FakeRouter(cfg, {"judge": [overflow]}), paths)
+
+        event = json.loads(store.events("judge_route_error")[-1]["detail_json"])
+        assert (event["unroutable"], event["payload_error"]) == (True, False)
+        assert only_task(store)["state"] == "judge_unroutable"
 
 
 def test_a_transient_judge_failure_still_spends_its_claims(tmp_path, cfg, paths):
