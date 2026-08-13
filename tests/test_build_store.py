@@ -950,3 +950,135 @@ def test_recording_the_same_object_again_updates_in_place(store):
     assert store.artifact_count("a") == 1
     row = store.artifact("a", "k")
     assert (row["size_bytes"], row["sha256"]) == (11, "bb")
+
+
+# ------------------------------------------------------- 10. document index
+
+
+def _doc(**over) -> dict:
+    row = {
+        "status": "ok",
+        "text_path": "corpus/text/2015_1_1_20_EN.txt",
+        "case_id": "C.A. 3221/2018",
+        "citation": "[2015] 1 S.C.R. 1",
+        "year": 2015,
+        "pages": 21,
+        "page_start": 1,
+        "page_end": 20,
+        "chars": 48000,
+        "headnote_chars": 6100,
+        "marker": "judgment_delivered_by",
+        "sha256": "cd" * 32,
+        "extract_version": 1,
+        "meta": {"signals": ["HELD:"], "reportable": None},
+    }
+    row.update(over)
+    return row
+
+
+def test_record_document_indexes_one_extracted_judgment(store):
+    store.upsert_source("s3://bucket", "CC-BY-4.0")
+    key = "data/pdf/year=2015/english/2015_1_1_20_EN.pdf"
+    store.record_document("s3://bucket", key, _doc())
+
+    row = store.document("s3://bucket", key)
+    assert row["status"] == "ok"
+    assert row["reason"] is None
+    assert row["text_path"] == "corpus/text/2015_1_1_20_EN.txt"
+    assert (row["pages"], row["page_start"], row["page_end"]) == (21, 1, 20)
+    assert (row["chars"], row["headnote_chars"]) == (48000, 6100)
+    assert row["marker"] == "judgment_delivered_by"
+    assert row["extract_version"] == 1
+    # meta travels as JSON through the same _dumps path every other table uses
+    assert json.loads(row["meta_json"])["signals"] == ["HELD:"]
+    assert _TS_RE.match(row["extracted_at"])
+    assert store.document("s3://bucket", "never/extracted.pdf") is None
+
+
+def test_document_rows_need_a_registered_source(store):
+    # Same FK reasoning as artifact: no text row may exist under a source
+    # for which nobody recorded a licence.
+    with pytest.raises(sqlite3.IntegrityError):
+        store.record_document("s3://nope", "k", _doc())
+
+
+def test_document_index_is_per_source_and_carries_the_resume_columns(store):
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_source("b", "CC-BY-4.0")
+    store.record_document("a", "k1", _doc())
+    store.record_document("a", "k2", _doc(status="quarantined", reason="no_judgment_start",
+                                          text_path=None, chars=None))
+    store.record_document("b", "k1", _doc(text_path="other/b.txt"))
+
+    index = store.document_index("a")
+    assert sorted(index) == ["k1", "k2"]
+    # The three facts the resume decision reads, and nothing has to be
+    # guessed from a NULL: status tells ok from quarantined, text_path says
+    # where the bytes should be, extract_version says whether the rules that
+    # produced them are still the rules.
+    assert index["k1"]["status"] == "ok"
+    assert index["k1"]["text_path"] == "corpus/text/2015_1_1_20_EN.txt"
+    assert index["k1"]["extract_version"] == 1
+    assert index["k2"]["status"] == "quarantined"
+    assert index["k2"]["reason"] == "no_judgment_start"
+    assert index["k2"]["text_path"] is None
+    # Two sources partitioned by year both hold "year=2015/..." keys.
+    assert store.document_index("b")["k1"]["text_path"] == "other/b.txt"
+
+
+def test_document_index_does_not_carry_the_per_document_meta_blob(store):
+    # ~40k rows are read in one go at the start of every extraction run. The
+    # resume decision reads five columns; meta_json is the one column that is
+    # unbounded per row, and carrying it would make resuming cost more than
+    # it saves.
+    store.upsert_source("a", "CC-BY-4.0")
+    store.record_document("a", "k1", _doc(meta={"padding": "x" * 4096}))
+    row = store.document_index("a")["k1"]
+    assert "meta_json" not in row
+    assert json.loads(store.document("a", "k1")["meta_json"])["padding"] == "x" * 4096
+
+
+def test_re_extracting_a_document_replaces_its_row(store):
+    # A rule change re-runs the extractor over a judgment already indexed:
+    # the row must move, not fork into two claiming the same key.
+    store.upsert_source("a", "CC-BY-4.0")
+    store.record_document("a", "k", _doc(chars=100, extract_version=1))
+    store.record_document("a", "k", _doc(status="quarantined", reason="headnote_residue",
+                                         text_path=None, chars=None, extract_version=2))
+    assert store.document_count("a") == 1
+    row = store.document("a", "k")
+    assert (row["status"], row["reason"], row["extract_version"]) == (
+        "quarantined", "headnote_residue", 2,
+    )
+    assert row["text_path"] is None
+
+
+def test_document_count_splits_by_status_and_by_source(store):
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_source("b", "CC-BY-4.0")
+    store.record_document("a", "k1", _doc())
+    store.record_document("a", "k2", _doc())
+    store.record_document("a", "k3", _doc(status="quarantined", reason="body_too_short"))
+    store.record_document("b", "k1", _doc())
+
+    assert store.document_count() == 4
+    assert store.document_count("a") == 3
+    assert store.document_count("a", status="ok") == 2
+    assert store.document_count("a", status="quarantined") == 1
+    assert store.document_count("b", status="quarantined") == 0
+
+
+def test_documents_reads_back_in_key_order_and_filters_by_status(store):
+    # The manifest and --audit both walk this: key order is year order for
+    # this corpus, so a sample taken along it is spread across the scope.
+    store.upsert_source("a", "CC-BY-4.0")
+    for key in ("year=2016/b.pdf", "year=2015/a.pdf", "year=2015/c.pdf"):
+        store.record_document("a", key, _doc())
+    store.record_document("a", "year=2015/q.pdf", _doc(status="quarantined", reason="no_text"))
+
+    assert [row["object_key"] for row in store.documents("a", status="ok")] == [
+        "year=2015/a.pdf", "year=2015/c.pdf", "year=2016/b.pdf",
+    ]
+    quarantined = store.documents("a", status="quarantined")
+    assert [row["reason"] for row in quarantined] == ["no_text"]
+    assert len(store.documents("a")) == 4

@@ -117,6 +117,15 @@ CREATE TABLE IF NOT EXISTS artifact (
   object_key TEXT NOT NULL, local_path TEXT NOT NULL,
   size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, etag TEXT, fetched_at TEXT,
   PRIMARY KEY (source_id, object_key));
+CREATE TABLE IF NOT EXISTS document (
+  source_id TEXT NOT NULL REFERENCES source(source_id),
+  object_key TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, text_path TEXT,
+  case_id TEXT, citation TEXT, year INTEGER,
+  pages INTEGER, page_start INTEGER, page_end INTEGER,
+  chars INTEGER, headnote_chars INTEGER, marker TEXT,
+  sha256 TEXT, extract_version INTEGER, meta_json TEXT, extracted_at TEXT,
+  PRIMARY KEY (source_id, object_key));
+CREATE INDEX IF NOT EXISTS document_by_status ON document(source_id, status);
 """
 
 _SEED_COLS = (
@@ -140,6 +149,16 @@ _JUDGEMENT_COLS = (
     "grounding", "validity", "coverage", "rationale",
     "raw_path", "raw_offset", "created_at",
 )
+_DOCUMENT_COLS = (
+    "source_id", "object_key", "status", "reason", "text_path",
+    "case_id", "citation", "year",
+    "pages", "page_start", "page_end",
+    "chars", "headnote_chars", "marker",
+    "sha256", "extract_version", "meta_json", "extracted_at",
+)
+# The five columns the extraction resume decision reads, and no more: the
+# index is loaded whole at the start of every run (see document_index).
+_DOCUMENT_RESUME_COLS = ("object_key", "status", "reason", "text_path", "extract_version")
 
 
 # Errors that mean "this raw record is unusable" rather than "the database is
@@ -405,6 +424,94 @@ class Store:
         return self._conn.execute(
             "SELECT COUNT(*) FROM artifact WHERE source_id = ?", (source_id,)
         ).fetchone()[0]
+
+    # --------------------------------------------------------------- documents
+
+    def record_document(self, source_id: str, object_key: str, row: dict) -> None:
+        """Index one extracted judgment - the text-phase twin of
+        record_artifact, and under the same durability rule: the text file is
+        already at `text_path` before this row claims it is.
+
+        A crash between the two costs an index row, never the text: the next
+        run sees a key with no row and extracts it again. That is cheaper
+        here than acquire.py's adopt path (one PDF re-parsed, not one object
+        re-downloaded), which is why there is no adopt here.
+
+        A QUARANTINED document is a row too, with `status='quarantined'`, the
+        reason, and no text_path. Recording the refusal is what makes an
+        interrupted run resumable in both directions: a document nothing may
+        emit must not be silently re-attempted forever, and it must not be
+        invisible to the operator either.
+
+        INSERT OR REPLACE on (source_id, object_key): re-extracting under new
+        rules moves the row rather than forking it, and `extract_version` is
+        what tells the two apart.
+        """
+        packed = dict(row)
+        packed["source_id"] = source_id
+        packed["object_key"] = object_key
+        if "meta" in packed and packed.get("meta_json") is None:
+            packed["meta_json"] = packed.pop("meta")
+        self._write(
+            _insert_sql("document", _DOCUMENT_COLS, "INSERT OR REPLACE"),
+            _pack(_fill(packed, extracted_at=utcnow()), _DOCUMENT_COLS),
+        )
+
+    def document(self, source_id: str, object_key: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM document WHERE source_id = ? AND object_key = ?",
+            (source_id, object_key),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def document_index(self, source_id: str) -> dict[str, dict]:
+        """Every indexed document for one source, keyed by object_key.
+
+        Read ONCE per extraction run, exactly as artifact_index is - the
+        resume decision is taken for tens of thousands of keys and a SELECT
+        apiece would make restarting cost more than the work it skips.
+        Unlike artifact_index this is NOT `SELECT *`: meta_json is unbounded
+        per row and no resume decision reads it, so the whole-corpus read
+        stays a few hundred bytes a row.
+        """
+        cols = ", ".join(_DOCUMENT_RESUME_COLS)
+        return {
+            row["object_key"]: dict(row)
+            for row in self._conn.execute(
+                f"SELECT {cols} FROM document WHERE source_id = ?", (source_id,)
+            ).fetchall()
+        }
+
+    def documents(self, source_id: str, status: str | None = None) -> list[dict]:
+        """Full document rows in object_key order, optionally one status only.
+
+        Key order is year order for this corpus (the keys are
+        `.../year=YYYY/english/...`), so a sample walked along it is spread
+        across the scope rather than concentrated in whatever the extractor
+        reached first.
+        """
+        sql = "SELECT * FROM document WHERE source_id = ?"
+        params: tuple = (source_id,)
+        if status is not None:
+            sql += " AND status = ?"
+            params += (status,)
+        return [
+            dict(row)
+            for row in self._conn.execute(sql + " ORDER BY object_key", params).fetchall()
+        ]
+
+    def document_count(self, source_id: str | None = None, *, status: str | None = None) -> int:
+        sql = "SELECT COUNT(*) FROM document"
+        clauses, params = [], []
+        if source_id is not None:
+            clauses.append("source_id = ?")
+            params.append(source_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        return self._conn.execute(sql, tuple(params)).fetchone()[0]
 
     # ------------------------------------------------------------------- tasks
 
