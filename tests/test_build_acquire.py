@@ -8,6 +8,7 @@ fixtures.
 
 import ast
 import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -40,6 +41,7 @@ from tuned.data.acquire import (
     sha256_file,
     year_prefixes,
 )
+from tuned.data.acquire import _READ_BLOCK as READ_BLOCK
 from tuned.data.store import Store
 
 ACQUIRE_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "acquire.py"
@@ -206,10 +208,16 @@ def test_local_path_for_refuses_a_key_that_escapes_the_root(tmp_path, key):
 
 
 def test_sha256_file_hashes_the_whole_file_not_the_first_block(tmp_path):
-    blob = bytes(range(256)) * 900  # 230,400 bytes: many read blocks
+    # The fixture has to EXCEED _READ_BLOCK (1 MiB) or a first-block-only
+    # hash passes this test: the metadata parquet and the InJudgements
+    # snapshot are both larger than that, so a wrong hash would go into
+    # artifact.sha256 and --verify would be blind past byte 1,048,576.
+    blob = bytes(range(256)) * 8192  # 2,097,152 bytes = two full blocks
+    assert len(blob) > READ_BLOCK
     path = tmp_path / "big.bin"
     path.write_bytes(blob)
     assert sha256_file(path) == hashlib.sha256(blob).hexdigest()
+    assert sha256_file(path) != hashlib.sha256(blob[:READ_BLOCK]).hexdigest()
 
 
 # --------------------------------------------------------------------------
@@ -261,6 +269,26 @@ def test_verify_re_reads_a_file_the_index_already_agrees_with(tmp_path):
     assert fetch_decision(_entry(10), path, _row(10), verify=True) == "adopt"
 
 
+def test_an_object_re_uploaded_under_a_key_we_already_hold_is_fetched_again(tmp_path):
+    # The SC bucket is a rolling release: an object CAN change under a key we
+    # already hold, and at the same length only the ETag says so. Nothing may
+    # verify content AGAINST an ETag (multipart is "<md5>-<parts>"), but
+    # inequality between what we recorded and what the listing now reports is
+    # still evidence the object was re-uploaded - and it is free, because the
+    # listing carries it either way.
+    path = tmp_path / "ok.pdf"
+    path.write_bytes(b"x" * 10)
+    held = {"size_bytes": 10, "sha256": "aa", "local_path": "p", "etag": "one"}
+
+    assert fetch_decision(ObjectEntry(PDF_KEY, 10, etag="two"), path, held) == "fetch"
+    assert fetch_decision(ObjectEntry(PDF_KEY, 10, etag="one"), path, held) == "skip"
+    # An ETag missing on either side is not evidence of anything, so it must
+    # not turn a settled corpus into a re-download of all 100k objects.
+    assert fetch_decision(ObjectEntry(PDF_KEY, 10, etag=None), path, held) == "skip"
+    assert fetch_decision(ObjectEntry(PDF_KEY, 10, etag="two"), path, {**held, "etag": None}) == "skip"
+    assert fetch_decision(ObjectEntry(PDF_KEY, 10, etag="two"), path, _row(10)) == "skip"
+
+
 # --------------------------------------------------------------------------
 # One object, durably.
 # --------------------------------------------------------------------------
@@ -291,6 +319,30 @@ def test_the_destination_only_appears_after_the_last_byte(tmp_path):
     # later run reads as complete. It has to be a rename of a finished file.
     assert seen == [False]
     assert dest.read_bytes() == body
+
+
+def test_the_bytes_are_fsynced_before_the_rename_that_publishes_them(tmp_path, monkeypatch):
+    # The whole durability argument rests on this primitive: os.replace is
+    # what makes the file visible at the path later runs read as complete, so
+    # a rename that reaches the directory before the data reaches the platter
+    # can survive a power loss as a present-but-empty judgment.
+    order: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        order.append("fsync")
+        return real_fsync(fd)
+
+    def replace(src, dst):
+        order.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+
+    body = b"a judgment" * 8
+    download_object(FakeBucket({PDF_KEY: body}), ObjectEntry(PDF_KEY, len(body)), tmp_path / PDF_KEY)
+    assert order == ["fsync", "replace"]
 
 
 def test_an_interrupted_transfer_leaves_nothing_behind(tmp_path):
@@ -422,6 +474,24 @@ def test_limit_stops_after_n_objects(store, tmp_path):
     assert store.artifact_count(SC_SOURCE_ID) == 2
 
 
+def test_limit_counts_work_done_so_a_resumed_run_advances(store, tmp_path):
+    # Counting objects EXAMINED would spend the whole cap re-deciding what is
+    # already local: `--limit 1000` on a resumed run would then walk the same
+    # first 1000 keys forever and never fetch anything.
+    objects = _objects(5)
+    root = tmp_path / "sc"
+    first = _acquire(store, FakeBucket(objects), root, objects, limit=2)
+    assert first["fetched"] == 2
+
+    bucket = FakeBucket(objects)
+    second = _acquire(store, bucket, root, objects, limit=2)
+    assert (second["skipped"], second["fetched"]) == (2, 2)
+    # And it advanced onto the NEXT two keys rather than re-deciding the
+    # first two for the rest of the corpus's life.
+    assert bucket.fetched == sorted(objects)[2:4]
+    assert store.artifact_count(SC_SOURCE_ID) == 4
+
+
 def test_verify_notices_a_local_file_that_changed_under_us(store, tmp_path):
     objects = {PDF_KEY: b"y" * 40}
     root = tmp_path / "sc"
@@ -445,22 +515,41 @@ def test_verify_notices_a_local_file_that_changed_under_us(store, tmp_path):
 # --------------------------------------------------------------------------
 
 def test_entries_for_walks_exactly_the_year_prefixes_asked_for():
-    objects = {**_objects(2, year=2015), **_objects(2, year=2009)}
+    # MORE THAN ONE YEAR on purpose: the dev scope is a 16-year walk, and a
+    # single-year tuple cannot tell a full walk from one that stops after the
+    # first prefix.
+    objects = {**_objects(2, year=2015), **_objects(2, year=2016), **_objects(2, year=2009)}
     bucket = FakeBucket(objects)
-    keys = [e.key for e in entries_for(bucket, "pdf", (2015,))]
-    assert bucket.prefixes == ["data/pdf/year=2015/english/"]
-    assert len(keys) == 2
-    assert all("year=2015" in k for k in keys)
+    keys = [e.key for e in entries_for(bucket, "pdf", (2015, 2016))]
+    assert bucket.prefixes == ["data/pdf/year=2015/english/", "data/pdf/year=2016/english/"]
+    assert len(keys) == 4
+    assert sorted({parse_year(k) for k in keys}) == [2015, 2016]
 
 
-def test_entries_for_drops_objects_that_are_not_this_kinds_payload():
-    objects = {
-        "metadata/parquet/year=2015/part-0.parquet": b"parquet",
-        "metadata/parquet/year=2015/_SUCCESS": b"",
-        "metadata/parquet/year=2015/manifest.json": b"{}",
-    }
-    entries = list(entries_for(FakeBucket(objects), "metadata", (2015,)))
-    assert [e.key for e in entries] == ["metadata/parquet/year=2015/part-0.parquet"]
+@pytest.mark.parametrize(
+    ("kind", "payload", "noise"),
+    [
+        (
+            "metadata",
+            "metadata/parquet/year=2015/part-0.parquet",
+            ("metadata/parquet/year=2015/_SUCCESS", "metadata/parquet/year=2015/manifest.json"),
+        ),
+        (
+            "pdf",
+            "data/pdf/year=2015/english/2015_1_1_20_EN.pdf",
+            (
+                "data/pdf/year=2015/english/index.json",
+                "data/pdf/year=2015/english/2015_1_1_20_EN.pdf.md5",
+            ),
+        ),
+    ],
+)
+def test_entries_for_drops_objects_that_are_not_this_kinds_payload(kind, payload, noise):
+    # BOTH kinds: listings carry markers, manifests and checksums, and
+    # downloading those would index bytes no later stage can read.
+    objects = {payload: b"payload", **{key: b"noise" for key in noise}}
+    entries = list(entries_for(FakeBucket(objects), kind, (2015,)))
+    assert [e.key for e in entries] == [payload]
 
 
 # --------------------------------------------------------------------------
@@ -666,4 +755,102 @@ def test_cli_reports_a_gated_dataset_and_exits_nonzero(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 2
     assert HF_SOURCES["injudgements"].url in out
-    assert "Traceback" not in out
+
+
+def _corpus_paths(config):
+    from tuned.data.config import load_build_config
+    from tuned.data.paths import build_paths
+
+    return build_paths(load_build_config(config, allow_unpinned=True).build.workdir)
+
+
+def test_a_gated_dataset_does_not_cost_the_days_long_pdf_pull(tmp_path, capsys):
+    # InJudgements is gated RIGHT NOW, so `--kind all` - the documented
+    # default command - hits this on the first real run. The whole point of
+    # exit 2 rather than a raise is that the PDFs are still pulled.
+    config = temp_config(tmp_path)
+    objects = _objects(2)
+
+    def snapshot(**kwargs):
+        raise GatedRepoError("403")
+
+    code = main(
+        ["--config", config, "--kind", "all", "--years", "2015"],
+        fetcher=FakeBucket(objects),
+        snapshot_fn=snapshot,
+    )
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "GATED" in out
+    paths = _corpus_paths(config)
+    for key, body in objects.items():
+        assert (paths.corpus_dir / "sc" / key).read_bytes() == body
+
+
+def test_a_transient_hub_failure_does_not_cost_the_days_long_pdf_pull_either(tmp_path, capsys):
+    # Same event class as a gated set, demoted the same way: a 5xx from the
+    # hub after the metadata already landed must not propagate out of main
+    # and leave the PDF pull unstarted. The exit code still says the run was
+    # not clean.
+    config = temp_config(tmp_path)
+    objects = _objects(2)
+
+    def snapshot(**kwargs):
+        raise ConnectionError("temporary failure in name resolution")
+
+    code = main(
+        ["--config", config, "--kind", "all", "--years", "2015"],
+        fetcher=FakeBucket(objects),
+        snapshot_fn=snapshot,
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "ConnectionError" in out
+    paths = _corpus_paths(config)
+    for key, body in objects.items():
+        assert (paths.corpus_dir / "sc" / key).read_bytes() == body
+    with Store.open(paths.state_db) as opened:
+        assert len(opened.events("acquire_failed")) == 3  # one per registered snapshot
+
+
+def test_a_run_that_lost_objects_does_not_report_success(tmp_path, capsys):
+    # A zero exit from a run that dropped judgments would clear a shell `&&`
+    # chain and start extraction on a corpus with holes in it.
+    config = temp_config(tmp_path)
+    objects = _objects(3)
+    bad = sorted(objects)[1]
+    bucket = FakeBucket(objects, truncate_keys={bad: 3})
+
+    code = main(["--config", config, "--kind", "pdf", "--years", "2015"], fetcher=bucket)
+    assert code == 1
+    assert bad in capsys.readouterr().out
+
+
+def test_every_lost_object_is_named_not_just_the_first_ten(tmp_path, capsys):
+    # --max-failures defaults to 25, so truncating the printed list at 10
+    # hides failures of a run that never reached the cap.
+    config = temp_config(tmp_path)
+    objects = _objects(12)
+    bucket = FakeBucket(objects, truncate_keys={k: 1 for k in objects})
+
+    assert main(["--config", config, "--kind", "pdf", "--years", "2015"], fetcher=bucket) == 1
+    out = capsys.readouterr().out
+    assert [key for key in sorted(objects) if key not in out] == []
+
+
+def test_a_verify_pass_does_not_call_re_reading_the_corpus_an_adoption(tmp_path, capsys):
+    # Under --verify every object the index agrees with takes the adopt path,
+    # so the summary would read "adopted 100000 skipped 0" on a corpus where
+    # nothing whatever was adopted.
+    config = temp_config(tmp_path)
+    objects = _objects(2)
+    main(["--config", config, "--kind", "pdf", "--years", "2015"], fetcher=FakeBucket(objects))
+    capsys.readouterr()
+
+    main(
+        ["--config", config, "--kind", "pdf", "--years", "2015", "--verify"],
+        fetcher=RefusesToFetch(objects),
+    )
+    out = capsys.readouterr().out
+    assert "re-hashed" in out
+    assert "adopted" not in out

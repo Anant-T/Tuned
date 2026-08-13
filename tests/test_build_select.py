@@ -10,12 +10,15 @@ from pathlib import Path
 import pytest
 from pipeline_fakes import temp_config
 
-from tuned.data.acquire import SC_SOURCE_ID
+from tuned.data.acquire import HF_SOURCES, SC_SOURCE_ID
 from tuned.data.select import (
     CITATION,
     CONSTITUTION_BENCH,
     CORAM,
     LANDMARK,
+    LANDMARKS_NO_TITLE_COLUMN,
+    LANDMARKS_NOT_ACQUIRED,
+    LANDMARKS_OK,
     SELECTION_FIELDS,
     SIGNAL_ORDER,
     case_type_of,
@@ -25,6 +28,7 @@ from tuned.data.select import (
     judges_of,
     landmark_key,
     landmark_keys,
+    landmark_set,
     main,
     metadata_rows,
     pdf_key_of,
@@ -358,15 +362,93 @@ def test_the_landmark_match_rate_is_reported_because_the_join_is_by_title():
     assert stats["by_signal"][LANDMARK] == 1
 
 
-def test_field_coverage_reports_which_column_names_actually_matched():
+def test_field_coverage_counts_rows_where_the_signal_resolved():
     # The parquet schema is not verified offline. If "judge" turns out to be
     # called something else, coverage says so on the first real run instead
     # of the corpus quietly having no Constitution Benches in it.
     rows = [_meta_row(), _meta_row(judge=None, author_judge=None), _meta_row(citation=None)]
     _, stats = select_corpus(rows)
+    assert stats["total"] == 3
     assert stats["field_coverage"]["citation"] == 2
     assert stats["field_coverage"]["judge"] == 2
-    assert stats["field_coverage"]["available_languages"] == 3
+    assert stats["field_coverage"]["language"] == 3
+
+
+def test_coverage_counts_the_candidate_that_resolved_not_the_first_name_in_the_list():
+    # THE CASE COVERAGE EXISTS FOR. Every signal reads through an ordered
+    # candidate list, so counting the literal first name reports on candidate
+    # #0 alone: "the fallback matched" and "nothing matched" both read 0, and
+    # an operator reading citation=0.0 would conclude the exact opposite of
+    # the truth. This row uses candidates #1 and #2 - the names P0 records
+    # for this corpus - and BOTH signals fire on it.
+    rows = [
+        {
+            "case_id": "Civil Appeal No. 7138 of 2010",
+            "title": "Government of India vs Isro Drivers Association",
+            "law_report_citation": "[2020] 7 S.C.R. 941",
+            "coram_members": FIVE_JUDGES,
+            "language_codes": "en",
+            "year": 2020,
+        }
+    ]
+    _, stats = select_corpus(rows)
+    assert stats["selected"] == 1
+    assert stats["by_signal"] == {CITATION: 1, CORAM: 1}
+
+    # The number the whole citation-is-universal question turns on.
+    assert stats["field_coverage"]["citation"] / stats["total"] == 1.0
+    assert stats["field_coverage"]["judge"] == 1
+    assert stats["field_coverage"]["language"] == 1
+    # And the map that actually answers "did our names match?".
+    assert stats["resolved_fields"]["citation"] == "law_report_citation"
+    assert stats["resolved_fields"]["judge"] == "coram_members"
+    assert stats["resolved_fields"]["language"] == "language_codes"
+
+
+def test_a_signal_no_candidate_resolved_names_no_winner():
+    rows = [{"mystery_column": "x", "year": 2015, "citation": "[2015] 1 S.C.R. 1"}]
+    _, stats = select_corpus(rows)
+    assert stats["field_coverage"]["citation"] == 1
+    assert stats["resolved_fields"]["citation"] == "citation"
+    # Nothing carried a bench, and the report says which name won rather than
+    # leaving "no Constitution Benches" and "no such column" indistinguishable.
+    assert stats["field_coverage"]["judge"] == 0
+    assert stats["resolved_fields"]["judge"] is None
+
+
+def test_the_uncapped_selection_is_ordered_too_not_left_in_parquet_order():
+    # The weights exist so that a capped OR INTERRUPTED run keeps the
+    # reported judgments before it keeps anything else. Extraction is the
+    # next task, is costed at 4-6 days, WILL be interrupted, and consumes
+    # this file top-down - and the documented default command has no --limit,
+    # so ordering only under a cap means the default run does none.
+    rows = [
+        _meta_row(case_id="Civil Appeal weak-1", judge=None, author_judge=None),
+        _meta_row(case_id="Civil Appeal weak-2", judge=None, author_judge=None),
+        _meta_row(case_id="Civil Appeal STRONG", judge=FIVE_JUDGES, author_judge=None),
+    ]
+    chosen, stats = select_corpus(rows)
+    assert stats["selected"] == 3
+    assert [row["priority"] for row in chosen] == [6, 4, 4]
+    assert [row["case_id"] for row in chosen] == [
+        "Civil Appeal STRONG",
+        "Civil Appeal weak-1",
+        "Civil Appeal weak-2",
+    ]
+
+
+def test_a_capped_run_is_a_prefix_of_the_uncapped_one():
+    # One ordering, not two: what a cap changes is where the file stops, so
+    # an interrupted uncapped run and a capped run keep the same judgments.
+    rows = [_meta_row(case_id=f"Civil Appeal {i}", judge=None, author_judge=None) for i in range(4)]
+    rows += [_meta_row(case_id=f"Criminal Appeal {i}", title="X v State") for i in range(4)]
+    rows += [_meta_row(case_id="Civil Appeal CB", judge=FIVE_JUDGES, author_judge=None)]
+
+    full, _ = select_corpus(rows)
+    for cap in (1, 3, 5):
+        capped, stats = select_corpus(rows, limit=cap)
+        assert stats["selected"] == cap
+        assert [r["case_id"] for r in capped] == [r["case_id"] for r in full[:cap]]
 
 
 def test_a_capped_run_takes_from_every_stratum_not_just_the_first():
@@ -405,6 +487,70 @@ def test_a_selection_row_carries_what_extraction_needs():
 # --------------------------------------------------------------------------
 # Reading what acquire indexed.
 # --------------------------------------------------------------------------
+
+def test_a_snapshot_with_no_title_column_is_not_a_missing_access_grant(store, tmp_path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    pa = pytest.importorskip("pyarrow")
+
+    source = HF_SOURCES["injudgements"]
+    # Never acquired: that IS the access grant, and saying so is right.
+    assert landmark_set(store) == (None, LANDMARKS_NOT_ACQUIRED)
+
+    store.upsert_source(source.source_id, "Apache-2.0")
+    untitled = tmp_path / "untitled.parquet"
+    pq.write_table(pa.table({"Text": ["a judgment"], "Labels": ["x"]}), untitled)
+    store.record_artifact(
+        source.source_id,
+        "data/train-0.parquet",
+        local_path=untitled,
+        size_bytes=untitled.stat().st_size,
+        sha256="x",
+    )
+    # On disk, but carrying no column this module recognises as a title. The
+    # answer is a column name in a file the operator already has, and
+    # reporting it as the missing grant sends them to the one place it is not.
+    assert landmark_set(store) == (None, LANDMARKS_NO_TITLE_COLUMN)
+
+    titled = tmp_path / "titled.parquet"
+    pq.write_table(pa.table({"Titles": ["Maneka Gandhi vs Union Of India"]}), titled)
+    store.record_artifact(
+        source.source_id,
+        "data/train-1.parquet",
+        local_path=titled,
+        size_bytes=titled.stat().st_size,
+        sha256="y",
+    )
+    keys, why = landmark_set(store)
+    assert why == LANDMARKS_OK
+    assert keys == landmark_keys([{"Titles": "Maneka Gandhi v. Union of India"}])
+
+
+def test_the_cli_does_not_send_an_operator_who_has_the_grant_to_go_and_get_it(tmp_path, capsys):
+    pq = pytest.importorskip("pyarrow.parquet")
+    pa = pytest.importorskip("pyarrow")
+    from tuned.data.config import load_build_config
+    from tuned.data.paths import build_paths
+
+    config = temp_config(tmp_path)
+    paths = build_paths(load_build_config(config, allow_unpinned=True).build.workdir).ensure()
+    untitled = tmp_path / "untitled.parquet"
+    pq.write_table(pa.table({"Text": ["a judgment"]}), untitled)
+    with Store.open(paths.state_db) as opened:
+        opened.upsert_source(HF_SOURCES["injudgements"].source_id, "Apache-2.0")
+        opened.record_artifact(
+            HF_SOURCES["injudgements"].source_id,
+            "data/train-0.parquet",
+            local_path=untitled,
+            size_bytes=untitled.stat().st_size,
+            sha256="x",
+        )
+
+    assert main(["--config", config], rows=[_meta_row()]) == 0
+    out = capsys.readouterr().out
+    assert "NO TITLE COLUMN" in out
+    # The grant page is the wrong answer here and must not be printed.
+    assert HF_SOURCES["injudgements"].url not in out
+
 
 def test_metadata_rows_reads_the_parquet_acquire_recorded(store, tmp_path):
     pq = pytest.importorskip("pyarrow.parquet")
@@ -457,17 +603,74 @@ def test_cli_writes_the_selection_and_records_the_run(tmp_path, capsys):
         assert '"selected": 3' in events[0]["detail_json"]
     out = capsys.readouterr().out
     assert "no_significance_signal" in out
-    # The pair with the next test is what makes the degraded banner mean
-    # something: it is absent exactly when the landmark list was there.
-    assert "DEGRADED" not in out
+    # The coverage block names the column that answered, and says so loudly
+    # where nothing did - a bare count is the thing that misled.
+    assert "<- citation" in out
+    assert "NO CANDIDATE MATCHED" in out  # nothing here carries a pdf link
+    # The pair with the next three tests is what makes each banner mean
+    # something: the missing-list one is absent exactly when the list was
+    # there, and the join warning is absent when the join worked.
+    assert "NO LANDMARK LIST" not in out
+    assert "NONE matched" not in out
+    assert "--no-landmarks" not in out
 
 
-def test_cli_says_loudly_when_it_ran_without_the_landmark_list(tmp_path, capsys):
+def test_the_default_command_writes_a_file_extraction_can_stop_half_way_through(tmp_path):
+    from tuned.data.config import load_build_config
+    from tuned.data.jsonl import read_jsonl
+    from tuned.data.paths import build_paths
+
+    config = temp_config(tmp_path)
+    rows = [_meta_row(case_id=f"Civil Appeal {i}", judge=None, author_judge=None) for i in range(4)]
+    rows.append(_meta_row(case_id="Civil Appeal CB", judge=FIVE_JUDGES, author_judge=None))
+
+    # No --limit: the documented default, and the run whose ordering used to
+    # be whatever order the parquet happened to list.
+    assert main(["--config", config], rows=rows, landmarks=frozenset()) == 0
+
+    paths = build_paths(load_build_config(config, allow_unpinned=True).build.workdir)
+    written = list(read_jsonl(paths.corpus_dir / "selection.jsonl"))
+    assert len(written) == 5
+    assert written[0]["case_id"] == "Civil Appeal CB"
+    assert [row["priority"] for row in written] == [6, 4, 4, 4, 4]
+
+
+def test_cli_says_when_it_ran_without_the_landmark_list_without_overstating_it(tmp_path, capsys):
     code = main(["--config", temp_config(tmp_path)], rows=[_meta_row()], landmarks=None)
     out = capsys.readouterr().out
     assert code == 0
-    assert "DEGRADED" in out
+    assert "NO LANDMARK LIST" in out
     assert "opennyaiorg/InJudgements_dataset" in out
+    # InJudgements is ~1,600 SC judgments spread over 1950-2017, so its
+    # absence costs a few hundred priority bumps in an 8-of-16-year window.
+    # It is not a blocker on P7, and the banner must not say the selection is
+    # materially weaker than it is.
+    assert "DEGRADED" not in out
+
+
+def test_cli_says_when_the_third_signal_was_switched_off_on_purpose(tmp_path, capsys):
+    # A THIRD way the list can be absent, and the only one that is nobody's
+    # problem. Falling through to silence would make a deliberately weakened
+    # run look like a complete one.
+    code = main(["--config", temp_config(tmp_path), "--no-landmarks"], rows=[_meta_row()])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "--no-landmarks" in out
+    assert HF_SOURCES["injudgements"].url not in out
+
+
+def test_cli_says_when_the_title_join_matched_nothing(tmp_path, capsys):
+    # A DIFFERENT failure from a missing list, and the one the normalised
+    # title join can produce silently and completely.
+    code = main(
+        ["--config", temp_config(tmp_path)],
+        rows=[_meta_row()],
+        landmarks=frozenset({"a title no metadata row carries"}),
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "NONE matched" in out
+    assert "NO LANDMARK LIST" not in out
 
 
 def test_cli_fails_when_a_non_empty_read_selected_nothing(tmp_path, capsys):
@@ -478,6 +681,20 @@ def test_cli_fails_when_a_non_empty_read_selected_nothing(tmp_path, capsys):
     code = main(["--config", temp_config(tmp_path)], rows=rows, landmarks=frozenset())
     assert code == 1
     assert "NOTHING SELECTED" in capsys.readouterr().out
+
+
+def test_a_limit_of_zero_is_a_typo_not_a_diagnosis_of_the_schema(tmp_path, capsys):
+    # `--limit 0` selects nothing from a perfectly good read, which the
+    # empty-selection backstop would report as "NOTHING SELECTED ... check
+    # the field coverage against the parquet's real column names" - sending
+    # an operator who mistyped a cap to audit a schema that is fine.
+    with pytest.raises(SystemExit):
+        main(
+            ["--config", temp_config(tmp_path), "--limit", "0"],
+            rows=[_meta_row()],
+            landmarks=frozenset(),
+        )
+    assert "NOTHING SELECTED" not in capsys.readouterr().out
 
 
 def test_cli_hard_exits_after_success():

@@ -27,13 +27,18 @@ uses - bytes durable BEFORE the row claiming they exist:
     failure that raises nothing) is discarded, not adopted;
   * `record_artifact` runs after the rename, so a crash in that window
     costs an index row and no download: the next run sees complete bytes
-    with no row, hashes them and adopts. That is the same shape as
-    store.reconcile_raw rebuilding generation rows from the raw logs.
+    with no row, hashes them and adopts. That is the same SHAPE as
+    store.reconcile_raw rebuilding generation rows from the raw logs, but
+    NOT the same cost - reconcile_raw rebuilds from local raw logs alone,
+    while adopting needs a live bucket listing to know which keys to look
+    for. Losing the database therefore costs a full re-listing plus a
+    re-hash of ~15 GB, which is why the index is worth keeping.
 
 Size is what the resume decision compares, because hashing ~15 GB of PDFs
 on every restart would cost more than the sync; `--verify` re-hashes and
 reports (run_event artifact_hash_changed) a file that changed under us
-without changing length.
+without changing length. An ETag that differs from the recorded one is the
+one free exception - see fetch_decision.
 
 Gated HuggingFace datasets are an ACCESS GRANT the operator has to make on
 the dataset page, and they fail with that instruction rather than a
@@ -250,9 +255,23 @@ def fetch_decision(
     Length, not hash, because re-hashing the whole corpus on every restart
     would cost more than the sync it is protecting; `verify=True` buys the
     hash back for a run that wants it.
+
+    The ETag is the one exception, and it is free: nothing may verify content
+    AGAINST an ETag (a multipart upload's is "<md5>-<parts>", not the body's
+    md5), but an ETag that DIFFERS from the one recorded means the object was
+    re-uploaded under a key already held - and the SC bucket is a rolling
+    release, so that happens. The local bytes are then the old object at the
+    same length, which is precisely what a size comparison cannot see.
     """
     path = Path(path)
     if not path.exists() or path.stat().st_size != entry.size:
+        return "fetch"
+    recorded = indexed.get("etag") if indexed is not None else None
+    if entry.etag and recorded and entry.etag != recorded:
+        # Absent on either side is not evidence of anything: index_tree
+        # records no ETag at all, and a run that re-fetched 100k objects
+        # because the listing stopped reporting them would be far worse than
+        # the one stale object this catches.
         return "fetch"
     if indexed is None or indexed["size_bytes"] != entry.size or verify:
         return "adopt"
@@ -336,6 +355,11 @@ def acquire_objects(
     is not in the objects. A failure to write the INDEX is deliberately not
     caught: that is the database, not the network, and continuing past it
     would produce a corpus nothing can find.
+
+    `limit` caps WORK - objects fetched, adopted or failed - and not objects
+    examined. Counting the examined ones would spend the whole cap on the
+    keys a resumed run skips, so `--limit 1000` would re-decide the same
+    first 1000 objects on every restart and never advance.
     """
     root = Path(root)
     stats: dict = {
@@ -356,7 +380,7 @@ def acquire_objects(
     index = store.artifact_index(source_id)
 
     for entry in entries:
-        if limit is not None and stats["considered"] >= limit:
+        if limit is not None and stats["fetched"] + stats["adopted"] + stats["failed"] >= limit:
             break
         stats["considered"] += 1
         try:
@@ -592,15 +616,21 @@ def _fmt_bytes(n: int) -> str:
     return f"{size:.1f} TiB"  # pragma: no cover - loop returns first
 
 
-def _print_object_stats(label: str, stats: dict) -> None:
+def _print_object_stats(label: str, stats: dict, *, verify: bool = False) -> None:
+    # Under --verify every object the index already agrees with takes the
+    # adopt path, so calling that column "adopted" would report 100k
+    # adoptions on a run that adopted nothing.
+    adopted = "re-hashed" if verify else "adopted"
     print(
         f"{label:<26}considered {stats['considered']:>7}  fetched {stats['fetched']:>7}  "
-        f"adopted {stats['adopted']:>6}  skipped {stats['skipped']:>7}  "
+        f"{adopted} {stats['adopted']:>6}  skipped {stats['skipped']:>7}  "
         f"failed {stats['failed']:>5}  {_fmt_bytes(stats['bytes'])}"
     )
     if stats["changed"]:
         print(f"{'':<26}CHANGED UNDER US {stats['changed']} (see run_event artifact_hash_changed)")
-    for failure in stats["failures"][:10]:
+    # Every one of them: the list is already bounded by --max-failures, and
+    # truncating at ten hid failures of a run that never reached the cap.
+    for failure in stats["failures"]:
         print(f"{'':<26}failed {failure['key']}: {failure['error']}")
 
 
@@ -621,7 +651,13 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
     )
     parser.add_argument("--years", default=None, help=f"default {DEV_YEARS[0]}-{DEV_YEARS[-1]}")
     parser.add_argument("--language", default=ENGLISH, choices=(ENGLISH, REGIONAL))
-    parser.add_argument("--limit", type=int, default=None, help="stop after N objects per kind")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="stop after N objects fetched or adopted per kind; objects already "
+        "local are skipped without spending the cap, so a resumed run advances",
+    )
     parser.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
     parser.add_argument(
         "--verify", action="store_true", help="re-hash files the index already agrees with"
@@ -676,6 +712,25 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
                         print(str(exc))
                         code = 2
                         continue
+                    except Exception as exc:
+                        # Nor is a hub 5xx, a DNS blip or a missing client
+                        # library. Exactly the same reasoning as the gated
+                        # branch above: this is a snapshot of a few hundred
+                        # megabytes, the next kind is days of PDFs, and
+                        # letting it propagate out of main would mean a
+                        # transient failure after the metadata already landed
+                        # costs the whole pull.
+                        print(f"hf:{key:<23}FAILED - {type(exc).__name__}: {exc}")
+                        store.log_event(
+                            "acquire_failed",
+                            {
+                                "source_id": source.source_id,
+                                "key": source.repo_id,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                        )
+                        code = max(code, 1)
+                        continue
                     print(
                         f"hf:{key:<23}indexed {stats['indexed']:>7}  "
                         f"skipped {stats['skipped']:>7}  {_fmt_bytes(stats['bytes'])}  "
@@ -694,7 +749,7 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
                 limit=args.limit,
                 max_failures=args.max_failures,
             )
-            _print_object_stats(f"{kind}:{args.language}", stats)
+            _print_object_stats(f"{kind}:{args.language}", stats, verify=args.verify)
             if stats["failed"]:
                 code = max(code, 1)
         print(f"artifacts indexed -> {store.artifact_count()} ({paths.state_db})")

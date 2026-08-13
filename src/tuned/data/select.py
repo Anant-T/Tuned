@@ -22,6 +22,33 @@ THE SIGNALS, in the order the research ranked them
 Case type is a STRATUM, never a filter: it decides what a capped run keeps
 from each bucket, and nothing is dropped for being the wrong kind of case.
 
+WHAT SELECTION ACTUALLY IS AT THIS SCOPE - read this before re-ranking
+---------------------------------------------------------------------
+None of the three signals narrows this corpus, and the honest description
+of what ships is "SC 2010-2025, English, all of it".
+
+* Signal 1 is CIRCULAR here. P0 established that the bucket's PDFs are the
+  S.C.R. typeset reprint and that the english filename convention
+  {year}_{volume}_{startpage}_{endpage}_EN.pdf IS S.C.R. pagination. Being
+  an object under data/pdf/year=YYYY/english/ is therefore equivalent to
+  being reported in the S.C.R. by CONSTRUCTION, not by sample. The plan's
+  ranking is sound for a corpus of all SC judgments and circular for a
+  corpus that is the reports series itself. A signal true of every row
+  contributes a constant to every row and cancels out of the ordering.
+* Signal 2 is real but rare - a Constitution Bench is a few dozen a year.
+* Signal 3 cannot reach half the scope: InJudgements is ~12k documents
+  1950-2017 of which ~1,600 are Supreme Court, so the reachable 2010-2017
+  slice is a few hundred rows against a 15-20k target.
+
+INVERTING the treatment (citation as a hard filter, rank on coram +
+landmark) buys nothing: a universal +4 cancels, and coram and landmark
+already rank correctly relative to each other. So the ranking is left
+alone and selection's remaining job is ORDERING - which is why
+select_corpus orders unconditionally rather than only under --limit. The
+real narrowing happens downstream: extraction quality, dedup, and sampling
+to the token budget. Nothing here should be re-ranked on the strength of a
+citation coverage number alone.
+
 WHAT IS DELIBERATELY NOT HERE
 -----------------------------
 * The upstream outcome column is corrupt - unresolved repo issue #29, 32
@@ -61,11 +88,21 @@ LANDMARK = "landmark"
 # Ranked, primary first. The order is the order the signals come back in,
 # and the weights make it an ordering rather than a claim: the court's own
 # filter outranks the other two together, so a capped or interrupted run
-# keeps reported judgments before it keeps anything else.
+# keeps reported judgments before it keeps anything else. Applied to EVERY
+# run, capped or not - see select_corpus, and see the docstring above for
+# why ordering is the only job these weights still do at this scope.
 SIGNAL_ORDER = (CITATION, CORAM, LANDMARK)
 SIGNAL_WEIGHTS = {CITATION: 4, CORAM: 2, LANDMARK: 1}
 
 CONSTITUTION_BENCH = 5
+
+# The InJudgements title column, and the two other spellings a re-export
+# might use. Also why the list can be absent in two different ways.
+_LANDMARK_TITLE_FIELDS = ("Titles", "title", "case_title")
+LANDMARKS_OK = "ok"
+LANDMARKS_NOT_ACQUIRED = "not_acquired"
+LANDMARKS_NO_TITLE_COLUMN = "no_title_column"
+LANDMARKS_DISABLED = "disabled"
 
 SELECTION_FIELDS = (
     "case_id",
@@ -85,9 +122,9 @@ SELECTION_FIELDS = (
 # Candidate column names, tried in order. The SC parquet schema is NOT
 # verified offline (18 fields, named in the research but never enumerated
 # against a real file), so every read is a small ordered list rather than
-# one guess - and select_corpus reports per-field coverage so the FIRST
-# real run says which names actually matched instead of quietly producing
-# a corpus with no Constitution Benches in it.
+# one guess - and select_corpus reports coverage per RESOLVED SIGNAL so the
+# FIRST real run says which names actually matched instead of quietly
+# producing a corpus with no Constitution Benches in it.
 _CITATION_FIELDS = ("citation", "law_report_citation", "neutral_citation")
 _JUDGE_FIELDS = ("judge", "author_judge", "coram_members", "bench")
 _TITLE_FIELDS = ("title", "case_title", "case_id", "diary_number")
@@ -97,9 +134,32 @@ _YEAR_FIELDS = ("year", "decision_date", "date", "judgment_date", "decision_year
 _COURT_FIELDS = ("court", "court_name", "court_name_normalized")
 _PDF_FIELDS = ("pdf_key", "pdf_link", "pdf_url", "raw_file_path", "file_path", "pdf_path")
 
-# What field_coverage reports on: the columns a wrong name would quietly
-# disable a signal or a filter through.
-COVERAGE_FIELDS = ("citation", "judge", "author_judge", "title", "case_id", "available_languages")
+# What coverage reports on: the signals and filters a wrong column name
+# would quietly disable. These are SIGNAL names, not column names - every
+# read above goes through a candidate list, so counting the literal first
+# name would report on candidate #0 alone and make "the fallback matched"
+# and "nothing matched" the same number, on the one instrument built to
+# tell them apart.
+COVERAGE_SIGNALS = (
+    "citation",
+    "judge",
+    "title",
+    "case_id",
+    "language",
+    "year",
+    "court",
+    "pdf_key",
+)
+_CANDIDATES = {
+    "citation": _CITATION_FIELDS,
+    "judge": _JUDGE_FIELDS,
+    "title": _TITLE_FIELDS,
+    "case_id": _CASE_ID_FIELDS,
+    "language": _LANGUAGE_FIELDS,
+    "year": _YEAR_FIELDS,
+    "court": _COURT_FIELDS,
+    "pdf_key": _PDF_FIELDS,
+}
 
 ENGLISH_CODES = frozenset({"en", "eng", "english"})
 
@@ -150,12 +210,22 @@ def _clean(value) -> str:
     return "" if text.lower() in _NULLISH else text
 
 
-def _first(row, fields) -> str:
+def _first_named(row, fields) -> tuple[str, str | None]:
+    """The first candidate that carried a value, AND which one it was.
+
+    The name is what answers "did our column names match?" - see
+    COVERAGE_SIGNALS. It is returned from the same walk that reads the value
+    so the two can never disagree.
+    """
     for field in fields:
         text = _clean(row.get(field))
         if text:
-            return text
-    return ""
+            return text, field
+    return "", None
+
+
+def _first(row, fields) -> str:
+    return _first_named(row, fields)[0]
 
 
 def citation_of(row) -> str | None:
@@ -185,38 +255,52 @@ def _judge_key(name: str) -> str:
     return re.sub(r"[^a-z]", "", _HONORIFICS.sub(" ", name or "").lower())
 
 
-def judges_of(row) -> tuple[str, ...]:
-    """The bench, as written, deduped on identity across the judge fields."""
-    parts: list[str] = []
+def judges_named(row) -> tuple[tuple[str, ...], str | None]:
+    """The bench and the FIRST judge column that contributed a name to it.
+
+    Deduped on identity across every judge field, because the author field
+    agreeing with the bench string is the difference between a 4-judge bench
+    and a Constitution Bench.
+    """
+    parts: list[tuple[str, str]] = []
     for field in _JUDGE_FIELDS:
         value = row.get(field)
         if value is None:
             continue
         if isinstance(value, (list, tuple, set)):
-            parts.extend(str(item) for item in value)
+            parts.extend((str(item), field) for item in value)
         else:
-            parts.extend(_JUDGE_SPLIT.split(str(value)))
+            parts.extend((part, field) for part in _JUDGE_SPLIT.split(str(value)))
     seen: set[str] = set()
     names: list[str] = []
-    for part in parts:
+    resolved: str | None = None
+    for part, field in parts:
         key = _judge_key(part)
         if not key or key in seen:
             continue
         seen.add(key)
         names.append(" ".join(part.split()))
-    return tuple(names)
+        if resolved is None:
+            resolved = field
+    return tuple(names), resolved
+
+
+def judges_of(row) -> tuple[str, ...]:
+    """The bench, as written, deduped on identity across the judge fields."""
+    return judges_named(row)[0]
 
 
 def coram_size(row) -> int:
     return len(judges_of(row))
 
 
-def english_available(row) -> bool | None:
-    """True / False / None when the row does not say.
+def english_named(row) -> tuple[bool | None, str | None]:
+    """English availability and the language column that answered.
 
-    None is NOT False on purpose: the PDF side is already partitioned into
-    english/ and regional/ prefixes, and an absent (or renamed) column must
-    not empty the corpus.
+    True / False / None when the row does not say. None is NOT False on
+    purpose: the PDF side is already partitioned into english/ and regional/
+    prefixes, and an absent (or renamed) column must not empty the corpus -
+    which is exactly why the column name is reported.
     """
     for field in _LANGUAGE_FIELDS:
         value = row.get(field)
@@ -229,23 +313,32 @@ def english_available(row) -> bool | None:
         codes = {item.strip().lower() for item in items if item.strip()}
         if not codes:
             continue
-        return bool(codes & ENGLISH_CODES)
-    return None
+        return bool(codes & ENGLISH_CODES), field
+    return None, None
 
 
-def year_of(row) -> int | None:
-    """The year the judgment sits in - from the partition the file came out
-    of when the reader supplied it, else from whichever date field exists."""
+def english_available(row) -> bool | None:
+    return english_named(row)[0]
+
+
+def year_named(row) -> tuple[int | None, str | None]:
+    """The year the judgment sits in, and the column it came out of - the
+    partition the file came from when the reader supplied it, else whichever
+    date field exists."""
     for field in _YEAR_FIELDS:
         value = row.get(field)
         if value is None:
             continue
         if isinstance(value, int) and not isinstance(value, bool):
-            return value
+            return value, field
         match = _YEAR_IN_TEXT.search(_clean(value))
         if match:
-            return int(match.group(1))
-    return None
+            return int(match.group(1)), field
+    return None, None
+
+
+def year_of(row) -> int | None:
+    return year_named(row)[0]
 
 
 def case_type_of(row) -> str:
@@ -270,12 +363,14 @@ def scr_prefix(citation: str | None) -> str | None:
     return f"{int(year)}_{int(volume)}_{int(page)}_"
 
 
-def pdf_key_of(row) -> str | None:
-    """The bucket key of this judgment's PDF, if a column carries one.
+def pdf_key_named(row) -> tuple[str | None, str | None]:
+    """The bucket key of this judgment's PDF and the column that carried it.
 
     Never a filter (see the field-name note above): a run whose metadata
     schema does not carry the link still selects, and extraction falls back
-    to matching scr_prefix against the keys acquire indexed.
+    to matching scr_prefix against the keys acquire indexed. Coverage on it
+    answers, on the first real run and for free, whether that fallback is
+    the only join extraction will have.
     """
     for field in _PDF_FIELDS:
         text = _first(row, (field,))
@@ -287,8 +382,31 @@ def pdf_key_of(row) -> str | None:
                 key = key.split(marker, 1)[1]
         key = key.lstrip("/")
         if key.lower().endswith(".pdf"):
-            return key
-    return None
+            return key, field
+    return None, None
+
+
+def pdf_key_of(row) -> str | None:
+    return pdf_key_named(row)[0]
+
+
+def resolved_fields_of(row) -> dict[str, str | None]:
+    """Which candidate column answered for each signal on THIS row.
+
+    None where nothing resolved. Aggregated over the run by select_corpus,
+    this is the map that answers "did our names match?" - and unlike a count
+    of literal first-choice column names, it can see a fallback winning.
+    """
+    return {
+        "citation": _first_named(row, _CITATION_FIELDS)[1],
+        "judge": judges_named(row)[1],
+        "title": _first_named(row, _TITLE_FIELDS)[1],
+        "case_id": _first_named(row, _CASE_ID_FIELDS)[1],
+        "language": english_named(row)[1],
+        "year": year_named(row)[1],
+        "court": _first_named(row, _COURT_FIELDS)[1],
+        "pdf_key": pdf_key_named(row)[1],
+    }
 
 
 # --------------------------------------------------------------------------
@@ -315,7 +433,7 @@ def landmark_keys(rows: Iterable[dict]) -> frozenset[str]:
     """Normalised titles from InJudgements rows (its column is `Titles`)."""
     keys = set()
     for raw in rows:
-        key = landmark_key(_first(raw, ("Titles", "title", "case_title")))
+        key = landmark_key(_first(raw, _LANDMARK_TITLE_FIELDS))
         if key:
             keys.add(key)
     return frozenset(keys)
@@ -406,13 +524,23 @@ def stratified_take(rows: Sequence[dict], n: int) -> list[dict]:
         bucket.sort(key=lambda row: -row["priority"])  # stable: input order breaks ties
     taken: list[dict] = []
     order = sorted(buckets)
-    while len(taken) < n and any(buckets.values()):
+    # Cursors, not pop(0): every run goes through here now, not only a
+    # capped one, and popping the front of a 25k-row list 25k times is
+    # quadratic - ~1e9 element moves on a full corpus.
+    cursors = dict.fromkeys(order, 0)
+    while len(taken) < n:
+        progressed = False
         for name in order:
-            if not buckets[name]:
+            index = cursors[name]
+            if index >= len(buckets[name]):
                 continue
-            taken.append(buckets[name].pop(0))
+            taken.append(buckets[name][index])
+            cursors[name] = index + 1
+            progressed = True
             if len(taken) >= n:
                 break
+        if not progressed:
+            break
     return taken
 
 
@@ -424,16 +552,19 @@ def select_corpus(
     limit: int | None = None,
 ) -> tuple[list[dict], dict]:
     """Run the selection over metadata rows; returns (selection, stats)."""
-    coverage = dict.fromkeys(COVERAGE_FIELDS, 0)
+    coverage = dict.fromkeys(COVERAGE_SIGNALS, 0)
+    winners: dict[str, dict[str, int]] = {signal: {} for signal in COVERAGE_SIGNALS}
     rejects: dict[str, int] = {}
     chosen: list[dict] = []
     total = 0
 
     for row in rows:
         total += 1
-        for field in COVERAGE_FIELDS:
-            if _clean(row.get(field)):
-                coverage[field] += 1
+        for signal, field in resolved_fields_of(row).items():
+            if field is None:
+                continue
+            coverage[signal] += 1
+            winners[signal][field] = winners[signal].get(field, 0) + 1
         decision = select_judgment(row, landmarks=landmarks, years=years)
         if not decision.selected:
             rejects[decision.reason] = rejects.get(decision.reason, 0) + 1
@@ -441,8 +572,15 @@ def select_corpus(
         chosen.append(selection_row(row, decision))
 
     matched = len(chosen)
-    if limit is not None and limit < matched:
-        chosen = stratified_take(chosen, limit)
+    # UNCONDITIONALLY, not only under a cap. The weights exist so that a
+    # capped OR INTERRUPTED run keeps the reported judgments first, and
+    # extraction - 4-6 days, consuming this file top-down - is the run that
+    # gets interrupted. Ordering only in the capped branch would leave the
+    # documented default command writing whatever order the parquet listed,
+    # so a half-finished extraction would have processed an arbitrary prefix.
+    # Taking the whole list through the same round-robin also makes a capped
+    # run exactly a prefix of the uncapped one.
+    chosen = stratified_take(chosen, matched if limit is None else limit)
 
     by_stratum: dict[str, int] = {}
     by_signal: dict[str, int] = {}
@@ -458,7 +596,13 @@ def select_corpus(
         "rejects": rejects,
         "by_stratum": by_stratum,
         "by_signal": by_signal,
+        # Rows on which each signal RESOLVED - through whichever candidate
+        # name won - and the name that won it.
         "field_coverage": coverage,
+        "resolved_fields": {
+            signal: (max(names, key=names.get) if names else None)
+            for signal, names in winners.items()
+        },
         # None means the gated list was not available at all, which is a
         # different (and weaker) run from one that had it and matched
         # nothing - and the difference is what the match rate diagnoses.
@@ -493,28 +637,36 @@ def metadata_rows(store, years=DEV_YEARS) -> Iterator[dict]:
             yield record
 
 
-def landmark_set(store) -> frozenset[str] | None:
-    """Landmark titles from the local InJudgements snapshot, or None if it
-    was never acquired (gated - see acquire.py)."""
+def landmark_set(store) -> tuple[frozenset[str] | None, str]:
+    """Landmark titles from the local InJudgements snapshot, and WHY if none.
+
+    The two ways this comes back empty send the operator to two different
+    places: `not_acquired` is the access grant on the dataset page, while
+    `no_title_column` is a column name in a file that is already on disk.
+    Reporting the second as the first tells an operator who already has the
+    grant to go and get it, which is the one place the answer is not.
+    """
     import pyarrow.parquet as pq
 
     source = HF_SOURCES["injudgements"]
     rows: list[dict] = []
-    found = False
+    snapshot_seen = False
+    titled = False
     for key, artifact in sorted(store.artifact_index(source.source_id).items()):
         if not key.lower().endswith(".parquet"):
             continue
+        snapshot_seen = True
         path = artifact["local_path"]
         # Title columns ONLY: this dataset carries whole judgments, and
         # reading them to build a set of names would cost gigabytes.
-        columns = [c for c in ("Titles", "title", "case_title") if c in pq.read_schema(path).names]
+        columns = [c for c in _LANDMARK_TITLE_FIELDS if c in pq.read_schema(path).names]
         if not columns:
             continue
-        found = True
+        titled = True
         rows.extend(pq.read_table(path, columns=columns).to_pylist())
-    if not found:
-        return None
-    return landmark_keys(rows)
+    if titled:
+        return landmark_keys(rows), LANDMARKS_OK
+    return None, (LANDMARKS_NO_TITLE_COLUMN if snapshot_seen else LANDMARKS_NOT_ACQUIRED)
 
 
 # --------------------------------------------------------------------------
@@ -544,6 +696,12 @@ def main(argv: Sequence[str] | None = None, *, rows=None, landmarks=_UNSET) -> i
         help="ignore the InJudgements list even if it is on disk (degraded run)",
     )
     args = parser.parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        # `--limit 0` would select nothing from a perfectly good read, and
+        # the empty-selection backstop below would then report it as a schema
+        # mismatch - sending an operator who mistyped a cap to audit column
+        # names that are fine.
+        parser.error(f"--limit must be at least 1, got {args.limit}")
 
     years = parse_years(args.years) if args.years else DEV_YEARS
     cfg = load_build_config(args.config)
@@ -552,11 +710,24 @@ def main(argv: Sequence[str] | None = None, *, rows=None, landmarks=_UNSET) -> i
     store = Store.open(paths.state_db)
     try:
         if landmarks is _UNSET:
-            landmarks = None if args.no_landmarks else landmark_set(store)
+            if args.no_landmarks:
+                landmarks, why = None, LANDMARKS_DISABLED
+            else:
+                landmarks, why = landmark_set(store)
+        else:
+            why = LANDMARKS_OK if landmarks is not None else LANDMARKS_NOT_ACQUIRED
         source = rows if rows is not None else metadata_rows(store, years)
         chosen, stats = select_corpus(source, landmarks=landmarks, years=years, limit=args.limit)
         written = write_jsonl(out_path, chosen)
-        store.log_event("corpus_selection", {**stats, "out_path": str(out_path), "years": list(years)})
+        store.log_event(
+            "corpus_selection",
+            {
+                **stats,
+                "landmarks_reason": why,
+                "out_path": str(out_path),
+                "years": list(years),
+            },
+        )
 
         print(f"metadata rows {stats['total']}  selected {stats['selected']} of {stats['matched']} matched")
         for signal in SIGNAL_ORDER:
@@ -565,14 +736,35 @@ def main(argv: Sequence[str] | None = None, *, rows=None, landmarks=_UNSET) -> i
             print(f"  stratum {stratum:<11}{count:>8}")
         for reason, count in sorted(stats["rejects"].items()):
             print(f"  reject[{reason}]: {count}")
-        print("  field coverage: " + ", ".join(f"{k}={v}" for k, v in stats["field_coverage"].items()))
-        if stats["degraded"]:
+        # Per RESOLVED signal, with the candidate that won: the schema is the
+        # one thing no offline check can settle, and this is the first real
+        # run's one cheap chance to read the diagnosis.
+        print(f"  coverage of {stats['total']} rows, by signal and the column that answered:")
+        for signal in COVERAGE_SIGNALS:
+            count = stats["field_coverage"][signal]
+            field = stats["resolved_fields"][signal]
+            via = field if field else "NO CANDIDATE MATCHED: " + ", ".join(_CANDIDATES[signal])
+            print(f"    {signal:<10}{count:>8}  <- {via}")
+        if why == LANDMARKS_NOT_ACQUIRED:
             print(
-                f"  DEGRADED: selected without the landmark list. Grant access to "
-                f"{HF_SOURCES['injudgements'].repo_id} "
-                f"({HF_SOURCES['injudgements'].url}), re-run `python -m tuned.data.acquire "
-                f"--kind hf --hf-source injudgements`, then re-run this command."
+                f"  NO LANDMARK LIST: the third and weakest signal did not run. Bounded:"
+                f" InJudgements is ~1,600 Supreme Court judgments over 1950-2017, so it"
+                f" reaches at most the 2010-2017 half of this scope and is worth 1"
+                f" priority point where it fires - it re-orders a few hundred rows. To"
+                f" add it: grant access to {HF_SOURCES['injudgements'].repo_id}"
+                f" ({HF_SOURCES['injudgements'].url}), re-run `python -m tuned.data.acquire"
+                f" --kind hf --hf-source injudgements`, then re-run this. NOT a blocker."
             )
+        elif why == LANDMARKS_NO_TITLE_COLUMN:
+            print(
+                f"  LANDMARK SNAPSHOT HAS NO TITLE COLUMN: "
+                f"{HF_SOURCES['injudgements'].repo_id} IS on disk, and carries none of "
+                f"{', '.join(_LANDMARK_TITLE_FIELDS)}. This is a column name in a file you "
+                f"already have, NOT an access grant - do not re-request access. Read the "
+                f"snapshot's schema and add the real name to _LANDMARK_TITLE_FIELDS."
+            )
+        elif why == LANDMARKS_DISABLED:
+            print("  --no-landmarks: the third signal was deliberately switched off.")
         elif stats["landmarks"] and not stats["landmark_matches"]:
             print(
                 f"  WARNING: {stats['landmarks']} landmark titles loaded and NONE matched - "

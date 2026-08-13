@@ -364,9 +364,12 @@ class Store:
         INSERT OR REPLACE on (source_id, object_key): the SC bucket is a
         rolling release, so an object can genuinely change under a key we
         already hold, and re-acquiring must move the row rather than fork it.
-        `etag` is provenance only - it is the object's MD5 for a single-part
-        upload but "<md5>-<parts>" for a multipart one, so nothing may verify
-        against it; size_bytes and sha256 are what verification uses.
+        `etag` is not a content hash - it is the object's MD5 for a
+        single-part upload but "<md5>-<parts>" for a multipart one - so
+        nothing may verify content AGAINST it, and size_bytes/sha256 are what
+        verification uses. Its INEQUALITY is still informative, though:
+        recorded != listed means the object was re-uploaded under this key,
+        which is why acquire.fetch_decision reads it.
         """
         self._write(
             "INSERT OR REPLACE INTO artifact "
