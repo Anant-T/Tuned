@@ -15,6 +15,7 @@ from tuned.data.select import (
     CITATION,
     CONSTITUTION_BENCH,
     CORAM,
+    COVERAGE_SIGNALS,
     LANDMARK,
     LANDMARKS_NO_TITLE_COLUMN,
     LANDMARKS_NOT_ACQUIRED,
@@ -202,6 +203,41 @@ def test_a_regional_only_judgment_is_filtered_out_here_not_downstream():
     assert decision.reason == "not_english"
 
 
+@pytest.mark.parametrize("value", ["NA", "N/A", "-", "--", "nil", "null", "nan", "none", "  "])
+def test_absent_spelled_the_way_this_corpus_spells_it_is_not_a_regional_judgment(value):
+    # The module already collapses these spellings for `citation`
+    # (test_a_null_shaped_citation_is_no_citation) and NOT for the language
+    # column, and the asymmetry is the bug: reading a literal "NA" as "not
+    # English" makes it a HARD REJECT. The row is dropped, the run still
+    # exits 0, and the coverage line reads a perfectly healthy
+    # `language <- available_languages` on every row - so the one instrument
+    # built to diagnose the schema points away from the fault. At 100% the
+    # operator gets NOTHING SELECTED, reject[not_english] = every row, and
+    # full language coverage: three readings, one of them wrong.
+    assert english_available(_meta_row(available_languages=value)) is None
+    assert select_judgment(_meta_row(available_languages=value)).selected is True
+
+
+def test_a_null_shaped_code_inside_a_language_list_is_not_a_language():
+    assert english_available(_meta_row(available_languages=["NA"])) is None
+    # ... and collapsing it must not cost the real code standing beside it.
+    assert english_available(_meta_row(available_languages=["en", "NA"])) is True
+    assert english_available(_meta_row(available_languages="hi, NA")) is False
+
+
+def test_a_null_shaped_language_column_does_not_shrink_the_corpus_behind_a_healthy_instrument():
+    rows = [_meta_row(case_id=f"Civil Appeal {i}", available_languages="NA") for i in range(3)]
+    _, stats = select_corpus(rows)
+    assert stats["selected"] == 3
+    assert "not_english" not in stats["rejects"]
+    # And the instrument must not call a column of "NA" a resolved language
+    # column. Coverage saying the column answered on every row, next to a
+    # not_english reject count, is the wrong diagnosis - and it is the one an
+    # operator would act on.
+    assert stats["field_coverage"]["language"] == 0
+    assert stats["resolved_fields"]["language"] is None
+
+
 def test_year_is_read_from_the_partition_or_from_a_date():
     assert year_of({"year": 2015}) == 2015
     assert year_of({"decision_date": "2015-03-12"}) == 2015
@@ -243,6 +279,12 @@ def test_a_landmark_is_selected_without_a_citation_or_a_large_bench():
     decision = select_judgment(row, landmarks=landmarks)
     assert decision.selected is True
     assert decision.signals == (LANDMARK,)
+    # The counterfactual is the point, and it is what the missing-list banner
+    # has to be honest about: the third signal does not only RE-ORDER rows the
+    # other two already selected, it ADMITS this one - without the list it is
+    # not in the corpus at all.
+    assert select_judgment(row, landmarks=None).selected is False
+    assert select_judgment(row, landmarks=frozenset()).reason == "no_significance_signal"
 
 
 def test_signals_come_back_in_the_order_the_research_ranked_them():
@@ -451,6 +493,42 @@ def test_a_capped_run_is_a_prefix_of_the_uncapped_one():
         assert [r["case_id"] for r in capped] == [r["case_id"] for r in full[:cap]]
 
 
+def test_the_cap_is_a_stratified_spread_so_priority_ranks_only_inside_a_stratum():
+    # WHAT THE ORDERING ACTUALLY IS, on a fixture that can see it. Every other
+    # ordering test here is single-stratum, where "strongest first" and
+    # "round-robin the strata" are the same list and the difference is
+    # invisible.
+    #
+    # `stratified_take` round-robins the strata in sorted() order and ranks by
+    # priority only WITHIN each one, so across strata the priority weights are
+    # subordinate to the stratum NAME: `civil` sorts before `criminal`, so a
+    # cap of 1 returns the strongest civil row even though a criminal row
+    # outranks it corpus-wide. That is the intended property - an interrupted
+    # extraction should have processed a proportional slice of the corpus
+    # shape rather than a run of one case type - and it is pinned here so it
+    # is a test rather than a paragraph.
+    rows = [
+        _meta_row(case_id="Civil Appeal 9", judge=None, author_judge=None),
+        _meta_row(case_id="Civil Appeal 10", judge=None, author_judge=None),
+        _meta_row(case_id="Criminal Appeal 1", title="X v State", judge=FIVE_JUDGES, author_judge=None),
+        _meta_row(case_id="Criminal Appeal 2", title="X v State", judge=FIVE_JUDGES, author_judge=None),
+    ]
+    chosen, _ = select_corpus(rows)
+    assert [row["case_id"] for row in chosen] == [
+        "Civil Appeal 9",
+        "Criminal Appeal 1",
+        "Civil Appeal 10",
+        "Criminal Appeal 2",
+    ]
+    # The strata interleave; the priorities therefore do NOT descend.
+    assert [row["priority"] for row in chosen] == [4, 6, 4, 6]
+
+    capped, _ = select_corpus(rows, limit=1)
+    assert [row["case_id"] for row in capped] == ["Civil Appeal 9"]
+    # ... and the row it kept is not the strongest one it had.
+    assert capped[0]["priority"] == 4 < max(row["priority"] for row in chosen)
+
+
 def test_a_capped_run_takes_from_every_stratum_not_just_the_first():
     rows = [_meta_row(case_id=f"Civil Appeal {i}") for i in range(10)]
     rows += [_meta_row(case_id=f"Criminal Appeal {i}", title="X v State") for i in range(2)]
@@ -465,6 +543,45 @@ def test_stratified_take_prefers_the_stronger_signals_within_a_stratum():
     weak = {"case_type": "civil", "priority": 4, "case_id": "weak"}
     strong = {"case_type": "civil", "priority": 6, "case_id": "strong"}
     assert [r["case_id"] for r in stratified_take([weak, strong], 1)] == ["strong"]
+
+
+def test_stratified_take_stays_linear_on_a_corpus_sized_input():
+    # EVERY run goes through stratified_take now, not only a capped one, so
+    # `n` here is the whole corpus (~25k rows, and 100k if the scope widens),
+    # not a small cap. The obvious implementation - pop the front of each
+    # stratum's list - is quadratic at that size: ~1e9 element moves, minutes
+    # of wall clock, on the module's default command. That regression was
+    # introduced and then caught by BENCHMARKING inside one round, which is
+    # not a guard; this is.
+    #
+    # Calibrated against a plain sort of the same rows on the same machine
+    # rather than against a wall-clock constant, so it means the same thing on
+    # a fast laptop and a loaded CI box. Measured: the cursor form runs at
+    # 3-4x that reference, the pop(0) form at 230-290x.
+    import time
+
+    size = 40_000
+    rows = [
+        {"case_type": "civil" if i % 2 else "criminal", "priority": i % 7, "case_id": str(i)}
+        for i in range(size)
+    ]
+
+    def fastest(call) -> float:
+        return min(
+            (lambda start=time.perf_counter(): (call(), time.perf_counter() - start)[1])()
+            for _ in range(3)
+        )
+
+    reference = fastest(lambda: sorted(rows, key=lambda row: -row["priority"]))
+    measured = fastest(lambda: stratified_take(rows, size))
+
+    assert measured < 30 * reference, (
+        f"stratified_take took {measured:.3f}s for {size} rows against a "
+        f"{reference:.3f}s reference sort ({measured / reference:.0f}x) - "
+        f"linear is ~4x, quadratic is ~250x"
+    )
+    # Whatever it costs, it still has to be the same answer.
+    assert len(stratified_take(rows, size)) == size
 
 
 def test_stratified_take_returns_everything_when_the_cap_is_not_binding():
@@ -577,6 +694,42 @@ def test_metadata_rows_reads_the_parquet_acquire_recorded(store, tmp_path):
     assert rows[0]["year"] == 2015
 
 
+def test_a_null_year_cell_under_a_year_partition_takes_the_partitions_year(store, tmp_path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    pa = pytest.importorskip("pyarrow")
+
+    store.upsert_source(SC_SOURCE_ID, "CC-BY-4.0")
+    path = tmp_path / "2015.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "case_id": ["CA 2015"],
+                "citation": ["[2015] 1 S.C.R. 1"],
+                "year": pa.array([None], type=pa.int64()),
+            }
+        ),
+        path,
+    )
+    store.record_artifact(
+        SC_SOURCE_ID,
+        "metadata/parquet/year=2015/part-0.parquet",
+        local_path=path,
+        size_bytes=path.stat().st_size,
+        sha256="x",
+    )
+
+    # A missing KEY and a null CELL are the same fact about the row and a
+    # different fact about the dict: `setdefault` fills the first and not the
+    # second, so a row whose `year` column is null is rejected `no_year` -
+    # thrown away by a hard filter while the partition it was read out of
+    # knows the answer.
+    rows = list(metadata_rows(store, (2015,)))
+    assert rows[0]["year"] == 2015
+    _, stats = select_corpus(rows)
+    assert stats["selected"] == 1
+    assert stats["rejects"] == {}
+
+
 # --------------------------------------------------------------------------
 # CLI.
 # --------------------------------------------------------------------------
@@ -604,7 +757,11 @@ def test_cli_writes_the_selection_and_records_the_run(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "no_significance_signal" in out
     # The coverage block names the column that answered, and says so loudly
-    # where nothing did - a bare count is the thing that misled.
+    # where nothing did - a bare count is the thing that misled. NOTE: every
+    # column on `_meta_row` is candidate #0, so on THIS fixture the signal
+    # name and the winning column name are the same string and this assertion
+    # cannot tell the two apart. The test that can is the fallback-schema one
+    # below; this pair only pins that the block is printed at all.
     assert "<- citation" in out
     assert "NO CANDIDATE MATCHED" in out  # nothing here carries a pdf link
     # The pair with the next three tests is what makes each banner mean
@@ -613,6 +770,53 @@ def test_cli_writes_the_selection_and_records_the_run(tmp_path, capsys):
     assert "NO LANDMARK LIST" not in out
     assert "NONE matched" not in out
     assert "--no-landmarks" not in out
+
+
+def test_the_printed_coverage_block_names_the_fallback_that_won_not_the_signal(tmp_path, capsys):
+    # THE LINE AN OPERATOR ACTUALLY READS, on the schema P0 records for this
+    # corpus. Every column here is a FALLBACK - candidate #1, #2 or #3 - and
+    # not one signal's own name exists as a column on the row, so
+    # "signal name" and "winning column name" cannot coincide and the block
+    # has to have gone through the resolved-field map to print the truth.
+    #
+    #   SHIPPED   citation 1 <- law_report_citation   judge 1 <- coram_members
+    #   MISREAD   citation 1 <- citation              judge 1 <- judge
+    #
+    # The second is a report that the first-choice names matched, on a run
+    # where none of them exist - the exact misreading `resolved_fields` was
+    # built to prevent, printed on the one line that gets read.
+    rows = [
+        {
+            "docket_number": "Civil Appeal No. 7138 of 2010",
+            "case_title": "Government of India vs Isro Drivers Association",
+            "law_report_citation": "[2020] 7 S.C.R. 941",
+            "coram_members": FIVE_JUDGES,
+            "language_codes": "en",
+            "court_name": "Supreme Court of India",
+            "decision_date": "2020-05-12",
+        }
+    ]
+    assert main(["--config", temp_config(tmp_path)], rows=rows, landmarks=frozenset()) == 0
+    out = capsys.readouterr().out
+    assert "NOTHING SELECTED" not in out
+
+    block = out.split("coverage of", 1)[1].splitlines()[1 : 1 + len(COVERAGE_SIGNALS)]
+    counted = {line.split()[0]: int(line.split()[1]) for line in block}
+    via = {line.split()[0]: line.split("<- ", 1)[1].strip() for line in block}
+    resolved = {k: v for k, v in via.items() if not v.startswith("NO CANDIDATE MATCHED")}
+    assert resolved == {
+        "citation": "law_report_citation",
+        "judge": "coram_members",
+        "title": "case_title",
+        "case_id": "docket_number",
+        "language": "language_codes",
+        "year": "decision_date",
+        "court": "court_name",
+    }
+    assert counted == dict.fromkeys(COVERAGE_SIGNALS, 1) | {"pdf_key": 0}
+    # The one signal with no column on this row still names its candidates,
+    # so "the fallback won" and "nothing matched" stay different readings.
+    assert via["pdf_key"].startswith("NO CANDIDATE MATCHED: pdf_key,")
 
 
 def test_the_default_command_writes_a_file_extraction_can_stop_half_way_through(tmp_path):
@@ -646,6 +850,15 @@ def test_cli_says_when_it_ran_without_the_landmark_list_without_overstating_it(t
     # It is not a blocker on P7, and the banner must not say the selection is
     # materially weaker than it is.
     assert "DEGRADED" not in out
+
+
+def test_the_module_does_not_still_promise_a_banner_it_stopped_printing():
+    # The banner became `NO LANDMARK LIST` with a bounded cost and "NOT a
+    # blocker" when the ruling settled what the third signal is worth. A
+    # docstring left saying the run "says DEGRADED" describes a string the
+    # module cannot emit, and it is the sentence a reader reaches first. Only
+    # the output tests could see the rename, and they read stdout.
+    assert "DEGRADED" not in SELECT_SRC.read_text(encoding="utf-8")
 
 
 def test_cli_says_when_the_third_signal_was_switched_off_on_purpose(tmp_path, capsys):

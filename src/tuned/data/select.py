@@ -16,8 +16,8 @@ THE SIGNALS, in the order the research ranked them
    the judgment.
 3. Membership of `opennyaiorg/InJudgements_dataset`, a pre-computed
    most-cited list stratified over 8 case types. GATED: when it is absent
-   the selection still runs, and says DEGRADED rather than looking
-   complete.
+   the selection still runs, and says NO LANDMARK LIST - with the bounded
+   cost of running without it - rather than looking complete.
 
 Case type is a STRATUM, never a filter: it decides what a capped run keeps
 from each bucket, and nothing is dropped for being the wrong kind of case.
@@ -88,9 +88,14 @@ LANDMARK = "landmark"
 # Ranked, primary first. The order is the order the signals come back in,
 # and the weights make it an ordering rather than a claim: the court's own
 # filter outranks the other two together, so a capped or interrupted run
-# keeps reported judgments before it keeps anything else. Applied to EVERY
-# run, capped or not - see select_corpus, and see the docstring above for
-# why ordering is the only job these weights still do at this scope.
+# keeps a stratum's reported judgments before it keeps that stratum's
+# unreported ones. WITHIN a stratum is the whole extent of it - across strata
+# stratified_take's round-robin comes first, so the strongest row in the
+# corpus is NOT necessarily the first row in the file (a cap of 1 returns the
+# strongest row of the alphabetically-first stratum). That is deliberate; see
+# stratified_take and select_corpus. Applied to EVERY run, capped or not, and
+# see the docstring above for why ordering is the only job these weights
+# still do at this scope.
 SIGNAL_ORDER = (CITATION, CORAM, LANDMARK)
 SIGNAL_WEIGHTS = {CITATION: 4, CORAM: 2, LANDMARK: 1}
 
@@ -301,6 +306,13 @@ def english_named(row) -> tuple[bool | None, str | None]:
     purpose: the PDF side is already partitioned into english/ and regional/
     prefixes, and an absent (or renamed) column must not empty the corpus -
     which is exactly why the column name is reported.
+
+    Each code goes through `_clean`, so the several spellings of "absent"
+    (`NA`, `-`, `nil`, `nan`, ...) read as "the row does not say" here for
+    the same reason they read as "no citation" over there. Reading a literal
+    "NA" as "not English" would make it a HARD REJECT rather than a missing
+    signal, and it would do it while coverage still reported the column as
+    answering on every row - the instrument pointing away from the fault.
     """
     for field in _LANGUAGE_FIELDS:
         value = row.get(field)
@@ -310,7 +322,7 @@ def english_named(row) -> tuple[bool | None, str | None]:
             items = [str(item) for item in value]
         else:
             items = re.split(r"[,;|\s]+", str(value))
-        codes = {item.strip().lower() for item in items if item.strip()}
+        codes = {code.lower() for code in (_clean(item) for item in items) if code}
         if not codes:
             continue
         return bool(codes & ENGLISH_CODES), field
@@ -516,6 +528,15 @@ def stratified_take(rows: Sequence[dict], n: int) -> list[dict]:
     A plain "first n" would hand the whole cap to whichever stratum the
     parquet happens to list first; the strata exist so that a capped run is
     still a spread of civil/criminal/constitutional/commercial matters.
+
+    The round-robin OUTRANKS priority: strata are visited in sorted() order
+    and priority ranks only inside one, so `n=1` returns the strongest row of
+    the alphabetically-first stratum rather than the strongest row overall.
+    That is the point - the spread is what makes a truncated result fail over
+    the whole corpus shape instead of over one case type - but it does mean
+    this is not "the top n by priority", and nothing downstream may read it
+    as that. Pinned by
+    test_the_cap_is_a_stratified_spread_so_priority_ranks_only_inside_a_stratum.
     """
     buckets: dict[str, list[dict]] = {}
     for row in rows:
@@ -572,12 +593,20 @@ def select_corpus(
         chosen.append(selection_row(row, decision))
 
     matched = len(chosen)
-    # UNCONDITIONALLY, not only under a cap. The weights exist so that a
-    # capped OR INTERRUPTED run keeps the reported judgments first, and
-    # extraction - 4-6 days, consuming this file top-down - is the run that
-    # gets interrupted. Ordering only in the capped branch would leave the
-    # documented default command writing whatever order the parquet listed,
-    # so a half-finished extraction would have processed an arbitrary prefix.
+    # UNCONDITIONALLY, not only under a cap. Extraction - 4-6 days, consuming
+    # this file top-down - is the run that gets interrupted, and ordering only
+    # in the capped branch would leave the documented default command writing
+    # whatever order the parquet listed, so a half-finished extraction would
+    # have processed an arbitrary prefix of it.
+    #
+    # What it is ordered INTO is a stratified SPREAD, not global priority
+    # order: stratified_take round-robins the strata by name and ranks on
+    # priority only inside each one. So a half-finished extraction has
+    # processed a proportional slice of civil/criminal/constitutional/
+    # commercial matters, strongest-first within each - it fails over the
+    # whole corpus shape rather than over one case type - and NOT the
+    # highest-priority rows of the corpus, which is a different (and worse)
+    # property to leave a truncated run holding.
     # Taking the whole list through the same round-robin also makes a capped
     # run exactly a prefix of the uncapped one.
     chosen = stratified_take(chosen, matched if limit is None else limit)
@@ -632,8 +661,13 @@ def metadata_rows(store, years=DEV_YEARS) -> Iterator[dict]:
         if year is not None and year not in years:
             continue
         for record in pq.read_table(artifact["local_path"]).to_pylist():
-            if year is not None:
-                record.setdefault("year", year)
+            # A missing KEY and a null CELL are the same fact about the row
+            # and a different fact about the dict, so `setdefault` is not
+            # enough: a parquet `year` column that is null for this row would
+            # leave it rejected `no_year` by a hard filter while the partition
+            # it was read out of knows the answer.
+            if year is not None and not _clean(record.get("year")):
+                record["year"] = year
             yield record
 
 
@@ -688,7 +722,12 @@ def main(argv: Sequence[str] | None = None, *, rows=None, landmarks=_UNSET) -> i
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="configs/data_law_v1.yaml")
     parser.add_argument("--years", default=None, help=f"default {DEV_YEARS[0]}-{DEV_YEARS[-1]}")
-    parser.add_argument("--limit", type=int, default=None, help="cap, taken across strata")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="cap, spread across the case-type strata - NOT the top N by priority",
+    )
     parser.add_argument("--out", default=None)
     parser.add_argument(
         "--no-landmarks",
@@ -750,7 +789,9 @@ def main(argv: Sequence[str] | None = None, *, rows=None, landmarks=_UNSET) -> i
                 f"  NO LANDMARK LIST: the third and weakest signal did not run. Bounded:"
                 f" InJudgements is ~1,600 Supreme Court judgments over 1950-2017, so it"
                 f" reaches at most the 2010-2017 half of this scope and is worth 1"
-                f" priority point where it fires - it re-orders a few hundred rows. To"
+                f" priority point where it fires - it re-orders a few hundred rows,"
+                f" and ADMITS the few of them nothing else selects (no citation and"
+                f" a bench under {CONSTITUTION_BENCH}). Same bound either way. To"
                 f" add it: grant access to {HF_SOURCES['injudgements'].repo_id}"
                 f" ({HF_SOURCES['injudgements'].url}), re-run `python -m tuned.data.acquire"
                 f" --kind hf --hf-source injudgements`, then re-run this. NOT a blocker."

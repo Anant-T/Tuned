@@ -492,6 +492,47 @@ def test_limit_counts_work_done_so_a_resumed_run_advances(store, tmp_path):
     assert store.artifact_count(SC_SOURCE_ID) == 4
 
 
+def test_a_failure_spends_the_cap_the_same_way_a_download_does(store, tmp_path):
+    # `--limit` caps WORK, and a failure is work: it cost a connection and a
+    # slot in the failure list. Counting only the successes would let a run
+    # whose objects are all failing walk the entire 100k-key listing under
+    # `--limit 10`, which is the opposite of what an operator reaches for a
+    # cap to do.
+    objects = _objects(4)
+    keys = sorted(objects)
+    bucket = FakeBucket(objects, fail_keys=keys[:2])
+    stats = _acquire(store, bucket, tmp_path / "sc", objects, limit=2)
+
+    assert (stats["failed"], stats["fetched"], stats["adopted"]) == (2, 0, 0)
+    assert stats["considered"] == 2
+    # The two good keys behind the failures were never reached, so the cap
+    # cannot be read as "N successes".
+    assert bucket.fetched == keys[:2]
+    assert store.artifact_count(SC_SOURCE_ID) == 0
+
+
+def test_a_re_upload_is_recorded_as_changed_on_a_plain_run_not_only_under_verify(store, tmp_path):
+    # `--verify` used to be the only way into the changed-hash branch, and the
+    # comment there still said so. The ETag decision routes a genuine
+    # re-upload - same length, new bytes, new ETag - through a PLAIN run's
+    # fetch, and that run has to record it: this event is the provenance trail
+    # for an object whose content moved under a key the corpus already cites.
+    root = tmp_path / "sc"
+    original = {PDF_KEY: b"y" * 40}
+    _acquire(store, FakeBucket(original), root, original)
+    was = store.artifact(SC_SOURCE_ID, PDF_KEY)["sha256"]
+
+    replaced = {PDF_KEY: b"n" * 40}
+    entries = [ObjectEntry(PDF_KEY, 40, "etag-after-the-re-upload")]
+    stats = acquire_objects(store, FakeBucket(replaced), entries, root=root)
+
+    assert (stats["fetched"], stats["skipped"], stats["changed"]) == (1, 0, 1)
+    events = store.events("artifact_hash_changed")
+    assert len(events) == 1
+    assert was in events[0]["detail_json"]
+    assert store.artifact(SC_SOURCE_ID, PDF_KEY)["sha256"] == hashlib.sha256(b"n" * 40).hexdigest()
+
+
 def test_verify_notices_a_local_file_that_changed_under_us(store, tmp_path):
     objects = {PDF_KEY: b"y" * 40}
     root = tmp_path / "sc"

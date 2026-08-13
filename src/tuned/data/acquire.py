@@ -419,8 +419,12 @@ def acquire_objects(
             and indexed["sha256"] != digest
         ):
             # Same length, different content: the local file changed under
-            # us (or upstream replaced the object in place). Only --verify
-            # reaches this, and it is the reason --verify exists.
+            # us, or upstream replaced the object in place. TWO ways in, and
+            # only the first needs a flag - --verify, which forces the re-read
+            # that can see a local file rotting under an unchanged listing;
+            # and a plain run whose ETag decision already said "fetch",
+            # because a re-upload at the same length is exactly what an ETag
+            # mismatch reports.
             stats["changed"] += 1
             store.log_event(
                 "artifact_hash_changed",
@@ -655,8 +659,9 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
         "--limit",
         type=int,
         default=None,
-        help="stop after N objects fetched or adopted per kind; objects already "
-        "local are skipped without spending the cap, so a resumed run advances",
+        help="stop after N objects fetched, adopted or FAILED per kind; a failure "
+        "spends the cap like a download does, and objects already local are "
+        "skipped without spending it, so a resumed run advances",
     )
     parser.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
     parser.add_argument(
