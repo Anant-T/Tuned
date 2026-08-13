@@ -112,6 +112,11 @@ CREATE TABLE IF NOT EXISTS budget_ledger (
   PRIMARY KEY (day, provider, model));
 CREATE TABLE IF NOT EXISTS run_event (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, kind TEXT, detail_json TEXT);
+CREATE TABLE IF NOT EXISTS artifact (
+  source_id TEXT NOT NULL REFERENCES source(source_id),
+  object_key TEXT NOT NULL, local_path TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, etag TEXT, fetched_at TEXT,
+  PRIMARY KEY (source_id, object_key));
 """
 
 _SEED_COLS = (
@@ -334,6 +339,69 @@ class Store:
     def get_seed(self, seed_id: str) -> dict | None:
         row = self._conn.execute("SELECT * FROM seed WHERE seed_id = ?", (seed_id,)).fetchone()
         return dict(row) if row is not None else None
+
+    # --------------------------------------------------------------- artifacts
+
+    def record_artifact(
+        self,
+        source_id: str,
+        object_key: str,
+        *,
+        local_path: str | Path,
+        size_bytes: int,
+        sha256: str,
+        etag: str | None = None,
+    ) -> None:
+        """Index one acquired object - the corpus-phase twin of
+        record_generation, and under the same durability rule: the bytes are
+        already at `local_path` before this row claims they are.
+
+        A crash between the two therefore costs an index row, never the
+        download: acquire.py re-derives the row by hashing the file that is
+        already on disk (its "adopt" path), exactly as reconcile_raw
+        re-derives generation rows from the raw logs.
+
+        INSERT OR REPLACE on (source_id, object_key): the SC bucket is a
+        rolling release, so an object can genuinely change under a key we
+        already hold, and re-acquiring must move the row rather than fork it.
+        `etag` is provenance only - it is the object's MD5 for a single-part
+        upload but "<md5>-<parts>" for a multipart one, so nothing may verify
+        against it; size_bytes and sha256 are what verification uses.
+        """
+        self._write(
+            "INSERT OR REPLACE INTO artifact "
+            "(source_id, object_key, local_path, size_bytes, sha256, etag, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (source_id, object_key, str(local_path), int(size_bytes), sha256, etag, utcnow()),
+        )
+
+    def artifact(self, source_id: str, object_key: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM artifact WHERE source_id = ? AND object_key = ?",
+            (source_id, object_key),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def artifact_index(self, source_id: str) -> dict[str, dict]:
+        """Every indexed object for one source, keyed by object_key.
+
+        Read ONCE per acquisition run rather than per object: the resume
+        decision is taken for each of ~100k keys, and a SELECT apiece would
+        make restarting an interrupted sync cost more than the sync.
+        """
+        return {
+            row["object_key"]: dict(row)
+            for row in self._conn.execute(
+                "SELECT * FROM artifact WHERE source_id = ?", (source_id,)
+            ).fetchall()
+        }
+
+    def artifact_count(self, source_id: str | None = None) -> int:
+        if source_id is None:
+            return self._conn.execute("SELECT COUNT(*) FROM artifact").fetchone()[0]
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM artifact WHERE source_id = ?", (source_id,)
+        ).fetchone()[0]
 
     # ------------------------------------------------------------------- tasks
 

@@ -891,3 +891,62 @@ def test_reconcile_does_not_overwrite_an_existing_row(store, tmp_path):
     row = store.latest_generation("t0")
     assert row["answer"] == "from the db"
     assert (row["raw_path"], row["raw_offset"]) != (str(raw), offset)
+
+
+# --------------------------------------------------------- 9. artifact index
+
+
+def test_record_artifact_indexes_one_downloaded_object(store):
+    store.upsert_source("s3://bucket", "CC-BY-4.0", url="s3://bucket/")
+    key = "data/pdf/year=2015/english/2015_1_1_20_EN.pdf"
+    store.record_artifact(
+        "s3://bucket",
+        key,
+        local_path="corpus/sc/2015.pdf",
+        size_bytes=158371,
+        sha256="ab" * 32,
+        etag='"deadbeef"',
+    )
+    row = store.artifact("s3://bucket", key)
+    assert row["local_path"] == "corpus/sc/2015.pdf"
+    assert row["size_bytes"] == 158371
+    assert row["sha256"] == "ab" * 32
+    assert row["etag"] == '"deadbeef"'
+    assert _TS_RE.match(row["fetched_at"])
+    assert store.artifact("s3://bucket", "never/fetched.pdf") is None
+
+
+def test_artifact_rows_need_a_registered_source(store):
+    # The FK is what stops an acquisition run indexing bytes under a source
+    # for which nobody ever recorded a licence.
+    with pytest.raises(sqlite3.IntegrityError):
+        store.record_artifact("s3://nope", "k", local_path="p", size_bytes=1, sha256="00")
+
+
+def test_artifact_index_is_per_source_and_keyed_by_object_key(store):
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_source("b", "Apache-2.0")
+    store.record_artifact("a", "k1", local_path="a/k1", size_bytes=10, sha256="aa")
+    store.record_artifact("a", "k2", local_path="a/k2", size_bytes=20, sha256="bb")
+    store.record_artifact("b", "k1", local_path="b/k1", size_bytes=30, sha256="cc")
+
+    index = store.artifact_index("a")
+    assert sorted(index) == ["k1", "k2"]
+    # The same object_key under another source must not leak into this one -
+    # two buckets partitioned by year both hold "year=2015/..." keys.
+    assert index["k1"]["local_path"] == "a/k1"
+    assert index["k2"]["size_bytes"] == 20
+    assert store.artifact_count("a") == 2
+    assert store.artifact_count("b") == 1
+    assert store.artifact_count() == 3
+
+
+def test_recording_the_same_object_again_updates_in_place(store):
+    # Upstream replaced the object: the index must carry the new bytes, not
+    # fork into two rows claiming the same key.
+    store.upsert_source("a", "CC-BY-4.0")
+    store.record_artifact("a", "k", local_path="a/k", size_bytes=10, sha256="aa")
+    store.record_artifact("a", "k", local_path="a/k", size_bytes=11, sha256="bb")
+    assert store.artifact_count("a") == 1
+    row = store.artifact("a", "k")
+    assert (row["size_bytes"], row["sha256"]) == (11, "bb")
