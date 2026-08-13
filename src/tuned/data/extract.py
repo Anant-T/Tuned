@@ -1050,20 +1050,35 @@ MANIFEST_FIELDS = (
 )
 
 
-def manifest_rows(store, rows: Iterable[dict], *, index: PdfIndex, source_id: str) -> Iterator[dict]:
+def manifest_rows(
+    store, rows: Iterable[dict], *, index: PdfIndex, source_id: str, dropped: list | None = None
+) -> Iterator[dict]:
     """One row per EMITTED judgment: the selection row plus what came out.
 
     Derived state, regenerable from (selection.jsonl + the document table) at
     any time, which is why an interrupted run losing it costs nothing. Only
     documents with text: listing a quarantined judgment would hand the
     segmenter a path that is not there.
+
+    ONE ROW PER OBJECT. Two selection rows can land on the same PDF - the
+    metadata can carry a judgment twice, and two citations can address one
+    object - and the corpus would then hold that judgment twice under two
+    case ids. Nothing downstream reads object_key for identity, so this is
+    the only place it can be caught; the first row wins, which in a
+    stratified file is the stronger one.
     """
     documents = {row["object_key"]: row for row in store.documents(source_id, status=STATUS_OK)}
+    seen: set[str] = set()
     for row in rows:
         key, _ = resolve_pdf(row, index)
         document = documents.get(key) if key else None
         if document is None:
             continue
+        if key in seen:
+            if dropped is not None:
+                dropped.append(key)
+            continue
+        seen.add(key)
         meta = json.loads(document["meta_json"] or "{}")
         merged = {
             **{field: row.get(field) for field in MANIFEST_FIELDS},
@@ -1087,7 +1102,19 @@ def write_manifest(
 ) -> int:
     from tuned.data.jsonl import write_jsonl
 
-    return write_jsonl(path, manifest_rows(store, rows, index=index, source_id=source_id))
+    dropped: list[str] = []
+    written = write_jsonl(
+        path, manifest_rows(store, rows, index=index, source_id=source_id, dropped=dropped)
+    )
+    if dropped:
+        # Not silent: two selection rows on one judgment is a fact about the
+        # metadata, and the operator should see it rather than wonder why
+        # the manifest is shorter than the emitted count.
+        store.log_event(
+            "manifest_duplicate_documents",
+            {"count": len(dropped), "keys": sorted(set(dropped))[:20]},
+        )
+    return written
 
 
 # --------------------------------------------------------------------------

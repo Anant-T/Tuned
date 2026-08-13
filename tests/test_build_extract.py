@@ -1083,6 +1083,34 @@ def test_the_manifest_joins_the_selection_row_to_the_extraction_facts(tmp_path, 
     assert row["doc_id"] == "2015_1_1_20_EN"
 
 
+def test_two_selection_rows_landing_on_one_pdf_are_written_to_the_manifest_once(
+    tmp_path, store
+):
+    # The metadata can carry the same judgment twice, and two citations can
+    # address one object. Emitting both would put that judgment in the
+    # corpus twice under two case ids, and nothing downstream reads
+    # object_key for identity - so this is the only place it can be caught.
+    key = _key()
+    _, paths = _corpus(tmp_path, [key], store=store)
+    rows = [_selection(key), _selection(key, case_id="C.A. 3221-A/2018")]
+    reader = FakeReader({paths[key]: scr_pages()})
+    extract_corpus(
+        store, rows, index=pdf_index(store), text_root=tmp_path / "text", reader=reader
+    )
+
+    out = tmp_path / "extraction.jsonl"
+    written = write_manifest(store, rows, out, index=pdf_index(store))
+
+    assert written == 1
+    # THE PREMISE: both rows really do resolve to the one PDF, so the
+    # deduplication is what makes this 1 and not the join failing.
+    assert [resolve_pdf(row, pdf_index(store))[0] for row in rows] == [key, key]
+    # ... and the drop is reported rather than swallowed.
+    events = [e for e in store.events("manifest_duplicate_documents")]
+    assert len(events) == 1
+    assert json.loads(events[0]["detail_json"])["count"] == 1
+
+
 # -------------------------------------------------------------------- audit
 
 def test_the_audit_prints_the_seam_on_both_sides_of_the_cut(tmp_path, store):
