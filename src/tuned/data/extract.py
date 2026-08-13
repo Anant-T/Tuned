@@ -34,28 +34,54 @@ rather than emitted in a maybe-clean state:
 
 The residue check is the load-bearing one. Cutting EARLY - at a marker-ish
 line inside the front matter - is the failure that would otherwise be
-silent, because the result still looks like a judgment; the residue check
-turns it into a refusal. Cutting LATE is caught by the strip fraction. A
-document nobody can segment confidently is worth far less than the cost of
-the one that quietly poisons a dataset, so the refusal set is meant to be
-non-empty and is reported as a rate.
+silent, because the result still looks like a judgment. Cutting LATE is
+caught by the strip fraction. A document nobody can segment confidently is
+worth far less than the cost of the one that quietly poisons a dataset, so
+the refusal set is meant to be non-empty and is reported as a rate.
 
-That check COMPARES the two halves of the document rather than only looking
-forward from the cut, and it reads the furniture in every rendering the PDF
-reader can produce (a table bar, a blockquote marker, a bullet, a heading
-hash, letter-spaced capitals, a mid-line wrap). Both of those are the answer
-to the same discovery: a guard that reads one rendering, or that can only
-see the 3,000 characters after the cut, does not REFUSE the documents it
-cannot read - it EMITS them, headnote and all, and the result is
-indistinguishable from a clean judgment for anything downstream. So on an
-emitted document `signals` is the whole file's signature set, and
+WHAT THE RESIDUE CHECK ACTUALLY GUARANTEES, stated narrowly because the
+wider claim that used to stand here was false. It is a union of FOUR rules,
+and an early cut is refused when it leaves the evidence any one of them
+reads:
+
+  1  SEAM      a signature within RESIDUE_WINDOW past the cut;
+  2  COMPARE   a signature name the removed head cannot account for,
+                anywhere in the file (including at its END, which no
+                forward window can reach);
+  3  BLOCK     the cut did not BEGIN a block of text, while furniture was
+                removed - a heading is set off, a wrapped line is not;
+  4  ENUM      the body opens on the item after the last one the removed
+                head reached - the two sides read as one list.
+
+Rules 1 and 2 read the SIGNATURES and 3 and 4 read the CUT, and that split
+is the answer to a demonstrated failure: a real headnote carries ONE `HELD:`
+with numbered points under it, so a cut inside that block satisfies both
+signature rules at once - the name is accounted for on the removed side and
+nothing repeats the label past the cut - and the document is emitted with
+the publisher's holding on top of it.
+
+The residual is what is left when all four are silent: an unnumbered
+publisher's paragraph continuing past a properly set-off cut, with no
+signature anywhere after it. That case is still EMITTED, and `signals` will
+name the furniture that WAS removed, so the first-run tell below does not
+fire on it. It is this module's sharpest known residual.
+
+The guard also reads the furniture in every rendering the PDF reader can
+produce (a table bar, a blockquote marker, a bullet, a heading hash,
+letter-spaced capitals - across a line wrap or not - a mid-line wrap, a
+soft-hyphenated word, an ordered-list heading). That is the answer to the
+same discovery: a guard that reads one rendering does not REFUSE the
+documents it cannot read - it EMITS them, headnote and all. So on an emitted
+document `signals` is the signature set of the whole CLEANED document, and
 
     `--audit` printing `headnote signals: none` against a document that
     visibly HAS a headnote means the guard is blind to this reporter's
     typesetting - and then every `ok` document in that run is suspect.
 
 That is the cheapest check available on run one and it is printed at the top
-of every audit.
+of every audit. It is a check on RECOGNITION and not on placement: it says
+nothing about the residual two paragraphs up, where the furniture IS
+recognised and `signals` reads healthy.
 
 RESUMABILITY IS THE DESIGN
 --------------------------
@@ -110,7 +136,15 @@ from tuned.data.select import SELECTION_FILENAME
 #      looking forward from the cut. Both change which documents are emitted
 #      AND (through demotion of table bars, blockquote markers and bullets)
 #      the text of the ones that are, so every version-1 row is stale.
-EXTRACT_VERSION = 2
+#   3  the residue check reads the CUT as well as the signatures (a cut that
+#      begins no block, or that continues the removed head's numbering, is
+#      refused), and the signature set grew four renderings - the bare and
+#      title-case `HELD` labels, the soft-hyphenated heading, the numbered
+#      section heading and the letter-spaced heading that wrapped. Both move
+#      the emitted SET; neither moves the text of a document that is still
+#      emitted, so a version-2 row is stale in its verdict and not in its
+#      bytes. Re-extraction is still the only way to find that out.
+EXTRACT_VERSION = 3
 
 TEXT_DIRNAME = "text"
 EXTRACTION_FILENAME = "extraction.jsonl"
@@ -158,6 +192,10 @@ MIN_LATIN_RATIO = 0.5
 # A headnote leaks at the SEAM; an incidental "HELD:" deep in a quotation is
 # a different thing and is not this check's business.
 RESIDUE_WINDOW = 3000
+# How far into the body an opening enumerator still counts as "this is where
+# the body starts". Past this the first number on a line is a quotation or a
+# statutory clause, not the seam.
+SEAM_ENUM_WINDOW = 1200
 
 # A page break is joined with a plain newline, NOT a blank line. A judgment
 # runs on across pages, so a blank line there would announce a paragraph
@@ -255,6 +293,38 @@ def _despace(text: str) -> str:
     that tells the reporter's `HELD` from the court's `held`.
     """
     return "\n".join("".join(line.split()) for line in text.split("\n"))
+
+
+def _despace_pairs(text: str) -> str:
+    """`_despace`, with every line also joined to the one after it.
+
+    A letter-spaced heading is set at whatever width the printed column was,
+    so `C A S E   L A W   R E F E R E N C E` arrives as TWO lines whenever the
+    column was narrower than the heading - and the per-line form then reads
+    two halves of a heading and recognises neither. Joining consecutive PAIRS
+    lets a heading cross one wrap while keeping the `^` anchor that stops
+    "list of acts" matching a sentence about one: a signature wholly inside
+    one line still begins a pair. (`$`-anchored signatures are read off the
+    per-line form; a pair has the next line stuck to its end by design.)
+
+    The LAST line has no successor and is not carried here: a lone `l[-1]`
+    entry would only repeat what `_despace` gives the same caller, which is
+    why mutating that tail away changed nothing and it is gone.
+    """
+    lines = ["".join(line.split()) for line in text.split("\n")]
+    return "\n".join(a + b for a, b in zip(lines, lines[1:]))
+
+
+# A word broken across a line by the typesetter's soft hyphen. `Case Law
+# Refer-\nence` is the same heading as `Case Law Reference`, and it is only
+# ever joined for MATCHING - the emitted text keeps what the reader gave it,
+# because guessing which hyphens were the author's is a different problem.
+_SOFT_HYPHEN = re.compile(r"-[ \t]*\n[ \t]*")
+
+
+def _dehyphen(text: str) -> str:
+    """Every soft-hyphen line break closed up, for the matching form only."""
+    return _SOFT_HYPHEN.sub("", text)
 
 
 # --------------------------------------------------------------------------
@@ -590,33 +660,111 @@ def author_line_offset(text: str) -> int | None:
 # it did not end at the margin. The `^` was buying nothing and hiding that
 # case. Everything else stays line-anchored: those are headings, and an
 # unanchored "list of acts" would match a sentence about one.
+# The newer volumes NUMBER their front-matter sections, and the reader puts
+# the enumerator in front of the heading exactly as printed - so a bare `^`
+# reads `1. Issue for Consideration` as prose. An ordered-list heading is a
+# heading.
+_ENUM_HEADING = r"[ \t]*(?:\(?\d{1,3}[.)][ \t]*)?"
+_ENUM_HEADING_SQUASHED = r"(?:\(?\d{1,3}[.)])?"
 _SIGNATURES = (
-    ("held", re.compile(r"\bHELD\s*[:.]"), re.compile(r"(?<![A-Za-z])HELD[:.]")),
+    # `HELD` is the reporter's label in three shapes the reprints actually
+    # use: `HELD:` anywhere on a line (the column wrap), a bare all-caps
+    # `HELD` opening a line with no punctuation at all, and the title-case
+    # `Held:` the volumes set as often as the shouted one. Only the first is
+    # unanchored - all-caps mid-line is unambiguous - and the title-case form
+    # is line-anchored AND requires the colon, because that is exactly what
+    # separates the reporter's label from the ordinary verb a column wrap can
+    # leave at the start of a line ("...the High Court / held: that ...",
+    # which is lower case and stays out).
+    #
+    # `Held:` is read on the DE-SPACED form only, and deliberately: taking
+    # the spacing out of a line cannot break a pattern that has no spacing in
+    # it, so a plain limb beside it would be a branch with no case of its own
+    # (it was there, mutation showed it was dead, and it is gone). The
+    # de-spaced BARE limb is anchored at both ends for the opposite reason -
+    # de-spacing `HELDER AND ANOTHER v. STATE` leaves a line that opens with
+    # those four letters and is a case name.
+    ("held",
+     re.compile(r"\bHELD\s*[:.]|^[ \t]*HELD\b", re.M),
+     re.compile(r"(?<![A-Za-z])HELD[:.]|^HELD$|^Held:", re.M)),
     ("case_law_reference",
-     re.compile(r"^\s*case\s+law\s+(?:reference|referred|cited)", re.I | re.M),
-     re.compile(r"^caselaw(?:reference|referred|cited)", re.I | re.M)),
+     re.compile(rf"^{_ENUM_HEADING}case\s+law\s+(?:reference|referred|cited)", re.I | re.M),
+     re.compile(rf"^{_ENUM_HEADING_SQUASHED}caselaw(?:reference|referred|cited)", re.I | re.M)),
     ("cases_referred_to",
-     re.compile(r"^\s*cases?\s+referred\s+to\s*:?\s*$", re.I | re.M),
-     re.compile(r"^cases?referredto:?$", re.I | re.M)),
+     re.compile(rf"^{_ENUM_HEADING}cases?\s+referred\s+to\s*:?\s*$", re.I | re.M),
+     re.compile(rf"^{_ENUM_HEADING_SQUASHED}cases?referredto:?$", re.I | re.M)),
     ("list_of_acts",
-     re.compile(r"^\s*list\s+of\s+acts", re.I | re.M),
-     re.compile(r"^listofacts", re.I | re.M)),
+     re.compile(rf"^{_ENUM_HEADING}list\s+of\s+acts", re.I | re.M),
+     re.compile(rf"^{_ENUM_HEADING_SQUASHED}listofacts", re.I | re.M)),
     ("list_of_keywords",
-     re.compile(r"^\s*list\s+of\s+keywords", re.I | re.M),
-     re.compile(r"^listofkeywords", re.I | re.M)),
+     re.compile(rf"^{_ENUM_HEADING}list\s+of\s+keywords", re.I | re.M),
+     re.compile(rf"^{_ENUM_HEADING_SQUASHED}listofkeywords", re.I | re.M)),
     ("issue_for_consideration",
-     re.compile(r"^\s*issues?\s+for\s+consideration", re.I | re.M),
-     re.compile(r"^issues?forconsideration", re.I | re.M)),
+     re.compile(rf"^{_ENUM_HEADING}issues?\s+for\s+consideration", re.I | re.M),
+     re.compile(rf"^{_ENUM_HEADING_SQUASHED}issues?forconsideration", re.I | re.M)),
     ("headnotes",
-     re.compile(r"^\s*headnotes?\s*:?\s*$", re.I | re.M),
-     re.compile(r"^headnotes?:?$", re.I | re.M)),
+     re.compile(rf"^{_ENUM_HEADING}headnotes?\s*:?\s*$", re.I | re.M),
+     re.compile(rf"^{_ENUM_HEADING_SQUASHED}headnotes?:?$", re.I | re.M)),
     ("case_arising_from",
-     re.compile(r"^\s*case\s+arising\s+from", re.I | re.M),
-     re.compile(r"^casearisingfrom", re.I | re.M)),
+     re.compile(rf"^{_ENUM_HEADING}case\s+arising\s+from", re.I | re.M),
+     re.compile(rf"^{_ENUM_HEADING_SQUASHED}casearisingfrom", re.I | re.M)),
     ("appearances",
-     re.compile(r"^\s*appearances?\s+for\s+parties", re.I | re.M),
-     re.compile(r"^appearances?forparties", re.I | re.M)),
+     re.compile(rf"^{_ENUM_HEADING}appearances?\s+for\s+parties", re.I | re.M),
+     re.compile(rf"^{_ENUM_HEADING_SQUASHED}appearances?forparties", re.I | re.M)),
 )
+
+
+# --------------------------------------------------------------------------
+# The seam. Where the cut sits INSIDE what it removed.
+# --------------------------------------------------------------------------
+#
+# THE FAILURE THESE TWO RULES EXIST FOR, which the signature rules cannot
+# see. A real S.C.R. headnote carries ONE `HELD:` and numbers the points
+# under it, so a marker-ish line inside that block satisfies every condition
+# the two signature rules need in order to stay silent: the only signature
+# name in the file is on the REMOVED side (so the comparison is satisfied by
+# name), and nothing repeats the label past the cut (so the window is empty).
+# The document is then emitted with the publisher's holding at the top of it
+# AND with `signals` naming the furniture that WAS removed - so the audit's
+# first-run tell, which reads `none` as the alarm, prints a healthy line over
+# contaminated text. That is worse than a rendering nothing recognises.
+#
+# Both rules therefore read the CUT rather than the signatures, and both are
+# armed only when the removed head carried furniture: where nothing editorial
+# was removed there is no block for the cut to be inside, and a document with
+# no headnote must not pay for this.
+
+# The removed head ends on a blank line - the evidence that the block the
+# last signature opened had CLOSED before the cut. A typeset heading is set
+# off from the text above it; a line that the printed column merely wrapped
+# onto is not, and that is the whole difference between `O R D E R` the
+# court's heading and `ORDER` the fourteenth word of the publisher's holding.
+_SEAM_BLOCK_BREAK = re.compile(r"\n[ \t]*\n[ \t]*\Z")
+# An enumerated item at a line start, optionally behind the label that opens
+# the block (`HELD: 1.`). The headnote's holding points and the judgment's own
+# paragraphs are both written this way, which is exactly why a body opening on
+# the number AFTER the one the headnote reached is the headnote continuing.
+_ENUM_ITEM = re.compile(r"^[ \t]{0,3}(?:[A-Za-z][A-Za-z ]{0,23}:[ \t]*)?\(?(\d{1,3})[.)][ \t]", re.M)
+
+
+def seam_splits_a_block(head: str) -> bool:
+    """True when the cut did not BEGIN a block of text."""
+    return _SEAM_BLOCK_BREAK.search(head) is None
+
+
+def seam_continues_an_enumeration(head: str, body: str) -> bool:
+    """True when the body opens on the item after the removed head's last one.
+
+    Compares the NUMBERS rather than demanding the body open at `1.`: a
+    judgment whose first paragraph the reader did not number would fail that,
+    and this rule is meant to cost recall only where the two sides of the cut
+    read as one list.
+    """
+    items = _ENUM_ITEM.findall(head)
+    opening = _ENUM_ITEM.search(body[:SEAM_ENUM_WINDOW])
+    if not items or opening is None:
+        return False
+    return int(opening.group(1)) == int(items[-1]) + 1
 
 
 def headnote_signals(text: str) -> tuple[str, ...]:
@@ -626,14 +774,26 @@ def headnote_signals(text: str) -> tuple[str, ...]:
     Everything the reader can put in front of the first word of a line - a
     table bar, a blockquote marker, a bullet, a heading hash, a bold run - is
     decoration, and a guard that reads one rendering of the furniture refuses
-    one rendering of the headnote and publishes the other seven.
+    one rendering of the headnote and publishes the other eight.
+
+    Each signature is then read against up to FOUR forms of the same text,
+    one per way the typesetting can break a heading the eye reads whole: as
+    demoted; with soft-hyphen line breaks closed up (`Case Law Refer-/ence`);
+    with spacing removed line by line (the letter-spaced heading); and with
+    spacing removed across one wrap (the letter-spaced heading the printed
+    column was too narrow to hold).
     """
     plain = demote_markdown(text)
-    despaced = _despace(plain)
+    dehyphenated = _dehyphen(plain)
+    plains = (plain,) if dehyphenated == plain else (plain, dehyphenated)
+    spaced_forms = tuple(
+        form for source in plains for form in (_despace(source), _despace_pairs(source))
+    )
     return tuple(
         name
         for name, pattern, spaced in _SIGNATURES
-        if pattern.search(plain) or spaced.search(despaced)
+        if any(pattern.search(form) for form in plains)
+        or any(spaced.search(form) for form in spaced_forms)
     )
 
 
@@ -874,7 +1034,20 @@ def extract_text(pages: Sequence[str]) -> Extraction:
             - set(removed_signals)
         )
     )
-    if residue:
+    # AND THE TWO THAT READ THE CUT INSTEAD OF THE SIGNATURES, because a
+    # headnote with ONE `HELD:` and numbered points under it satisfies both
+    # rules above while the cut sits in the middle of it (see the seam rules).
+    # Armed only when furniture was actually removed.
+    #
+    #   BLOCK:   the cut did not begin a block. A heading is set off; a
+    #            wrapped line is not.
+    #   ENUM:    the body opens on the item after the last one the removed
+    #            head reached, i.e. the two sides read as one list.
+    head = joined[: boundary.offset]
+    split_seam = bool(removed_signals) and (
+        seam_splits_a_block(head) or seam_continues_an_enumeration(head, body)
+    )
+    if residue or split_seam:
         # The cut landed INSIDE the front matter, or went over the top of it.
         # Emitting this document would ship the publisher's summary of the
         # answer.
@@ -964,22 +1137,44 @@ READER_REQUIRED = ("page_chunks", "margins", "table_strategy")
 
 
 def _reader_options(to_markdown) -> dict:
-    """READER_OPTIONS this `to_markdown` can actually take, or an error."""
+    """READER_OPTIONS this `to_markdown` can actually take, or an error.
+
+    A `**kwargs` in the signature does NOT satisfy the requirement, and that
+    is the whole point of the check rather than an oversight of it: a reader
+    that swallows `**kwargs` accepts `margins=0` without applying it, so a
+    renamed option would leave the library's 50-point CROP in force on every
+    page while this function reported that it had pinned the behaviour. An
+    option that is only *accepted* is not an option that is *honoured*, and
+    only an explicit parameter is evidence of the latter.
+    """
     import inspect
 
     params = inspect.signature(to_markdown).parameters
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return dict(READER_OPTIONS)
+    var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
     missing = [name for name in READER_REQUIRED if name not in params]
     if missing:
         raise ExtractionError(
             f"the installed pymupdf4llm does not accept {', '.join(missing)}, and this "
             f"module pins the reader's behaviour rather than inheriting it - `margins` "
             f"above all, because the library's default crops the running heads and the "
-            f"page-tail footnotes away before this module can see them. Check the "
-            f"installed version against READER_OPTIONS in this file."
+            f"page-tail footnotes away before this module can see them"
+            + (
+                " (its signature takes **kwargs, which accepts these names without "
+                "promising to honour them - that is not the same thing and is not "
+                "accepted here)"
+                if var_keyword
+                else ""
+            )
+            + f". Check the installed version against READER_OPTIONS in this file."
         )
-    return {name: value for name, value in READER_OPTIONS.items() if name in params}
+    # The non-required ones may ride in on **kwargs: losing a progress bar to
+    # a renamed option is not worth stopping a run over, which is the same
+    # reason they are not in READER_REQUIRED.
+    return {
+        name: value
+        for name, value in READER_OPTIONS.items()
+        if name in params or var_keyword
+    }
 
 
 def read_pdf_pages(path: str | Path) -> list[str]:
@@ -1306,8 +1501,14 @@ def manifest_rows(
     metadata can carry a judgment twice, and two citations can address one
     object - and the corpus would then hold that judgment twice under two
     case ids. Nothing downstream reads object_key for identity, so this is
-    the only place it can be caught; the first row wins, which in a
-    stratified file is the stronger one.
+    the only place it can be caught.
+
+    WHICH row wins is the FIRST one in the order `rows` arrives in, and that
+    is all this guarantees: it is deduplication, not selection. The dropped
+    keys are logged as `manifest_duplicate_documents` rather than discarded
+    silently, because a judgment addressed by two citations is a fact about
+    the metadata and the operator is the one who can say which citation is
+    the one to keep.
     """
     documents = {row["object_key"]: row for row in store.documents(source_id, status=STATUS_OK)}
     seen: set[str] = set()
@@ -1423,11 +1624,15 @@ def _from_line_start(excerpt: str, truncated: bool) -> str:
 # a clean judgment, and the line the operator would otherwise scroll past
 # says exactly what a clean document says.
 AUDIT_TELL = (
-    "  READ THIS FIRST: an emitted document reports every editorial signature it still\n"
-    "  carries, so `headnote signals: none` means THIS FILE HAS NO HEADNOTE ANYWHERE. If\n"
-    "  you can see a headnote on a document that printed `none`, the guard cannot read\n"
-    "  this reporter's typesetting - and then every `ok` document in this run is\n"
-    "  suspect, not just this one. Stop and re-read the boundary rules."
+    "  READ THIS FIRST: an emitted document lists every editorial signature the guard\n"
+    "  RECOGNISED in it, so `headnote signals: none` means the guard found no editorial\n"
+    "  furniture anywhere in this file after cleanup (running heads, signature stamps and\n"
+    "  pre-boundary footnotes are removed before it looks). If you can see a headnote on a\n"
+    "  document that printed `none`, the guard cannot read this reporter's typesetting -\n"
+    "  and then every `ok` document in this run is suspect, not just this one.\n"
+    "  It settles RECOGNITION and not placement: a document that names the furniture it\n"
+    "  removed can still have been cut inside that furniture, which the four residue\n"
+    "  rules narrow but do not close. Stop and re-read the boundary rules."
 )
 
 

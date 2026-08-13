@@ -31,6 +31,10 @@ from tuned.data.extract import (
     RESIDUE_WINDOW,
     RUNNING_DIGIT_BLIND_CHARS,
     RUNNING_MAX_CHARS,
+    _despace,
+    _despace_pairs,
+    _MD_TABLE_ROW,
+    _SIGNATURES,
     clean_pages,
     demote_markdown,
     extract_text,
@@ -300,6 +304,31 @@ FURNITURE = {
         f"Bombay Engineering Service (Recruitment) Rules, 1978, r.7. {_HELD}\n\n"
         f"|{_REF}|||\n|---|---|---|\n|(2011) 4 SCC 707|referred to|para 12|\n"
     ),
+    # THE NINTH RENDERING AND THE TWO THAT ARE NOT RENDERINGS AT ALL, added
+    # after the round-1 residual was read back as "exotic" and two of its six
+    # shapes turned out to be ordinary law-report typography:
+    #
+    #   held_bare        the label with no punctuation after it;
+    #   held_title_case  the label as the newer volumes set it;
+    #   soft_hyphen      a heading the typesetter broke with a hyphen;
+    #   numbered_heading a front-matter section printed as an ordered list;
+    #   spaced_and_wrapped  a letter-spaced heading too wide for the column,
+    #                    which the per-line de-spacing reads as two halves of
+    #                    a heading and recognises as neither.
+    "held_bare": (
+        "HELD 1. The seniority of a promotee is reckoned from regular appointment.\n\n"
+        f"{_REF}\n{_REF_ROW}\n"
+    ),
+    "held_title_case": (
+        "Held: 1. The seniority of a promotee is reckoned from regular appointment.\n\n"
+        f"{_REF}\n{_REF_ROW}\n"
+    ),
+    "soft_hyphen": f"{_HELD}\n\nCase Law Refer-\nence:\n{_REF_ROW}\n",
+    "numbered_heading": f"1. {_HELD}\n\n2. {_REF}\n{_REF_ROW}\n",
+    "spaced_and_wrapped": (
+        "H E L D :  1. The seniority of a promotee is reckoned from regular\n"
+        f"appointment.\n\nC A S E   L A W\nR E F E R E N C E :\n{_REF_ROW}\n"
+    ),
 }
 
 # The same block with the furniture taken out and NOTHING else changed. It is
@@ -358,6 +387,142 @@ def test_an_early_cut_is_refused_in_every_rendering_of_the_furniture(rendering):
     assert control.text.startswith("ORDER")
 
 
+# Each signature is a union of two patterns - one read on the demoted text
+# and one on the same text with its spacing removed - and until this round
+# only `held` and `case_law_reference` had a fixture for the second. The
+# seven SECTIONED signatures the newer volumes actually use were pinned in
+# their canonical rendering only, so the whole de-spaced half of each was
+# deletable with the suite green. A union's branches each need the case only
+# they can carry, and these are those cases.
+
+_SECTIONED = {
+    "list_of_acts": ("L I S T   O F   A C T S", "Code of Civil Procedure, 1908"),
+    "list_of_keywords": ("L I S T   O F   K E Y W O R D S", "Seniority; promotion; rule 7"),
+    "cases_referred_to": ("C A S E S   R E F E R R E D   T O :", "(2011) 4 SCC 707"),
+    "issue_for_consideration": (
+        "I S S U E   F O R   C O N S I D E R A T I O N",
+        "Whether ad hoc officiation counts towards seniority.",
+    ),
+    "headnotes": ("H E A D N O T E S", "Service Law - Promotion - Seniority."),
+    "case_arising_from": (
+        "C A S E   A R I S I N G   F R O M",
+        "Judgment and Order dated 12.03.2017 of the High Court of Bombay.",
+    ),
+    "appearances": (
+        "A P P E A R A N C E S   F O R   P A R T I E S",
+        "Ms. A. Shenoy, Sr. Adv. for the appellant.",
+    ),
+    "case_law_reference": ("C A S E   L A W   R E F E R E N C E", "(2011) 4 SCC 707"),
+    "held": ("H E L D :", "1. The seniority is reckoned from regular appointment."),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_SECTIONED))
+def test_every_signature_is_recognised_in_the_letter_spaced_rendering(name):
+    # THE CASE THE DE-SPACED HALF OF EACH SIGNATURE ALONE CAN CARRY. A
+    # typeset heading is letter-spaced, and the demoted text of one carries no
+    # adjacent "list" or "acts" for a plain pattern to find - so if this is
+    # the rendering the volume uses, the de-spaced pattern is the ONLY thing
+    # between that headnote and the corpus.
+    heading, body = _SECTIONED[name]
+    assert name in headnote_signals(f"{heading}\n{body}\n")
+    # THE PREMISE that makes this a test of the de-spaced branch and not of
+    # the signature as a whole: the plain branch cannot see this text at all.
+    plain_only = tuple(
+        n for n, pattern, _ in _SIGNATURES if pattern.search(f"{heading}\n{body}\n")
+    )
+    assert name not in plain_only
+    # ... and the control, so that "recognised" is not "recognises anything":
+    # the same words unspaced but not a heading are not a signature.
+    assert name not in headnote_signals(f"The parties addressed us on the {body}\n")
+
+
+@pytest.mark.parametrize("name", sorted(set(_SECTIONED) - {"held"}))
+def test_a_letter_spaced_section_heading_is_still_one_when_the_volume_numbers_it(name):
+    # THE CASE THE ENUMERATOR PREFIX OF THE DE-SPACED PATTERN ALONE CARRIES.
+    # The two prefixes - one on the plain pattern, one on the de-spaced - each
+    # covered for the other while a single fixture had both readings, so
+    # either was deletable. This document has only the de-spaced reading: the
+    # heading is letter-spaced, so nothing in it is adjacent enough for a
+    # plain pattern, AND it is numbered, so a de-spaced pattern without the
+    # prefix is anchored past the enumerator and sees nothing.
+    heading, body = _SECTIONED[name]
+    assert name in headnote_signals(f"2. {heading}\n{body}\n")
+    plain_only = tuple(
+        n for n, pattern, _ in _SIGNATURES if pattern.search(f"2. {heading}\n{body}\n")
+    )
+    assert name not in plain_only
+
+
+def test_the_plain_form_carries_a_label_the_column_wrapped_after_a_word():
+    # THE CASE THE UNANCHORED LIMB OF THE PLAIN `held` PATTERN ALONE CARRIES,
+    # and the reason the two forms of the same limb are not the same rule. The
+    # de-spaced limb refuses a letter immediately before the label - `WITHHELD:`
+    # must not read as furniture, and de-spacing deletes the space that would
+    # otherwise say so - so when the printed column happens to wrap after a
+    # WORD rather than after punctuation, only the plain form, which still has
+    # the space to anchor `\b` on, sees the reporter's label.
+    line = (
+        "Bombay Engineering Service (Recruitment) Rules, 1978, rule 7 seniority HELD: 1. The\n"
+        "seniority of a promotee is reckoned from regular appointment.\n"
+    )
+    assert "held" in headnote_signals(line)
+    assert not any(
+        spaced.search(form)
+        for name, _, spaced in _SIGNATURES
+        if name == "held"
+        for form in (_despace(line), _despace_pairs(line))
+    )
+    # ... and the negative that limb is shaped around: a word ENDING in the
+    # label is not the label.
+    assert headnote_signals("The consent was WITHHELD: the appeal fails.") == ()
+
+
+def test_the_plain_form_carries_a_bare_label_with_its_text_on_the_same_line():
+    # THE CASE THE PLAIN HALF OF `held` ALONE CAN CARRY, which is the other
+    # side of the same union. Taking the spacing out of this line runs the
+    # label into the sentence after it ("HELDTheseniority..."), and the
+    # de-spaced pattern is anchored at both ends precisely so that a case name
+    # like "HELDER AND ANOTHER" is not a signature - so only the plain form,
+    # which has a word boundary to work with, sees this one.
+    line = "HELD The seniority of a promotee is reckoned from regular appointment.\n"
+    assert "held" in headnote_signals(line)
+    spaced_only = tuple(n for n, _, spaced in _SIGNATURES if spaced.search(_despace(line)))
+    assert "held" not in spaced_only
+    assert "held" not in tuple(
+        n for n, _, spaced in _SIGNATURES if spaced.search(_despace_pairs(line))
+    )
+
+
+def test_the_plain_form_carries_a_heading_the_column_wrapped_twice():
+    # THE CASE THE PLAIN HALF OF `case_law_reference` ALONE CAN CARRY. The
+    # de-spaced form reads one line, and the pair form reads two; a narrow
+    # column can break a three-word heading over THREE lines, and the plain
+    # pattern's `\s+` is the only thing that spans them - which is also why
+    # that `\s+` is not the `[ \t]+` it looks like it could be.
+    text = "Case\nLaw\nReference:\n(2011) 4 SCC 707       referred to       para 12\n"
+    assert "case_law_reference" in headnote_signals(text)
+    spaced_forms = (_despace(text), _despace_pairs(text))
+    assert not any(
+        spaced.search(form)
+        for name, _, spaced in _SIGNATURES
+        if name == "case_law_reference"
+        for form in spaced_forms
+    )
+    # ... and the same heading NUMBERED, which is the case the enumerator
+    # prefix of the PLAIN pattern alone carries: the de-spaced forms are
+    # already out (the heading is broken over three lines), so if the plain
+    # pattern is anchored past the enumerator nothing sees this headnote.
+    numbered = "3. " + text
+    assert "case_law_reference" in headnote_signals(numbered)
+    assert not any(
+        spaced.search(form)
+        for name, _, spaced in _SIGNATURES
+        if name == "case_law_reference"
+        for form in (_despace(numbered), _despace_pairs(numbered))
+    )
+
+
 def test_a_marker_further_from_the_furniture_than_the_window_is_still_refused():
     # The window is measured in CHARACTERS and the front matter is measured
     # in PAGES: P0 puts the S.C.R. headnote at pages 1-3 of a routine
@@ -403,15 +568,17 @@ def test_a_marker_on_line_one_strips_nothing_and_is_not_a_successful_strip():
     assert headnote_signals(front[:RESIDUE_WINDOW]) == ()
 
 
-def test_a_cut_between_two_held_points_is_caught_at_the_seam_though_the_names_match():
-    # THE CASE THE COMPARISON CANNOT SEE, and the reason the seam window is
-    # still there beside it. The marker fires in the MIDDLE of the HELD
-    # block: `held` is on the removed side too, so the comparison is
+def test_a_cut_between_two_held_points_is_caught_though_the_names_match():
+    # THE CASE THE COMPARISON CANNOT SEE. The marker fires in the MIDDLE of
+    # the HELD block: `held` is on the removed side too, so the comparison is
     # satisfied by name while the second half of the publisher's holding sits
-    # directly under the cut. Only a rule that fires on the evidence AT THE
-    # SEAM, regardless of what was removed, refuses this document - which is
-    # why the check is a union of the two and not a replacement of one by the
-    # other.
+    # directly under the cut.
+    #
+    # This fixture repeats the LABEL on both sides, which is one rendering and
+    # not the common one - a real headnote carries one `HELD:` and numbers the
+    # points under it, which is the fixture two tests below. Three of the four
+    # seam rules fire here at once, so this test pins the conclusion and NOT
+    # any one rule; the branch-alone cases are the four tests that follow.
     front = (
         _CAPTION
         + "HELD: 1. The seniority of a promotee is reckoned from the date of regular\n"
@@ -426,12 +593,285 @@ def test_a_cut_between_two_held_points_is_caught_at_the_seam_though_the_names_ma
     assert result.reason == Q_HEADNOTE_RESIDUE
     assert result.text == ""
     # THE PREMISE: the comparison really is satisfied here - the same
-    # signature name stands on both sides of the cut - so the seam window is
-    # the only rule that can be doing the refusing.
+    # signature name stands on both sides of the cut - so the comparison is
+    # not what refused it.
     cut = front.index("ORDER")
     assert find_judgment_start(front).offset == cut
     assert "held" in headnote_signals(front[:cut])
     assert "held" in headnote_signals(front[cut:][:RESIDUE_WINDOW])
+
+
+def test_the_seam_window_alone_carries_a_cut_that_lands_between_two_holdings():
+    # BRANCH CASE 1 of the four-branch residue rule: the SEAM WINDOW, and the
+    # only document in the suite that no other branch can refuse. The cut is a
+    # properly set-off `ORDER` line between two unnumbered holdings, so it
+    # begins a block (branch 3 silent) and continues no enumeration (branch 4
+    # silent); `held` stands on both sides, so the comparison is satisfied
+    # (branch 2 silent). What is left is the evidence AT THE SEAM.
+    front = (
+        _CAPTION
+        + "HELD: The seniority of a promotee is reckoned from the date of regular\n"
+        "appointment and not from the date on which ad hoc officiation began.\n"
+        "\n"
+        "ORDER\n"
+        "\n"
+        "HELD: The High Court was in error in reading rule 7 as conferring a right\n"
+        "to count officiation towards seniority.\n"
+    )
+    result = extract_text([front + _pad(BODY, 2600)])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # THE PREMISES, one per silenced branch.
+    cut = front.index("ORDER")
+    assert find_judgment_start(front).offset == cut
+    assert "held" in headnote_signals(front[:cut])                  # comparison satisfied
+    assert front[:cut].endswith("\n\n")                             # the cut begins a block
+    assert re.search(r"^\s{0,3}\(?\d{1,3}[.)]\s", front, re.M) is None   # nothing enumerated
+    # ... and the seam window is the one thing that does see it.
+    assert "held" in headnote_signals(front[cut:][:RESIDUE_WINDOW])
+
+
+def test_an_early_cut_in_a_one_held_headnote_is_refused_when_the_next_point_is_only_numbered():
+    # THE CRITICAL. A real S.C.R. headnote carries ONE `HELD:` and numbers the
+    # points under it, and that is all it takes to satisfy every condition the
+    # first two branches need in order to stay silent: the only signature name
+    # in the file stands on the removed side, and the seam window past the cut
+    # is EMPTY because the publisher's second point does not repeat the label.
+    #
+    # The document is then emitted with the publisher's holding at the top of
+    # it AND with `signals: ('held',)` - so the audit's first-run tell, which
+    # reads `none` as the alarm, prints a healthy-looking line over
+    # contaminated text. That is strictly worse than a rendering nothing
+    # recognises, and it is what the third and fourth branches exist for.
+    front = (
+        _CAPTION
+        + "HELD: 1. The seniority of a promotee is reckoned from the date of regular\n"
+        "appointment and not from the date on which ad hoc officiation began.\n"
+        "ORDER\n\n"
+        "2. The High Court was in error in reading rule 7 as conferring a right to\n"
+        "count officiation towards seniority.\n"
+    )
+    document = front + _pad(BODY, 2600)
+    result = extract_text([document])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # THE PREMISES: both older branches really are satisfied by this document,
+    # so neither of them can be what refused it.
+    cut = front.index("ORDER")
+    assert find_judgment_start(front).offset == cut
+    assert headnote_signals(document[cut:][:RESIDUE_WINDOW]) == ()
+    assert set(headnote_signals(document)) <= set(headnote_signals(front[:cut]))
+    # THE CONTROL, and the whole finding: the identical document with the
+    # publisher's LABEL taken off - same cut, same words, same numbering - is
+    # emitted. So it is the furniture on the removed side, and nothing about
+    # the shape of this fixture, that does the refusing.
+    control = extract_text([front.replace("HELD: 1.", "1.") + _pad(BODY, 2600)])
+    assert control.ok, control.reason
+    assert control.text.startswith("ORDER")
+
+
+def test_an_early_cut_on_a_wrapped_order_line_inside_the_holding_is_refused():
+    # THE CRITICAL, second shape and the one that needs no numbering trick at
+    # all: the printed column wrapped so that one line reads exactly `ORDER`,
+    # deep inside the holding. Everything after it is the publisher's, and the
+    # whole of it would have been emitted.
+    front = (
+        _CAPTION
+        + "Service Law - Promotion - Seniority of promotees inter se - Whether the\n"
+        "period of ad hoc officiation counts towards seniority.\n"
+        "HELD: 1. The seniority of a promotee is reckoned from the date of regular\n"
+        "appointment and not from the date on which ad hoc officiation began, and the\n"
+        "rule must be read in that light and in no other, for the reasons which the\n"
+        "ORDER\n"
+        "2. The construction placed on rule 7 by the Full Bench does not lay down good\n"
+        "law and the appeal is accordingly allowed with no order as to costs.\n"
+        "3. The seniority list shall be redrawn within three months from today.\n"
+    )
+    document = front + _pad(BODY, 2600)
+    result = extract_text([document])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # THE PREMISES, again: the seam window is empty and the comparison is
+    # satisfied, so this refusal is neither of them.
+    cut = front.index("ORDER\n")
+    assert find_judgment_start(front).offset == cut
+    assert headnote_signals(document[cut:][:RESIDUE_WINDOW]) == ()
+    assert set(headnote_signals(document)) <= set(headnote_signals(front[:cut]))
+    # THE CONTROL: label off, everything else identical, emitted.
+    control = extract_text([front.replace("HELD: 1.", "1.") + _pad(BODY, 2600)])
+    assert control.ok, control.reason
+    assert control.text.startswith("ORDER")
+
+
+def test_a_cut_that_does_not_begin_a_block_is_refused_when_furniture_was_removed():
+    # BRANCH CASE 3: THE SEAM BREAK, alone. A typeset heading is set off from
+    # the text above it; a wrapped line is not. So when the removed head
+    # carried editorial furniture, the cut has to BEGIN a block - and this
+    # document's does not, while carrying no enumeration anywhere for branch 4
+    # to read and no signature past the cut for branch 1.
+    front = (
+        _CAPTION
+        + "HELD: The seniority of a promotee is reckoned from the date of regular\n"
+        "appointment and not from the date on which ad hoc officiation began, and the\n"
+        "ORDER\n"
+        "of the High Court proceeded on a reading of rule 7 that its language does not\n"
+        "carry, as the parties were agreed before us at the hearing of this appeal.\n"
+    )
+    document = front + _pad(BODY, 2600)
+    result = extract_text([document])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # THE PREMISES, one per silenced branch.
+    cut = front.index("ORDER\n")
+    assert find_judgment_start(front).offset == cut
+    assert headnote_signals(document[cut:][:RESIDUE_WINDOW]) == ()           # branch 1 silent
+    assert set(headnote_signals(document)) <= set(headnote_signals(front[:cut]))  # branch 2 silent
+    assert re.search(r"^\s{0,3}\(?\d{1,3}[.)]\s", front, re.M) is None       # branch 4 silent
+    # THE CONTROL: the same cut in the same words with no furniture removed is
+    # emitted, so the seam break only ever fires on a cut through furniture.
+    control = extract_text([front.replace("HELD: ", "") + _pad(BODY, 2600)])
+    assert control.ok, control.reason
+    assert control.text.startswith("ORDER")
+
+
+def test_a_cut_that_continues_the_removed_headnotes_numbering_is_refused():
+    # BRANCH CASE 4: THE SEAM ENUMERATION, alone. Here the reporter really did
+    # set `ORDER` off as its own block - between two numbered holding points -
+    # so the seam break is satisfied and the cut still lands inside the
+    # publisher's list. A judgment begins at ITS first paragraph; a body that
+    # opens on the point after the one the headnote had reached is the
+    # headnote continuing.
+    # THREE points before the cut and not one, so that "the LAST item the
+    # removed head reached" is a different number from "the first one it
+    # had": a rule that compared against the first would pass this document
+    # and the fixture would never say so.
+    front = (
+        _CAPTION
+        + "HELD: 1. The seniority of a promotee is reckoned from the date of regular\n"
+        "appointment and not from the date on which ad hoc officiation began.\n"
+        "2. Rule 7 confers no right to count officiation towards seniority.\n"
+        "3. The Full Bench decision does not lay down good law.\n"
+        "\n"
+        "ORDER\n"
+        "\n"
+        "4. The seniority list shall be redrawn within three months from today, and\n"
+        "the appeal is allowed in those terms with no order as to costs.\n"
+    )
+    document = front + _pad(BODY, 2600)
+    result = extract_text([document])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # THE PREMISES, one per silenced branch.
+    cut = front.index("ORDER\n")
+    assert find_judgment_start(front).offset == cut
+    assert headnote_signals(document[cut:][:RESIDUE_WINDOW]) == ()           # branch 1 silent
+    assert set(headnote_signals(document)) <= set(headnote_signals(front[:cut]))  # branch 2 silent
+    assert front[:cut].endswith("\n\n")                                      # branch 3 silent
+    # ... and the premise the three points exist for: the head reached 3, so
+    # only a rule reading the LAST item can meet the body's 4.
+    assert re.findall(r"^(?:HELD: )?(\d)\.", front[:cut], re.M) == ["1", "2", "3"]
+    # THE CONTROL: the same document whose body opens at ITS OWN first
+    # paragraph instead of the headnote's next one is emitted.
+    control = extract_text([front.replace("\n4. The seniority list", "\n1. The seniority list")
+                            + _pad(BODY, 2600)])
+    assert control.ok, control.reason
+
+
+def test_a_headnote_that_has_paragraph_breaks_earlier_does_not_excuse_the_cut():
+    # The block break is read at the END of the removed head and nowhere else,
+    # which is the difference between "this headnote had paragraphs in it" and
+    # "the cut began one". A `HELD` block runs to several points and has blank
+    # lines between them; a rule that accepted any blank line anywhere would be
+    # satisfied by the FIRST of them and never look at the seam again.
+    front = (
+        _CAPTION
+        + "HELD: The seniority of a promotee is reckoned from regular appointment.\n"
+        "\n"
+        "The High Court read rule 7 as conferring a right that its language does not\n"
+        "carry, and the construction placed on it by the Full Bench is therefore the\n"
+        "ORDER\n"
+        "under appeal, which cannot be sustained on any reading of the rule.\n"
+    )
+    document = front + _pad(BODY, 2600)
+    result = extract_text([document])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # THE PREMISES: the head really does carry a paragraph break, and it is
+    # really not at the seam - and no other branch can see this document.
+    cut = front.index("ORDER\n")
+    assert "\n\n" in front[:cut]
+    assert not front[:cut].endswith("\n\n")
+    assert headnote_signals(document[cut:][:RESIDUE_WINDOW]) == ()
+    assert set(headnote_signals(document)) <= set(headnote_signals(front[:cut]))
+    assert re.search(r"^\s{0,3}\(?\d{1,3}[.)]\s", front, re.M) is None
+
+
+def test_a_cut_after_a_single_holding_point_still_reads_the_number_behind_the_label():
+    # The enumerator of the FIRST holding point sits behind the label that
+    # opens the block (`HELD: 1.`) and not at the start of its line, so a rule
+    # that only reads line-anchored numbers sees no enumeration at all in a
+    # one-point headnote - which is the commonest headnote there is. The test
+    # above has three points and cannot say this, because its second and third
+    # are line-anchored and carry the comparison on their own.
+    front = (
+        _CAPTION
+        + "HELD: 1. The seniority of a promotee is reckoned from the date of regular\n"
+        "appointment and not from the date on which ad hoc officiation began.\n"
+        "\n"
+        "ORDER\n"
+        "\n"
+        "2. The High Court was in error in reading rule 7 as conferring a right to\n"
+        "count officiation towards seniority.\n"
+    )
+    document = front + _pad(BODY, 2600)
+    result = extract_text([document])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # THE PREMISES: every other branch is silent, and the ONLY enumerator in
+    # the removed head is the one standing behind the label.
+    cut = front.index("ORDER\n")
+    assert headnote_signals(document[cut:][:RESIDUE_WINDOW]) == ()
+    assert set(headnote_signals(document)) <= set(headnote_signals(front[:cut]))
+    assert front[:cut].endswith("\n\n")
+    assert re.search(r"^\s{0,3}\(?\d{1,3}[.)]\s", front[:cut], re.M) is None
+
+
+def test_a_judgment_that_restarts_its_own_numbering_is_not_read_as_a_continuation():
+    # THE RECALL SIDE of branch 4, and the reason it compares the NUMBERS
+    # rather than demanding the body open at 1. The headnote here runs to
+    # three points and the judgment opens at its own paragraph 1, which is
+    # what a reprint looks like; a rule that refused every body not opening at
+    # `1.` would also refuse every judgment whose first paragraph the reader
+    # did not number.
+    front = (
+        _CAPTION
+        + "HELD: 1. The seniority of a promotee is reckoned from regular appointment.\n"
+        "2. The High Court was in error in reading rule 7.\n"
+        "3. The seniority list shall be redrawn within three months.\n"
+        "\n"
+    )
+    result = extract_text([front + _pad(BODY, 2600)])
+
+    assert result.ok, result.reason
+    assert result.text.startswith("The Judgment of the Court was delivered by")
+    # THE PREMISE: the removed head really did end on point 3 and the body
+    # really does open at 1, so branch 4 had something to compare.
+    assert "3. The seniority list" in front
+    assert re.search(r"^1\.", result.text, re.M) is not None
 
 
 def test_an_emitted_document_reports_every_signature_it_still_carries():
@@ -638,6 +1078,12 @@ def test_a_judgment_with_no_headnote_at_all_is_kept_whole():
         ("The following Judgment of the Court was delivered by", "judgment_delivered_by"),
         ("The Judgment and Order of the Court was delivered by", "judgment_delivered_by"),
         ("**The Judgment of the Court was delivered by**", "judgment_delivered_by"),
+        # THE SECOND ALTERNATION OF `_DELIVERED_BY`, which nothing reached:
+        # the reporters put the verb before the noun as often as after it, and
+        # with no case here the whole limb was deletable with the suite green.
+        ("NAVIN SINHA, J. delivered the following judgment", "judgment_delivered_by"),
+        ("The Court delivered the following order", "judgment_delivered_by"),
+        ("R.F. NARIMAN, J. delivered the following Judgment", "judgment_delivered_by"),
         ("J U D G M E N T", "judgment_heading"),
         ("JUDGMENT", "judgment_heading"),
         ("## JUDGMENT", "judgment_heading"),
@@ -698,7 +1144,25 @@ def test_headnote_signals_name_the_editorial_furniture_and_not_ordinary_prose():
     # own quotation of an order as the reporter's headnote and refuse the
     # document. Prose is never in capitals; the reprint's HELD always is.
     assert headnote_signals("held: that the suit was barred by limitation.") == ()
-    assert headnote_signals("Held: that the suit was barred by limitation.") == ()
+    # WHERE THAT LINE MOVED, and why. The assertion here used to be that
+    # title-case `Held:` is prose too, which was over-broad: the rationale
+    # above is about what a COLUMN WRAP can leave at the start of a line, and
+    # a wrap cannot capitalise a word. A capital at a line start means the
+    # source had one - a sentence opening or a heading - and `Held:` opening a
+    # line is the label the newer volumes set. So it is furniture, and the
+    # discriminator that survives is the one the rationale actually supports:
+    # LOWER CASE stays out, and title case is LINE-ANCHORED, so the verb
+    # inside a sentence is untouched wherever the wrap happens to fall.
+    assert headnote_signals("Held: that the suit was barred by limitation.") == ("held",)
+    assert headnote_signals("The High Court Held: that the suit was barred.") == ()
+    # The two other renderings of the same label that no pattern read: a bare
+    # all-caps HELD with no punctuation at all, and the same heading with the
+    # spacing the typesetter put in it.
+    assert headnote_signals("HELD\nThe seniority is reckoned from regular appointment.") == ("held",)
+    assert headnote_signals("H E L D\nThe seniority is reckoned from appointment.") == ("held",)
+    # ... and the negative that keeps `HELD` from meaning "any capital word":
+    # an all-caps line is not a signature unless it is THIS label.
+    assert headnote_signals("HELDER AND ANOTHER v. STATE OF MAHARASHTRA") == ()
 
 
 # --------------------------------------------------------------------------
@@ -1013,6 +1477,41 @@ def test_markdown_decoration_is_demoted_without_eating_the_filename_underscores(
     assert demote_markdown("-----") == ""
 
 
+@pytest.mark.parametrize(
+    "row,alternative",
+    [
+        # A leading bar with NOTHING to close it - the shape a reader emits
+        # when the table's right edge ran off the detected region. One bar, so
+        # the two-bar alternative cannot see it.
+        ("|Case Law Reference", "leading_bar"),
+        # Two bars and no leading one - a row the reader indented past the
+        # three columns the leading-bar alternative allows, or one it never
+        # opened. No bar in column 0, so that alternative cannot see it.
+        ("     Case Law | Reference | para 12", "two_bars"),
+    ],
+)
+def test_a_table_row_is_demoted_in_both_shapes_the_reader_can_emit(row, alternative):
+    # `_MD_TABLE_ROW` is a union of two alternatives and the `md_table`
+    # fixture satisfies BOTH, so either could be deleted with the suite green.
+    # These are the rows only one of them can carry - and a bar left in
+    # column 0 is the difference between refusing a document and publishing
+    # the reporter's Case Law Reference table.
+    assert "|" not in demote_markdown(row)
+    assert "Case Law" in demote_markdown(row)
+    # THE PREMISE: this row has the shape only ONE alternative can read, and
+    # it is stated as a fact about the ROW rather than as a second copy of the
+    # rule - a test that re-implements the pattern it is testing passes when
+    # the two copies drift together and says nothing when they drift apart.
+    assert _MD_TABLE_ROW.search(row) is not None
+    if alternative == "leading_bar":
+        assert row.lstrip(" \t").startswith("|") and row.count("|") == 1
+    else:
+        assert not row.lstrip(" \t").startswith("|") and row.count("|") == 2
+    # ... and the whole point of the rule, which "no bars left" does not make
+    # on its own: the furniture under the bar is visible to the guard again.
+    assert headnote_signals(demote_markdown(row)) == ("case_law_reference",)
+
+
 # --------------------------------------------------------------------------
 # The join, the resume decision, and the run.
 # --------------------------------------------------------------------------
@@ -1043,6 +1542,7 @@ from tuned.data.extract import (
     pdf_index,
     read_pdf_pages,
     resolve_pdf,
+    audit_sample,
     spread,
     text_path_for,
     write_manifest,
@@ -1750,6 +2250,37 @@ def test_the_audit_of_a_run_that_refused_everything_still_shows_the_refusals(tmp
     assert store.document_count(SC_SOURCE_ID, status=STATUS_OK) == 0
 
 
+def test_a_healthy_corpus_still_spends_half_the_audit_on_the_refusals(tmp_path, store):
+    # THE OTHER HALF OF THE FILL RULE, and the case that half had none of.
+    # `max(n - emitted, n // 2)` has two terms: the first rescues the audit of
+    # a run that refused everything (the test above), and the SECOND is the
+    # ordinary run - where there are more than enough successes to fill the
+    # sample and the refusals would be crowded out to nothing by an even walk
+    # over a table they are a minority of. With no case here, `n // 2` was
+    # deletable with the whole suite green.
+    emitted = [_key(start=1 + 50 * i, end=40 + 50 * i) for i in range(8)]
+    refused = [_key(start=901, end=940), _key(start=951, end=990)]
+    _, paths = _corpus(tmp_path, emitted + refused, store=store)
+    unsegmentable = scr_pages(body=BODY.split("\n", 1)[1])
+    reader = FakeReader(
+        {paths[k]: scr_pages() for k in emitted} | {paths[k]: unsegmentable for k in refused}
+    )
+    extract_corpus(
+        store, [_selection(k) for k in emitted + refused], index=pdf_index(store),
+        text_root=tmp_path / "text", reader=reader,
+    )
+
+    picked = audit_sample(store, 4, source_id=SC_SOURCE_ID)
+
+    assert len(picked) == 4
+    assert sum(row["status"] == STATUS_QUARANTINED for row in picked) == 2
+    # THE PREMISE that makes this the SECOND term and not the first: there are
+    # plenty of emitted documents, so `n - emitted` is negative and only the
+    # half rule can be what reserved the two places.
+    assert store.document_count(SC_SOURCE_ID, status=STATUS_OK) == len(emitted)
+    assert 4 - store.document_count(SC_SOURCE_ID, status=STATUS_OK) < 0
+
+
 # --------------------------------------------------------------- the reader
 
 def test_the_reader_pins_the_options_that_decide_what_the_text_contains(monkeypatch):
@@ -1811,6 +2342,70 @@ def test_a_reader_missing_only_a_cosmetic_option_still_runs(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "pymupdf4llm", Terse)
     assert read_pdf_pages("a.pdf") == ["only page"]
+
+
+def test_a_reader_that_only_swallows_kwargs_is_refused_like_one_that_cannot_take_them(
+    monkeypatch,
+):
+    # THE ESCAPE HATCH THAT DEFEATED THE CHECK IT WAS PAIRED WITH. A reader
+    # whose signature ends in `**kwargs` ACCEPTS `margins=0` and then does
+    # nothing with it, so the library's 50-point crop stays in force on every
+    # page while the option check reports that the behaviour is pinned - which
+    # is precisely the silent default this check exists to prevent, arriving
+    # by a different door. Accepting a name is not honouring it.
+    seen = {}
+
+    class Loose:
+        @staticmethod
+        def to_markdown(path, *, page_chunks=False, **kwargs):
+            seen.update(kwargs)
+            # What the library actually does with what it swallowed: nothing.
+            # The crop default is still what produced this page.
+            return ["page one"]
+
+    monkeypatch.setitem(sys.modules, "pymupdf4llm", Loose)
+    with pytest.raises(ExtractionError, match="margins"):
+        read_pdf_pages("a.pdf")
+    # THE PREMISES. The reader really would have run and really would have
+    # taken the options without complaint - so nothing but this check stands
+    # between a renamed option and a silently cropped corpus.
+    assert seen == {}
+    assert Loose.to_markdown("a.pdf", margins=0, table_strategy="x") == ["page one"]
+    assert seen == {"margins": 0, "table_strategy": "x"}
+    # ... and the error names the option whose default decides the corpus.
+    assert "**kwargs" in _error_text(Loose)
+
+
+def _error_text(module) -> str:
+    from tuned.data.extract import _reader_options
+
+    try:
+        _reader_options(module.to_markdown)
+    except ExtractionError as exc:
+        return str(exc)
+    return ""
+
+
+def test_a_reader_with_kwargs_beside_the_required_options_may_use_them_for_the_rest(
+    monkeypatch,
+):
+    # The other side of the same line, so that the rule above is "**kwargs is
+    # not evidence" and not "**kwargs is fatal": a reader that names the three
+    # corpus-deciding options explicitly is honouring them, and the cosmetic
+    # ones may ride in on the catch-all.
+    seen = {}
+
+    class Modern:
+        @staticmethod
+        def to_markdown(path, *, page_chunks=False, margins=(0, 50, 0, 50),
+                        table_strategy="lines_strict", **kwargs):
+            seen.update(page_chunks=page_chunks, margins=margins, **kwargs)
+            return ["only page"]
+
+    monkeypatch.setitem(sys.modules, "pymupdf4llm", Modern)
+    assert read_pdf_pages("a.pdf") == ["only page"]
+    assert seen["margins"] == 0
+    assert seen["show_progress"] is False
 
 
 # ---------------------------------------------------------------------- CLI
