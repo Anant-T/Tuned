@@ -40,6 +40,23 @@ document nobody can segment confidently is worth far less than the cost of
 the one that quietly poisons a dataset, so the refusal set is meant to be
 non-empty and is reported as a rate.
 
+That check COMPARES the two halves of the document rather than only looking
+forward from the cut, and it reads the furniture in every rendering the PDF
+reader can produce (a table bar, a blockquote marker, a bullet, a heading
+hash, letter-spaced capitals, a mid-line wrap). Both of those are the answer
+to the same discovery: a guard that reads one rendering, or that can only
+see the 3,000 characters after the cut, does not REFUSE the documents it
+cannot read - it EMITS them, headnote and all, and the result is
+indistinguishable from a clean judgment for anything downstream. So on an
+emitted document `signals` is the whole file's signature set, and
+
+    `--audit` printing `headnote signals: none` against a document that
+    visibly HAS a headnote means the guard is blind to this reporter's
+    typesetting - and then every `ok` document in that run is suspect.
+
+That is the cheapest check available on run one and it is printed at the top
+of every audit.
+
 RESUMABILITY IS THE DESIGN
 --------------------------
 This runs for hours over tens of thousands of documents and WILL be
@@ -87,7 +104,13 @@ from tuned.data.select import SELECTION_FILENAME
 
 # Bump when a cleanup or boundary rule changes: rows written under an older
 # version are re-extracted, rows at this version are left alone.
-EXTRACT_VERSION = 1
+#
+#   2  the headnote guard reads the furniture in every rendering the reader
+#      can emit, and compares the two halves of the document instead of only
+#      looking forward from the cut. Both change which documents are emitted
+#      AND (through demotion of table bars, blockquote markers and bullets)
+#      the text of the ones that are, so every version-1 row is stale.
+EXTRACT_VERSION = 2
 
 TEXT_DIRNAME = "text"
 EXTRACTION_FILENAME = "extraction.jsonl"
@@ -154,10 +177,18 @@ class ExtractionError(RuntimeError):
 # --------------------------------------------------------------------------
 
 # pymupdf4llm emits MARKDOWN: `**bold**` for emphasised runs, `#` headings
-# for detected headers, `-----` rules. Downstream is a numbered-paragraph
-# regex (P0's one corpus-wide Tier-1 signal), and `**1.**` does not match
-# `^\d+\.`, so the decoration is removed here rather than fought with
+# for detected headers, `-----` rules, `|cell|cell|` for detected TABLES,
+# `>` for indented blocks and `-` for lists. Downstream is a numbered-
+# paragraph regex (P0's one corpus-wide Tier-1 signal), and `**1.**` does not
+# match `^\d+\.`, so the decoration is removed here rather than fought with
 # everywhere it could turn up.
+#
+# It is also, and more importantly, what the HEADNOTE GUARD reads. Every
+# editorial signature below is anchored at a line start, so a `|` or a `>` in
+# front of "Case Law Reference" is the difference between refusing a document
+# and publishing the reporter's headnote. Demotion is therefore not
+# cosmetic: it is the guard's eyesight, and it must strip every decoration
+# that can sit BEFORE the first word of a line.
 _MD_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.M)
 _MD_RULE = re.compile(r"^[ \t]{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$", re.M)
 _MD_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", re.DOTALL)
@@ -165,11 +196,34 @@ _MD_ITALIC_STAR = re.compile(r"(?<!\*)\*(?=\S)([^*\n]+?)(?<=\S)\*(?!\*)")
 # Underscore emphasis ONLY when the underscores are not inside a word: the
 # S.C.R. object stem is `2020_7_941_960_EN` and a bare "_" strip would eat it.
 _MD_ITALIC_UNDER = re.compile(r"(?<![A-Za-z0-9_])_(?=\S)([^_\n]+?)(?<=\S)_(?![A-Za-z0-9_])")
+# A table's own decoration. The S.C.R. headnote's Case Law Reference block IS
+# a grid, so it is exactly what the reader's table detection turns into
+# `|pipes|` - and a `|` in column 0 is enough to hide the single most
+# recognisable piece of front matter in the corpus from a `^`-anchored rule.
+# The separator row (`|---|---|`) carries no text and goes; a content row
+# keeps its cells and loses its bars. A line with two or more bars is treated
+# as a row as well, because which of the two shapes this reader emits is a
+# property of a library version nobody here has run.
+_MD_TABLE_RULE = re.compile(r"^[ \t]{0,3}\|[ \t:|-]*$", re.M)
+_MD_TABLE_ROW = re.compile(r"^(?:[ \t]{0,3}\|.*|.*\|.*\|.*)$", re.M)
+# Blockquote and list markers, for the same reason and nothing more: both sit
+# in front of the first word of a line.
+_MD_QUOTE = re.compile(r"^[ \t]{0,3}(?:>[ \t]?)+", re.M)
+_MD_BULLET = re.compile(r"^[ \t]{0,3}[-*+][ \t]+", re.M)
 
 
 def demote_markdown(text: str) -> str:
-    """Markdown decoration out, characters in."""
+    """Markdown decoration out, characters in.
+
+    Order matters twice: a quoted rule (`> ---`) is only a rule once the
+    quote marker is gone, and a rule (`- - -`) is only distinguishable from a
+    bullet before the bullet is stripped.
+    """
+    text = _MD_TABLE_RULE.sub("", text)
+    text = _MD_TABLE_ROW.sub(lambda m: m.group(0).replace("|", " "), text)
+    text = _MD_QUOTE.sub("", text)
     text = _MD_RULE.sub("", text)
+    text = _MD_BULLET.sub("", text)
     text = _MD_HEADING.sub("", text)
     text = _MD_BOLD.sub(r"\1", text)
     text = _MD_ITALIC_STAR.sub(r"\1", text)
@@ -189,6 +243,18 @@ def _squash(line: str) -> str:
     reliable way to recognise one is to take the spacing out entirely.
     """
     return re.sub(r"\s+", "", line).casefold()
+
+
+def _despace(text: str) -> str:
+    """Every line with its spacing removed, one line per line, CASE KEPT.
+
+    The same answer `_squash` gives the boundary matcher, given to the
+    headnote guard - which needs it for the same reason (`H E L D :` and
+    `C A S E  L A W  R E F E R E N C E` are how a letter-spaced heading
+    extracts) and needs the CASE with it, because case is the only thing
+    that tells the reporter's `HELD` from the court's `held`.
+    """
+    return "\n".join("".join(line.split()) for line in text.split("\n"))
 
 
 # --------------------------------------------------------------------------
@@ -213,6 +279,15 @@ _SIGNATURE_HEADER = re.compile(r"^digitally\s+signed\s+by\s*:?$", re.I)
 # The print-alignment letters P0 found running down the left margin of the
 # reprints. A lettered SECTION heading ("A. FACTUAL MATRIX") carries text
 # and is not this.
+#
+# UNMODELLED, and it belongs to the reader rather than to this rule: this
+# assumes the reader emits each `A`-`H` as a LINE OF ITS OWN. A layout-aware
+# reader that inlines the margin letter into the adjacent text instead would
+# both zero `dropped: N margin` (which reads as "these reprints have no
+# margin letters" and is not what it means) and put a stray capital in front
+# of the paragraph number - breaking the `^\d+\.` anchor that P0 identified
+# as the only corpus-wide Tier-1 signal. `dropped: N margin` reading 0 on the
+# first run is therefore a thing to CHECK against the page, not a pass.
 _MARGIN_LETTER = re.compile(r"^[A-H]\.?$")
 
 
@@ -380,13 +455,6 @@ def split_footnotes(page: str, para_high: int) -> tuple[str, list[str], int]:
     return "\n".join(lines[:start]), block, para_high
 
 
-@dataclass(frozen=True)
-class CleanedPages:
-    pages: tuple[str, ...]
-    footnotes: tuple[tuple[int, str], ...]  # (page index, line)
-    stats: dict
-
-
 def clean_pages(pages: Sequence[str]) -> tuple[list[str], dict]:
     """Every cleanup pass, in the order P0 ranked the nuisances.
 
@@ -395,7 +463,7 @@ def clean_pages(pages: Sequence[str]) -> tuple[list[str], dict]:
     depends on which side of the headnote boundary its page falls.
     """
     demoted = [demote_markdown(page or "") for page in pages]
-    stats = {"signature": 0, "margin_letter": 0, "running": 0, "footnote": 0}
+    stats = {"signature": 0, "margin_letter": 0, "running": 0, "footnote_pages": 0}
 
     staged: list[str] = []
     for page in demoted:
@@ -423,7 +491,7 @@ def clean_pages(pages: Sequence[str]) -> tuple[list[str], dict]:
     for index, page in enumerate(staged):
         body, moved, para_high = split_footnotes(page, para_high)
         if moved:
-            stats["footnote"] += 1
+            stats["footnote_pages"] += 1
             footnotes.extend((index, line) for line in moved)
         out.append(body)
     stats["footnote_lines"] = tuple(footnotes)
@@ -507,26 +575,66 @@ def author_line_offset(text: str) -> int | None:
 # --------------------------------------------------------------------------
 
 # The furniture of an S.C.R. headnote, in both the older typeset shape and
-# the sectioned shape the newer volumes use. Anchored at a line start and
-# (for HELD) case-sensitive, because the COURT writes "held" in prose all
-# day - "this Court held that..." must not read as editorial furniture, or
-# every judgment discussing a precedent is quarantined.
+# the sectioned shape the newer volumes use. Each is matched TWICE - once on
+# the demoted text and once on the same text with its spacing removed - and
+# the second form is not a nicety: a letter-spaced heading is how these
+# reprints print a heading, and a guard that cannot read one is a guard that
+# EMITS the headnote under it.
+#
+# `HELD` is case-sensitive and NOT anchored to a line start. Casing is the
+# discriminator that matters - the COURT writes "held" in prose all day, and
+# "this Court held that..." must never read as editorial furniture or every
+# judgment discussing a precedent is quarantined - while POSITION is not a
+# discriminator at all: the text is hard-wrapped at whatever width the column
+# was, so the reporter's `HELD:` lands mid-line whenever the sentence before
+# it did not end at the margin. The `^` was buying nothing and hiding that
+# case. Everything else stays line-anchored: those are headings, and an
+# unanchored "list of acts" would match a sentence about one.
 _SIGNATURES = (
-    ("held", re.compile(r"^HELD\s*[:.]", re.M)),
-    ("case_law_reference", re.compile(r"^\s*case\s+law\s+(?:reference|referred|cited)", re.I | re.M)),
-    ("cases_referred_to", re.compile(r"^\s*cases?\s+referred\s+to\s*:?\s*$", re.I | re.M)),
-    ("list_of_acts", re.compile(r"^\s*list\s+of\s+acts", re.I | re.M)),
-    ("list_of_keywords", re.compile(r"^\s*list\s+of\s+keywords", re.I | re.M)),
-    ("issue_for_consideration", re.compile(r"^\s*issues?\s+for\s+consideration", re.I | re.M)),
-    ("headnotes", re.compile(r"^\s*headnotes?\s*:?\s*$", re.I | re.M)),
-    ("case_arising_from", re.compile(r"^\s*case\s+arising\s+from", re.I | re.M)),
-    ("appearances", re.compile(r"^\s*appearances?\s+for\s+parties", re.I | re.M)),
+    ("held", re.compile(r"\bHELD\s*[:.]"), re.compile(r"(?<![A-Za-z])HELD[:.]")),
+    ("case_law_reference",
+     re.compile(r"^\s*case\s+law\s+(?:reference|referred|cited)", re.I | re.M),
+     re.compile(r"^caselaw(?:reference|referred|cited)", re.I | re.M)),
+    ("cases_referred_to",
+     re.compile(r"^\s*cases?\s+referred\s+to\s*:?\s*$", re.I | re.M),
+     re.compile(r"^cases?referredto:?$", re.I | re.M)),
+    ("list_of_acts",
+     re.compile(r"^\s*list\s+of\s+acts", re.I | re.M),
+     re.compile(r"^listofacts", re.I | re.M)),
+    ("list_of_keywords",
+     re.compile(r"^\s*list\s+of\s+keywords", re.I | re.M),
+     re.compile(r"^listofkeywords", re.I | re.M)),
+    ("issue_for_consideration",
+     re.compile(r"^\s*issues?\s+for\s+consideration", re.I | re.M),
+     re.compile(r"^issues?forconsideration", re.I | re.M)),
+    ("headnotes",
+     re.compile(r"^\s*headnotes?\s*:?\s*$", re.I | re.M),
+     re.compile(r"^headnotes?:?$", re.I | re.M)),
+    ("case_arising_from",
+     re.compile(r"^\s*case\s+arising\s+from", re.I | re.M),
+     re.compile(r"^casearisingfrom", re.I | re.M)),
+    ("appearances",
+     re.compile(r"^\s*appearances?\s+for\s+parties", re.I | re.M),
+     re.compile(r"^appearances?forparties", re.I | re.M)),
 )
 
 
 def headnote_signals(text: str) -> tuple[str, ...]:
-    """Which pieces of editorial headnote furniture this text carries."""
-    return tuple(name for name, pattern in _SIGNATURES if pattern.search(text))
+    """Which pieces of editorial headnote furniture this text carries.
+
+    Demotes FIRST, so the guard sees exactly what the boundary matcher sees.
+    Everything the reader can put in front of the first word of a line - a
+    table bar, a blockquote marker, a bullet, a heading hash, a bold run - is
+    decoration, and a guard that reads one rendering of the furniture refuses
+    one rendering of the headnote and publishes the other seven.
+    """
+    plain = demote_markdown(text)
+    despaced = _despace(plain)
+    return tuple(
+        name
+        for name, pattern, spaced in _SIGNATURES
+        if pattern.search(plain) or spaced.search(despaced)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -695,6 +803,9 @@ def extract_text(pages: Sequence[str]) -> Extraction:
         offsets.append(cursor)
         cursor += len(page) + len(PAGE_SEPARATOR)
     joined = PAGE_SEPARATOR.join(cleaned)
+    # Every signature the document carries ANYWHERE. It is what a refusal
+    # reports, and it is one half of the residue comparison below.
+    doc_signals = headnote_signals(joined)
 
     def no(reason: str, **over) -> Extraction:
         return Extraction(
@@ -702,7 +813,7 @@ def extract_text(pages: Sequence[str]) -> Extraction:
             reason,
             pages=n_pages,
             reportable=reportable,
-            signals=headnote_signals(joined),
+            signals=doc_signals,
             cleanup=stats,
             **over,
         )
@@ -721,10 +832,52 @@ def extract_text(pages: Sequence[str]) -> Extraction:
         )
 
     body = joined[boundary.offset :]
-    residue = headnote_signals(body[:RESIDUE_WINDOW])
+    boundary_page = _page_of(offsets, boundary.offset)
+    # Footnotes are appended at the end of the document, so they travel
+    # ACROSS the boundary unless they are filtered by the page they came
+    # off. Strictly after the boundary page: the boundary page carries both
+    # the tail of the headnote and the head of the judgment, and an
+    # editorial reference is the one thing that must not come back. Decided
+    # here rather than after the checks so that what is kept is part of what
+    # the residue check reads - text appended after the guard has run is
+    # text the guard never saw.
+    kept = [line for page, line in footnote_lines if page > boundary_page]
+    removed_signals = headnote_signals(joined[: boundary.offset])
+
+    # THE RESIDUE CHECK, in two directions, because there are two ways to be
+    # wrong about a cut and only one of them looks forward.
+    #
+    #   NEAR:    any signature within RESIDUE_WINDOW past the cut. A headnote
+    #            leaks at the SEAM, and this fires on the evidence regardless
+    #            of what was removed.
+    #   BEYOND:  any signature the document carries that the REMOVED HEAD
+    #            does not. The window is measured in characters and the front
+    #            matter is measured in pages (P0: pages 1-3 of a routine
+    #            judgment), so a marker at the top of the front matter has
+    #            nothing to see inside the window - and a marker on line one
+    #            removes nothing at all, which the window cannot distinguish
+    #            from a document that never had a headnote.
+    #
+    # BEYOND compares by signature NAME, not by occurrence, and that is what
+    # keeps it from refusing the ordinary case: a reprint whose front matter
+    # carried `HELD:` and whose judgment later quotes an earlier report's
+    # `HELD:` is emitted, because the name is accounted for on the removed
+    # side. What it refuses is a signature with NO counterpart in what was
+    # thrown away - which is indistinguishable, from outside the document,
+    # from a headnote the cut went over the top of. It also catches the one
+    # thing no forward window ever could: editorial matter at the END of a
+    # file, which this module has no pass to strip.
+    residue = sorted(
+        set(headnote_signals(body[:RESIDUE_WINDOW]))
+        | (
+            (set(doc_signals) | set(headnote_signals("\n".join(kept))))
+            - set(removed_signals)
+        )
+    )
     if residue:
-        # The cut landed INSIDE the front matter. Emitting this document
-        # would ship the publisher's summary of the answer.
+        # The cut landed INSIDE the front matter, or went over the top of it.
+        # Emitting this document would ship the publisher's summary of the
+        # answer.
         return no(Q_HEADNOTE_RESIDUE, marker=boundary.marker, headnote_chars=boundary.offset)
     # SHORT BEFORE LARGE-STRIP, deliberately. When both hold there is
     # nothing to recover either way, and `strip_too_large` should keep its
@@ -735,13 +888,6 @@ def extract_text(pages: Sequence[str]) -> Extraction:
     if boundary.offset / len(joined) > MAX_STRIP_FRACTION:
         return no(Q_STRIP_TOO_LARGE, marker=boundary.marker, headnote_chars=boundary.offset)
 
-    boundary_page = _page_of(offsets, boundary.offset)
-    # Footnotes are appended at the end of the document, so they travel
-    # ACROSS the boundary unless they are filtered by the page they came
-    # off. Strictly after the boundary page: the boundary page carries both
-    # the tail of the headnote and the head of the judgment, and an
-    # editorial reference is the one thing that must not come back.
-    kept = [line for page, line in footnote_lines if page > boundary_page]
     if kept:
         body = body.rstrip() + "\n\n" + FOOTNOTE_HEADING + "\n" + "\n".join(kept)
 
@@ -758,7 +904,14 @@ def extract_text(pages: Sequence[str]) -> Extraction:
         # Signals of what was REMOVED - "this document had a headnote and it
         # is gone". A quarantine reports the signals of the WHOLE document
         # instead, because there the question is what is in the file at all.
-        signals=headnote_signals(joined[: boundary.offset]),
+        #
+        # On an EMITTED document the two are the same set, and that is a
+        # property of the check above rather than a coincidence: nothing is
+        # emitted while it still carries a signature the removed head did
+        # not. So `signals: none` on an emitted document means the file
+        # carries no editorial furniture anywhere - which is what makes it
+        # readable as a first-run alarm (see audit_report).
+        signals=removed_signals,
         reportable=reportable,
         footnotes=len(kept),
         cleanup=stats,
@@ -768,6 +921,66 @@ def extract_text(pages: Sequence[str]) -> Extraction:
 # --------------------------------------------------------------------------
 # The reader seam. Nothing above this line imports a PDF library.
 # --------------------------------------------------------------------------
+
+# EVERY option that decides what the text CONTAINS is passed explicitly, so
+# that the corpus is a property of this repository and not of whatever the
+# resolver installed. Each of these has a library default, and each default
+# quietly decides something this module then has to live with:
+#
+#   margins=0          the library's default crops 50 points off the top and
+#                      bottom of EVERY page. That band is where the running
+#                      head, the printed page number, the page-tail FOOTNOTES
+#                      and the REPORTABLE line live - i.e. the default
+#                      deletes the input to three passes below, and
+#                      `dropped: N running` would read 0 for a reason that
+#                      has nothing to do with the document.
+#   table_strategy     the Case Law Reference block is a GRID, and this
+#                      decides whether it arrives as `|pipes|` or as plain
+#                      lines. demote_markdown handles both, but which one
+#                      shows up is not left to a version number.
+#   write_images /     no image, and no base64 of an image, may ever land in
+#   embed_images       a judgment's text.
+#   force_text         text drawn over a figure is still the court's words.
+#   show_progress      a progress bar per document, over tens of thousands of
+#                      documents, is noise in a log nobody can then read.
+#
+# UNVERIFIED against a real pymupdf4llm (it is in the [build] extra and is
+# not installed here), which is the reason for the signature check rather
+# than a reason to leave the defaults in place: an option this module cannot
+# pass is a behaviour this module cannot state.
+READER_OPTIONS = {
+    "page_chunks": True,
+    "margins": 0,
+    "table_strategy": "lines_strict",
+    "write_images": False,
+    "embed_images": False,
+    "force_text": True,
+    "show_progress": False,
+}
+# The ones whose absence changes the CORPUS silently. A reader that cannot
+# take these is refused; the rest degrade to their defaults, because losing a
+# progress bar is not worth stopping a run over.
+READER_REQUIRED = ("page_chunks", "margins", "table_strategy")
+
+
+def _reader_options(to_markdown) -> dict:
+    """READER_OPTIONS this `to_markdown` can actually take, or an error."""
+    import inspect
+
+    params = inspect.signature(to_markdown).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(READER_OPTIONS)
+    missing = [name for name in READER_REQUIRED if name not in params]
+    if missing:
+        raise ExtractionError(
+            f"the installed pymupdf4llm does not accept {', '.join(missing)}, and this "
+            f"module pins the reader's behaviour rather than inheriting it - `margins` "
+            f"above all, because the library's default crops the running heads and the "
+            f"page-tail footnotes away before this module can see them. Check the "
+            f"installed version against READER_OPTIONS in this file."
+        )
+    return {name: value for name, value in READER_OPTIONS.items() if name in params}
+
 
 def read_pdf_pages(path: str | Path) -> list[str]:
     """One string per page, via pymupdf4llm.
@@ -782,7 +995,7 @@ def read_pdf_pages(path: str | Path) -> list[str]:
             "pymupdf4llm is needed to read the judgment PDFs and is not installed - "
             "run: pip install -e .[build]"
         ) from exc
-    chunks = pymupdf4llm.to_markdown(str(path), page_chunks=True)
+    chunks = pymupdf4llm.to_markdown(str(path), **_reader_options(pymupdf4llm.to_markdown))
     return [chunk["text"] if isinstance(chunk, dict) else str(chunk) for chunk in chunks]
 
 
@@ -963,12 +1176,15 @@ def extract_corpus(
         "quarantined": 0,
         "skipped": 0,
         "failed": 0,
+        "duplicate_rows": 0,
+        "reportable": 0,
         "chars": 0,
         "routes": dict.fromkeys(JOIN_ROUTES, 0),
         "reasons": {},
         "failures": [],
     }
     indexed = store.document_index(source_id)
+    seen: set[str] = set()
 
     for row in rows:
         if limit is not None and (
@@ -980,6 +1196,17 @@ def extract_corpus(
         stats["routes"][route] += 1
         if key is None:
             continue
+        if key in seen:
+            # ONE OBJECT, ONE ROW, and the FIRST row wins - the same rule the
+            # manifest applies, applied in the same direction. Two selection
+            # rows can land on one PDF, and if this one re-recorded from the
+            # later row then `--force` would leave the document row and the
+            # manifest row describing one judgment under two case ids, with
+            # nothing downstream reading object_key for identity to notice.
+            # It also saves re-reading the same PDF.
+            stats["duplicate_rows"] += 1
+            continue
+        seen.add(key)
 
         try:
             dest = text_path_for(text_root, key)
@@ -999,6 +1226,16 @@ def extract_corpus(
                 ) from exc
             continue
 
+        if result.reportable is not None:
+            # Counted because a NON-NULL flag on this corpus is a warning,
+            # not a fact about the judgment: P0 found REPORTABLE in 2 of 70
+            # of these objects, and the flag belongs to the COURT-RELEASED
+            # PDF rather than to the S.C.R. reprint. So a document that
+            # carries one is better read as "this object may not be a
+            # reprint" - i.e. exactly the object whose boundary rules may not
+            # apply. Un-counted, that caveat was in a report nobody reads at
+            # runtime.
+            stats["reportable"] += 1
         span = page_span_from_key(key)
         record = {
             "status": STATUS_OK if result.ok else STATUS_QUARANTINED,
@@ -1154,13 +1391,44 @@ def audit_sample(store, n: int, *, source_id: str = SC_SOURCE_ID) -> list[dict]:
     """
     quarantined = store.documents(source_id, status=STATUS_QUARANTINED)
     emitted = store.documents(source_id, status=STATUS_OK)
-    want_bad = min(len(quarantined), n // 2) if quarantined else 0
+    # Half, or as many as it takes to fill the sample when there are not
+    # enough emitted documents to fill it with. The second half of that
+    # matters most in the worst case there is: a run that refused everything
+    # would otherwise print an audit with nothing in it, at exactly the
+    # moment the operator most needs to see what was refused.
+    want_bad = min(len(quarantined), max(n - len(emitted), n // 2)) if quarantined else 0
     picked = spread(emitted, n - want_bad) + spread(quarantined, want_bad)
     return sorted(picked, key=lambda row: row["object_key"])
 
 
 def _indent(text: str, prefix: str = "      ") -> str:
     return "\n".join(prefix + line for line in text.strip().splitlines()) or prefix + "(nothing)"
+
+
+def _from_line_start(excerpt: str, truncated: bool) -> str:
+    """An excerpt that begins where a line does.
+
+    A window cut by character count opens mid-word, and the operator is
+    being asked to JUDGE this text - the first line has to be readable.
+    """
+    if not truncated or "\n" not in excerpt:
+        return excerpt
+    return excerpt.split("\n", 1)[1]
+
+
+# The one check that costs nothing on run one and settles the largest
+# residual in the module: whether the guard can read THIS reporter's
+# typesetting at all. It is printed at the top of every audit because a
+# blind guard is silent everywhere else - a contaminated document reads like
+# a clean judgment, and the line the operator would otherwise scroll past
+# says exactly what a clean document says.
+AUDIT_TELL = (
+    "  READ THIS FIRST: an emitted document reports every editorial signature it still\n"
+    "  carries, so `headnote signals: none` means THIS FILE HAS NO HEADNOTE ANYWHERE. If\n"
+    "  you can see a headnote on a document that printed `none`, the guard cannot read\n"
+    "  this reporter's typesetting - and then every `ok` document in this run is\n"
+    "  suspect, not just this one. Stop and re-read the boundary rules."
+)
 
 
 def audit_report(
@@ -1170,13 +1438,15 @@ def audit_report(
 
     RE-EXTRACTED rather than read back from disk, for two reasons: the text
     that was thrown away is not kept anywhere (the store holds the judgment,
-    not the publisher's headnote), and re-running is also a check that the
-    rules still produce what the corpus holds.
+    not the publisher's headnote), and re-running is a CHECK - the sampled
+    document is re-extracted under today's rules and compared, byte for
+    byte, against the row the corpus holds.
     """
     lines = [
         f"AUDIT of {store.document_count(source_id, status=STATUS_OK)} emitted and "
         f"{store.document_count(source_id, status=STATUS_QUARANTINED)} quarantined documents"
         f"  (extract_version {EXTRACT_VERSION})",
+        AUDIT_TELL,
     ]
     for row in audit_sample(store, n, source_id=source_id):
         key = row["object_key"]
@@ -1201,6 +1471,29 @@ def audit_report(
         result = extract_text(pages)
         boundary = find_judgment_start(joined)
 
+        # The other half of "re-running is also a check": what the rules
+        # produce TODAY against what the corpus was built from. A row that no
+        # longer reproduces is not a document to read, it is a version bump
+        # that has not been run - and the audit is the only place anything
+        # compares the two.
+        now = STATUS_OK if result.ok else STATUS_QUARANTINED
+        if now != row["status"]:
+            lines.append(
+                f"    !! THE RULES NO LONGER AGREE WITH THE CORPUS: the store says "
+                f"{row['status']}{' (' + row['reason'] + ')' if row['reason'] else ''}, "
+                f"re-extracting now gives {now}"
+                f"{' (' + result.reason + ')' if result.reason else ''} - re-run with a "
+                f"bumped extract_version"
+            )
+        elif result.ok and row["sha256"]:
+            digest = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+            if digest != row["sha256"]:
+                lines.append(
+                    f"    !! DIFFERS FROM THE STORED TEXT: {row['chars']:,} chars stored, "
+                    f"{len(result.text):,} chars now - the text on disk was produced by "
+                    f"rules this run no longer has"
+                )
+
         if not result.ok:
             lines.append(f"    QUARANTINED {result.reason}")
             lines.append(f"    headnote signals: {', '.join(result.signals) or 'none'}")
@@ -1222,10 +1515,15 @@ def audit_report(
             f"    headnote signals: {', '.join(result.signals) or 'none'}   "
             f"reportable: {result.reportable or '-'}   "
             f"dropped: {stats['signature']} signature / {stats['margin_letter']} margin / "
-            f"{stats['running']} running / {stats['footnote']} footnote"
+            f"{stats['running']} running lines, footnotes off "
+            f"{stats['footnote_pages']} pages"
         )
         lines.append("    LAST OF WHAT WAS REMOVED (must be the reporter's editorial matter):")
-        lines.append(_indent(joined[max(0, boundary.offset - AUDIT_REMOVED_CHARS): boundary.offset]))
+        start = max(0, boundary.offset - AUDIT_REMOVED_CHARS)
+        opens_mid_line = start > 0 and joined[start - 1] != "\n"
+        lines.append(
+            _indent(_from_line_start(joined[start: boundary.offset], truncated=opens_mid_line))
+        )
         lines.append("    FIRST OF WHAT WAS KEPT (must be the court's own words):")
         lines.append(_indent(result.text[:AUDIT_KEPT_CHARS]))
     return "\n".join(lines)
@@ -1325,6 +1623,19 @@ def main(argv: Sequence[str] | None = None, *, reader=None) -> int:
         )
         for reason, count in sorted(stats["reasons"].items()):
             print(f"    quarantine[{reason}]: {count}")
+        if stats["duplicate_rows"]:
+            print(
+                f"    {stats['duplicate_rows']} selection rows named a PDF another row had "
+                f"already taken - first row wins, in the index and in the manifest alike"
+            )
+        if stats["reportable"]:
+            print(
+                f"    {stats['reportable']} documents carry a REPORTABLE / NON-REPORTABLE "
+                f"flag. That flag belongs to the COURT-RELEASED judgment PDF, not to the "
+                f"S.C.R. reprint (P0 found it in 2 of 70), so read a non-null flag as "
+                f"'this object may not be a reprint' - which is exactly the object whose "
+                f"boundary rules may not apply. Put these in the --audit sample."
+            )
         decided = stats["extracted"] + stats["quarantined"]
         if decided and stats["quarantined"] / decided > QUARANTINE_ALARM:
             print(

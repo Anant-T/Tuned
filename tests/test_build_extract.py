@@ -11,10 +11,13 @@ marginal print-alignment letters down the left margin, followed by the
 court's own judgment.
 """
 
+import re
+
 import pytest
 
 from tuned.data.extract import (
     FOOTNOTE_HEADING,
+    FOOTNOTE_MAX_SHARE,
     MAX_STRIP_FRACTION,
     MIN_BODY_CHARS,
     MIN_DOC_CHARS,
@@ -200,23 +203,224 @@ def test_the_residue_check_sees_the_sectioned_front_matter_too():
     assert find_judgment_start(front).marker == "judgment_heading"
 
 
-def test_an_editorial_phrase_far_past_the_seam_is_not_treated_as_residue():
-    # The window is finite on purpose. A headnote leaks AT the seam; a
-    # judgment quoting an earlier report's "HELD:" a page later is ordinary
-    # legal writing, and refusing those documents would cost more than the
-    # check is worth.
+def test_a_quoted_held_costs_nothing_when_the_headnote_it_matches_was_removed():
+    # WHERE THE RECALL BOUNDARY SITS, half one. The residue check compares
+    # the two halves of the document by signature NAME, not by occurrence: a
+    # reprint whose front matter carried `HELD:` and whose judgment later
+    # quotes an earlier report's `HELD:` is EMITTED, because that name is
+    # already accounted for on the removed side. This is what keeps the
+    # whole-document comparison from refusing the ordinary case, and it is
+    # why the rule is a comparison and not a scan.
     quotation = "HELD: 1. The seniority of a promotee is reckoned from regular appointment.\n"
     # BOUNDED, so that a mutant widening the window cannot make this fixture
     # allocate its way out of failing (the harness note from Task 10: a test
     # parametrised by the value under mutation thrashes instead of dying).
     body = _paras(1, min(RESIDUE_WINDOW, 20_000) + 800) + quotation
-    result = extract_text(["The Judgment of the Court was delivered by\nNAVIN SINHA, J.\n" + body])
+    result = extract_text(
+        [HEADNOTE + "\nThe Judgment of the Court was delivered by\nNAVIN SINHA, J.\n" + body]
+    )
 
     assert result.ok, result.reason
     assert "HELD:" in result.text
-    # ... and the premise that makes this test about the WINDOW: the phrase
-    # really is past it.
+    # ... and the two premises that make this test about the COMPARISON: the
+    # quotation really is past the window, and the removed side really did
+    # carry the same signature name.
     assert result.text.index("HELD:") > RESIDUE_WINDOW
+    assert "held" in headnote_signals(HEADNOTE)
+
+
+def test_the_same_quotation_in_a_document_that_had_nothing_removed_is_refused():
+    # WHERE THE RECALL BOUNDARY SITS, half two - and the documented cost of
+    # the rule, taken deliberately. This is the fixture above with its front
+    # matter deleted: the cut is at offset 0, so nothing was removed, and the
+    # `HELD:` in the body has no counterpart on the removed side. From
+    # outside the document that is indistinguishable from a headnote the cut
+    # went over the top of (which is exactly what
+    # `test_a_marker_on_line_one_strips_nothing...` below is), and the two
+    # errors are not symmetric: a false quarantine costs corpus size, which
+    # is countable in the reason breakdown and recoverable by re-running,
+    # while a false emit puts the publisher's copyrighted summary of the
+    # answer into a published dataset where nothing downstream can find it.
+    quotation = "HELD: 1. The seniority of a promotee is reckoned from regular appointment.\n"
+    body = _paras(1, min(RESIDUE_WINDOW, 20_000) + 800) + quotation
+    result = extract_text(["The Judgment of the Court was delivered by\nNAVIN SINHA, J.\n" + body])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # The premise: the phrase is past the window, so this refusal is the
+    # whole-document comparison and not the seam check.
+    assert body.index("HELD:") > RESIDUE_WINDOW
+
+
+# --------------------------------------------------------------------------
+# The residue guard, in every rendering the reader can hand it.
+# --------------------------------------------------------------------------
+#
+# THE FINDING THIS SECTION EXISTS FOR. The guard reads the publisher's
+# editorial furniture, and pymupdf4llm renders that furniture in whatever
+# shape the typesetting suggests: a markdown TABLE for the Case Law Reference
+# grid, letter-spaced capitals for a heading, a blockquote or a bullet for an
+# indented block, a `#` heading for a large font, and a mid-line `HELD:`
+# wherever the printed column happened to wrap. A guard that reads only the
+# canonical rendering does not refuse the others - it EMITS them, headnote
+# and all, and a contaminated document reads exactly like a clean judgment,
+# so nothing downstream can ever find it again.
+#
+# The property is therefore not "the canonical shape is caught" but "every
+# rendering of the same words reaches the same verdict". The renderings below
+# are the same two pieces of furniture eight ways.
+
+_HELD = "HELD: 1. The seniority of a promotee is reckoned from regular appointment."
+_REF = "Case Law Reference:"
+_REF_ROW = "(2011) 4 SCC 707       referred to       para 12"
+
+FURNITURE = {
+    "canonical": f"{_HELD}\n\n{_REF}\n{_REF_ROW}\n",
+    "bold": f"**{_HELD}**\n\n**{_REF}**\n{_REF_ROW}\n",
+    "md_heading": f"#### {_HELD}\n\n#### {_REF}\n{_REF_ROW}\n",
+    "md_table": (
+        f"{_HELD}\n\n"
+        f"|{_REF}|||\n|---|---|---|\n|(2011) 4 SCC 707|referred to|para 12|\n"
+    ),
+    "letter_spaced": (
+        "H E L D :  1. The seniority of a promotee is reckoned from regular\n"
+        f"appointment.\n\nC A S E   L A W   R E F E R E N C E\n{_REF_ROW}\n"
+    ),
+    "mid_line_wrap": (
+        f"Bombay Engineering Service (Recruitment) Rules, 1978, r.7. {_HELD}\n\n"
+        f"{_REF}\n{_REF_ROW}\n"
+    ),
+    "blockquote": f"> {_HELD}\n>\n> {_REF}\n> {_REF_ROW}\n",
+    "leading_bullet": f"- {_HELD}\n\n- {_REF}\n- {_REF_ROW}\n",
+    # BOTH pieces hidden at once, which is the shape that matters: one blind
+    # rendering is survivable because the other signature still fires, and
+    # this is the document where neither does.
+    "table_and_wrap": (
+        f"Bombay Engineering Service (Recruitment) Rules, 1978, r.7. {_HELD}\n\n"
+        f"|{_REF}|||\n|---|---|---|\n|(2011) 4 SCC 707|referred to|para 12|\n"
+    ),
+}
+
+# The same block with the furniture taken out and NOTHING else changed. It is
+# the control that makes every test below non-vacuous: with this in place the
+# identical early cut is emitted, so the furniture - and only the furniture -
+# is what does the refusing.
+NO_FURNITURE = (
+    "The appeal turns on the construction of rule 7 of the 1978 Rules and on\n"
+    "nothing else, as the parties were agreed before us at the hearing.\n"
+)
+
+_CAPTION = (
+    "KALYANI SHARMA\nv.\nSTATE OF MAHARASHTRA AND OTHERS\n"
+    "(Civil Appeal No. 3221 of 2018)\n15 MARCH 2020\n"
+)
+
+
+def _catchwords(chars: int) -> str:
+    """Editorial catchword lines carrying no signature at all."""
+    line = (
+        "Bombay Engineering Service (Recruitment) Rules, 1978 - r.7 - Seniority of "
+        "promotees inter se - Whether the period of ad hoc officiation counts towards "
+        "seniority in the cadre - Appeal allowed.\n"
+    )
+    return line * max(1, -(-chars // len(line)))
+
+
+@pytest.mark.parametrize("rendering", sorted(FURNITURE))
+def test_the_editorial_furniture_is_recognised_in_every_rendering(rendering):
+    # The guard has to see what the READER emits, not what the reporter
+    # printed. Every rendering below is the same two pieces of furniture.
+    assert headnote_signals(FURNITURE[rendering]) == ("held", "case_law_reference")
+    # ... and the negative half, without which "sees everything" would pass
+    # by seeing everything: ordinary editorial prose is not furniture.
+    assert headnote_signals(NO_FURNITURE + _catchwords(400)) == ()
+
+
+@pytest.mark.parametrize("rendering", sorted(FURNITURE))
+def test_an_early_cut_is_refused_in_every_rendering_of_the_furniture(rendering):
+    front = _CAPTION + "ORDER\n\n" + FURNITURE[rendering]
+    result = extract_text([front + _pad(BODY, 2600)])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # PREMISE 1: the spurious "ORDER" really is taken as the boundary, so the
+    # residue guard is the only thing standing between this document and the
+    # corpus.
+    assert find_judgment_start(front).marker == "judgment_heading"
+    # PREMISE 2 - the control, and the whole finding. The SAME document with
+    # the furniture replaced by ordinary editorial prose is EMITTED, at the
+    # identical early cut. So a rendering the guard cannot read is not a near
+    # miss: it is the publisher's headnote in the corpus.
+    control = extract_text([_CAPTION + "ORDER\n\n" + NO_FURNITURE + _pad(BODY, 2600)])
+    assert control.ok, control.reason
+    assert control.text.startswith("ORDER")
+
+
+def test_a_marker_further_from_the_furniture_than_the_window_is_still_refused():
+    # The window is measured in CHARACTERS and the front matter is measured
+    # in PAGES: P0 puts the S.C.R. headnote at pages 1-3 of a routine
+    # judgment, and a typeset law-report page is comfortably more than 1,500
+    # characters - so RESIDUE_WINDOW covers well under half of it. A spurious
+    # marker at the TOP of the front matter therefore has nothing to see
+    # inside the window at all, and only the whole-document comparison can
+    # catch it.
+    catchwords = _catchwords(min(RESIDUE_WINDOW, 20_000) + 200)
+    front = _CAPTION + "ORDER\n\n" + catchwords + "\n" + FURNITURE["canonical"]
+    result = extract_text([front + _pad(BODY, 2600)])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # THE PREMISE that makes this a test of the comparison and not of the
+    # window: past the cut, the window is empty.
+    cut = front.index("ORDER")
+    assert headnote_signals(front[cut:][:RESIDUE_WINDOW]) == ()
+    assert front.index("HELD:") - cut > RESIDUE_WINDOW
+
+
+def test_a_marker_on_line_one_strips_nothing_and_is_not_a_successful_strip():
+    # The reporter puts "ORDER" at the TOP of the front matter, above the
+    # headnote it introduces. The marker is found at offset 0, so the "strip"
+    # removes nothing and the whole headnote is emitted as if it were the
+    # court's own words - and `--audit` reports `headnote signals: none` on
+    # it, which is indistinguishable from "this document had no headnote".
+    front = (
+        "ORDER\n\n" + _CAPTION + _catchwords(min(RESIDUE_WINDOW, 20_000) + 200) + "\n"
+        + FURNITURE["canonical"]
+    )
+    result = extract_text([front + _pad(BODY, 2600)])
+
+    assert not result.ok
+    assert result.reason == Q_HEADNOTE_RESIDUE
+    assert result.text == ""
+    # THE PREMISE: nothing was removed, and there was nothing in the window
+    # either - so neither the seam check nor the strip fraction can be what
+    # refused this document.
+    assert result.headnote_chars == 0
+    assert find_judgment_start(front).offset == 0
+    assert headnote_signals(front[:RESIDUE_WINDOW]) == ()
+
+
+def test_an_emitted_document_reports_every_signature_it_still_carries():
+    # THE FIRST-RUN TELL, as a property rather than as advice. Because a
+    # document is emitted only when the removed side accounts for every
+    # signature the document carries, `signals` on an emitted document is the
+    # whole document's signature set - so `headnote signals: none` in the
+    # audit means "no editorial furniture anywhere in this file", and NOT
+    # "the guard looked and shrugged". A blind guard therefore shows up as
+    # `none` printed against a document that visibly has a headnote.
+    emitted = extract_text(scr_pages())
+    assert emitted.ok, emitted.reason
+    cleaned, _ = clean_pages(scr_pages())
+    assert set(emitted.signals) == set(headnote_signals("\n".join(cleaned)))
+    assert emitted.signals != ()
+
+    plain = extract_text([_pad(BODY, 2600)])
+    assert plain.ok, plain.reason
+    assert plain.signals == ()
+    assert headnote_signals(_pad(BODY, 2600)) == ()
 
 
 def test_a_boundary_that_would_discard_most_of_the_document_is_quarantined():
@@ -303,6 +507,82 @@ def test_a_page_break_in_the_middle_of_a_sentence_does_not_become_a_paragraph_br
 
     assert result.ok, result.reason
     assert "explained on this record, and\nwe turn to the evidence" in result.text
+
+
+def test_a_cut_that_is_both_too_large_and_too_short_is_reported_as_the_short_body():
+    # DESIGN DECISION 6, which nothing enforced. When both rules hold there
+    # is nothing to recover either way, and the ORDER decides which word the
+    # operator reads on the quarantine breakdown. `strip_too_large` has to
+    # keep its alarming meaning - MOST OF A DOCUMENT THAT STILL HAD PLENTY OF
+    # TEXT IN IT was thrown away, i.e. a boundary bug - and if it fired first
+    # it would also fire on every one-line dismissal order in the corpus and
+    # stop meaning anything at all.
+    front = _pad(HEADNOTE, 12000)
+    body = _pad("The Judgment of the Court was delivered by\nNAVIN SINHA, J.\n", 900)
+    result = extract_text([front + "\n" + body])
+
+    assert not result.ok
+    assert result.reason == Q_BODY_TOO_SHORT
+    # BOTH rules really do fire on this document - which is what makes this a
+    # test of the order and not of either rule. (The two tests above are the
+    # disjoint cases, and neither can see the order at all.)
+    assert len(body.strip()) < MIN_BODY_CHARS
+    assert len(front) / (len(front) + len(body)) > MAX_STRIP_FRACTION
+
+
+def test_the_emitted_text_is_plain_and_the_paragraph_anchor_survives():
+    # THE TIER-1 SEGMENTATION CONTRACT, and it was pinned only inside
+    # find_judgment_start's own per-line demotion - not on what the pipeline
+    # EMITS. pymupdf4llm hands over markdown, `**1.**` does not match the
+    # `^\d+\.` paragraph regex that P0 found to be the only corpus-wide
+    # segmentation signal, and a corpus of undemoted text is a corpus
+    # segment.py cannot read. The regression would surface a stage later, as
+    # a segmenter that mysteriously finds no paragraphs.
+    page = (
+        "**The Judgment of the Court was delivered by**\n"
+        "## NAVIN SINHA, J.\n"
+        "-----\n"
+        + "".join(
+            f"**{n}.** The submission advanced on behalf of the appellant proceeds on a "
+            f"reading of the record which, on examination, the record does not bear out.\n"
+            for n in range(1, 16)
+        )
+    )
+    result = extract_text([page])
+
+    assert result.ok, result.reason
+    assert "**" not in result.text
+    assert "#" not in result.text
+    assert "-----" not in result.text
+    # THE POINT, which absence alone does not make: the downstream anchor
+    # matches the EMITTED text and does not match what the reader handed
+    # over, so the demotion is what puts it there.
+    assert re.search(r"^\d+\.", result.text, re.M) is not None
+    assert re.search(r"^\d+\.", page, re.M) is None
+
+
+def test_the_emitted_text_carries_no_blank_run_the_packer_would_read_as_a_gap():
+    # normalise_whitespace, which nothing pinned at the pipeline level. The
+    # Tier-3 packer downstream reads blank lines as structure, and the page
+    # joiner two rules up exists for exactly that reason - so leaving the
+    # reader's own blank runs in place would undo it from the other end.
+    page = (
+        "The Judgment of the Court was delivered by\nNAVIN SINHA, J.   \n\n\n\n"
+        + _paras(1, 2000)
+        + "\n\n\n\n"
+    )
+    result = extract_text([page])
+
+    assert result.ok, result.reason
+    assert "\n\n\n" not in result.text
+    assert "   \n" not in result.text
+    # One trailing newline, not none and not four: a file every consumer can
+    # concatenate without inventing a paragraph break.
+    assert result.text.endswith("\n")
+    assert not result.text.endswith("\n\n")
+    # THE PREMISE: the input really does carry the runs and the trailing
+    # spaces, so this is a test of the pass and not of the fixture.
+    assert "\n\n\n" in page and "   \n" in page
 
 
 def test_a_judgment_with_no_headnote_at_all_is_kept_whole():
@@ -497,7 +777,7 @@ def test_a_footnote_at_the_foot_of_a_page_stops_splitting_a_sentence():
     ]
     cleaned, stats = clean_pages(pages)
 
-    assert stats["footnote"] == 1
+    assert stats["footnote_pages"] == 1
     # The sentence now runs on across the page break instead of being cut in
     # half by the citation.
     assert cleaned[0].rstrip().endswith("the deposition of")
@@ -525,7 +805,7 @@ def test_a_numbered_paragraph_at_the_foot_of_a_page_is_never_taken_for_a_footnot
     )
     cleaned, stats = clean_pages([page])
 
-    assert stats["footnote"] == 0
+    assert stats["footnote_pages"] == 0
     assert cleaned[0].rstrip().endswith(tail.strip())
 
 
@@ -542,9 +822,86 @@ def test_a_paragraph_below_the_footnote_block_keeps_the_whole_block_in_place():
     )
     cleaned, stats = clean_pages([page])
 
-    assert stats["footnote"] == 0
+    assert stats["footnote_pages"] == 0
     assert "13. We turn to the evidence" in cleaned[0]
     assert "Gurmit Singh" in cleaned[0]
+
+
+def test_a_reference_block_that_is_most_of_the_page_is_left_where_it_is():
+    # One of the two guards decision 4 names, and neither of them had a test.
+    # The failure both exist to avoid is taking a numbered PARAGRAPH out of
+    # the body: a "footnote block" that is most of the page is not a footnote
+    # block - it is a page of citations, or the reading order coming back
+    # scrambled - and moving it takes the page with it.
+    head = "12. The question is whether the delay stands explained on this record.\n"
+    block = (
+        "1 State of Punjab v. Gurmit Singh, (1996) 2 SCC 384, at paragraph 21, where "
+        "the point was considered at length and the earlier authorities reviewed.\n"
+        "2 Kesavananda Bharati v. State of Kerala, (1973) 4 SCC 225, at paragraph 316.\n"
+    )
+    cleaned, stats = clean_pages([head + block])
+
+    assert stats["footnote_pages"] == 0
+    assert "Gurmit Singh" in cleaned[0]
+    # THE PREMISE and the disjointness in one: the block satisfies every
+    # OTHER condition - it reads as references, and its numbers are below the
+    # paragraph above it - so the share guard is the only thing that can be
+    # holding it, and the SAME block on a page long enough to make it a
+    # minority is moved.
+    assert len(block) > len(head + block) * FOOTNOTE_MAX_SHARE
+    long_page = head + _PAGE_FILLER + _PAGE_FILLER + "\n" + block
+    _, long_stats = clean_pages([long_page])
+    assert len(block) < len(long_page) * FOOTNOTE_MAX_SHARE
+    assert long_stats["footnote_pages"] == 1
+
+
+def test_a_footnote_block_of_several_notes_is_moved_whole():
+    # FOOTNOTE_WINDOW is how far up from the foot of the page the block's
+    # FIRST marker is looked for, and it had no test. A window that reaches
+    # only the last line moves the last note and leaves the ones above it
+    # interleaved with the judgment - which is the same corruption the pass
+    # exists to fix, only quieter, because the page still looks tidy.
+    page = (
+        f"12. The question is whether the delay stands explained. {_PAGE_FILLER}\n"
+        "13. We turn to the evidence bearing on it, which begins with the deposition of\n"
+        "1 State of Punjab v. Gurmit Singh, (1996) 2 SCC 384, at paragraph 21.\n"
+        "2 Sharma v. State of Maharashtra, (2004) 2 SCC 1, at paragraph 9.\n"
+        "3 Kesavananda Bharati v. State of Kerala, (1973) 4 SCC 225.\n"
+    )
+    cleaned, stats = clean_pages([page])
+
+    assert stats["footnote_pages"] == 1
+    # ALL THREE, not just the one at the foot.
+    assert len(stats["footnote_lines"]) == 3
+    for name in ("Gurmit Singh", "Sharma v. State", "Kesavananda"):
+        assert name not in cleaned[0]
+    # ... and the body ends at the sentence the notes interrupted, which is
+    # what says the block was taken from the right place.
+    assert cleaned[0].rstrip().endswith("the deposition of")
+
+
+def test_a_document_too_short_for_most_pages_to_mean_anything_keeps_its_repeated_lines():
+    # RUNNING_MIN_PAGES, untested. "Furniture on MOST pages" says nothing
+    # over two pages, and the deletion it licenses is silent: a two-page
+    # judgment whose pages share a short line - a continued heading, a party
+    # name - would lose it with no record anywhere that it had been there.
+    short = [
+        f"{RUNNING_HEADER}\n1. The appellant filed a writ petition in the High Court.\n",
+        f"{RUNNING_HEADER}\n2. The respondent answered it on affidavit.\n",
+    ]
+    cleaned, stats = clean_pages(short)
+
+    assert RUNNING_HEADER in "\n".join(cleaned)
+    assert stats["running"] == 0
+    # THE CONTROL: the same line over enough pages IS furniture and does go.
+    # Without it this test would pass on a pass that removed nothing at all.
+    longer = short + [
+        f"{RUNNING_HEADER}\n3. The High Court heard them at some length.\n",
+        f"{RUNNING_HEADER}\n4. We now record our conclusion on the point.\n",
+    ]
+    cleaned_longer, longer_stats = clean_pages(longer)
+    assert RUNNING_HEADER not in "\n".join(cleaned_longer)
+    assert longer_stats["running"] == 4
 
 
 def test_footnotes_from_the_headnote_pages_do_not_survive_the_strip():
@@ -566,7 +923,7 @@ def test_footnotes_from_the_headnote_pages_do_not_survive_the_strip():
     # really are detected and moved out of their pages. A fixture in which
     # nothing is moved would pass every assertion below while the page
     # filter did no work at all.
-    assert stats["footnote"] == 3
+    assert stats["footnote_pages"] == 3
     assert result.ok, result.reason
     assert result.boundary_page == 1
 
@@ -606,6 +963,13 @@ def test_the_page_span_comes_out_of_the_object_key():
     # language ground truth), and a regional object that happens to share
     # the numeric convention must not be read as one of ours.
     assert page_span_from_key("data/pdf/year=2020/regional/2020_7_941_960_HI.pdf") is None
+    # An inverted span is a key nobody can read - `pages` would be negative
+    # and the citation's page anchor would point backwards - so it does not
+    # parse. The price, stated here so that it is found by reading rather
+    # than by a hole in the corpus: that object drops out of the prefix index
+    # too, and if the metadata carries no pdf_key column it can then only
+    # ever join as `unmatched`.
+    assert page_span_from_key("data/pdf/year=2020/english/2020_7_960_941_EN.pdf") is None
 
 
 def test_markdown_decoration_is_demoted_without_eating_the_filename_underscores():
@@ -624,12 +988,14 @@ def test_markdown_decoration_is_demoted_without_eating_the_filename_underscores(
 
 import json
 import os
+import sys
 from pathlib import Path
 
 from pipeline_fakes import temp_config
 
 from tuned.data.acquire import SC_LICENSE, SC_SOURCE_ID
 from tuned.data.extract import (
+    AUDIT_REMOVED_CHARS,
     EXTRACT_VERSION,
     PART_SUFFIX,
     ROUTE_AMBIGUOUS,
@@ -644,6 +1010,7 @@ from tuned.data.extract import (
     extract_decision,
     main,
     pdf_index,
+    read_pdf_pages,
     resolve_pdf,
     spread,
     text_path_for,
@@ -836,15 +1203,38 @@ def test_a_quarantined_document_is_not_re_attempted_at_the_same_version(tmp_path
 # --------------------------------------------------------------- durability
 
 def test_the_text_file_is_whole_or_absent_never_a_prefix(tmp_path, monkeypatch):
+    # THE FAILURE HAS TO HAPPEN DURING THE WRITE. Killing the rename instead
+    # is a test that cannot observe what it is about: after `os.replace` the
+    # only moment a prefix could have been visible at `path` has already
+    # passed, so a writer that streams straight into `path` passes it - and
+    # then the cleanup (`part.unlink()`, where `part` IS `path` under that
+    # mutation) deletes the evidence and both assertions come out true.
     dest = tmp_path / "out" / "a.txt"
+    part = dest.with_name(dest.name + PART_SUFFIX)
+    text = "The Judgment of the Court was delivered by\n" * 200
+    payload = text.encode("utf-8")
+    at_failure = {}
 
-    def dying_replace(src, dst):
-        raise OSError("killed between the write and the rename")
+    def dying_fsync(fd):
+        # The process dies with the buffer half flushed: what is on disk at
+        # this instant is a strict PREFIX of a judgment.
+        os.ftruncate(fd, len(payload) // 3)
+        at_failure["part_size"] = part.stat().st_size if part.exists() else None
+        at_failure["dest_exists"] = dest.exists()
+        raise OSError("killed part of the way through the write")
 
-    monkeypatch.setattr(os, "replace", dying_replace)
+    monkeypatch.setattr(os, "fsync", dying_fsync)
     with pytest.raises(OSError):
-        write_text(dest, "the judgment text")
+        write_text(dest, text)
 
+    # THE PREMISE, without which the assertions below are about nothing: a
+    # prefix of the judgment really was on disk at the moment of failure.
+    assert at_failure["part_size"] is not None
+    assert 0 < at_failure["part_size"] < len(payload)
+    # THE POINT: it was never under the name a reader looks at. This is the
+    # assertion a non-atomic writer fails, and it can only be made while the
+    # failure is still in flight.
+    assert at_failure["dest_exists"] is False
     assert not dest.exists()
     # ... and the partial does not survive its own failure, where a later
     # run could find it beside the real name.
@@ -1053,6 +1443,59 @@ def test_the_recorded_document_carries_the_span_and_the_selection_identity(tmp_p
     assert json.loads(row["meta_json"])["signals"] == ["held", "case_law_reference"]
 
 
+def test_a_second_selection_row_on_one_pdf_does_not_re_record_the_document(tmp_path, store):
+    # Two rows, two case ids, one PDF. The manifest keeps the FIRST row, so
+    # the index has to as well: re-recording from the later row would leave
+    # the document row and the manifest row describing one judgment under two
+    # identities, and nothing downstream reads object_key for identity, so
+    # nothing could ever see it. --force is where it bites, because that is
+    # the mode in which the second row is not skipped by the resume rule.
+    key = _key()
+    _, paths = _corpus(tmp_path, [key], store=store)
+    rows = [_selection(key), _selection(key, case_id="C.A. 3221-A/2018")]
+    reader = FakeReader({paths[key]: scr_pages()})
+
+    stats = extract_corpus(
+        store, rows, index=pdf_index(store), text_root=tmp_path / "text", reader=reader,
+        force=True,
+    )
+
+    assert stats["extracted"] == 1
+    assert stats["duplicate_rows"] == 1
+    assert store.document(SC_SOURCE_ID, key)["case_id"] == rows[0]["case_id"]
+    # ... and the PDF was read once, not twice.
+    assert len(reader.read) == 1
+    # THE PREMISES: both rows really do resolve to the one PDF, and they
+    # really do disagree about which judgment it is.
+    assert [resolve_pdf(row, pdf_index(store))[0] for row in rows] == [key, key]
+    assert rows[0]["case_id"] != rows[1]["case_id"]
+
+
+def test_the_run_counts_the_documents_carrying_a_reportable_flag(tmp_path, store):
+    # A NON-NULL flag on this corpus is a warning rather than a fact about
+    # the judgment: P0 found it in 2 of 70 objects, and it belongs to the
+    # COURT-RELEASED PDF and not to the S.C.R. reprint - so a document that
+    # has one may not be a reprint at all, which makes it exactly the
+    # document whose boundary rules may not apply. That caveat existed only
+    # in a report until it was counted.
+    flagged, plain = _key(start=1, end=20), _key(start=101, end=140)
+    _, paths = _corpus(tmp_path, [flagged, plain], store=store)
+    pages = scr_pages()
+    reader = FakeReader(
+        {paths[flagged]: ["REPORTABLE\n" + pages[0], *pages[1:]], paths[plain]: pages}
+    )
+
+    stats = extract_corpus(
+        store, [_selection(k) for k in (flagged, plain)], index=pdf_index(store),
+        text_root=tmp_path / "text", reader=reader,
+    )
+
+    assert stats["reportable"] == 1
+    # THE PREMISE: both documents were extracted, so the count is the flag
+    # and not the extraction.
+    assert stats["extracted"] == 2
+
+
 # ----------------------------------------------------------------- manifest
 
 def test_the_manifest_joins_the_selection_row_to_the_extraction_facts(tmp_path, store):
@@ -1135,6 +1578,83 @@ def test_the_audit_prints_the_seam_on_both_sides_of_the_cut(tmp_path, store):
     assert "judgment_delivered_by" in report
     assert key in report
 
+    # ... and the removed side opens where a LINE does. It is a window cut by
+    # character count, so 400 characters back lands wherever it lands, and
+    # the operator is being asked to read this text and judge it.
+    removed = (
+        report.split("LAST OF WHAT WAS REMOVED")[1]
+        .split("\n", 1)[1]
+        .split("FIRST OF WHAT WAS KEPT")[0]
+    )
+    opening = removed.strip().splitlines()[0].strip()
+    cleaned, _ = clean_pages(scr_pages())
+    joined = "\n".join(cleaned)
+    assert any(line.strip() == opening for line in joined.split("\n"))
+    # THE PREMISE: the window really is truncated here, and the raw cut
+    # really would have opened mid-word - so the snap is what put a whole
+    # line at the top and not the fixture.
+    result = extract_text(scr_pages())
+    assert result.headnote_chars > AUDIT_REMOVED_CHARS
+    assert joined[result.headnote_chars - AUDIT_REMOVED_CHARS - 1] != "\n"
+
+
+def test_the_audit_opens_with_the_check_that_settles_whether_the_guard_can_read_at_all(
+    tmp_path, store
+):
+    # The cheapest check available on run one, and the only one that can find
+    # a guard that is blind to this reporter's typesetting - because a
+    # contaminated document reads like a clean judgment everywhere else. It
+    # has to be impossible to miss, so it is the first thing in the report,
+    # above the sample.
+    key = _key()
+    _, paths = _corpus(tmp_path, [key], store=store)
+    reader = FakeReader({paths[key]: scr_pages()})
+    extract_corpus(
+        store, [_selection(key)], index=pdf_index(store), text_root=tmp_path / "text",
+        reader=reader,
+    )
+
+    report = audit_report(store, 1, index=pdf_index(store), reader=reader)
+
+    assert "READ THIS FIRST" in report
+    assert "headnote signals: none" in report.split("---")[0]
+    # It is the HEAD of the report, before the first document.
+    assert report.index("READ THIS FIRST") < report.index(key)
+
+
+def test_the_audit_says_when_the_rules_no_longer_reproduce_what_the_corpus_holds(
+    tmp_path, store
+):
+    # `--audit` re-extracts rather than reading back from disk, and the
+    # docstring's second reason for that - "re-running is also a check that
+    # the rules still produce what the corpus holds" - was a claim with no
+    # code under it: nothing compared anything to the row it already had.
+    key = _key()
+    _, paths = _corpus(tmp_path, [key], store=store)
+    reader = FakeReader({paths[key]: scr_pages()})
+    extract_corpus(
+        store, [_selection(key)], index=pdf_index(store), text_root=tmp_path / "text",
+        reader=reader,
+    )
+
+    fresh = audit_report(store, 1, index=pdf_index(store), reader=reader)
+    assert "DIFFERS FROM THE STORED TEXT" not in fresh
+    assert "NO LONGER AGREE" not in fresh
+
+    # The corpus now holds text these rules do not produce - which is what a
+    # rule change without a version bump leaves behind.
+    row = store.document(SC_SOURCE_ID, key)
+    store.record_document(SC_SOURCE_ID, key, dict(row, sha256="0" * 64, chars=11))
+    stale = audit_report(store, 1, index=pdf_index(store), reader=reader)
+    assert "DIFFERS FROM THE STORED TEXT" in stale
+
+    # ... and a row whose STATUS no longer reproduces is the louder half of
+    # the same check.
+    store.record_document(SC_SOURCE_ID, key, dict(row, status=STATUS_QUARANTINED,
+                                                 reason=Q_NO_JUDGMENT_START))
+    flipped = audit_report(store, 1, index=pdf_index(store), reader=reader)
+    assert "NO LONGER AGREE" in flipped
+
 
 def test_the_audit_sample_walks_the_corpus_instead_of_reading_the_first_n():
     # Object keys sort by year, so a sample taken along them is a walk
@@ -1168,6 +1688,93 @@ def test_the_audit_shows_quarantined_documents_and_why(tmp_path, store):
     # The refusals are the reason the audit exists, so they are sampled
     # ALONGSIDE the successes rather than being crowded out by them.
     assert ok_key in report
+
+
+def test_the_audit_of_a_run_that_refused_everything_still_shows_the_refusals(tmp_path, store):
+    # "Half of them refusals" must not become "none of them" on the run whose
+    # audit matters most. Half of an odd sample rounds down, so a corpus with
+    # no successes to make up the other half printed an audit with nothing in
+    # it at all - at exactly the moment the operator needs to see what was
+    # refused and why.
+    keys = [_key(start=1, end=20), _key(start=101, end=140)]
+    _, paths = _corpus(tmp_path, keys, store=store)
+    unsegmentable = scr_pages(body=BODY.split("\n", 1)[1])
+    reader = FakeReader({paths[k]: unsegmentable for k in keys})
+    extract_corpus(
+        store, [_selection(k) for k in keys], index=pdf_index(store),
+        text_root=tmp_path / "text", reader=reader,
+    )
+
+    report = audit_report(store, 1, index=pdf_index(store), reader=reader)
+
+    assert Q_NO_JUDGMENT_START in report
+    assert sum(key in report for key in keys) == 1
+    # THE PREMISE: there really is nothing emitted to sample instead.
+    assert store.document_count(SC_SOURCE_ID, status=STATUS_OK) == 0
+
+
+# --------------------------------------------------------------- the reader
+
+def test_the_reader_pins_the_options_that_decide_what_the_text_contains(monkeypatch):
+    # THE READER'S DEFAULTS ARE NOT THIS REPO'S DECISIONS. pymupdf4llm crops
+    # 50 points off the top and bottom of every page unless told otherwise,
+    # and that band is where the running head, the printed page number, the
+    # page-tail footnotes and the REPORTABLE line live - so three passes
+    # above would silently receive nothing to do, and the audit would report
+    # that as a clean document.
+    seen = {}
+
+    class Library:
+        @staticmethod
+        def to_markdown(path, *, page_chunks=False, margins=(0, 50, 0, 50),
+                        table_strategy="lines_strict", write_images=False,
+                        embed_images=False, force_text=True, show_progress=True):
+            seen.update(
+                path=path, page_chunks=page_chunks, margins=margins,
+                table_strategy=table_strategy, show_progress=show_progress,
+            )
+            return [{"text": "page one"}, {"text": "page two"}]
+
+    monkeypatch.setitem(sys.modules, "pymupdf4llm", Library)
+
+    assert read_pdf_pages("a.pdf") == ["page one", "page two"]
+    assert seen["margins"] == 0
+    assert seen["page_chunks"] is True
+    assert seen["table_strategy"] == "lines_strict"
+    assert seen["show_progress"] is False
+    # THE PREMISE, without which "margins == 0" is a test of nothing: the
+    # library's own default is a crop, so passing nothing is a decision too.
+    assert Library.to_markdown.__defaults__ is None
+    import inspect
+
+    assert inspect.signature(Library.to_markdown).parameters["margins"].default != 0
+
+
+def test_a_reader_that_cannot_take_the_pinned_options_is_refused_not_silently_defaulted(
+    monkeypatch,
+):
+    class Old:
+        @staticmethod
+        def to_markdown(path, *, page_chunks=False, table_strategy="lines_strict"):
+            return []
+
+    monkeypatch.setitem(sys.modules, "pymupdf4llm", Old)
+    with pytest.raises(ExtractionError, match="margins"):
+        read_pdf_pages("a.pdf")
+
+
+def test_a_reader_missing_only_a_cosmetic_option_still_runs(monkeypatch):
+    # The line between the two: an option that changes the CORPUS is refused,
+    # an option that changes the LOG is dropped. Stopping a run over a
+    # progress bar would be its own kind of wrong.
+    class Terse:
+        @staticmethod
+        def to_markdown(path, *, page_chunks=False, margins=(0, 50, 0, 50),
+                        table_strategy="lines_strict"):
+            return ["only page"]
+
+    monkeypatch.setitem(sys.modules, "pymupdf4llm", Terse)
+    assert read_pdf_pages("a.pdf") == ["only page"]
 
 
 # ---------------------------------------------------------------------- CLI
@@ -1211,6 +1818,29 @@ def test_cli_extracts_the_selection_into_the_build_corpus(tmp_path, capsys):
     assert "HELD:" not in body
     manifest = (paths.corpus_dir / "extraction.jsonl").read_text(encoding="utf-8")
     assert json.loads(manifest.splitlines()[0])["object_key"] == key
+
+
+def test_cli_says_so_when_it_refused_more_than_a_quarter_of_what_it_read(tmp_path, capsys):
+    # First-run signal #2, and it had no test. The refusal set is MEANT to be
+    # non-empty - that is the design - so the number alone tells the operator
+    # nothing; the RATE is what says the fault is in the rules or in the
+    # source rather than in the individual documents.
+    config = temp_config(tmp_path)
+    paths = _build_paths(config)
+    keys = [_key(start=s, end=s + 19) for s in (1, 101, 201, 301)]
+    store, local = _corpus(tmp_path, keys, store=Store.open(paths.state_db))
+    store.close()
+    _write_selection(paths, [_selection(k) for k in keys])
+    unsegmentable = scr_pages(body=BODY.split("\n", 1)[1])
+    docs = {local[keys[0]]: scr_pages()}
+    docs.update({local[k]: unsegmentable for k in keys[1:]})
+
+    assert main(["--config", config], reader=FakeReader(docs)) == 0
+
+    out = capsys.readouterr().out
+    assert "HIGH QUARANTINE RATE" in out
+    # The rate, not the count: three of four.
+    assert "75.0%" in out
 
 
 def test_cli_refuses_a_run_in_which_nothing_could_be_joined_to_a_pdf(tmp_path, capsys):
