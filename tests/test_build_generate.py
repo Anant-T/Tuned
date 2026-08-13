@@ -11,6 +11,7 @@ from pipeline_fakes import (
     SEED_TEXT,
     TRANSITION_META,
     FakeRouter,
+    StealsTheLease,
     build_cfg,
     cfg_with_fourth_judge_family,
     cfg_with_context,
@@ -451,6 +452,46 @@ def test_provider_failure_at_the_cap_rejects(tmp_path, cfg, paths):
             run(store, cfg, FakeRouter(cfg, {"generator": [error]}), paths)
         assert only_task(store)["disposition"] == "exhausted:error"
         assert only_task(store)["state"] == "rejected"
+
+
+def test_the_generation_attempt_cap_is_three_and_there_is_no_fourth_claim(tmp_path, cfg, paths):
+    """Every exhaustion test here loops `for _ in range(MAX_ATTEMPTS)`, which
+    is parameterised by the value under test and holds at 3 and at 99 alike.
+    The number is load-bearing now that --reopen re-arms the counter: it is
+    the only bound on what one row can spend across a reopen cycle, on a fleet
+    that runs for days against hard daily caps. So: the literal, and a fourth
+    claim that does not happen."""
+    assert MAX_ATTEMPTS == 3
+    with make_store(tmp_path) as store:
+        # No reasoning channel and no inline tags: the trace gate fails the
+        # row into a regeneration every time, which is the path that spends.
+        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, None)]})
+        for _ in range(MAX_ATTEMPTS + 2):
+            run(store, cfg, router, paths)
+
+        assert len(router.calls_for("generator")) == MAX_ATTEMPTS
+        task = only_task(store)
+        assert task["attempts"] == MAX_ATTEMPTS
+        assert task["state"] == "rejected"
+
+
+def test_run_workers_does_not_count_a_disposition_the_fence_refused(tmp_path, cfg, paths):
+    """The other half of I2, driven rather than hand-fed. The test below feeds
+    `absorb(landed=False)` literally - i.e. the value run_workers is supposed
+    to DERIVE - so `landed = True` survives it. Here the lease really moves
+    mid-pass and the batch totals have to show it."""
+    with make_store(tmp_path) as store:
+        proxy = StealsTheLease(store, at="record_generation")
+        totals = run(proxy, cfg, FakeRouter(cfg), paths)
+
+        assert proxy.stolen
+        assert (totals["lost_leases"], totals["gen_ok"]) == (1, 0)
+        assert totals["dispositions"] == {}
+        # The tokens were spent whoever owns the row now.
+        assert totals["prompt_tokens"] + totals["completion_tokens"] > 0
+        # ...and the live holder still has the task, untouched by the loser.
+        task = only_task(store)
+        assert (task["claimed_by"], task["state"]) == ("thief-worker", "generating")
 
 
 def test_a_disposition_the_fence_refused_is_not_counted_as_one(tmp_path, cfg, paths):

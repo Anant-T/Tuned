@@ -354,6 +354,36 @@ def cfg_with_fourth_judge_family(cfg: BuildConfig, *, max_context: int = 131072)
     )
 
 
+class StealsTheLease:
+    """Store proxy that hands the task to another worker at a chosen call.
+
+    Everything else is delegated untouched, so the pass under test runs
+    against the real store: the point is WHEN the lease moves, not what the
+    store does about it. `when` narrows the steal to one call of a repeated
+    method (`log_event`, say) by inspecting its arguments.
+    """
+
+    def __init__(self, store, at: str, thief: str = "thief-worker", when=None):
+        self._store = store
+        self._at = at
+        self._thief = thief
+        self._when = when
+        self.stolen = False
+
+    def __getattr__(self, name):
+        attr = getattr(self._store, name)
+        if name != self._at or self.stolen:
+            return attr
+
+        def steal(*args, **kwargs):
+            if self._when is None or self._when(*args, **kwargs):
+                self.stolen = True
+                self._store.conn.execute("UPDATE task SET claimed_by = ?", (self._thief,))
+            return attr(*args, **kwargs)
+
+        return steal
+
+
 def cfg_with_split_pools(cfg: BuildConfig, *, judge_context: int, tiebreak_context: int):
     """A pool whose JUDGE role is complete and whose TIEBREAK role is not.
 

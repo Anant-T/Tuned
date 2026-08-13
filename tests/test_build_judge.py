@@ -7,6 +7,7 @@ from pipeline_fakes import (
     LONG_SEED_TEXT,
     TRANSITION_META,
     FakeRouter,
+    StealsTheLease,
     build_cfg,
     cfg_with_fourth_judge_family,
     chat_response,
@@ -16,12 +17,13 @@ from pipeline_fakes import (
     temp_config,
 )
 
-from tuned.data.generate import run_workers
+from tuned.data.generate import build_prompt, judge_messages, judge_needed_tokens, run_workers
 from tuned.data.jsonl import read_at
 from tuned.data.providers import ProviderError
 from tuned.data.judge import (
     BORDERLINE,
     FAIL,
+    JUDGE_MAX_TOKENS,
     JUDGE_STATE_FROM,
     JUDGE_STATE_TO,
     MAX_JUDGE_ATTEMPTS,
@@ -990,35 +992,6 @@ def test_a_lost_lease_stops_the_decision_being_logged_twice(tmp_path, cfg, paths
 # to catch it.
 # --------------------------------------------------------------------------
 
-class StealsTheLease:
-    """Store proxy that hands the task to another worker at a chosen call.
-
-    Everything else is delegated untouched, so the pass under test runs
-    against the real store: the point is WHEN the lease moves, not what the
-    store does about it.
-    """
-
-    def __init__(self, store, at: str, thief: str = "thief-worker", when=None):
-        self._store = store
-        self._at = at
-        self._thief = thief
-        self._when = when
-        self.stolen = False
-
-    def __getattr__(self, name):
-        attr = getattr(self._store, name)
-        if name != self._at or self.stolen:
-            return attr
-
-        def steal(*args, **kwargs):
-            if self._when is None or self._when(*args, **kwargs):
-                self.stolen = True
-                self._store.conn.execute("UPDATE task SET claimed_by = ?", (self._thief,))
-            return attr(*args, **kwargs)
-
-        return steal
-
-
 def _claimed(store, worker="worker-a"):
     return store.claim_tasks(worker, 1, state_from=JUDGE_STATE_FROM, state_to=JUDGE_STATE_TO)[0]
 
@@ -1227,6 +1200,61 @@ def test_a_park_the_fence_refused_is_neither_written_nor_counted(tmp_path, cfg, 
         assert (stats.skipped, stats.lost_leases) == (0, 1)
 
 
+def test_a_reject_the_fence_refused_is_not_counted_as_a_decision(tmp_path, cfg, paths):
+    """The fourth fenced write on this side. The lease moves INSIDE
+    log_event("judge_decision") - after the probe that guards the decision and
+    before the write it guards - so only the write can refuse it, and the
+    counters have to follow the write here as they do on the accept path."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = _claimed(store)
+        proxy = StealsTheLease(
+            store, at="log_event", when=lambda kind, detail: kind == "judge_decision"
+        )
+        stats = JudgeStats()
+        # Both judges fail it: decide() rejects without buying a tiebreak.
+        router = FakeRouter(cfg, {"judge": [judge_reply(1, 1, 1)]})
+
+        ended = asyncio.run(
+            judge_task(proxy, cfg, router, task, paths=paths, worker_id="worker-a", stats=stats)
+        )
+
+        assert (ended, proxy.stolen) == ("lost-lease", True)
+        assert only_task(store)["state"] == JUDGE_STATE_TO  # the live holder still has it
+        assert (stats.decided, stats.rejected, stats.lost_leases) == (0, 0, 1)
+        assert _lost_lease_event(store)["wanted_state"] == "rejected"
+
+
+def test_a_requeue_the_fence_refused_after_a_tiebreak_failure_is_a_lost_lease(
+    tmp_path, cfg, paths
+):
+    """A transient tiebreak failure hands the task back to the judging queue -
+    a fenced write like every other, and the one path where a refused write
+    used to be reported as a clean re-queue."""
+    transient = ProviderError(
+        "role 'tiebreak': all 3 eligible model(s) failed; last: 429",
+        status=429, provider="groq", model="openai/gpt-oss-20b", retryable=True,
+    )
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = _claimed(store)
+        proxy = StealsTheLease(
+            store, at="log_event", when=lambda kind, detail: kind == "judge_route_error"
+        )
+        stats = JudgeStats()
+        router = FakeRouter(
+            cfg,
+            {"judge": [judge_reply(5, 5, 5), judge_reply(1, 1, 1)], "tiebreak": [transient]},
+        )
+
+        ended = asyncio.run(
+            judge_task(proxy, cfg, router, task, paths=paths, worker_id="worker-a", stats=stats)
+        )
+
+        assert (ended, proxy.stolen) == ("lost-lease", True)
+        assert stats.lost_leases == 1
+        assert only_task(store)["state"] == JUDGE_STATE_TO  # NOT handed back
+        assert _lost_lease_event(store)["wanted_state"] == JUDGE_STATE_FROM
+
+
 def test_a_recorded_slot_with_no_resolvable_ref_is_never_reused(cfg):
     """The three ways a recorded judgement cannot stand in for a call, at the
     unit. The ref cases collapse into one: an absent ref makes an empty
@@ -1289,6 +1317,61 @@ def test_a_payload_400_at_the_judge_costs_one_call_not_eight(tmp_path, cfg, path
         assert reopen_tasks(store, ["judge_error"]) == {"judge_error": 1}
 
 
+def test_a_payload_400_at_the_tiebreak_costs_one_call_not_seven(tmp_path, cfg, paths):
+    """The same bound on the OTHER role, and it is worth more than it looks:
+    slots a and b are reused from the judgement table on every re-claim, so a
+    tiebreak that re-queues buys nothing else - the whole cost of the extra
+    seven claims lands on the tiebreak role, whose model list is not even the
+    same one."""
+    payload_400 = ProviderError(
+        "groq/openai/gpt-oss-20b: HTTP 400 (bad request, aborting the call): "
+        '{"error": "unknown parameter"}',
+        status=400, provider="groq", model="openai/gpt-oss-20b", retryable=False,
+    )
+    with judged_store(tmp_path, paths, cfg) as store:
+        # One pass, one fail: the disagreement decide() sends to a tiebreak.
+        router = FakeRouter(
+            cfg,
+            {"judge": [judge_reply(5, 5, 5), judge_reply(1, 1, 1)], "tiebreak": [payload_400]},
+        )
+        for _ in range(MAX_JUDGE_ATTEMPTS):
+            run_judge(store, cfg, router, paths)
+
+        assert len(router.calls_for("tiebreak")) == 1
+        assert len(router.calls_for("judge")) == 2  # both slots banked on pass 1
+        task = only_task(store)
+        assert task["state"] == "judge_error"
+        assert task["disposition"].startswith("tiebreak:")
+        assert reopen_tasks(store, ["judge_error"]) == {"judge_error": 1}
+
+
+def test_the_tiebreak_parks_at_the_attempt_cap_not_one_claim_past_it(tmp_path, cfg, paths):
+    """A TRANSIENT tiebreak failure still spends claims, and the cap is read
+    with >=: at exactly MAX_JUDGE_ATTEMPTS the row parks. With > it buys one
+    more paid tiebreak per row, wave-wide."""
+    transient = ProviderError(
+        "role 'tiebreak': all 3 eligible model(s) failed; last: 429",
+        status=429, provider="groq", model="openai/gpt-oss-20b", retryable=True,
+    )
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(
+            cfg,
+            {"judge": [judge_reply(5, 5, 5), judge_reply(1, 1, 1)], "tiebreak": [transient]},
+        )
+        # The claim bumps attempts, so the pass that must park is the one that
+        # arrives holding exactly the cap.
+        store.conn.execute("UPDATE task SET attempts = ?", (MAX_JUDGE_ATTEMPTS - 1,))
+        run_judge(store, cfg, router, paths)
+
+        task = only_task(store)
+        assert task["attempts"] == MAX_JUDGE_ATTEMPTS
+        assert task["state"] == "judge_error"
+        assert task["disposition"].startswith("tiebreak:")
+        # ...and the parked row is invisible to the next sweep.
+        run_judge(store, cfg, router, paths)
+        assert len(router.calls_for("tiebreak")) == 1
+
+
 def test_a_transient_judge_failure_still_spends_its_claims(tmp_path, cfg, paths):
     """The narrower bound is for the no-progress payload case only: a 429 is
     the ordinary weather of a free tier and must still be retried."""
@@ -1302,6 +1385,69 @@ def test_a_transient_judge_failure_still_spends_its_claims(tmp_path, cfg, paths)
             run_judge(store, cfg, router, paths)
         assert len(router.calls_for("judge")) == 3
         assert only_task(store)["state"] == JUDGE_STATE_FROM
+
+
+def test_the_judge_attempt_cap_is_eight_and_the_eighth_claim_is_the_last(tmp_path, cfg, paths):
+    """Every exhaustion test in this file loops `for _ in range(
+    MAX_JUDGE_ATTEMPTS)` - parameterised by the value under test, so it holds
+    at 8 and at 99 alike. The number matters more since --reopen re-arms the
+    counter: these caps are now the only bound on what one row can spend
+    across a reopen cycle, on a fleet running for days against hard daily
+    caps. So: the literal, and a claim past it that does not happen."""
+    assert MAX_JUDGE_ATTEMPTS == 8
+    transient = ProviderError(
+        "role 'judge': all 3 eligible model(s) failed; last: 429",
+        status=429, provider="mistral", model="mistral-small-latest", retryable=True,
+    )
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(cfg, {"judge": [transient]})
+        for _ in range(MAX_JUDGE_ATTEMPTS + 3):
+            run_judge(store, cfg, router, paths)
+
+        # Eight claims total and then the row is parked and unclaimable - not
+        # a ninth, whatever the loop asks for. Seven of them are judge calls
+        # because the GENERATION claim spent the first: both caps read the one
+        # `attempts` counter (concern 6), which is exactly why the number has
+        # to be pinned as a number.
+        task = only_task(store)
+        assert task["attempts"] == MAX_JUDGE_ATTEMPTS
+        assert len(router.calls_for("judge")) == MAX_JUDGE_ATTEMPTS - 1
+        assert task["state"] == "judge_error"
+
+
+def test_the_judge_sizes_the_call_it_is_about_to_buy_the_way_the_preflight_does(
+    tmp_path, cfg, paths
+):
+    """R3-C2's SPENDING half. The ruling was ONE sizer called by both sides;
+    the preflight caller has four tests and the spender had none, so reverting
+    judge_slot to `sum(len(m["content"]) for m in messages) // 4 + max_tokens`
+    left the suite green. On a Devanagari row - which is what this corpus is -
+    the two disagree by enough to change the routing decision."""
+    widened = cfg_with_fourth_judge_family(cfg)
+    devanagari = "अभियुक्त को भारतीय दंड संहिता की धारा तीन सौ दो के अंतर्गत दोषी ठहराया गया। " * 140
+    with open_store(tmp_path, n_seeds=1, text=devanagari) as store:
+        plan_wave(store, widened, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
+        asyncio.run(
+            run_workers(
+                store, widened, FakeRouter(widened), paths=paths,
+                streams=["synthesis"], n_workers=1, max_batches=1,
+            )
+        )
+        task = only_task(store)
+        gen = store.latest_generation(task["task_id"])
+        router = FakeRouter(widened, {"judge": [judge_reply(5, 5, 5)]})
+        run_judge(store, widened, router, paths)
+
+        call = router.calls_for("judge")[0]
+        source = build_prompt(widened, task, store.get_seed(task["seed_id"])).judge_source
+        messages = judge_messages(source, gen["think"], gen["answer"])
+        assert call["messages"] == messages
+        assert call["est_tokens"] == judge_needed_tokens(messages, reply_tokens=JUDGE_MAX_TOKENS)
+        # ...and the number is load-bearing: it is what takes the 8k judge out
+        # of the pool for this row. The chars/4 sizing leaves it in.
+        assert "glm" in call["exclude_families"]
+        chars_over_four = sum(len(m["content"]) for m in messages) // 4 + JUDGE_MAX_TOKENS
+        assert "glm" not in undersized_families(widened, "judge", chars_over_four)
 
 
 def test_a_reopened_judge_row_gets_its_attempt_budget_back(tmp_path, cfg, paths):
