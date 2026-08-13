@@ -37,6 +37,7 @@ import random
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 import httpx
@@ -865,6 +866,23 @@ class PoolGap:
     # (judge.py decides on the two judges and rejects the unresolved
     # disagreement), so it is reported and survivable.
     fatal: bool
+    # API-key env vars that would fill this slot if they were set.  Empty when
+    # nothing about this gap is about keys.
+    key_envs: tuple[str, ...] = ()
+    # True when the slot is empty at EVERY row size, not merely above one.
+    # That is the fact ``--allow-pool-gaps`` turns on: the override's whole
+    # justification is "the short rows still run", and here there are no short
+    # rows to run - the same walk comes up empty with the context filter
+    # removed entirely.  A missing key is the usual way to earn it (an unkeyed
+    # ref is skipped at every size), which is why an override that treats a
+    # key-shaped gap like a length-shaped one restores the damage the key
+    # filter was added to prevent: every row pays judge A and parks.
+    unservable: bool = False
+
+    @property
+    def key_shaped(self) -> bool:
+        """A key that has not arrived is among the reasons this slot is empty."""
+        return bool(self.key_envs)
 
 
 def required_context(needed_tokens: int) -> int:
@@ -908,12 +926,120 @@ def _first_family(router: "Router", role: str, exclude: frozenset[str]) -> str |
     return None
 
 
+def _fillable_at_any_size(router: "Router", gen_family: str, slots: Sequence[str]) -> bool:
+    """Could these judge slots be filled if no row were too long for anything?
+
+    Context length is the ONLY part of the exclusion a shorter row lifts:
+    family separation and a missing key hold identically at every size.  So
+    the same walk with the size exclusion removed answers the question
+    ``--allow-pool-gaps`` depends on - "are the short rows still servable?" -
+    and answers it in the Router's own filter rather than by reasoning about
+    which reason emptied the slot.
+
+    Every slot is walked, not only the one that failed: a row is servable only
+    if BOTH judges can be found for it, and a pool that fills slot A at 2k
+    tokens and never fills slot B is the shape that pays for one judge per row
+    and parks the lot.
+    """
+    chosen: list[str] = []
+    for _ in slots:
+        family = _first_family(router, "judge", frozenset({gen_family, *chosen}))
+        if family is None:
+            return False
+        chosen.append(family)
+    return True
+
+
+def _generator_windows(cfg: BuildConfig, router: "Router") -> dict[str, int | None]:
+    """generator family -> the largest context window it offers (None = undeclared).
+
+    Walked through ``Router.eligible_refs`` for the same reason the judge slots
+    are: a generator family behind a key that has not arrived produces no rows,
+    so a judge gap reported for it is a refusal about a combination that cannot
+    occur - and every spurious refusal pushes the operator toward the override.
+
+    The window is per FAMILY and takes the largest, because ``undersized_families``
+    excludes a family only when EVERY model in it is too small: one big model
+    keeps the whole family routable.
+    """
+    windows: dict[str, int | None] = {}
+    for ref in router.eligible_refs("generator"):
+        _, model = cfg.model_for(ref)
+        cap = model.limits.get("max_context")
+        if model.family not in windows:
+            windows[model.family] = None if cap is None else int(cap)
+        elif windows[model.family] is not None:
+            windows[model.family] = None if cap is None else max(windows[model.family], int(cap))
+    return windows
+
+
+def _sized_for(
+    default: int,
+    needed_for_window: "Callable[[int | None, str], int] | None",
+    window: int | None,
+    role: str,
+) -> int:
+    """The size THIS generator family's judge check runs at.
+
+    ``min`` with the flat worst case on purpose: the sizer can only ever make
+    the check smaller, so a caller that passes a broken one narrows nothing it
+    was not already entitled to narrow.
+    """
+    if needed_for_window is None:
+        return default
+    return min(default, int(needed_for_window(window, role)))
+
+
+def _judge_gap_detail(
+    *,
+    advice: int,
+    gen_family: str,
+    slot: str,
+    needed: int,
+    judge_families: Sequence[str],
+    too_small: Sequence[str],
+    chosen: Sequence[str],
+    key_envs: Sequence[str],
+    unservable: bool,
+) -> str:
+    remedy = f"add one judge in a further family with max_context >= {advice}"
+    if key_envs:
+        remedy = f"set {', '.join(key_envs)}, or {remedy}"
+    scope = (
+        "no row size is servable, so --allow-pool-gaps cannot run short rows "
+        "past this one"
+        if unservable
+        else "shorter rows still route"
+    )
+    return (
+        f"a {gen_family} generation of {needed} tokens has no judge for slot "
+        f"{slot}: the judge pool is {list(judge_families)}, minus the "
+        f"generator's own {gen_family!r}, minus {list(too_small)} on context "
+        f"length, minus {list(chosen)} already used, minus anything whose API "
+        f"key is unset ({scope}). {remedy}"
+    )
+
+
+def _tiebreak_gap_detail(
+    *, advice: int, gen_family: str, needed: int, chosen: Sequence[str], key_envs: Sequence[str]
+) -> str:
+    remedy = f"add one tiebreak in a further family with max_context >= {advice}"
+    if key_envs:
+        remedy = f"set {', '.join(key_envs)}, or {remedy}"
+    return (
+        f"a {gen_family} generation of {needed} tokens judged by {list(chosen)} has no "
+        f"third family left to break a tie; judge.py decides on the two judges and "
+        f"rejects the unresolved disagreement (run_event "
+        f"tiebreak_unroutable_two_judge_decision). {remedy}"
+    )
+
+
 def pool_gaps(
     cfg: BuildConfig,
     *,
     needed_tokens: int,
     tiebreak_needed_tokens: int | None = None,
-    router: "Router | None" = None,
+    needed_for_window: "Callable[[int | None, str], int] | None" = None,
 ) -> list[PoolGap]:
     """Every judge/tiebreak slot the pool cannot fill for the LONGEST row.
 
@@ -934,29 +1060,40 @@ def pool_gaps(
     that then parked rows half-paid.  There is now one sizing function
     (generate.worst_case_judge_tokens) and this reports what it is given.
 
+    ``needed_for_window(window, role)`` is the OTHER half of "a gap that
+    cannot occur is not a gap": a generator family whose largest window is 8k
+    cannot be handed the longest row the length band permits, so checking its
+    judge slots at that length invents a refusal.  Given the hook, each family
+    is checked at what its own window permits (never above the flat number).
+
+    The advice every gap prints is the LARGEST window any gap in this config
+    needs, not each gap's own: the operator adds ONE model to both routing
+    lists, and a number that closes the judge gap while leaving a tiebreak
+    warning behind is a number that sent them shopping twice.
+
     Deliberately NOT a fallback: reusing a family when the pool runs out
     would put a model's own family in front of its own prose, which is the
     invariant the separation exists to protect.  The fix is one more model in
     the config, or one more key in the environment; this is how the operator
     learns which, in one second.
     """
-    if router is None:
-        # A bare Router: nothing is cooling on a fresh one and the default
-        # budget gate passes, so what this adds over a raw config walk is
-        # precisely the key filter - which is the point.
-        router = Router(cfg)
-    tiebreak_needed = needed_tokens if tiebreak_needed_tokens is None else tiebreak_needed_tokens
-    too_small_judge = undersized_families(cfg, "judge", needed_tokens)
-    too_small_tiebreak = undersized_families(cfg, "tiebreak", tiebreak_needed)
+    # A bare Router: nothing is cooling on a fresh one and the default budget
+    # gate passes, so what this adds over a raw config walk is precisely the
+    # key filter - which is the point.  A LIVE router is deliberately not
+    # accepted: cooling and budget are facts about the minute, not about the
+    # config, and this walk would have to ask the budget gate about a call of
+    # est_tokens=0 while judge_slot asks it about the real size.
+    router = Router(cfg)
+    tiebreak_flat = needed_tokens if tiebreak_needed_tokens is None else tiebreak_needed_tokens
     judge_families = sorted({cfg.model_for(r)[1].family for r in cfg.routing_refs("judge")})
-    gaps: list[PoolGap] = []
-    seen: set[str] = set()
-    for gen_ref in cfg.routing_refs("generator"):
-        _, gen_model = cfg.model_for(gen_ref)
-        gen_family = gen_model.family
-        if gen_family in seen:
-            continue
-        seen.add(gen_family)
+    # (detail-builder, PoolGap fields, the window this gap needs closed)
+    pending: list[tuple[Callable[..., str], dict, int]] = []
+
+    for gen_family, window in _generator_windows(cfg, router).items():
+        judge_needed = _sized_for(needed_tokens, needed_for_window, window, "judge")
+        tiebreak_needed = _sized_for(tiebreak_flat, needed_for_window, window, "tiebreak")
+        too_small_judge = undersized_families(cfg, "judge", judge_needed)
+        too_small_tiebreak = undersized_families(cfg, "tiebreak", tiebreak_needed)
         chosen: list[str] = []
         blocked = False
         for slot in ("a", "b"):
@@ -964,27 +1101,29 @@ def pool_gaps(
             family = _first_family(router, "judge", exclude)
             if family is None:
                 envs = _blocking_key_envs(cfg, "judge", exclude)
-                remedy = (
-                    f"set {', '.join(envs)}, or add one judge in a further family "
-                    f"with max_context >= {required_context(needed_tokens)}"
-                    if envs
-                    else f"add one judge in a further family with max_context >= "
-                    f"{required_context(needed_tokens)}"
-                )
-                gaps.append(
-                    PoolGap(
-                        role="judge",
-                        generator_family=gen_family,
-                        slot=slot,
-                        detail=(
-                            f"a {gen_family} generation of {needed_tokens} tokens has no "
-                            f"judge for slot {slot}: the judge pool is {judge_families}, "
-                            f"minus the generator's own {gen_family!r}, minus "
-                            f"{sorted(too_small_judge)} on context length, minus "
-                            f"{chosen} already used, minus anything whose API key is "
-                            f"unset. {remedy}"
+                unservable = not _fillable_at_any_size(router, gen_family, ("a", "b"))
+                pending.append(
+                    (
+                        partial(
+                            _judge_gap_detail,
+                            gen_family=gen_family,
+                            slot=slot,
+                            needed=judge_needed,
+                            judge_families=judge_families,
+                            too_small=sorted(too_small_judge),
+                            chosen=list(chosen),
+                            key_envs=envs,
+                            unservable=unservable,
                         ),
-                        fatal=True,
+                        dict(
+                            role="judge",
+                            generator_family=gen_family,
+                            slot=slot,
+                            fatal=True,
+                            key_envs=envs,
+                            unservable=unservable,
+                        ),
+                        required_context(judge_needed),
                     )
                 )
                 blocked = True
@@ -993,24 +1132,33 @@ def pool_gaps(
         if blocked:
             continue
         exclude = frozenset({gen_family, *chosen}) | too_small_tiebreak
-        tiebreak = _first_family(router, "tiebreak", exclude)
-        if tiebreak is None:
-            gaps.append(
-                PoolGap(
-                    role="tiebreak",
-                    generator_family=gen_family,
-                    slot="tiebreak",
-                    detail=(
-                        f"a {gen_family} generation of {tiebreak_needed} tokens judged by "
-                        f"{chosen} has no third family left to break a tie; judge.py "
-                        f"decides on the two judges and rejects the unresolved "
-                        f"disagreement (run_event "
-                        f"tiebreak_unroutable_two_judge_decision)"
+        if _first_family(router, "tiebreak", exclude) is None:
+            envs = _blocking_key_envs(cfg, "tiebreak", exclude)
+            pending.append(
+                (
+                    partial(
+                        _tiebreak_gap_detail,
+                        gen_family=gen_family,
+                        needed=tiebreak_needed,
+                        chosen=list(chosen),
+                        key_envs=envs,
                     ),
-                    fatal=False,
+                    dict(
+                        role="tiebreak",
+                        generator_family=gen_family,
+                        slot="tiebreak",
+                        fatal=False,
+                        key_envs=envs,
+                        # The tiebreak has a defined, unpaid fallback, so
+                        # "no row size escapes it" costs decisions, not money.
+                        unservable=False,
+                    ),
+                    required_context(tiebreak_needed),
                 )
             )
-    return gaps
+
+    advice = max((required for _, _, required in pending), default=0)
+    return [PoolGap(detail=detail(advice=advice), **fields) for detail, fields, _ in pending]
 
 
 class Router:

@@ -71,7 +71,9 @@ from tuned.data.config import ModelRef
 from tuned.data.gates import GateContext, split_think
 from tuned.data.jsonl import append_ndjson
 from tuned.data.providers import (
+    CHARS_PER_TOKEN_INDIC,
     CHARS_PER_TOKEN_LATIN,
+    CONTEXT_SAFETY_MARGIN,
     DEFAULT_JUDGE_REPLY_TOKENS,
     ProviderError,
     context_estimate,
@@ -368,6 +370,70 @@ def judge_needed_tokens(
     return context_estimate(messages) + int(reply_tokens)
 
 
+def judge_tokens_for_generator_window(
+    cfg,
+    window: int | None,
+    *,
+    reply_tokens: int = DEFAULT_JUDGE_REPLY_TOKENS,
+    prompt_id: str = JUDGE_PROMPT_ID,
+) -> int:
+    """The largest judge call a generation routed to a `window`-token model can make.
+
+    `window=None` means "no ceiling", which is the build-wide worst case:
+    everything the length band permits, in the script that tokenizes hardest.
+
+    With a ceiling, the row is bounded twice over and the smaller bound wins.
+    Everything the judge is shown came through that one generation call:
+
+    * the {source} is the grounding slots, a SUBSET of the generator's own
+      prompt - and that prompt had to satisfy `required_context(prompt +
+      max_output) <= window`, which is what `undersized_families` enforces
+      before the call is made;
+    * the candidate (trace + answer) is what the call produced, so it is at
+      most `max_output_tokens(cfg)` tokens of reply.
+
+    Converting the reply back into characters is the one step that is not a
+    rearrangement of numbers the code already enforces: it charges every reply
+    token at CHARS_PER_TOKEN_LATIN, the most characters this module's own
+    model ever gives a token, so re-estimating those characters in Devanagari
+    over-counts rather than under-counts. That direction matters - under-
+    counting here would clear a judge that then cannot hold the row, which is
+    R3-C2 with extra steps.
+    """
+    band_chars = int(cfg.build.length_band.total_max * CHARS_PER_TOKEN_LATIN)
+    if window is None:
+        chars = band_chars
+    else:
+        reply = max_output_tokens(cfg)
+        material = max(0.0, window / CONTEXT_SAFETY_MARGIN - reply) * CHARS_PER_TOKEN_INDIC
+        chars = min(band_chars, int(material) + int(reply * CHARS_PER_TOKEN_LATIN))
+    return judge_needed_tokens(
+        judge_messages(WORST_CASE_CHAR * chars, "", "", prompt_id=prompt_id),
+        reply_tokens=reply_tokens,
+    )
+
+
+def judge_sizer(cfg, *, reply_tokens: int = DEFAULT_JUDGE_REPLY_TOKENS):
+    """The per-generator-window sizing hook `providers.pool_gaps` takes.
+
+    Same renderer and same estimator as everything else in this file; what the
+    hook adds is that a generator family which CANNOT be handed the longest row
+    the band permits is not checked as though it could. A refusal over a
+    combination that cannot occur is not a free refusal: it is the operator
+    reaching for --allow-pool-gaps.
+    """
+
+    def needed_for_window(window: int | None, role: str) -> int:
+        return judge_tokens_for_generator_window(
+            cfg,
+            window,
+            reply_tokens=reply_tokens,
+            prompt_id=TIEBREAK_PROMPT_ID if role == "tiebreak" else JUDGE_PROMPT_ID,
+        )
+
+    return needed_for_window
+
+
 def worst_case_judge_tokens(
     cfg,
     *,
@@ -391,10 +457,8 @@ def worst_case_judge_tokens(
     and the hardest way to spend it is entirely in Devanagari, which is a
     large fraction of this corpus and tokenizes at 1.5 chars/token.
     """
-    chars = int(cfg.build.length_band.total_max * CHARS_PER_TOKEN_LATIN)
-    material = WORST_CASE_CHAR * chars
-    return judge_needed_tokens(
-        judge_messages(material, "", "", prompt_id=prompt_id), reply_tokens=reply_tokens
+    return judge_tokens_for_generator_window(
+        cfg, None, reply_tokens=reply_tokens, prompt_id=prompt_id
     )
 
 
@@ -418,16 +482,26 @@ def preflight_messages(
       permits - on family separation, on context length, or because the only
       family left sits behind an API key that has not arrived. All three empty
       the judge role for a whole class of rows, and the row only discovers
-      that AFTER paying for the other judge. Overridable with allow_pool_gaps,
-      because an operator who knows the gap may legitimately want to run short
-      rows while the fourth-family judge is still being sourced.
+      that AFTER paying for the other judge.
+
+    allow_pool_gaps overrides the second one, and ONLY where the override's
+    justification is true. A context-length gap empties the slot above a size,
+    so an operator who knows about it can legitimately run the short rows while
+    the fourth-family judge is sourced. A gap the same walk still reports with
+    the length filter removed entirely - typically because an unkeyed family is
+    skipped at every size - has no short rows to run: every row pays judge A
+    and parks, which is the failure the key filter was added to prevent. Those
+    stay refusals whatever the flag says, and `PoolGap.unservable` is the fact
+    that decides it.
 
     The tiebreak's own gap is a warning, never a refusal: judge.py has a
     defined, unpaid fallback for it (decide on the two judges, reject the
     unresolved disagreement) and round 1 shipped it deliberately.
 
     The size the pool is checked at comes from worst_case_judge_tokens, i.e.
-    from the judge's own renderer and estimator. Nothing here re-derives it.
+    from the judge's own renderer and estimator, capped per generator family
+    by what that family's own window permits (judge_sizer). Nothing here
+    re-derives either number.
     """
     refusals: list[str] = []
     warnings: list[str] = []
@@ -443,10 +517,11 @@ def preflight_messages(
         tiebreak_needed_tokens=worst_case_judge_tokens(
             cfg, reply_tokens=judge_reply_tokens, prompt_id=TIEBREAK_PROMPT_ID
         ),
+        needed_for_window=judge_sizer(cfg, reply_tokens=judge_reply_tokens),
     )
     for gap in gaps:
         line = f"routing.{gap.role} slot {gap.slot}: {gap.detail}"
-        if gap.fatal and not allow_pool_gaps:
+        if gap.fatal and (not allow_pool_gaps or gap.unservable):
             refusals.append(line)
         else:
             warnings.append(line)
@@ -465,10 +540,13 @@ def print_preflight(cfg, roles: Sequence[str], *, allow_pool_gaps: bool = False,
     if refusals:
         print(
             "not starting: fix the above, or pass --allow-pool-gaps to run "
-            "anyway where the gap is a POOL gap - including one an API key "
-            "would open, since running short rows while a key is pending is a "
-            "real choice. A role with no usable key at all is never "
-            "overridable: those calls cannot be made."
+            "anyway where the gap only bites ABOVE a row size - running the "
+            "short rows while a bigger judge is sourced is a real choice. It "
+            "does NOT override a gap that no row size escapes (an unkeyed "
+            "judge family is skipped at every size): there are no short rows "
+            "to run, so every row would pay for judge A and park. A role with "
+            "no usable key at all is never overridable either: those calls "
+            "cannot be made."
         )
     return not refusals
 

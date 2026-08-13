@@ -13,6 +13,8 @@ from pipeline_fakes import (
     FakeRouter,
     build_cfg,
     cfg_with_fourth_judge_family,
+    cfg_with_context,
+    cfg_with_split_pools,
     chat_response,
     open_store,
     paths_for,
@@ -40,13 +42,14 @@ from tuned.data.generate import (
     gate_context,
     generate_once,
     grounding_text,
+    judge_sizer,
     next_attempt,
     preflight_messages,
     run_workers,
 )
 from tuned.data.generate import main as generate_main
 from tuned.data.jsonl import read_at
-from tuned.data.providers import ProviderError
+from tuned.data.providers import ProviderError, required_context
 from tuned.data.tasks import plan_wave, reopen_tasks
 
 
@@ -1037,6 +1040,113 @@ def test_the_preflight_refuses_a_16k_fourth_family_judge(cfg, monkeypatch):
     # ...and the same config with a 32k model in the same slot starts clean.
     thirty_two_k = cfg_with_fourth_judge_family(cfg, max_context=32768)
     assert preflight_messages(thirty_two_k, ("generator",)) == ([], [])
+
+
+def test_allow_pool_gaps_cannot_override_a_gap_no_row_size_escapes(cfg, monkeypatch):
+    """R4-C1. The flag's justification - "running short rows while a key is
+    pending is a real choice" - is true of a CONTEXT gap and false of this
+    one: an unkeyed judge family is skipped at every size, so a magistral row
+    has no slot B whatever its length. This is also the LIKELY first launch,
+    because the shipped config's own gap already tells the operator to pass
+    the flag; starting that way means every row pays for judge A and parks."""
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    widened = cfg_with_fourth_judge_family(cfg)  # the new judge is a groq model
+
+    forced, warnings = preflight_messages(
+        widened, GENERATOR_PREFLIGHT_ROLES, allow_pool_gaps=True
+    )
+    assert any("routing.judge" in line and "GROQ_API_KEY" in line for line in forced)
+    assert any("no row size is servable" in line for line in forced)
+    # The gap the override IS for still moves to warnings under the flag.
+    assert any("routing.judge" in line for line in warnings)
+
+    # ...and the same config with the key set starts clean, so the refusal is
+    # about the key and not about the flag.
+    monkeypatch.setenv("GROQ_API_KEY", "sk-test")
+    assert preflight_messages(widened, GENERATOR_PREFLIGHT_ROLES) == ([], [])
+
+
+def test_the_shipped_configs_own_gap_is_still_overridable(cfg, monkeypatch):
+    """The other half of R4-C1: the fourth-family judge is a MODEL the
+    operator is sourcing, not a key, and short rows really do route. Refusing
+    that one as well would leave no way to run the pilot at all."""
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    refusals, warnings = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
+    assert any("routing.judge slot b" in line for line in refusals)
+    forced, forced_warnings = preflight_messages(
+        cfg, GENERATOR_PREFLIGHT_ROLES, allow_pool_gaps=True
+    )
+    assert forced == []
+    assert any("shorter rows still route" in line for line in forced_warnings)
+
+
+def test_the_preflight_advises_one_model_that_closes_every_gap_it_reports(cfg, monkeypatch):
+    """The advice is what the operator is choosing a model against right now.
+    It was judge-only: the preflight sizes the tiebreak separately (23,733 vs
+    23,729), so a model of EXACTLY the advised size closed the judge gap and
+    opened a tiebreak warning. Driven through preflight_messages, which is the
+    production call - the old pinning test called pool_gaps WITHOUT
+    tiebreak_needed_tokens and could not see it."""
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    refusals, warnings = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
+    advised = {
+        int(line.split("max_context >= ")[1].split()[0]) for line in refusals + warnings
+    }
+    assert len(advised) == 1, "the operator adds ONE model; it needs ONE number"
+    advice = advised.pop()
+
+    exact = cfg_with_fourth_judge_family(cfg, max_context=advice)
+    assert preflight_messages(exact, GENERATOR_PREFLIGHT_ROLES) == ([], [])
+    short = cfg_with_fourth_judge_family(cfg, max_context=advice - 1)
+    assert preflight_messages(short, GENERATOR_PREFLIGHT_ROLES) != ([], [])
+
+
+def test_the_preflight_checks_each_generator_family_at_its_own_window(cfg, monkeypatch):
+    """The 8k generator is diverted long before the length band's longest row,
+    so a judge gap reported for it at that length is a refusal about a
+    combination that cannot occur. The 40k generator's gap is real and stays."""
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    patched = cfg_with_context(cfg, family="qwen", role="judge", max_context=20000)
+    refusals, _ = preflight_messages(patched, GENERATOR_PREFLIGHT_ROLES)
+    assert any("a mistral generation" in line for line in refusals)
+    assert not any("a gpt-oss generation" in line for line in refusals)
+
+
+@pytest.mark.parametrize("generator_window", [8192, 131072])
+def test_the_preflight_sizes_the_tiebreak_with_the_tiebreak_prompt(
+    cfg, monkeypatch, generator_window
+):
+    """The judge and the tiebreak are different prompts and the preflight
+    passes both sizes - the flat worst case AND the per-window hook. Drop
+    either and the tiebreak is checked against a prompt nobody sends. They are
+    four tokens apart on this config, so the pin is a model that sits between
+    the two requirements; the parameters put the generator on each side of the
+    band, because the flat number only reaches a family whose window does not
+    cap it."""
+    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.setenv(env, "sk-test")
+    base = cfg_with_context(
+        cfg, family="gpt-oss", role="generator", max_context=generator_window
+    )
+    sizer = judge_sizer(base)
+    judge_required = required_context(sizer(generator_window, "judge"))
+    tiebreak_required = required_context(sizer(generator_window, "tiebreak"))
+    assert judge_required < tiebreak_required
+
+    tight = cfg_with_split_pools(
+        base, judge_context=131072, tiebreak_context=tiebreak_required - 1
+    )
+    refusals, warnings = preflight_messages(tight, GENERATOR_PREFLIGHT_ROLES)
+    assert refusals == []
+    assert any("routing.tiebreak" in line for line in warnings)
+
+    opened = cfg_with_split_pools(base, judge_context=131072, tiebreak_context=tiebreak_required)
+    assert preflight_messages(opened, GENERATOR_PREFLIGHT_ROLES) == ([], [])
 
 
 def test_the_preflight_refuses_a_judge_slot_that_is_only_missing_a_key(cfg, monkeypatch):

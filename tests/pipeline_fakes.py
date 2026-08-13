@@ -354,6 +354,62 @@ def cfg_with_fourth_judge_family(cfg: BuildConfig, *, max_context: int = 131072)
     )
 
 
+def cfg_with_split_pools(cfg: BuildConfig, *, judge_context: int, tiebreak_context: int):
+    """A pool whose JUDGE role is complete and whose TIEBREAK role is not.
+
+    One fourth-family model in the judge list only, so every judge slot fills,
+    and one fifth-family model in the tiebreak list only at a size the caller
+    chooses. That is what lets a test put a threshold between what the judge
+    prompt requires and what the (slightly longer) tiebreak prompt requires -
+    the two are sized separately, and nothing else in the config can tell them
+    apart.
+    """
+    from dataclasses import replace
+
+    def model(model_id, family, role, max_context):
+        return ModelCfg(
+            id=model_id,
+            family=family,
+            roles=(role,),
+            limits={"rpm": 30, "tpm": 8000, "max_context": max_context, "max_output": 8192},
+            params={"temperature": 0.2},
+        )
+
+    extra = (
+        model("fourth-judge", "fourth", "judge", judge_context),
+        model("fifth-tiebreak", "fifth", "tiebreak", tiebreak_context),
+    )
+    providers = tuple(
+        replace(p, models=p.models + extra) if p.name == "groq" else p for p in cfg.providers
+    )
+    return replace(
+        cfg,
+        providers=providers,
+        routing=replace(
+            cfg.routing,
+            judge=cfg.routing.judge + ("groq/fourth-judge",),
+            tiebreak=cfg.routing.tiebreak + ("groq/fifth-tiebreak",),
+        ),
+    )
+
+
+def cfg_with_context(cfg: BuildConfig, *, family: str, role: str, max_context: int):
+    """The shipped config with one (family, role)'s context window rewritten."""
+    from dataclasses import replace
+
+    def patch(model):
+        if model.family != family or role not in model.roles:
+            return model
+        return replace(model, limits={**model.limits, "max_context": max_context})
+
+    return replace(
+        cfg,
+        providers=tuple(
+            replace(p, models=tuple(patch(m) for m in p.models)) for p in cfg.providers
+        ),
+    )
+
+
 def temp_config(tmp_path) -> str:
     """The real build config with its workdir redirected into tmp_path.
 
