@@ -1546,6 +1546,12 @@ def test_the_shortfall_line_and_the_manifest_carry_the_verified_expectation(tmp_
     assert f"{bbl['rows']} rows, 24365 expected across 2 config/split" in out
     assert f"{bbl['row_shortfall']} SHORT" in out
     assert EVAL_COUNTS_VERIFIED_AT in out
+    # THE DATE ITSELF, as a literal. Its comment says an edit to it is a
+    # decision rather than a typo-fix, and the suite has to agree with that or
+    # the sentence is decoration: every assertion above passes with any date at
+    # all, because they all read the constant.
+    assert EVAL_COUNTS_VERIFIED_AT == "2026-08-14"
+    assert "2026-08-14" in out
 
     # ... and the set with no verified count says the instrument is off rather
     # than printing a shortfall of zero, which reads identically to "complete".
