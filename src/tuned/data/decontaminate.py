@@ -346,15 +346,22 @@ class DecontaminationError(RuntimeError):
 # questions.
 #
 # The class is derived from unicodedata rather than hand-listed, over the BMP
-# ranges that carry Indic and diacritic marks (U+0300-U+1AFF covers combining
-# diacriticals through every Indic block; U+A8E0-U+A8FF is Devanagari
-# Extended). Measured at import: under a millisecond.
+# ranges that carry Indic and diacritic marks: U+0300-U+1DFF (combining
+# diacriticals, every mainline Indic block, Combining Diacritical Marks
+# Extended, VEDIC EXTENSIONS at U+1CD0-U+1CFF and the Supplement at
+# U+1DC0-U+1DFF) plus U+A8E0-U+A8FF for Devanagari Extended, which sits far
+# outside the first range. It is NOT "every Indic block" - the comment here
+# used to say so while stopping at U+1AFF, which left U+1CDA (Vedic tone
+# marker) splitting a word in a Sanskrit citation. Measured cold at import:
+# 1.0-1.1 ms over 152 ranges. (The comment here said "under a millisecond" for
+# the narrower scan, which measured 3.65 ms on the reviewer's machine and
+# 1.4 ms on this one - it is a small number, not an unmeasured one.)
 def _combining_marks() -> str:
     """The body of a regex character class holding every combining mark."""
     import unicodedata
 
     ranges: list[list[int]] = []
-    for code in [*range(0x0300, 0x1B00), *range(0xA8E0, 0xA900)]:
+    for code in [*range(0x0300, 0x1E00), *range(0xA8E0, 0xA900)]:
         if unicodedata.category(chr(code)).startswith("M"):
             if ranges and code == ranges[-1][1] + 1:
                 ranges[-1][1] = code
@@ -369,6 +376,21 @@ def _combining_marks() -> str:
 # matra following punctuation is not a word, and requiring the first character
 # to be alphanumeric is what keeps that out without a second rule.
 _TOKEN = re.compile(rf"[^\W_](?:[^\W_]|[{_combining_marks()}])*", re.UNICODE)
+
+# ZERO-WIDTH NON-JOINER and ZERO-WIDTH JOINER, STRIPPED rather than added to
+# the class above, and the difference between those two decisions is the whole
+# point. They are category Cf, so `\w` excludes them and a word carrying one
+# used to split there: `प्रतिवादी` written with a ZWNJ read as two tokens, and a
+# three-word phrase spelled with them read as five - the same inflation as the
+# matra bug one category over, with the same two consequences (a one-word edit
+# stops being a one-token edit, and a short phrase clears the 5-token floor and
+# becomes falsely matchable).
+#
+# ADDING them to the class would fix the split and leave the two spellings of
+# the same word unequal, which is the fault that matters here: an eval item and
+# a training row that differ only in an invisible joiner would compare as
+# different words. STRIPPING makes them equal, and equal is what a screen needs.
+_ZERO_WIDTH = str.maketrans({"‌": None, "‍": None})
 _MASK = (1 << 64) - 1
 _BASE = 1_000_003
 
@@ -379,10 +401,12 @@ def tokens(text: str) -> tuple[str, ...]:
     Punctuation, markup and whitespace are dropped, so a row that differs
     from an eval item only in typesetting still matches it. Digits are KEPT:
     section numbers and years are most of what distinguishes one legal
-    question from another. COMBINING MARKS STAY INSIDE THE WORD THEY MODIFY -
-    see _TOKEN for the measurement that forced it.
+    question from another. COMBINING MARKS STAY INSIDE THE WORD THEY MODIFY
+    and ZERO-WIDTH JOINERS ARE REMOVED FIRST, so the joiner and joiner-less
+    spellings of a word are the same token - see _TOKEN and _ZERO_WIDTH for
+    the measurements that forced both.
     """
-    return tuple(_TOKEN.findall((text or "").lower()))
+    return tuple(_TOKEN.findall((text or "").lower().translate(_ZERO_WIDTH)))
 
 
 def gram_hashes(toks: Sequence[str], n: int = NGRAM) -> frozenset[int]:
@@ -1524,8 +1548,10 @@ def decontaminate_items(
             if hit.level == LEVEL_CASE_ID:
                 # Every identifier that matched, not just the one the drop is
                 # filed under: this is a count of ROW-MATCHES per identifier
-                # and it sums to at least the number of drops, by design. See
-                # hits_for for why the lever this feeds needs all of them.
+                # over CASE-IDENTIFIER hits, so it sums to at least
+                # `by_level["case_id"]` - NOT to `dropped`, since a row dropped
+                # on text or on the semantic layer contributes nothing to it.
+                # See hits_for for why the lever this feeds needs all of them.
                 for key in hit.detail["identifiers"]:
                     stats["identifier_drops"][key] = stats["identifier_drops"].get(key, 0) + 1
         drops.append(
@@ -1960,16 +1986,34 @@ def semhash_available() -> bool:
 
 
 def semhash_index(records: Sequence[str]):
-    """`SemHash.from_records`, with construction failure as its own error.
+    """`SemHash.from_records`, with construction failure split BY ERROR KIND.
 
     Both seams build their index through here so that "the model could not be
     fetched" and "the API drifted" cannot arrive at the caller as the same
     exception - they are different statuses with different remedies.
+
+    THE SPLIT IS THE ERROR, NOT THE CALL SITE, and that distinction cost this
+    module a round. Everything raised here used to become SemanticModelError,
+    whose remedy text says in as many words "This is NOT API drift" - so a
+    renamed `from_records` or a renamed keyword, which is construction-side API
+    drift and nothing else, sent the operator to pre-warm a cache that was
+    already warm. A TypeError or an AttributeError from a constructor is the
+    signature this module is written against having moved; anything else
+    (OSError and its huggingface_hub descendants, connection and cache errors)
+    is the model.
     """
     from semhash import SemHash  # local import: absence is a status, not a crash
 
     try:
         return SemHash.from_records(records=list(records))
+    except (TypeError, AttributeError) as exc:
+        raise SemanticSeamError(
+            f"semhash's constructor is not the one this module is written against "
+            f"({type(exc).__name__}: {exc}). It is documented as "
+            f"`SemHash.from_records(records=[...])`; if the installed version renamed the "
+            f"method or the keyword, fix semhash_index. THIS IS API DRIFT - the model and "
+            f"the cache are not the problem, so pre-warming the cache will not help."
+        ) from exc
     except Exception as exc:
         raise SemanticModelError(
             f"semhash could not build its embedding index ({type(exc).__name__}: {exc}). "
@@ -2470,14 +2514,27 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
         # same screen as `ran`, and this is where the difference is written
         # down. See semantic_script_record.
         "semantic_scripts": semantic_script_record(semantic_layer, semantic_controls),
-        # ROW-MATCHES per identifier, so this sums to at least `dropped`: a row
-        # that shares two identifiers with the eval side is blamed on both,
-        # because --no-case-id-from-text removes a whole channel and the
-        # operator deciding whether to pass it has to see every identifier
-        # that would have cost this row.
+        # ROW-MATCHES per identifier, over CASE-IDENTIFIER drops only, and
+        # TRUNCATED to the top `top`. Both halves of that sentence were wrong
+        # here before: it claimed to sum to at least `dropped`, which is false
+        # twice over - a row dropped on text or on the semantic layer carries
+        # no identifier and contributes nothing (11 drops summed to 1 on a real
+        # fixture), and the slice below discards the tail (30 identifiers
+        # summed to 20). What IS true is that every case-identifier hit blames
+        # at least one identifier, so the TOTAL is at least
+        # `by_level["case_id"]` - and the total is recorded beside the slice so
+        # the truncation is visible rather than inferred.
+        #
+        # A row that shares two identifiers with the eval side is blamed on
+        # both, because --no-case-id-from-text removes a whole channel and the
+        # operator deciding whether to pass it has to see every identifier that
+        # would have cost this row.
         "top_identifiers": sorted(
             stats["identifier_drops"].items(), key=lambda kv: (-kv[1], kv[0])
         )[:top],
+        "identifier_drops_total": sum(stats["identifier_drops"].values()),
+        "identifier_drops_identifiers": len(stats["identifier_drops"]),
+        "top_identifiers_shown": min(top, len(stats["identifier_drops"])),
     }
 
 

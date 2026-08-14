@@ -210,21 +210,6 @@ def _near(text: str, others, threshold: float) -> bool:
     return _nearest(text, others)[1] >= threshold
 
 
-@pytest.fixture(autouse=True)
-def _the_semantic_layer_is_opt_in(monkeypatch):
-    """No test here runs the REAL semhash unless it says so.
-
-    The [build] extra may or may not be installed on any given machine, and a
-    suite whose drop counts depend on that is not a suite - with semhash
-    present the seam runs inside every CLI test, fetches a model, and flags
-    rows the exact stack did not. `sys.modules[name] = None` is the documented
-    way to make `import semhash` raise ImportError, which is precisely the
-    state semhash_available() exists to report; install_fake_semhash overrides
-    this entry for the tests that pin the seam itself.
-    """
-    monkeypatch.setitem(sys.modules, "semhash", None)
-
-
 def install_fake_semhash(monkeypatch, *, attr="selected", answer="real", provenance=True):
     """Put a `semhash` module in sys.modules.
 
@@ -286,6 +271,12 @@ def install_fake_semhash(monkeypatch, *, attr="selected", answer="real", provena
                 raise OSError(
                     "We couldn't connect to 'https://huggingface.co' to load the model"
                 )
+            if answer == "drifted-constructor":
+                # CONSTRUCTION-SIDE API DRIFT, which is not a missing model.
+                # The rung used to be chosen by the raise site, so this landed
+                # on `semhash-model-unavailable`, whose remedy says in as many
+                # words "This is NOT API drift".
+                raise TypeError("from_records() got an unexpected keyword argument 'records'")
             self.records = list(records)
 
         @classmethod
@@ -948,20 +939,56 @@ def test_a_drop_blames_every_identifier_that_matched_and_not_just_the_first():
     citation always named the citation and never the case. That lever removes
     a whole channel, so the operator has to see every identifier that would
     have cost the row, redundant ones included."""
+    leaked_text = prose(573, 40)
     index = EvalIndex([
         EvalItem("iltur", "iltur#0", prose(570, 40),
                  frozenset({"cit:2020 INSC 484", "cnr:DLHC010001232020"})),
+        EvalItem("iltur", "iltur#1", leaked_text, frozenset()),
     ])
     both = row(prose(571, 30), citation="2020 INSC 484", cnr="DLHC010001232020")
     only_citation = row(prose(572, 30), citation="2020 INSC 484")
-    _, drops, stats = decontaminate_items(items(both, only_citation), index)
+    # A TEXT-level drop carrying no identifier at all. Without one in the
+    # fixture the invariant below is unfalsifiable - every drop was a
+    # two-identifier case_id drop, so "sums to at least `dropped`" could not
+    # fail however wrong it was.
+    text_only = row(prose(574, 60) + " " + leaked_text)
+    _, drops, stats = decontaminate_items(items(both, only_citation, text_only), index)
     assert stats["identifier_drops"] == {"cit:2020 INSC 484": 2, "cnr:DLHC010001232020": 1}
     # The drop record carries both, and still files the row under one reason.
     assert drops[0]["hits"][0]["identifiers"] == ["cit:2020 INSC 484", "cnr:DLHC010001232020"]
     assert drops[0]["reason"] == f"{LEVEL_CASE_ID}:iltur"
-    # It is a count of ROW-MATCHES, so it sums to at least the drop count.
+    assert drops[2]["reason"] == f"{LEVEL_TEXT}:iltur"
+
     manifest = manifest_of(stats, {}, index, inputs=[], semantic="x")
-    assert sum(count for _, count in manifest["top_identifiers"]) >= stats["dropped"]
+    total = manifest["identifier_drops_total"]
+    # THE INVARIANT, corrected. It counts row-matches over CASE-IDENTIFIER
+    # hits, so it is bounded below by those and NOT by `dropped`: the manifest
+    # claimed the latter, and here the two differ.
+    assert total == 3 >= stats["by_level"][LEVEL_CASE_ID] == 2
+    assert stats["dropped"] == 3 and total >= stats["by_level"][LEVEL_CASE_ID]
+    assert manifest["identifier_drops_identifiers"] == 2
+
+
+def test_the_identifier_table_says_how_much_of_itself_it_is_showing():
+    """The other half of the false invariant: `top_identifiers` is a TRUNCATED
+    slice, so it sums to less than the total whenever more identifiers matched
+    than fit - 30 identifiers summed to 20 - and nothing said so."""
+    ids = {f"cit:2020 INSC {i:03d}" for i in range(30)}
+    index = EvalIndex([EvalItem("iltur", "iltur#0", prose(575, 40), frozenset(ids))])
+    tagged = replace(item_of(row(prose(576, 30)), "fixture#0"), identifiers=frozenset(ids))
+    _, _, stats = decontaminate_items([tagged], index)
+    assert len(stats["identifier_drops"]) == 30
+
+    manifest = manifest_of(stats, {}, index, inputs=[], semantic="x")
+    assert manifest["identifier_drops_total"] == 30
+    assert manifest["identifier_drops_identifiers"] == 30
+    assert manifest["top_identifiers_shown"] == len(manifest["top_identifiers"]) == 20
+    assert sum(count for _, count in manifest["top_identifiers"]) == 20 < 30
+    # ... and a run where nothing is truncated says THAT, rather than being
+    # indistinguishable from one that is.
+    small = manifest_of(stats, {}, index, inputs=[], semantic="x", top=50)
+    assert small["top_identifiers_shown"] == 30
+    assert sum(count for _, count in small["top_identifiers"]) == 30
 
 
 def test_an_eval_item_under_the_floor_is_counted_not_silently_ignored():
@@ -1125,6 +1152,55 @@ _ENGLISH_EQUIVALENT = (
     "under which section of the indian penal code is the punishment for murder "
     "prescribed and what is it"
 )
+
+
+def test_a_zero_width_joiner_does_not_split_a_word_or_change_its_identity():
+    """ZWNJ (U+200C) and ZWJ (U+200D) are category Cf, so `\\w` excludes them
+    and a word carrying one split there - the matra bug one category over, with
+    the same two consequences: a three-word phrase read as five tokens (and so
+    cleared the 5-token floor and became falsely matchable), and a one-word
+    edit stopped being a one-token edit.
+
+    They are STRIPPED rather than added to the token class, and that choice is
+    the point: adding them would fix the split and leave the joiner and
+    joiner-less spellings of one word comparing as two different words, which
+    for a screen is the fault that matters."""
+    joined, plain = "प्रति‌वादी अपील खारिज", "प्रतिवादी अपील खारिज"
+    assert tokens(joined) == tokens(plain) == ("प्रतिवादी", "अपील", "खारिज")
+    assert len(tokens(joined)) == 3, "not five - the floor and the level depend on this"
+    assert tokens("क्‍ष") == tokens("क्ष")
+    # The zero-width characters never become tokens of their own either.
+    assert tokens("‌‍") == ()
+    # A three-word phrase spelled with joiners stays under the floor exactly as
+    # its plain spelling does.
+    assert window_for(len(tokens(joined))) == 0
+
+
+def test_the_mark_class_covers_the_indic_blocks_the_comment_names():
+    """The comment used to claim "U+0300-U+1AFF covers every Indic block". It
+    does not: Vedic Extensions (U+1CD0-U+1CFF) sit outside it, so U+1CDA split
+    a word in a Sanskrit citation, and Devanagari Extended (U+A8E0) is a
+    separate range that only happened to be listed."""
+    # Vedic tone marker, which used to split this word in two.
+    assert tokens("रामा᳚यण कथा") == ("रामा᳚यण", "कथा")
+    # Devanagari Extended - the second range, pinned so deleting it is caught.
+    assert tokens("क꣠म शब्द") == ("क꣠म", "शब्द")
+    # Combining Diacritical Marks Supplement, the top of the extended range.
+    assert len(tokens("a᷀b")) == 1
+    # NOT ONLY DEVANAGARI. Every Indic script the corpus can carry reads one
+    # token per word, and narrowing the scan back to the Devanagari block alone
+    # would leave all of these splitting at every vowel sign.
+    for text, count in (
+        ("மேல்முறையீடு தள்ளுபடி செய்யப்பட்டது", 3),   # tamil
+        ("আপিল খারিজ করা হয়েছে", 4),                   # bengali
+        ("అప్పీలు కొట్టివేయబడింది", 2),                  # telugu
+        ("ਅਪੀਲ ਖਾਰਜ ਕੀਤੀ", 3),                          # gurmukhi
+        ("അപ്പീൽ തള്ളി", 2),                            # malayalam
+        ("ಮೇಲ್ಮನವಿ ವಜಾ", 2),                            # kannada
+        ("અપીલ રદ કરી", 3),                             # gujarati
+        ("ଅପିଲ ଖାରଜ", 2),                               # odia
+    ):
+        assert len(tokens(text)) == count == len(text.split()), text
 
 
 def test_a_hindi_word_is_one_token_and_not_one_token_per_matra():
@@ -2279,17 +2355,43 @@ def test_the_content_key_separates_the_prompt_from_the_answer():
 
 
 def test_this_module_cannot_reach_the_network():
-    """The guard on the guard. The semantic layer is opt-in here through a
+    """The guard on the guard. The semantic layer is opt-in through a conftest
     fixture, and deleting that fixture left the suite green on an air-gapped
     machine while making 38 outbound HTTP attempts on a networked one - a
-    suite whose meaning depends on which box it runs on. conftest.py refuses
-    the socket layer for this module, and this is the assertion that says so
-    rather than assuming it."""
+    suite whose meaning depends on which box it runs on.
+
+    ALL FOUR HOOKS, one case each. Only `create_connection` was covered, so
+    three of the four could be deleted with the suite still green - and the
+    uncovered ones are the ones that matter most: `getaddrinfo` and
+    `create_connection` are what requests/urllib3 reach for, `connect` and
+    `connect_ex` are what a raw socket uses, so any one of them left open is a
+    live path out."""
     import socket
 
-    with pytest.raises(Exception) as exc:  # noqa: B017 - the type is conftest's
-        socket.create_connection(("huggingface.co", 443), timeout=1)
-    assert "hermetic" in str(exc.value)
+    attempts = {
+        "create_connection": lambda: socket.create_connection(("huggingface.co", 443), 1),
+        "getaddrinfo": lambda: socket.getaddrinfo("huggingface.co", 443),
+        "connect": lambda: socket.socket().connect(("huggingface.co", 443)),
+        "connect_ex": lambda: socket.socket().connect_ex(("huggingface.co", 443)),
+    }
+    for name, attempt in attempts.items():
+        with pytest.raises(Exception) as exc:  # noqa: B017 - the type is conftest's
+            attempt()
+        assert "hermetic" in str(exc.value), f"socket.{name} is not refused"
+
+
+def test_the_semantic_layer_is_opt_in_for_every_module_in_this_suite():
+    """The opt-in used to be a per-module copy, so a module that imported
+    decontaminate later - test_build_citations, test_build_statutes and
+    test_build_store already do - inherited an UNGUARDED semantic path by
+    default. It is one suite-wide fixture in conftest now, and this is the
+    assertion that it is reaching this test rather than being assumed."""
+    from tuned.data.decontaminate import semhash_available
+
+    assert sys.modules.get("semhash", "absent") is None
+    assert semhash_available() is False
+    with pytest.raises(ImportError):
+        import semhash  # noqa: F401
 
 
 def test_a_machine_without_semhash_records_that_and_never_reads_as_screened(tmp_path, capsys):
@@ -2351,6 +2453,27 @@ def test_a_model_that_cannot_be_fetched_is_not_a_drifted_api(tmp_path, monkeypat
     assert "NOT API drift" in manifest["semantic_detail"]
     assert "semantic layer did NOT run (semhash-model-unavailable)" in out
     # The exact stack still ran: this layer's absence is a status, not a crash.
+    assert manifest["counts"]["total"] == 2
+
+
+def test_a_renamed_constructor_is_api_drift_and_not_a_missing_model(
+    tmp_path, monkeypatch, capsys
+):
+    """Round 2 moved this seam one place and left the rung split by the RAISE
+    SITE rather than by the error. Everything out of semhash_index became
+    `semhash-model-unavailable`, so a renamed `from_records` or a renamed
+    keyword - construction-side API drift and nothing else - was reported with
+    a remedy that says, in as many words, "This is NOT API drift" and sends the
+    operator to pre-warm a cache that is already warm."""
+    code, manifest, _ = _semantic_run(tmp_path, monkeypatch, answer="drifted-constructor")
+    out = capsys.readouterr().out
+    assert code == 0
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE == "semhash-control-failed"
+    assert manifest["semantic"] != SEMANTIC_NO_MODEL
+    assert "THIS IS API DRIFT" in manifest["semantic_detail"]
+    assert "fix semhash_index" in manifest["semantic_detail"]
+    assert "pre-warming the cache will not help" in manifest["semantic_detail"]
+    assert "semantic layer did NOT run (semhash-control-failed)" in out
     assert manifest["counts"]["total"] == 2
 
 

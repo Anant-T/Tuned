@@ -56,18 +56,6 @@ from tuned.data.jsonl import write_jsonl
 from tuned.data.store import Store
 
 
-@pytest.fixture(autouse=True)
-def _the_semantic_layer_is_opt_in(monkeypatch):
-    """Same reason as the decontaminate module's copy of this: with the
-    [build] extra installed the real seam runs inside every CLI test and the
-    suite's drop counts start depending on which machine it is running on.
-    Autouse fixtures do not cross module boundaries, so this is stated in both
-    places rather than imported."""
-    import sys
-
-    monkeypatch.setitem(sys.modules, "semhash", None)
-
-
 def grams(text: str) -> frozenset[int]:
     return gram_hashes(tokens(text), NGRAM)
 
@@ -586,6 +574,24 @@ def test_a_model_that_cannot_be_fetched_is_its_own_status_here_too(
     assert manifest["semantic"] == SEMANTIC_NO_MODEL == "semhash-model-unavailable"
     assert manifest["semantic"] != SEMANTIC_UNUSABLE
     assert "NOT API drift" in manifest["semantic_detail"]
+    assert manifest["counts"]["kept"] == 2  # the exact stack still ran
+
+
+def test_a_renamed_constructor_is_api_drift_here_too(tmp_path, monkeypatch, capsys):
+    """The rung is chosen by the ERROR, not by where it was raised. Both
+    modules build their index through decontaminate.semhash_index, so both
+    inherited the fault where a renamed `from_records` reported
+    `semhash-model-unavailable` and told the operator to warm a warm cache."""
+    cfg, paths = _decontaminated(tmp_path, [row(prose(164, 200), "a"),
+                                            row(prose(165, 200), "b")])
+    capsys.readouterr()
+    install_fake_semhash(monkeypatch, answer="drifted-constructor")
+    assert dedupe_main(["--config", cfg]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE == "semhash-control-failed"
+    assert manifest["semantic"] != SEMANTIC_NO_MODEL
+    assert "THIS IS API DRIFT" in manifest["semantic_detail"]
+    assert "pre-warming the cache will not help" in manifest["semantic_detail"]
     assert manifest["counts"]["kept"] == 2  # the exact stack still ran
 
 
