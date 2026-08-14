@@ -469,15 +469,42 @@ def test_the_narrow_level_carries_a_case_neither_of_the_others_can():
     assert drops[0]["hits"][0]["eval_tokens"] == 20
 
 
-def test_the_narrow_level_is_a_near_match_rule_and_not_a_loose_one():
-    """Its control: a rule that fires on everything is not a rule. The same
-    20-token question with SIX of its words changed is not a leak of it."""
+def test_the_narrow_band_tolerates_exactly_one_edit_and_no_more():
+    """Its control, and a limitation worth stating rather than discovering.
+
+    The window is chosen so that G = L - w + 1 lands on 2w, which is what
+    makes one central edit score exactly CONTAINMENT. The arithmetic of that
+    is a CLIFF, not a slope: two edits destroy 2w >= G grams and containment
+    goes to ZERO, with no band in between. So below 38 tokens the rule buys
+    one substituted token and nothing else - measured here, because a fixture
+    that assumed a gentle slope would have been asserting a property this
+    design does not have.
+
+    Above 38 tokens the window stops shrinking and the slope returns: a
+    100-token item still scores 0.85 after one edit and 0.26 after five.
+    """
     words = prose(401, 20).split()
     question = " ".join(words)
-    paraphrase = " ".join(_edited(words, 6))
-    leaked = prose(404, 300) + " " + paraphrase + " " + prose(405, 300)
+    window = window_for(20)
+    scores = [
+        containment(gram_hashes(tokens(question), window),
+                    gram_hashes(tokens(" ".join(_edited(words, k))), window))
+        for k in (1, 2, 3)
+    ]
+    assert scores == [CONTAINMENT, 0.0, 0.0]
+
+    leaked = prose(404, 300) + " " + " ".join(_edited(words, 2)) + " " + prose(405, 300)
     kept, drops, _ = decontaminate_items(items(row(leaked)), index_of(question))
     assert len(kept) == 1 and not drops
+
+    long_words = prose(406, 100).split()
+    long_question = " ".join(long_words)
+    slope = [
+        round(containment(gram_hashes(tokens(long_question), NGRAM),
+                          gram_hashes(tokens(" ".join(_edited(long_words, k))), NGRAM)), 2)
+        for k in (1, 5)
+    ]
+    assert slope == [0.85, 0.26], "above the cap the rule degrades gradually again"
 
 
 def test_capping_the_window_at_the_constant_is_what_keeps_long_items_screenable():
@@ -979,9 +1006,12 @@ def test_a_set_far_smaller_than_it_is_documented_to_be_is_a_refusal(store, tmp_p
     # nobody has checked is the failure the module exists to prevent.
     assert "Do NOT waive" in blocked[0]
 
-    eval_snapshot(store, tmp_path, "bbl", [{"question": prose(600 + i, 40)}
-                                           for i in range(floor)], name="data/test-1.jsonl")
-    assert eval_corpus(store, spec).status == EVAL_OK
+    # The same file rewritten with ONE more row - exactly at the floor, which
+    # is what makes this a boundary and not a gap.
+    eval_snapshot(store, tmp_path, "bbl", [{"question": prose(510 + i, 40)}
+                                           for i in range(floor)])
+    at_the_floor = eval_corpus(store, spec)
+    assert (at_the_floor.rows, at_the_floor.status) == (floor, EVAL_OK)
 
 
 def test_a_set_that_is_short_of_its_documented_count_says_so_without_refusing(store, tmp_path):

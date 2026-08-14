@@ -96,10 +96,20 @@ calibrated relaxation is to raise the divisor (3 -> 2.5 costs the one-edit
 guarantee below ~20 tokens and buys two tokens of evidence back). Do not
 change it before reading that count.
 
-Still NOT delivered, and the docstring says so rather than implying otherwise:
-a 5% word-level paraphrase measures C ~ 0.33 at every length from 40 to 1,200
-tokens and is not caught by any exact rule at this threshold. That is what the
-semantic layer is for, and the semantic layer is optional and unverified.
+WHAT IS STILL NOT DELIVERED, stated rather than implied:
+
+* Below 38 tokens the tolerance is EXACTLY ONE substituted token and it is a
+  CLIFF, not a slope. The window is chosen so an item's gram count lands on
+  2*window, which is what makes one central edit score exactly 0.5 - and two
+  edits then destroy 2*window >= all of them, so containment goes straight to
+  ZERO with no band in between. Above 38 the window stops shrinking and the
+  slope returns (a 100-token item scores 0.85 after one edit and 0.26 after
+  five). Measured in
+  test_the_narrow_band_tolerates_exactly_one_edit_and_no_more.
+* A 5% word-level paraphrase measures C ~ 0.33 at 400 tokens and above, ~0.26
+  at 100 and ~0.07 at 40 - i.e. it is never caught by any exact rule at this
+  threshold, and SHORTER items are worse, not better. That is what the
+  semantic layer is for, and the semantic layer is optional and unverified.
 
 WHERE THIS DEPARTS FROM THE PLAN, and the measurement that forced it
 --------------------------------------------------------------------
