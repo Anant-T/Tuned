@@ -2087,6 +2087,24 @@ def duplicate_provenance(result) -> tuple[str | None, float | None, str | None]:
     selected_records reads as "nothing was contaminated" and has to be an
     error; a default here reads as "we do not know which item", which is what
     the old code said about every single drop.
+
+    IT NORMALISES TWO SHAPES, because the installed library emits two. semhash
+    0.4.1 hands back a `DuplicateRecord` whose `record` and whose duplicates are
+    plain strings for a NEAR duplicate and single-key dicts (`{"text": ...}`)
+    for an EXACT one - but only when `deduplicate` was called with exactly one
+    record, which is what a row shorter than one probe window, or one script's
+    share of a mixed window, is. Unnormalised, the dict reached
+    `item_by_text.get(...)` and this function's caller died on `TypeError:
+    unhashable type: 'dict'` - a crash raised BY the value returned from the
+    one function in this module documented as unable to raise, on the case the
+    module exists for (a verbatim leak). Both shapes are read; anything else
+    degrades to None, which reads as "we do not know which item".
+
+    TIES ARE BROKEN BY TEXT, not by the order the index returned them in. Two
+    eval items can sit at the same distance from a probe - the same question in
+    two eval sets, a question and its own restatement - and `by_eval_set` in the
+    manifest is a counter, not a diagnostic aside, so which of them gets the
+    blame may not depend on an approximate index's traversal order.
     """
     best_text, best_score, best_probe = None, None, None
     try:
@@ -2094,15 +2112,33 @@ def duplicate_provenance(result) -> tuple[str | None, float | None, str | None]:
     except (AttributeError, TypeError):
         return None, None, None
     for record in filtered:
-        probe = getattr(record, "record", None)
+        probe = _provenance_text(getattr(record, "record", None))
         for pair in getattr(record, "duplicates", None) or ():
             try:
-                text, score = pair[0], float(pair[1])
+                text, score = _provenance_text(pair[0]), float(pair[1])
             except (TypeError, ValueError, IndexError):
                 continue
-            if best_score is None or score > best_score:
+            if text is None:
+                continue
+            if best_score is None or (score, text) > (best_score, best_text or ""):
                 best_text, best_score, best_probe = text, score, probe
     return best_text, best_score, best_probe
+
+
+def _provenance_text(value) -> str | None:
+    """A semhash record as a string, whichever of its two shapes it arrived in.
+
+    A single-key mapping is unwrapped (the key is the column name semhash gave
+    the strings it was handed, `text` today, and this does not depend on it
+    being called that); a string is itself; anything else is unknown and reads
+    as None rather than as a wrong answer.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and len(value) == 1:
+        inner = next(iter(value.values()))
+        return inner if isinstance(inner, str) else None
+    return None
 
 
 class SemanticFilter:

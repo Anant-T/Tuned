@@ -2949,6 +2949,59 @@ def test_a_semantic_hit_without_provenance_reads_as_unknown_and_does_not_raise(m
     assert duplicate_provenance(junk()) == (None, None, None)
 
 
+def _filtered(*records):
+    """A result object carrying `records` as its DuplicateRecords."""
+    dupes = [type("D", (), {"record": probe, "duplicates": pairs})() for probe, pairs in records]
+    return type("R", (), {"filtered": dupes})()
+
+
+def test_the_provenance_reads_both_shapes_the_installed_library_returns():
+    """THE SHAPE THAT CRASHED THE RUN. semhash 0.4.1 hands back a
+    DuplicateRecord of plain strings for a NEAR duplicate and of single-key
+    dicts for an EXACT one - but only when `deduplicate` was called with exactly
+    one record, which is what a row shorter than a probe window is, and what one
+    script's share of a mixed window usually is.
+
+    Unnormalised the dict reached `item_by_text.get(...)` and the caller died on
+    `TypeError: unhashable type: 'dict'` - raised BY the return value of the one
+    function in this module documented as unable to raise, on the case the
+    module exists for. Both shapes now read as the text; anything else reads as
+    'we do not know which item'."""
+    assert duplicate_provenance(_filtered(("probe", [("an eval item", 0.9)]))) == (
+        "an eval item", 0.9, "probe",
+    )
+    assert duplicate_provenance(
+        _filtered(({"text": "probe"}, [({"text": "an eval item"}, 1.0)]))
+    ) == ("an eval item", 1.0, "probe")
+    # A mapping this module cannot read is unknown, never a wrong answer.
+    assert duplicate_provenance(_filtered(("p", [({"a": "x", "b": "y"}, 1.0)]))) == (
+        None, None, None,
+    )
+    assert duplicate_provenance(_filtered(("p", [({"text": 7}, 1.0)]))) == (None, None, None)
+
+
+def test_the_provenance_breaks_a_score_TIE_by_the_item_and_not_by_index_order():
+    """`by_eval_set` is a manifest counter, not a diagnostic aside, so which of
+    two equally-close eval items is blamed may not depend on the order an
+    approximate index happened to return them in. The same two candidates in
+    either order give the same answer."""
+    pairs = [("bbl item", 0.87), ("aibe item", 0.87)]
+    assert duplicate_provenance(_filtered(("p", pairs)))[0] == "bbl item"
+    assert duplicate_provenance(_filtered(("p", list(reversed(pairs)))))[0] == "bbl item"
+    # ... and across DuplicateRecords, not only within one.
+    assert duplicate_provenance(
+        _filtered(("p1", [("bbl item", 0.87)]), ("p2", [("aibe item", 0.87)]))
+    )[0] == "bbl item"
+    assert duplicate_provenance(
+        _filtered(("p2", [("aibe item", 0.87)]), ("p1", [("bbl item", 0.87)]))
+    )[0] == "bbl item"
+    # A strictly better score still wins - the tie-break is a tie-break.
+    assert duplicate_provenance(
+        _filtered(("p", [("zzz item", 0.9), ("aaa item", 0.87)]))
+    )[0] == "zzz item"
+
+
+
 # --------------------------------------------------------------------------
 # THE THRESHOLD TABLE, as fixtures rather than as a comment.
 #
@@ -3361,6 +3414,29 @@ def test_the_latin_control_has_a_ceiling_against_the_shipped_model(monkeypatch):
     for too_high in (0.9, 0.95):
         why = decon.semantic_controls(threshold=too_high)[SCRIPT_LATIN]
         assert "REWORDED copy" in why, f"the control has no ceiling at {too_high}"
+
+
+def test_a_verbatim_leak_in_a_single_probe_row_does_not_crash_the_run(monkeypatch):
+    """THE SHAPE THAT CRASHED, against the library that emits it. semhash 0.4.1
+    returns single-key dicts instead of strings for an EXACT duplicate found by
+    a one-record query - a row shorter than one probe window, or one script's
+    share of a mixed window. The run died on `TypeError: unhashable type:
+    'dict'` inside `match`, on the case this module exists for."""
+    real_semhash(monkeypatch)
+    import tuned.data.decontaminate as decon
+
+    question = EVAL_QUESTIONS[0]
+    seam = decon.SemanticFilter([EvalItem("bbl", "bbl#0", question, frozenset())])
+    assert len(probe_texts(question)) == 1, "the trigger is a ONE-probe query"
+    hit = seam.match(question)
+    assert hit is not None and (hit.eval_set, hit.item_id) == ("bbl", "bbl#0")
+    assert hit.detail["score"] == 1.0
+    assert hit.detail["probe_words"] == len(question.split())
+    # The same query at the seam level, so the shape is pinned where it lands
+    # rather than only through the caller that died on it.
+    result = decon.semhash_index([question]).deduplicate(records=[question], threshold=0.8)
+    text, score, probe = duplicate_provenance(result)
+    assert (text, score, probe) == (question, 1.0, question)
 
 
 def test_the_probe_geometry_closes_the_alignment_gap_against_the_shipped_model(monkeypatch):
