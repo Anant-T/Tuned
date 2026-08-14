@@ -2291,20 +2291,26 @@ def semantic_controls(*, threshold: float = SEMANTIC_THRESHOLD) -> dict[str, str
     return out
 
 
-def semantic_control(*, threshold: float = SEMANTIC_THRESHOLD) -> None:
-    """Raise unless AT LEAST ONE script's control passes.
+def screened_scripts(results: dict[str, str]) -> list[str]:
+    """The scripts this run may screen, from every script's control result.
 
-    The ladder: a script whose half fails is not screened and is recorded as
-    such; a run where NO half passes has no working seam at all and is
-    `semhash-control-failed`, the same rung as a drifted API. dedupe.py's
-    control is single-script by construction (it compares this corpus against
-    itself, and rule 2 already scopes it) and keeps its own shape.
+    Raises unless AT LEAST ONE script's control passed. The ladder: a script
+    whose half fails is not screened and is recorded as such; a run where NO
+    half passes has no working seam at all and is `semhash-control-failed`, the
+    same rung as a drifted API. dedupe.py's control is single-script by
+    construction (it compares this corpus against itself, and rule 2 already
+    scopes it) and keeps its own shape.
+
+    The ladder lives HERE and not in main() so there is one of it. The version
+    this replaced was a `semantic_control()` that main() had stopped calling -
+    it re-derived the same decision inline - so inverting the function's
+    condition changed no behaviour anywhere and the mutation survived the whole
+    suite.
     """
-    failures = semantic_controls(threshold=threshold)
-    if not any(detail == "" for detail in failures.values()):
-        raise SemanticSeamError(
-            " / ".join(detail for detail in failures.values() if detail)
-        )
+    passed = sorted(script for script, why in results.items() if not why)
+    if not passed:
+        raise SemanticSeamError(" / ".join(why for why in results.values() if why))
+    return passed
 
 
 # --------------------------------------------------------------------------
@@ -2637,14 +2643,9 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
                     # seam's power PER SCRIPT before the 20,000-item index is
                     # built. A script whose control fails is not screened.
                     semantic_controls_ran = semantic_controls()
-                    passed = sorted(
-                        script for script, why in semantic_controls_ran.items() if not why
+                    seam = SemanticFilter(
+                        eval_items, screened=screened_scripts(semantic_controls_ran)
                     )
-                    if not passed:
-                        raise SemanticSeamError(
-                            " / ".join(why for why in semantic_controls_ran.values() if why)
-                        )
-                    seam = SemanticFilter(eval_items, screened=passed)
                 except SemanticModelError as exc:
                     # Its own rung. The remedy is network or a warm cache, and
                     # sending an operator to look for API drift instead is the

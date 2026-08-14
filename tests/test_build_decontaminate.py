@@ -71,6 +71,7 @@ from tuned.data.decontaminate import (
     refusals,
     row_form,
     selected_records,
+    screened_scripts,
     semantic_controls,
     store_items,
     title_key,
@@ -2413,6 +2414,20 @@ def test_this_module_cannot_reach_the_network():
             attempt()
         assert "hermetic" in str(exc.value), f"socket.{name} is not refused"
 
+    # EACH HOOK IS PATCHED IN ITS OWN RIGHT, and behaviour alone cannot say so:
+    # `create_connection` calls `getaddrinfo` internally, so deleting the first
+    # hook leaves the call raising through the second and every behavioural
+    # assertion above still green. All four are the same refusal object, so a
+    # deleted hook is one that is not.
+    hooks = {
+        socket.socket.connect, socket.socket.connect_ex,
+        socket.create_connection, socket.getaddrinfo,
+    }
+    assert len(hooks) == 1, (
+        f"{4 - len(hooks) + 1} of the four socket hooks are the shared refusal and the rest "
+        f"are the real thing - a live path out that the calls above cannot detect"
+    )
+
 
 def test_the_semantic_layer_is_opt_in_for_every_module_in_this_suite():
     """The opt-in used to be a per-module copy, so a module that imported
@@ -2550,9 +2565,31 @@ def test_a_seam_that_reads_the_whole_row_and_not_its_windows_fails_the_control(m
     import tuned.data.decontaminate as decon
 
     monkeypatch.setattr(decon, "probe_texts", lambda text, **kw: [text] if text else [])
+    results = decon.semantic_controls()
+    assert "REWORDED copy" in results[SCRIPT_LATIN]
+    # ... and with no script left standing, the whole layer is control-failed.
     with pytest.raises(SemanticSeamError) as exc:
-        decon.semantic_control()
+        decon.screened_scripts(results)
     assert "REWORDED copy" in str(exc.value)
+
+
+def test_one_failing_script_is_a_waiver_and_no_passing_script_is_a_refusal():
+    """The ladder, stated once and asserted here rather than re-derived at the
+    call site. It used to live in a `semantic_control()` that main() had
+    stopped calling and in main() itself, so inverting the function's condition
+    - turning every per-script waiver into a whole-layer refusal - changed no
+    behaviour at all and survived the suite."""
+    assert screened_scripts({SCRIPT_LATIN: "", SCRIPT_DEVANAGARI: "no power here"}) == [
+        SCRIPT_LATIN
+    ]
+    assert screened_scripts({SCRIPT_LATIN: "", SCRIPT_DEVANAGARI: ""}) == sorted(
+        [SCRIPT_LATIN, SCRIPT_DEVANAGARI]
+    )
+    with pytest.raises(SemanticSeamError) as exc:
+        screened_scripts({SCRIPT_LATIN: "latin broke", SCRIPT_DEVANAGARI: "devanagari broke"})
+    assert "latin broke" in str(exc.value) and "devanagari broke" in str(exc.value)
+    with pytest.raises(SemanticSeamError):
+        screened_scripts({})
 
 
 def test_the_probe_windows_cover_every_position_of_the_row():
