@@ -3121,6 +3121,32 @@ def test_the_semantic_threshold_table_reproduces_at_the_shipped_operating_point(
     clean = sum(bool(seam.matches(text)) for text in CLEAN_ROWS)
 
     assert (verbatim, reworded, siblings, clean) == (5, 5, 0, 0)
+
+    # THE WHOLE TABLE, not just the shipped column. A comment table that is
+    # only checked at its own operating point cannot say the point is the RIGHT
+    # one, and the version this replaced was wrong in two cells (it claimed 5/5
+    # verbatim at 0.9 and a sibling range that never reproduced).
+    rows = {}
+    for point in (0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95):
+        at = _table_seam(monkeypatch, point)
+        rows[point] = (
+            sum(bool(at.matches(leak_row(q, worst=True))) for q in EVAL_QUESTIONS),
+            sum(bool(at.matches(leak_row(q, worst=True))) for q in REWORDED_LEAKS),
+            sum(bool(at.matches(leak_row(q, worst=False))) for q in SIBLING_QUESTIONS),
+            sum(bool(at.matches(leak_row(q, worst=False))) for q in SAME_STEM_SIBLINGS),
+            sum(bool(at.matches(text)) for text in CLEAN_ROWS),
+        )
+    assert rows == {
+        # (verbatim, reworded, siblings, same-stem siblings, clean)
+        0.60: (5, 5, 3, 5, 0),
+        0.65: (5, 5, 2, 5, 0),
+        0.70: (5, 5, 1, 5, 0),
+        0.75: (5, 5, 0, 3, 0),
+        0.80: (5, 5, 0, 2, 0),
+        0.85: (5, 4, 0, 0, 0),
+        0.90: (4, 2, 0, 0, 0),
+        0.95: (0, 0, 0, 0, 0),
+    }, "the table in SEMANTIC_THRESHOLD's comment no longer describes this module"
     # THE PRICE, named and asserted rather than described as zero. These rows
     # score 0.000 containment against the eval item and the exact stack keeps
     # them; this layer does not, and the manifest's per-Hit provenance is what

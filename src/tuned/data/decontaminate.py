@@ -1603,7 +1603,7 @@ SEMANTIC_RAN = "ran"
 # the table is re-runnable: test_the_semantic_threshold_table_reproduces.
 #
 #   threshold           0.6   0.65   0.7   0.75   0.8   0.85   0.9   0.95
-#   verbatim leaks      5/5    5/5   5/5    5/5   5/5    5/5   5/5    0/5
+#   verbatim leaks      5/5    5/5   5/5    5/5   5/5    5/5   4/5    0/5
 #   reworded leaks      5/5    5/5   5/5    5/5   5/5    4/5   2/5    0/5
 #   siblings dropped    3/5    2/5   1/5    0/5   0/5    0/5   0/5    0/5
 #   SAME-STEM siblings  5/5    5/5   5/5    3/5   2/5    0/5   0/5    0/5
@@ -1619,9 +1619,9 @@ SEMANTIC_RAN = "ran"
 # because this corpus is about the same statutes the eval sets are.
 #
 # THERE IS NO CLEAN SEPARATION, and pretending otherwise is what the previous
-# table did. Measured on these fixtures the reworded leaks span 0.809-0.918
+# table did. Measured on these fixtures the reworded leaks span 0.819-0.915
 # and the same-stem siblings span 0.714-0.847, so the two distributions
-# OVERLAP on [0.809, 0.847]: any threshold in that band both misses a leak and
+# OVERLAP on [0.819, 0.847]: any threshold in that band both misses a leak and
 # drops a sibling. 0.8 sits below the overlap and therefore buys every leak at
 # a MEASURED, NAMED price - 2 of 5 same-stem siblings, exact containment 0.000
 # on both, rows the exact stack rightly keeps. That price is the right one
@@ -1640,10 +1640,14 @@ SEMANTIC_THRESHOLD = 0.8
 # largest multiple of the stride at or below d, which holds min(L, size - (d
 # mod stride)) of it - so the WORST placement leaves size - stride + 1 words
 # in the best window. At the previous 20/10 that was 11 of a 20-word question
-# and the gap was live: measured, a 19-word verbatim eval question at offset
-# 5 mod 10 inside a 299-word row was NOT dropped at 0.8, and one of five
-# reworded leaks at worst alignment scored 0.703 where the best-aligned copy
-# scored 0.93.
+# and the gap was live. Measured on the repo's own five reworded leaks, each
+# placed at the worst offset ITS geometry admits:
+#
+#     20/10   0.890 0.825 0.890 0.866 0.735   -> 4 of 5 caught at 0.8
+#     30/10   0.897 0.892 0.909 0.915 0.819   -> 5 of 5
+#
+# The fifth is a genuine rewording of a BhashaBench-shaped question and 20/10
+# lost it by 0.065. Re-run by test_the_probe_geometry_closes_the_alignment_gap.
 #
 # So the size is chosen to make the guarantee hold instead:
 #
@@ -1651,9 +1655,7 @@ SEMANTIC_THRESHOLD = 0.8
 #
 # 30 - 10 + 1 = 21 words, and BBL's MCQ stems are ~20. EVERY span of 21 words
 # or fewer now sits ENTIRELY inside at least one probe, at every offset, and
-# the alignment gap is closed rather than documented. Measured at 30/10 with
-# the leaks at worst alignment: 5 of 5 reworded leaks caught at 0.8 against 4
-# of 5 at 20/10.
+# the alignment gap is closed rather than documented.
 #
 # It is also CHEAPER, which is the part that is easy to disbelieve: the number
 # of windows is about (row - size)/stride, so widening the window at a fixed
