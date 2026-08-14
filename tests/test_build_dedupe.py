@@ -522,6 +522,22 @@ def test_a_seam_that_ignores_its_input_fails_the_control_in_either_direction(
     assert "exactly one record must go" in manifest["semantic_detail"]
 
 
+def test_a_seam_that_blows_up_mid_control_is_a_status_and_not_a_crash(tmp_path, monkeypatch, capsys):
+    """decontaminate.py's reason, and this module refuses nothing at all: a
+    query that raises something neither of this project's errors must leave the
+    exact stack's result on disk with the status recorded, not take the run
+    down."""
+    text = prose(161, 200)
+    cfg, paths = _decontaminated(tmp_path, [row(text, "a"), row(prose(163, 200), "b")])
+    capsys.readouterr()
+    install_fake_semhash(monkeypatch, answer="raises-at-query")
+    assert dedupe_main(["--config", cfg]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE
+    assert "RuntimeError: usearch index is corrupt" in manifest["semantic_detail"]
+    assert manifest["counts"]["kept"] == 2
+
+
 def test_a_seam_that_flags_the_wrong_record_fails_the_control(tmp_path, monkeypatch, capsys):
     """The identity half of the control, which had no case of its own: a seam
     that keeps BOTH members of the duplicate pair and drops the unrelated

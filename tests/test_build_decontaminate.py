@@ -221,6 +221,8 @@ def install_fake_semhash(monkeypatch, *, attr="selected", answer="real"):
 
         def deduplicate(self, records, threshold=0.9):
             """Query records that are duplicates OF THE INDEX are removed."""
+            if answer == "raises-at-query":
+                raise RuntimeError("usearch index is corrupt or the model failed to load")
             if answer == "keep-everything":
                 return Result(list(records))
             if answer == "keep-nothing":
@@ -232,6 +234,8 @@ def install_fake_semhash(monkeypatch, *, attr="selected", answer="real"):
             )
 
         def self_deduplicate(self, threshold=0.9):
+            if answer == "raises-at-query":
+                raise RuntimeError("usearch index is corrupt or the model failed to load")
             if answer == "keep-everything":
                 return Result(list(self.records))
             if answer == "keep-nothing":
@@ -2150,6 +2154,22 @@ def test_a_model_that_cannot_be_fetched_is_not_a_drifted_api(tmp_path, monkeypat
     assert "semantic layer did NOT run (semhash-model-unavailable)" in out
     # The exact stack still ran: this layer's absence is a status, not a crash.
     assert manifest["counts"]["total"] == 2
+
+
+def test_a_seam_that_blows_up_mid_control_is_a_status_and_not_a_crash(tmp_path, monkeypatch, capsys):
+    """What the broad `except Exception` is for, and it had no case: semhash
+    builds an index and loads a model lazily, so a QUERY can raise something
+    that is neither SemanticSeamError nor SemanticModelError. Narrow the catch
+    to this module's own errors and that exception kills a decontamination run
+    the refusal ladder has already cleared - and this layer's contract is that
+    its failure is a STATUS, never a crash."""
+    code, manifest, _ = _semantic_run(tmp_path, monkeypatch, answer="raises-at-query")
+    assert code == 0
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE
+    assert "RuntimeError: usearch index is corrupt" in manifest["semantic_detail"]
+    # The exact stack still ran and still wrote its output.
+    assert manifest["counts"]["total"] == 2 and manifest["counts"]["kept"] == 2
+    assert "semantic layer did NOT run" in capsys.readouterr().out
 
 
 def test_a_seam_that_only_recognises_an_exact_copy_fails_the_control(tmp_path, monkeypatch):
