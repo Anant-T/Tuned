@@ -111,8 +111,7 @@ verbatim inside a 2,500-token training row scores
 
 - three orders of magnitude below 0.8 - while its containment in the row is
   1.0. (Measured on the fixture in
-  test_a_verbatim_eval_question_inside_a_long_row: jaccard 0.0055,
-  containment 1.0.) A Jaccard threshold only fires when the two texts are
+  test_the_jaccard_rule_the_brief_asks_for_cannot_see_a_verbatim_leak.) A Jaccard threshold only fires when the two texts are
   the SAME LENGTH and nearly identical, i.e. when the training row IS the
   eval item. That case is real but rare; the common one is quotation inside a
   longer row, and Jaccard is blind to it.
@@ -151,7 +150,9 @@ WHAT THIS MODULE CANNOT SEE (read before trusting a green run)
   semantic layer (semhash) is the intended answer and is optional - its
   status is recorded in the manifest either way, and `--require-semantic`
   turns its absence into a refusal.
-* An eval item under 5 tokens (counted, per level 2).
+* An eval item under 5 tokens (counted PER SET - and a set whose items
+  are all under it is refused, because a screen that compared against
+  nothing is not a screen).
 * A row whose case identity nothing records. `case_identifier_coverage` in
   the manifest is that instrument: if it reads 0, level 3 did not run, and
   the run says so loudly rather than reporting clean. NOTHING in the pipeline
@@ -167,6 +168,7 @@ Build:  python -m tuned.data.decontaminate --config configs/data_law_v1.yaml
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import zlib
@@ -536,6 +538,10 @@ class EvalSet:
     key: str
     why: str
     split: str | None = None
+    # How many rows this set is DOCUMENTED to hold, or None where nobody has
+    # written the number down. Never checked against the Hub - see
+    # EVAL_MIN_SHARE for what is and is not done with it.
+    expect_rows: int | None = None
 
     @property
     def source(self):
@@ -569,6 +575,7 @@ EVAL_SETS = {
         # Test split only: the train split is not what the model is measured
         # on, and screening against it would cost yield for nothing.
         split="test",
+        expect_rows=24_365,
     ),
     "iltur": EvalSet(
         key="iltur",
@@ -586,6 +593,28 @@ EVAL_NO_FILES = "no_files"
 EVAL_NO_TEXT_COLUMN = "no_text_column"
 EVAL_EMPTY = "empty"
 EVAL_UNREADABLE = "unreadable"
+# The files are there and readable in principle, but the library that reads
+# them is not installed. A different remedy from every other rung, and the one
+# EVERY operator hits on the first real run: HF snapshots are usually parquet.
+EVAL_NO_READER = "no_reader"
+# Loaded, and NOTHING in it can match anything. An eval set the screen
+# compared against nothing is not a screened eval set, whatever the row count
+# says, and "cannot reach an eval set must not report clean" is not satisfied
+# by reaching it in name only.
+EVAL_UNMATCHABLE = "unmatchable"
+# Loaded, and far smaller than the set is documented to be - a fragment, a
+# single shard, or a repo id that resolved to something else.
+EVAL_TOO_FEW = "too_few_rows"
+
+# The floor is a HUNDREDTH of the documented count, not a half, and the reason
+# is that the documented count comes from the same unverified source as the
+# repo ids. A floor that refuses a CORRECT download would push the operator
+# straight to `--allow-missing-eval bbl`, which is the exact outcome this
+# module exists to prevent - so the refusal is sized to catch a set that is
+# obviously not the set, and the SHORTFALL against expect_rows is printed and
+# recorded at every level below it, where an operator can act on it without
+# being tempted to waive anything.
+EVAL_MIN_SHARE = 0.01
 
 # Every candidate column an eval row might carry its question in, tried in
 # order. Same discipline as select.py's schema handling: the real column names
@@ -621,10 +650,20 @@ class EvalCorpus:
     text_field: str | None = None
     detail: str = ""
     allowed_missing: bool = False
+    # Items nothing in this module can match (under SHORT_MIN_TOKENS). Counted
+    # HERE and not only in the index, because a set that is entirely
+    # unmatchable has to be refused before anything is written.
+    unmatchable: int = 0
 
     @property
     def ok(self) -> bool:
         return self.status == EVAL_OK
+
+    @property
+    def shortfall(self) -> int:
+        """How many rows short of the documented count, or 0."""
+        expect = self.spec.expect_rows
+        return max(0, expect - self.rows) if expect else 0
 
 
 def read_rows(path: Path) -> Iterator[dict]:
@@ -727,6 +766,17 @@ def eval_corpus(store, spec: EvalSet, *, reader=read_rows) -> EvalCorpus:
     for key, path in paths:
         try:
             records = list(reader(path))
+        except ImportError as exc:
+            # NOT "unreadable". The file is fine and the repo id is fine; the
+            # reader is missing, and sending an operator to re-download a
+            # correct snapshot - or worse, to doubt a repo id that is the one
+            # genuinely uncertain thing here - is the wrong instruction. HF
+            # snapshots are usually parquet, so this is what the first real
+            # run hits, on all three sets at once.
+            return EvalCorpus(
+                spec, EVAL_NO_READER, files=len(paths),
+                detail=f"{key}: {exc}",
+            )
         except Exception as exc:  # a corrupt or unreadable snapshot file
             return EvalCorpus(
                 spec, EVAL_UNREADABLE, files=len(paths),
@@ -755,10 +805,29 @@ def eval_corpus(store, spec: EvalSet, *, reader=read_rows) -> EvalCorpus:
         )
     if not items:
         return EvalCorpus(spec, EVAL_EMPTY, files=len(paths), rows=rows, detail="0 rows")
-    return EvalCorpus(
+    corpus = EvalCorpus(
         spec, EVAL_OK, items=items, files=len(paths), rows=rows,
         text_field=max(winners, key=winners.get),
+        unmatchable=sum(1 for item in items if not window_for(len(tokens(item.text)))),
     )
+    floor = math.ceil((spec.expect_rows or 0) * EVAL_MIN_SHARE)
+    if floor and rows < floor:
+        corpus.status = EVAL_TOO_FEW
+        corpus.detail = (
+            f"{rows} rows, and this set is documented to hold {spec.expect_rows}. "
+            f"Under {floor} ({EVAL_MIN_SHARE:.0%}) this is a fragment, a single shard, or "
+            f"a different dataset"
+        )
+    elif corpus.unmatchable == len(items):
+        # The one thing that must not be got wrong, one layer in from a
+        # missing set: the screen ran against a corpus none of whose items it
+        # can match, and the run would otherwise be stamped decontaminated.
+        corpus.status = EVAL_UNMATCHABLE
+        corpus.detail = (
+            f"all {len(items)} items are under {SHORT_MIN_TOKENS} tokens, so NOTHING here "
+            f"can match any of them - this set was compared against nothing"
+        )
+    return corpus
 
 
 def eval_corpora(store, *, allow_missing: Iterable[str] = (), reader=read_rows,
@@ -770,6 +839,55 @@ def eval_corpora(store, *, allow_missing: Iterable[str] = (), reader=read_rows,
         corpus.allowed_missing = not corpus.ok and key in allowed
         out[key] = corpus
     return out
+
+
+def _acquire_remedy(key: str, spec: EvalSet) -> str:
+    return (
+        f"python -m tuned.data.acquire --kind hf --hf-source {key}\n"
+        f"               (accept the terms at {spec.url} first if it is gated;\n"
+        f"                if that repo id is wrong, fix EVAL_SETS - it has never\n"
+        f"                been checked against the Hub)"
+    )
+
+
+def _remedy(key: str, corpus: EvalCorpus) -> str:
+    """What to DO about this status. They send the operator to different
+    places, which is the whole reason each way of coming back short is its own
+    status rather than one warning."""
+    spec = corpus.spec
+    if corpus.status == EVAL_NO_READER:
+        return (
+            "pip install -e .[build]\n"
+            "               (the snapshot is fine and so is the repo id - the reader for\n"
+            "                these files is not installed. HF snapshots are usually\n"
+            "                parquet, so this is the first-run case, not a corrupt file)"
+        )
+    if corpus.status == EVAL_UNREADABLE:
+        return (
+            f"the file itself is corrupt - delete it and re-run\n"
+            f"               python -m tuned.data.acquire --kind hf --hf-source {key}"
+        )
+    if corpus.status == EVAL_NO_TEXT_COLUMN:
+        return (
+            "add this set's real question column to _EVAL_TEXT_FIELDS in this module\n"
+            "               (the file is on disk and readable; nothing in it was\n"
+            "                recognised as a question)"
+        )
+    if corpus.status == EVAL_UNMATCHABLE:
+        return (
+            "read the column that was chosen - an item under 5 tokens is an answer\n"
+            "               key or a label, not a question, so _EVAL_TEXT_FIELDS is\n"
+            "               probably matching the wrong column"
+        )
+    if corpus.status == EVAL_TOO_FEW:
+        return (
+            f"check the split and the shard count under {spec.url}\n"
+            f"               (if {spec.expect_rows} is simply the wrong number, fix\n"
+            f"                EvalSet.expect_rows - it has never been checked against the\n"
+            f"                Hub. Do NOT waive the set to get past this: a waived BBL is\n"
+            f"                the failure this module exists to prevent)"
+        )
+    return _acquire_remedy(key, spec)
 
 
 def refusals(corpora: dict[str, EvalCorpus]) -> list[str]:
@@ -784,10 +902,7 @@ def refusals(corpora: dict[str, EvalCorpus]) -> list[str]:
         out.append(
             f"eval set {key!r} ({spec.repo_id}) is {corpus.status}: {corpus.detail}.\n"
             f"    it guards: {spec.why}\n"
-            f"    get it:    python -m tuned.data.acquire --kind hf --hf-source {key}\n"
-            f"               (accept the terms at {spec.url} first if it is gated;\n"
-            f"                if that repo id is wrong, fix EVAL_SETS - it has never\n"
-            f"                been checked against the Hub)\n"
+            f"    fix it:    {_remedy(key, corpus)}\n"
             f"    override:  --allow-missing-eval {key}  (recorded in the manifest)"
         )
     return out
@@ -1314,6 +1429,8 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
                 "allowed_missing": corpus.allowed_missing,
                 "files": corpus.files,
                 "rows": corpus.rows,
+                "expect_rows": corpus.spec.expect_rows,
+                "row_shortfall": corpus.shortfall,
                 "items": len(corpus.items),
                 "text_field": corpus.text_field,
                 "detail": corpus.detail,
@@ -1468,6 +1585,15 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
                     f" {LEVEL_NARROW} {bands[LEVEL_NARROW]},"
                     f" {LEVEL_SHORT} {bands[LEVEL_SHORT]},"
                     f" unmatchable {bands['unmatchable']}"
+                )
+            if corpus.shortfall:
+                # Not a refusal below the floor, but never silent either: the
+                # documented count is the only handle on "this is a fragment
+                # of the set" that does not require the network.
+                print(
+                    f"    {corpus.rows} rows, {corpus.spec.expect_rows} documented"
+                    f" - {corpus.shortfall} SHORT. Check the split and the shard count"
+                    f" before trusting this screen"
                 )
             if corpus.ok and len(corpus.items) < corpus.rows:
                 # Some rows of a set that IS loaded carried none of the

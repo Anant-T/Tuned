@@ -1,8 +1,10 @@
 import json
+import math
 import os
 import random
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,11 +12,16 @@ from pipeline_fakes import open_store, paths_for, temp_config
 
 from tuned.data.decontaminate import (
     CONTAINMENT,
+    EVAL_EMPTY,
+    EVAL_MIN_SHARE,
     EVAL_NO_FILES,
+    EVAL_NO_READER,
     EVAL_NO_TEXT_COLUMN,
     EVAL_NOT_ACQUIRED,
     EVAL_OK,
     EVAL_SETS,
+    EVAL_TOO_FEW,
+    EVAL_UNMATCHABLE,
     EVAL_UNREADABLE,
     LEVEL_CASE_ID,
     LEVEL_NARROW,
@@ -104,10 +111,25 @@ def eval_snapshot(store, root: Path, key: str, records, *, name="data/test-0.jso
     return path
 
 
+def eval_filler(spec, have: int) -> list[dict]:
+    """Enough extra questions to clear this set's documented-row floor.
+
+    Production refuses a set holding under EVAL_MIN_SHARE of the rows it is
+    documented to hold (244 for BBL), because a set that small is a fragment
+    or a different dataset. Fixtures are three rows long, so they say so here
+    rather than each test carrying 244 lines - and the floor itself is tested
+    on both sides in test_a_set_far_smaller_than_it_is_documented_to_be_is_a_
+    refusal, which is where a mutation of it dies.
+    """
+    floor = math.ceil((spec.expect_rows or 0) * EVAL_MIN_SHARE)
+    return [{"question": prose(700_000 + i, 20)} for i in range(max(0, floor - have))]
+
+
 def all_eval_snapshots(store, root: Path, records_by_key=None):
     records_by_key = records_by_key or {}
-    for key in EVAL_SETS:
-        eval_snapshot(store, root, key, records_by_key.get(key, [{"question": prose(900 + ord(key[0]), 40)}]))
+    for key, spec in EVAL_SETS.items():
+        records = records_by_key.get(key, [{"question": prose(900 + ord(key[0]), 40)}])
+        eval_snapshot(store, root, key, list(records) + eval_filler(spec, len(records)))
 
 
 # --------------------------------------------------------------------------
@@ -769,9 +791,12 @@ def test_eval_rows_that_carry_no_question_column_are_reported_even_when_the_set_
     paths = paths_for(tmp_path)
     write_jsonl(paths.streams_dir / "replay.jsonl", [row(prose(99, 40))])
     store = Store.open(paths.state_db)
+    # iltur rather than bbl: it carries no documented row count, so the two
+    # numbers this test is about are the ones it writes and not a floor's
+    # padding.
     all_eval_snapshots(
         store, tmp_path / "hf",
-        {"bbl": [{"question": prose(100, 40)}] + [{"mystery_column": "x"}] * 9},
+        {"iltur": [{"question": prose(100, 40)}] + [{"mystery_column": "x"}] * 9},
     )
     store.close()
 
@@ -779,7 +804,8 @@ def test_eval_rows_that_carry_no_question_column_are_reported_even_when_the_set_
     out = capsys.readouterr().out
     assert "9 of 10 rows carried none of" in out
     manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
-    assert (manifest["eval_sets"]["bbl"]["rows"], manifest["eval_sets"]["bbl"]["items"]) == (10, 1)
+    assert (manifest["eval_sets"]["iltur"]["rows"],
+            manifest["eval_sets"]["iltur"]["items"]) == (10, 1)
 
 
 # --------------------------------------------------------------------------
@@ -822,7 +848,9 @@ def test_each_way_an_eval_set_comes_back_short_has_its_own_status(
 ):
     """They send the operator to different places, so they are different
     statuses - select.py's not_acquired/no_title_column lesson."""
-    spec = EVAL_SETS["bbl"]
+    # expect_rows cleared: the documented-row floor is a rung of its own and
+    # is tested on both sides in its own test, so it is not what decides here.
+    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
     store.upsert_source(spec.source_id, spec.license)
     if files == "jsonl":
         eval_snapshot(store, tmp_path, "bbl", records)
@@ -844,6 +872,141 @@ def test_each_way_an_eval_set_comes_back_short_has_its_own_status(
     corpus = eval_corpus(store, spec)
     assert corpus.status == expected
     assert (corpus.status == EVAL_OK) == (not refusals({"bbl": corpus}))
+
+
+def test_an_eval_set_that_loads_but_can_match_nothing_is_a_refusal(store, tmp_path, capsys):
+    """Reproduced before it was fixed: a BBL snapshot of one 3-token question
+    loaded `ok`, screened against NOTHING, and the run exited 0 with the
+    output stamped decontaminated. The refusal ladder had rungs for absent,
+    no-files, no-column, unreadable and zero-rows, and none for LOADED AND
+    USELESS - which defeats the one requirement the module has, because
+    reaching an eval set in name only is not reaching it."""
+    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
+    eval_snapshot(store, tmp_path, "bbl", [{"question": "define estoppel"},
+                                           {"question": "what is res judicata"}])
+    corpus = eval_corpus(store, spec)
+    assert corpus.status == EVAL_UNMATCHABLE
+    assert corpus.unmatchable == len(corpus.items) == 2
+    blocked = refusals({"bbl": corpus})
+    assert len(blocked) == 1
+    assert "NOTHING here can match any of them" in blocked[0]
+    # ... and the remedy is the column, not another download.
+    assert "_EVAL_TEXT_FIELDS" in blocked[0]
+
+    # The control: ONE matchable item among them (the same file rewritten, so
+    # the only difference is that one question) and the set is usable again,
+    # with the hole counted rather than refused.
+    eval_snapshot(store, tmp_path, "bbl", [{"question": "define estoppel"},
+                                           {"question": prose(500, 40)}])
+    live = eval_corpus(store, spec)
+    assert live.status == EVAL_OK
+    assert (live.unmatchable, len(live.items)) == (1, 2)
+    assert not refusals({"bbl": live})
+
+
+def test_a_set_far_smaller_than_it_is_documented_to_be_is_a_refusal(store, tmp_path):
+    """The three repo ids are admitted guesses, so 'wrong but resolvable id'
+    is a live first-run failure - and a fragment of the right dataset is the
+    same shape. Both sides of the floor, which is a HUNDREDTH of the
+    documented count for the reason written beside EVAL_MIN_SHARE."""
+    spec = EVAL_SETS["bbl"]
+    floor = math.ceil(spec.expect_rows * EVAL_MIN_SHARE)
+    assert (spec.expect_rows, floor) == (24_365, 244)
+
+    eval_snapshot(store, tmp_path, "bbl", [{"question": prose(510 + i, 40)}
+                                           for i in range(floor - 1)])
+    short = eval_corpus(store, spec)
+    assert short.status == EVAL_TOO_FEW
+    assert short.rows == floor - 1
+    blocked = refusals({"bbl": short})
+    assert "24365" in blocked[0].replace(",", "")
+    # The trap this rung sets for itself: waiving BBL to get past a number
+    # nobody has checked is the failure the module exists to prevent.
+    assert "Do NOT waive" in blocked[0]
+
+    eval_snapshot(store, tmp_path, "bbl", [{"question": prose(600 + i, 40)}
+                                           for i in range(floor)], name="data/test-1.jsonl")
+    assert eval_corpus(store, spec).status == EVAL_OK
+
+
+def test_a_set_that_is_short_of_its_documented_count_says_so_without_refusing(store, tmp_path):
+    """Between the floor and the documented count there is no refusal - the
+    number has never been checked against the Hub - but there is never silence
+    either."""
+    spec = EVAL_SETS["bbl"]
+    eval_snapshot(store, tmp_path, "bbl",
+                  [{"question": prose(700 + i, 40)} for i in range(300)])
+    corpus = eval_corpus(store, spec)
+    assert corpus.status == EVAL_OK
+    assert corpus.shortfall == 24_365 - 300
+    assert not refusals({"bbl": corpus})
+
+
+def test_an_eval_set_that_holds_no_rows_at_all_is_a_refusal(store, tmp_path):
+    """EVAL_EMPTY, which was the one status in the ladder with no test."""
+    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
+    eval_snapshot(store, tmp_path, "bbl", [])
+    corpus = eval_corpus(store, spec)
+    assert corpus.status == EVAL_EMPTY
+    assert corpus.files == 1 and corpus.rows == 0
+    assert len(refusals({"bbl": corpus})) == 1
+
+
+def test_a_missing_reader_is_not_a_corrupt_file_and_not_a_wrong_repo_id(store, tmp_path):
+    """The parquet case, i.e. what EVERY operator hits on the first real run
+    on all three sets at once: HF snapshots are usually parquet and pyarrow is
+    in the [build] extra. It refused correctly before, but told the operator
+    to re-download and to doubt the repo id - which is the one genuinely
+    uncertain thing here, so the misdirection pointed straight at it."""
+    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
+    path = tmp_path / "bbl" / "data" / "test-0.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"PAR1")
+    store.upsert_source(spec.source_id, spec.license, url=spec.url)
+    store.record_artifact(
+        spec.source_id, "data/test-0.parquet", local_path=path, size_bytes=4, sha256="0" * 64
+    )
+
+    def reader(path):
+        raise ImportError("No module named 'pyarrow'")
+
+    corpus = eval_corpus(store, spec, reader=reader)
+    assert corpus.status == EVAL_NO_READER
+    assert corpus.files == 1, "the premise: the .parquet file WAS selected to be read"
+    blocked = refusals({"bbl": corpus})
+    assert "pip install -e .[build]" in blocked[0]
+    assert "re-run" not in blocked[0] and "repo id is wrong" not in blocked[0]
+
+    # ... and a file that is genuinely corrupt still says so, with the other
+    # remedy, so this is a fork in the ladder and not a rename of it.
+    def corrupt(path):
+        raise ValueError("Expecting value: line 1 column 1")
+
+    assert eval_corpus(store, spec, reader=corrupt).status == EVAL_UNREADABLE
+    assert "corrupt" in refusals({"bbl": eval_corpus(store, spec, reader=corrupt)})[0]
+
+
+def test_the_cli_refuses_an_unmatchable_set_and_writes_nothing(tmp_path, capsys):
+    """End to end, because the reproduction was end to end: TINY-BBL exit 0,
+    bbl status ok, unmatchable 1."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "replay.jsonl", [row(prose(520, 40))])
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf")
+    # Replace bbl entirely with questions nothing can match, at a row count
+    # that clears the documented-row floor so THIS rung is what fires.
+    store.conn.execute("DELETE FROM artifact WHERE source_id = ?", (EVAL_SETS["bbl"].source_id,))
+    eval_snapshot(store, tmp_path / "hf", "bbl",
+                  [{"question": "define estoppel"} for _ in range(300)])
+    store.close()
+
+    assert decon_main(["--config", cfg, "--no-generated"]) == 2
+    out = capsys.readouterr().out
+    assert "REFUSING TO DECONTAMINATE" in out
+    assert EVAL_UNMATCHABLE in out
+    assert not (paths.out_dir / "decontaminated.jsonl").exists()
+    assert not (paths.out_dir / "decontamination.json").exists()
 
 
 def test_a_question_is_screened_separately_from_its_options(store, tmp_path):
