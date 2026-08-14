@@ -2335,6 +2335,13 @@ class SemanticFilter:
         # "compared by the exact stack ONLY", which overstates a row whose other
         # windows were screened in full.
         self.wholly_unscreened_rows: dict[str, int] = {}
+        # Probes with no letters in them at all - a table of section numbers, a
+        # citation list. Counted SEPARATELY from the unscreened ones and never
+        # as a hole, because there is no eval question in them to miss; counted
+        # rather than dropped on the floor, because "no letterless windows" and
+        # "letterless windows, ignored" must not read the same in the manifest.
+        self.letterless_probes = 0
+        self.letterless_rows = 0
 
     def screening_scripts(self) -> frozenset[str]:
         """The scripts this layer can actually find a leak in.
@@ -2352,6 +2359,17 @@ class SemanticFilter:
         """What this layer screened and what it did not, by script."""
         out: dict[str, dict] = {}
         seen = set(self.items_by_script) | set(self.unscreened_probes)
+        if self.letterless_probes:
+            out[SCRIPT_NONE] = {
+                "screened": False, "eval_items": 0,
+                # NOT `unscreened`: the banner reads those as holes and this is
+                # not one. Its own pair of names, so the count is readable and
+                # the hole count stays honest.
+                "unscreened_probes": 0, "unscreened_rows": 0,
+                "wholly_unscreened_rows": 0,
+                "letterless_probes": self.letterless_probes,
+                "letterless_rows": self.letterless_rows,
+            }
         for script in sorted(seen):
             out[script] = {
                 "screened": script in self.indexes,
@@ -2392,6 +2410,7 @@ class SemanticFilter:
             return None
         hit = None
         screened_here = 0
+        letterless = False
         for script in sorted(by_script):
             group = by_script[script]
             index = self.indexes.get(script)
@@ -2403,7 +2422,10 @@ class SemanticFilter:
                     continue
                 if script == SCRIPT_NONE:
                     # A letterless probe - a table of section numbers. There is
-                    # no eval question in it to miss.
+                    # no eval question in it to miss, so it is counted under its
+                    # own name and never as an unscreened hole.
+                    self.letterless_probes += len(group)
+                    letterless = True
                     continue
                 self.unscreened_probes[script] = (
                     self.unscreened_probes.get(script, 0) + len(group)
@@ -2432,6 +2454,8 @@ class SemanticFilter:
                 item.item_id if item else "semhash",
                 detail,
             )
+        if letterless:
+            self.letterless_rows += 1
         if not screened_here:
             for script in by_script:
                 if script in self.unscreened_rows:
@@ -2664,13 +2688,23 @@ def semantic_script_record(layer, controls: dict[str, str] | None) -> dict:
         index_built = bool(entry["screened"])
         record.update(entry)
         record["index"] = index_built
-        # ONE definition, and every clause of it is here rather than spread
-        # over three readers. A failing control can never reach an index in
-        # production (main builds the layer from screened_scripts), so the
-        # first clause is a statement this record makes rather than a guess.
-        record["screened"] = bool(
-            record["control_passed"] and index_built and entry["eval_items"]
+        # ONE definition, in one place, and BOTH clauses have a case:
+        # `control_passed` is false for a script the seam has no power in, and
+        # `index_built` is false for a script whose control passed over no eval
+        # items at all. "Items > 0" is not a third clause because it cannot be
+        # false when index_built is true - SemanticFilter only ever builds an
+        # index for a script it has items for, which is asserted directly
+        # rather than restated here as a branch with no case.
+        record["screened"] = bool(record["control_passed"] and index_built)
+    if SCRIPT_NONE in out:
+        # Named, counted and explicitly NOT a hole. A probe with no letters in
+        # it is a table of section numbers or a citation list; there is no eval
+        # question in it to miss, and the banner does not report it as one.
+        out[SCRIPT_NONE]["control"] = (
+            "no letters in these probes at all, so there is no eval question in them "
+            "to miss - counted rather than screened, and not a hole"
         )
+        out[SCRIPT_NONE]["control_passed"] = False
     return dict(sorted(out.items()))
 
 

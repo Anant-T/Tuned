@@ -2975,7 +2975,13 @@ def test_a_letterless_window_and_an_unlisted_script_are_different_holes(
     paths = paths_for(tmp_path)
     numbers = " ".join(f"{n} ({n % 7}) [{n}]" for n in range(302, 372))
     meitei = " ".join(["ꯃꯤꯇꯩ ꯃꯌꯦꯛ ꯑꯦ ꯂꯣꯟ ꯀꯨꯝꯖ"] * 12)
-    write_jsonl(paths.streams_dir / "s.jsonl", [row(numbers), row(meitei), row(prose(885, 60))])
+    write_jsonl(paths.streams_dir / "s.jsonl", [
+        # The answer half is letterless too: Item.text is prompt + answer, and
+        # an ordinary answer would put Latin letters into every probe.
+        row(numbers, answer="302 (1) [1973] 34"),
+        row(meitei, answer="ꯀꯨꯝꯖ ꯂꯣꯟ"),
+        row(prose(885, 60)),
+    ])
     store = Store.open(paths.state_db)
     all_eval_snapshots(store, tmp_path / "hf")
     store.close()
@@ -2986,8 +2992,15 @@ def test_a_letterless_window_and_an_unlisted_script_are_different_holes(
         (paths.out_dir / "decontamination.json").read_text(encoding="utf-8")
     )["semantic_scripts"]
 
-    # The letterless row is not a hole and is not reported as one.
-    assert SCRIPT_NONE not in scripts
+    # The letterless row is COUNTED, under its own name, and is not a hole:
+    # "no letterless windows" and "letterless windows, ignored" must not read
+    # the same in the manifest, and neither may read as an unscreened script.
+    assert scripts["none"]["letterless_rows"] == 1
+    assert scripts["none"]["letterless_probes"] > 0
+    assert scripts["none"]["unscreened_probes"] == 0
+    assert scripts["none"]["unscreened_rows"] == 0
+    assert "no eval question in them to miss" in scripts["none"]["control"]
+    assert SCRIPT_NONE == "none", "the manifest key is this constant's value"
     assert "SEMANTIC SCREENING IS OFF FOR NONE" not in out
     # The Meitei row is, by name.
     assert scripts["meitei_mayek"]["screened"] is False
@@ -3063,6 +3076,49 @@ def test_screened_means_the_control_passed_and_an_index_holds_items():
         stats, {}, EvalIndex([]), inputs=[], semantic=SEMANTIC_UNAVAILABLE,
         semantic_layer=None, semantic_controls=None,
     )["semantic_scripts"] == {}
+
+
+def test_each_clause_of_screened_has_a_case_of_its_own(monkeypatch):
+    """`screened` is `control passed AND an index was built`, and neither
+    clause is decoration: a layer that HOLDS Devanagari items but was not asked
+    to index them, and a layer that indexed a script whose control failed, must
+    both read false. The third reading - an index over zero items - is not a
+    clause because SemanticFilter cannot produce one, which is asserted here
+    rather than restated as a branch nothing can reach."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    _, _, stats = decontaminate_items(items(row(prose(888, 40))), EvalIndex([]))
+    hindi = EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset())
+    english = EvalItem("bbl", "bbl#en", prose(889, 40), frozenset())
+
+    # THE INDEX CLAUSE: items in a script, control passed for it, no index.
+    layer = SemanticFilter([hindi, english], screened=[SCRIPT_LATIN, SCRIPT_DEVANAGARI])
+    layer.indexes.pop(SCRIPT_DEVANAGARI)
+    scripts = manifest_of(
+        stats, {}, EvalIndex([]), inputs=[], semantic=SEMANTIC_RAN, semantic_layer=layer,
+        semantic_controls={SCRIPT_LATIN: "", SCRIPT_DEVANAGARI: ""},
+    )["semantic_scripts"]
+    assert scripts[SCRIPT_DEVANAGARI]["control_passed"] is True
+    assert scripts[SCRIPT_DEVANAGARI]["eval_items"] == 1
+    assert scripts[SCRIPT_DEVANAGARI]["index"] is False
+    assert scripts[SCRIPT_DEVANAGARI]["screened"] is False
+
+    # THE CONTROL CLAUSE: an index that exists over a script the seam has no
+    # power in. A contradiction main() cannot reach, and the record must not
+    # resolve it in the flattering direction.
+    both = SemanticFilter([hindi, english], screened=[SCRIPT_LATIN, SCRIPT_DEVANAGARI])
+    scripts = manifest_of(
+        stats, {}, EvalIndex([]), inputs=[], semantic=SEMANTIC_RAN, semantic_layer=both,
+        semantic_controls={SCRIPT_LATIN: "", SCRIPT_DEVANAGARI: "flags everything"},
+    )["semantic_scripts"]
+    assert scripts[SCRIPT_DEVANAGARI]["index"] is True
+    assert scripts[SCRIPT_DEVANAGARI]["screened"] is False
+    assert scripts[SCRIPT_LATIN]["screened"] is True
+
+    # ... and the invariant the missing third clause would have guarded.
+    for script, index in both.indexes.items():
+        assert len(both.items_by_script[script]) >= 1
+    assert set(both.indexes) <= set(both.items_by_script)
+    assert set(both.screening_scripts()) == set(both.indexes)
 
 
 def test_a_semantic_layer_with_no_working_script_at_all_is_control_failed(
