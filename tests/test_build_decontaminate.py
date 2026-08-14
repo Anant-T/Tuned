@@ -2653,9 +2653,18 @@ def test_the_probe_geometry_is_pinned_against_literals_in_both_directions():
     # ... and the two constants really do produce that span, so a reader can
     # see the arithmetic and a mutant cannot satisfy the literals and break it.
     assert SEMANTIC_COVERED_SPAN == SEMANTIC_PROBE_WORDS - SEMANTIC_PROBE_STRIDE + 1
-    # The stride is a COST lever as well as a coverage one: halving it doubles
-    # the queries per row, which is why 10 is pinned from below too.
-    assert len(probe_texts(" ".join(f"w{i}" for i in range(300)))) == 29
+    # THE COST CLAIM, which is the counter-intuitive half of the argument and
+    # was written in a comment and checked nowhere: widening the window at a
+    # fixed stride REMOVES a probe per row, and narrowing the stride is the
+    # expensive lever that does not close the gap.
+    def probes(words, size, stride):
+        return len(probe_texts(" ".join(f"w{i}" for i in range(words)),
+                               size=size, stride=stride))
+
+    for words, now, before in ((100, 9, 10), (300, 29, 30), (1300, 129, 130)):
+        assert probes(words, 30, 10) == now
+        assert probes(words, 20, 10) == before
+    assert probes(300, 20, 5) == 58, "halving the stride is what doubles the cost"
 
 
 def test_every_span_of_21_words_lies_wholly_inside_one_probe_window():
@@ -3321,7 +3330,7 @@ def test_the_control_cosines_are_what_this_module_says_they_are(monkeypatch):
     )
     # Cross-script similarity is near zero, which is what makes routing a
     # mixed probe to ONE index safe in the only direction that matters.
-    assert abs(cos(devanagari.item, latin.item)) < 0.1
+    assert cos(devanagari.item, latin.item) == pytest.approx(0.032, abs=0.01)
 
 
 def test_the_same_stem_siblings_are_rows_the_exact_stack_keeps(monkeypatch):
