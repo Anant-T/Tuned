@@ -12,6 +12,7 @@ from pipeline_fakes import open_store, paths_for, temp_config
 
 from tuned.data.decontaminate import (
     CONTAINMENT,
+    EVAL_COUNTS_VERIFIED_AT,
     EVAL_EMPTY,
     EVAL_MIN_SHARE,
     EVAL_NO_FILES,
@@ -39,6 +40,7 @@ from tuned.data.decontaminate import (
     TITLE_MIN_TOKENS,
     EvalIndex,
     EvalItem,
+    EvalPart,
     SemanticSeamError,
     containment,
     decontaminate_items,
@@ -1099,7 +1101,7 @@ def test_each_way_an_eval_set_comes_back_short_has_its_own_status(
     statuses - select.py's not_acquired/no_title_column lesson."""
     # expect_rows cleared: the documented-row floor is a rung of its own and
     # is tested on both sides in its own test, so it is not what decides here.
-    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
+    spec = replace(EVAL_SETS["bbl"], parts=())
     store.upsert_source(spec.source_id, spec.license)
     if files == "jsonl":
         eval_snapshot(store, tmp_path, "bbl", records)
@@ -1130,7 +1132,7 @@ def test_an_eval_set_that_loads_but_can_match_nothing_is_a_refusal(store, tmp_pa
     no-files, no-column, unreadable and zero-rows, and none for LOADED AND
     USELESS - which defeats the one requirement the module has, because
     reaching an eval set in name only is not reaching it."""
-    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
+    spec = replace(EVAL_SETS["bbl"], parts=())
     eval_snapshot(store, tmp_path, "bbl", [{"question": "define estoppel"},
                                            {"question": "what is res judicata"}])
     corpus = eval_corpus(store, spec)
@@ -1194,9 +1196,145 @@ def test_a_set_that_is_short_of_its_documented_count_says_so_without_refusing(st
     assert not refusals({"bbl": corpus})
 
 
+def test_the_shortfall_line_and_the_manifest_carry_the_verified_expectation(tmp_path, capsys):
+    """First-run check #1 IS this line, so the numbers in it are load-bearing
+    and had no test. It has to name the rows read, the rows expected for the
+    splits selected, and the date the expectation was verified - and the
+    manifest has to carry the same three so the dataset card can."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "s.jsonl", [row(prose(920, 60))])
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf")
+    store.close()
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+
+    bbl = manifest["eval_sets"]["bbl"]
+    assert bbl["expect_rows"] == 24_365
+    assert bbl["expect_verified_at"] == EVAL_COUNTS_VERIFIED_AT
+    assert bbl["row_shortfall"] == 24_365 - bbl["rows"] > 0
+    assert bbl["row_surplus"] == 0
+    assert bbl["selection"]["include_splits"] == ["test"]
+    assert [p["rows"] for p in bbl["expect_parts"]] == [17_047, 7_318]
+    assert f"{bbl['rows']} rows, 24365 expected across 2 config/split" in out
+    assert f"{bbl['row_shortfall']} SHORT" in out
+    assert EVAL_COUNTS_VERIFIED_AT in out
+
+    # ... and the set with no verified count says the instrument is off rather
+    # than printing a shortfall of zero, which reads identically to "complete".
+    assert manifest["eval_sets"]["iltur"]["expect_rows"] is None
+    assert manifest["eval_sets"]["iltur"]["expect_verified_at"] is None
+    assert "the floor and the shortfall line are OFF here" in out
+
+
+def test_the_floor_counts_ROWS_and_not_the_items_they_produce(store, tmp_path):
+    """The distinction the whole floor argument rests on, and it had no test:
+    a BBL row with options produces TWO items, so a floor read off `len(items)`
+    is satisfied by half the download. Under an item floor these 122 rows -
+    exactly half of BBL's 244 - would clear it, because they carry 244 items
+    between them."""
+    spec = EVAL_SETS["bbl"]
+    floor = math.ceil(spec.expect_rows * EVAL_MIN_SHARE)
+    half = [
+        {"question": prose(880 + i, 40), "options": [prose(881 + i, 20)]}
+        for i in range(floor // 2)
+    ]
+    eval_snapshot(store, tmp_path, "bbl", half)
+    corpus = eval_corpus(store, spec)
+    assert corpus.rows == floor // 2 < floor
+    assert len(corpus.items) == floor >= floor, "the items alone would clear the floor"
+    assert corpus.status == EVAL_TOO_FEW
+
+
+def test_bbls_expectation_encodes_BOTH_CONFIGS_so_one_of_them_reads_short(store, tmp_path):
+    """BBL is two configs of one split - English 17,047 and Hindi 7,318,
+    verified against the datasets-server. An English-only download is the live
+    version of "the row count and the expectation describe different
+    populations": it is a complete config and an incomplete set, and it has to
+    say so rather than pass silently or be refused."""
+    spec = EVAL_SETS["bbl"]
+    assert [(p.config, p.split, p.rows) for p in spec.parts] == [
+        ("english", "test", 17_047), ("hindi", "test", 7_318),
+    ]
+    assert spec.expect_rows == 24_365
+    eval_snapshot(store, tmp_path, "bbl", [{"question": prose(890 + i, 40)} for i in range(300)],
+                  name="english/test-00000-of-00002.jsonl")
+    corpus = eval_corpus(store, spec)
+    assert corpus.status == EVAL_OK  # a config that IS complete is not a refusal
+    assert corpus.shortfall == 24_365 - 300
+    assert corpus.surplus == 0
+
+
+def test_aibes_single_train_split_is_the_complete_shape_and_reads_no_shortfall(store, tmp_path):
+    """The other end of the same fix. aibe has ONE split, named `train`, and
+    it IS the eval set (1,157 rows, verified) - so a filter for a `test` split
+    would empty it and a whole-repo expectation would be right by accident.
+    The complete download must read `ok` with a shortfall of exactly zero."""
+    spec = EVAL_SETS["aibe"]
+    assert spec.expect_rows == 1_157 and not spec.include_splits
+    eval_snapshot(store, tmp_path, "aibe",
+                  [{"question": prose(900 + i, 40)} for i in range(1_157)],
+                  name="data/train-00000-of-00001.jsonl")
+    corpus = eval_corpus(store, spec)
+    assert (corpus.status, corpus.rows, corpus.shortfall, corpus.surplus) == (EVAL_OK, 1_157, 0, 0)
+    assert corpus.selection["selected"] == ["data/train-00000-of-00001.jsonl"]
+
+
+def test_iltur_is_screened_against_its_test_splits_and_the_manifest_names_which(store, tmp_path):
+    """~488,000 rows across 8 heterogeneous configs, `bail` alone 353,698. At
+    the measured ~220 bytes per distinct gram that whole repo is tens of GB of
+    index, and a screen that OOMs on the operator's machine screens nothing -
+    so the eval surface is the TEST-TYPE splits of every config. A subset that
+    is not named narrows the guarantee silently, so it is named here, matched
+    on the SPLIT (config names were never verified) and recorded."""
+    spec = EVAL_SETS["iltur"]
+    for name in ("bail/train_all-00000-of-00004.jsonl", "cjpe/fold_1-00000-of-00001.jsonl",
+                 "rr/dev-00000-of-00001.jsonl"):
+        eval_snapshot(store, tmp_path, "iltur", [{"question": prose(910, 40)}], name=name)
+    for name in ("bail/test_specific-00000-of-00001.jsonl", "lsi/expert-00000-of-00001.jsonl"):
+        eval_snapshot(store, tmp_path, "iltur", [{"question": prose(911, 40)}], name=name)
+    corpus = eval_corpus(store, spec)
+    assert corpus.status == EVAL_OK
+    assert corpus.files == 2 and corpus.rows == 2
+    assert corpus.selection["selected"] == [
+        "bail/test_specific-00000-of-00001.jsonl", "lsi/expert-00000-of-00001.jsonl",
+    ]
+    assert {e["key"] for e in corpus.selection["excluded"]} == {
+        "bail/train_all-00000-of-00004.jsonl", "cjpe/fold_1-00000-of-00001.jsonl",
+        "rr/dev-00000-of-00001.jsonl",
+    }
+    assert {e["why"] for e in corpus.selection["excluded"]} == {"train", "fold", "dev"}
+    assert not corpus.selection["fallback_all_files"]
+    # No verified per-split counts for this set, so the floor and the shortfall
+    # instrument are OFF rather than denominated against a number nobody read.
+    assert spec.expect_rows is None and corpus.shortfall == 0
+
+
+def test_a_layout_that_names_no_split_reads_everything_and_says_so(store, tmp_path):
+    """Over-screening is safe; screening nothing is the failure this module
+    exists to prevent. But the fallback also means the row count is being
+    compared against the wrong expectation, so it is recorded and printed."""
+    spec = EVAL_SETS["iltur"]
+    eval_snapshot(store, tmp_path, "iltur", [{"question": prose(912, 40)}], name="rows.jsonl")
+    corpus = eval_corpus(store, spec)
+    assert corpus.files == 1 and corpus.selection["fallback_all_files"] is True
+    assert corpus.selection["excluded"] == []
+
+
+def test_an_unverified_part_turns_the_expectation_off_rather_than_guessing():
+    """A None anywhere in a set's parts means the sum would be a guess, and a
+    floor denominated against a guess refuses correct downloads."""
+    spec = replace(EVAL_SETS["bbl"], parts=(EvalPart("english", "test", 17_047),
+                                            EvalPart("hindi", "test", None)))
+    assert spec.expect_rows is None
+    assert replace(spec, parts=()).expect_rows is None
+
+
 def test_an_eval_set_that_holds_no_rows_at_all_is_a_refusal(store, tmp_path):
     """EVAL_EMPTY, which was the one status in the ladder with no test."""
-    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
+    spec = replace(EVAL_SETS["bbl"], parts=())
     eval_snapshot(store, tmp_path, "bbl", [])
     corpus = eval_corpus(store, spec)
     assert corpus.status == EVAL_EMPTY
@@ -1210,7 +1348,7 @@ def test_a_missing_reader_is_not_a_corrupt_file_and_not_a_wrong_repo_id(store, t
     in the [build] extra. It refused correctly before, but told the operator
     to re-download and to doubt the repo id - which is the one genuinely
     uncertain thing here, so the misdirection pointed straight at it."""
-    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
+    spec = replace(EVAL_SETS["bbl"], parts=())
     path = tmp_path / "bbl" / "data" / "test-0.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"PAR1")
@@ -1344,7 +1482,7 @@ def test_the_split_filter_matches_a_name_component_and_not_a_substring(store, tm
     """`latest.parquet` contains "test". A bare substring filter selects it,
     drops the real split, and screens against the wrong file - which
     over-screens nothing and under-screens everything."""
-    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
+    spec = replace(EVAL_SETS["bbl"], parts=())
     eval_snapshot(store, tmp_path, "bbl", [{"question": "the real split " + prose(6, 30)}],
                   name="data/test-00000-of-00001.jsonl")
     eval_snapshot(store, tmp_path, "bbl", [{"question": "a rolling export " + prose(7, 30)}],
@@ -1355,7 +1493,7 @@ def test_the_split_filter_matches_a_name_component_and_not_a_substring(store, tm
 
 
 def test_the_split_filter_prefers_the_named_split_but_never_empties_the_set(store, tmp_path):
-    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
+    spec = replace(EVAL_SETS["bbl"], parts=())
     eval_snapshot(store, tmp_path, "bbl", [{"question": "train only " + prose(1, 30)}],
                   name="data/train-0.jsonl")
     eval_snapshot(store, tmp_path, "bbl", [{"question": "test only " + prose(2, 30)}],
