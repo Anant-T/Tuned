@@ -17,6 +17,7 @@ from tuned.data.decontaminate import (
     EVAL_SETS,
     EVAL_UNREADABLE,
     LEVEL_CASE_ID,
+    LEVEL_NARROW,
     LEVEL_SHORT,
     LEVEL_TEXT,
     NGRAM,
@@ -36,6 +37,7 @@ from tuned.data.decontaminate import (
     identifiers_from_text,
     item_of,
     jaccard,
+    level_for,
     manifest_of,
     refusals,
     row_form,
@@ -43,6 +45,7 @@ from tuned.data.decontaminate import (
     store_items,
     title_key,
     tokens,
+    window_for,
 )
 from tuned.data.decontaminate import main as decon_main
 from tuned.data.jsonl import write_jsonl
@@ -264,7 +267,10 @@ def test_the_jaccard_rule_the_brief_asks_for_cannot_see_a_verbatim_leak():
     reads 1.0 on the same pair. This is the measurement the module's rule is
     built on, so it is asserted rather than described.
     """
-    question = "which of the following best describes the doctrine of " + prose(1, 20)
+    question = "which of the following best describes the doctrine of " + prose(1, 31)
+    # Long enough to be screened at the full window, so this test is about
+    # Jaccard against containment and not about window_for.
+    assert level_for(len(tokens(question))) == LEVEL_TEXT
     long_row = prose(2, 1200) + " " + question + " " + prose(3, 1200)
     q_grams = gram_hashes(tokens(question), NGRAM)
     r_grams = gram_hashes(tokens(long_row), NGRAM)
@@ -315,15 +321,20 @@ def test_the_gram_index_finds_every_pair_brute_force_finds():
     rng = random.Random(11)
     eval_texts = [prose(rng.randrange(10_000), rng.randint(20, 60)) for _ in range(40)]
     index = index_of(*eval_texts)
+    # The premise the multi-window index has to survive: these items do NOT
+    # all sit at one window, so a walk that read a single table would miss
+    # whole bands of the corpus.
+    assert len(set(index.windows)) > 1
     checked = 0
     for _ in range(40):
         base = rng.choice(eval_texts)
         overlap = " ".join(base.split()[: rng.randint(0, 40)])
         row_text = prose(rng.randrange(10_000), 30) + " " + overlap
-        grams = gram_hashes(tokens(row_text), NGRAM)
-        proposed = index.candidates(grams)
+        query = index.query(tokens(row_text))
+        proposed = index.candidates(query)
         for ix, text in enumerate(eval_texts):
-            true_shared = len(gram_hashes(tokens(text), NGRAM) & grams)
+            window = index.windows[ix]
+            true_shared = len(gram_hashes(tokens(text), window) & query[window])
             if true_shared:
                 assert ix in proposed, "candidate step lost a pair with a real overlap"
                 assert proposed[ix] == true_shared
@@ -360,6 +371,118 @@ def test_the_containment_threshold_decides_in_both_directions():
     assert len(decontaminate_items(items(row(light)), index)[0]) == 1
 
 
+def _edited(words, k, seed=7):
+    """`words` with `k` substitutions spread evenly through the sequence."""
+    rng = random.Random(seed)
+    out = list(words)
+    step = len(words) / (k + 1)
+    for i in range(k):
+        out[int(step * (i + 1))] = "xreplacedx" + str(rng.randrange(10_000))
+    return out
+
+
+def _containment_after_edits(length: int, edits: int, window: int, seed: int = 0) -> float:
+    words = prose(length * 3 + 1 + seed, length).split()
+    left = gram_hashes(tokens(" ".join(words)), window)
+    right = gram_hashes(tokens(" ".join(_edited(words, edits))), window)
+    return containment(left, right)
+
+
+def test_one_substituted_token_still_scores_above_the_threshold_at_every_length():
+    """The property the length-aware window exists to deliver, measured over
+    the whole range rather than asserted at one point.
+
+    Below 38 tokens a FIXED 13-gram window puts a one-word edit at zero - it
+    is an exact-match rule wearing a near-match label - and BBL is 24,365 MCQ
+    questions, most of them shorter than that.
+    """
+    for length in range(NGRAM, 220):
+        window = window_for(length)
+        score = _containment_after_edits(length, 1, window)
+        assert score >= CONTAINMENT, (length, window, score)
+
+    # ... and the fixed window it replaces does not, which is the measurement
+    # that forced this. These are the numbers in the module docstring.
+    fixed = {length: _containment_after_edits(length, 1, NGRAM)
+             for length in (13, 20, 25, 29, 35, 37, 38, 50)}
+    assert [round(fixed[k], 3) for k in (13, 20, 25)] == [0.0, 0.0, 0.0]
+    assert 0.2 < fixed[29] < 0.3 and 0.4 < fixed[35] < 0.45
+    # The crossover: at 38 tokens the two windows ARE the same window, so a
+    # rule that started the full window one token earlier or later would be
+    # claiming an edit tolerance it does not have.
+    assert fixed[37] < CONTAINMENT <= fixed[38]
+    assert window_for(38) == NGRAM and window_for(37) < NGRAM
+
+
+def test_the_narrow_level_carries_a_case_neither_of_the_others_can():
+    """A 20-token MCQ question with ONE word changed, leaked into a long row.
+
+    Invisible to the full window (containment 0.000, so `text` cannot see it),
+    and not a whole-sequence match (so `short` cannot either) - and its own
+    length is what puts it out of both.
+    """
+    words = prose(401, 20).split()
+    question = " ".join(words)
+    leaked_form = " ".join(_edited(words, 1))
+    assert level_for(len(tokens(question))) == LEVEL_NARROW
+    assert containment(
+        gram_hashes(tokens(question), NGRAM), gram_hashes(tokens(leaked_form), NGRAM)
+    ) == 0.0
+
+    leaked = prose(402, 300) + " " + leaked_form + " " + prose(403, 300)
+    kept, drops, _ = decontaminate_items(items(row(leaked)), index_of(question))
+    assert not kept
+    assert drops[0]["reason"] == f"{LEVEL_NARROW}:bbl"
+    assert drops[0]["hits"][0]["window"] == 7
+    assert drops[0]["hits"][0]["eval_tokens"] == 20
+
+
+def test_the_narrow_level_is_a_near_match_rule_and_not_a_loose_one():
+    """Its control: a rule that fires on everything is not a rule. The same
+    20-token question with SIX of its words changed is not a leak of it."""
+    words = prose(401, 20).split()
+    question = " ".join(words)
+    paraphrase = " ".join(_edited(words, 6))
+    leaked = prose(404, 300) + " " + paraphrase + " " + prose(405, 300)
+    kept, drops, _ = decontaminate_items(items(row(leaked)), index_of(question))
+    assert len(kept) == 1 and not drops
+
+
+def test_capping_the_window_at_the_constant_is_what_keeps_long_items_screenable():
+    """The cap's own case. A 150-token IL-TUR-style item gramed at (L+1)//3 =
+    50 would need fifty consecutive untouched tokens per gram, so three edits
+    take it to zero; at 13 the same item still scores 0.72."""
+    words = prose(411, 150).split()
+    question = " ".join(words)
+    quoted = " ".join(_edited(words, 3))
+    assert window_for(150) == NGRAM
+    assert containment(gram_hashes(tokens(question), 50), gram_hashes(tokens(quoted), 50)) == 0.0
+    assert containment(gram_hashes(tokens(question), NGRAM),
+                       gram_hashes(tokens(quoted), NGRAM)) > CONTAINMENT
+
+    leaked = prose(412, 400) + " " + quoted + " " + prose(413, 400)
+    kept, drops, _ = decontaminate_items(items(row(leaked)), index_of(question))
+    assert not kept and drops[0]["reason"] == f"{LEVEL_TEXT}:bbl"
+
+
+def test_a_short_question_that_shares_a_statutory_phrase_has_a_boundary_too():
+    """The statute exception, one length band down - the false-positive price
+    the narrow window is paid for with, pinned on BOTH sides.
+
+    At 20 tokens the rule tolerates a shared run of 12 tokens and refuses 13,
+    i.e. it asks for two thirds of the question rather than the four fifths a
+    fixed 13-gram window asks for. That gap is the whole cost of the change.
+    """
+    words = prose(421, 20).split()
+    question = " ".join(words)
+    index = index_of(question)
+    for shared, expect_drop in ((12, False), (13, True)):
+        quoted = " ".join(words[:shared])
+        row_text = prose(422, 200) + " " + quoted + " " + prose(423, 200)
+        kept, drops, _ = decontaminate_items(items(row(row_text)), index)
+        assert bool(drops) is expect_drop, (shared, drops)
+
+
 def test_a_statute_quotation_both_sides_quote_is_not_contamination():
     """The spec's standing exception: statutes are the domain being taught, so
     a shared provision must not empty the corpus. This is the reason the rule
@@ -376,6 +499,10 @@ def test_a_statute_quotation_both_sides_quote_is_not_contamination():
     # would drop.
     assert len(q_grams & r_grams) >= 10
     assert containment(q_grams, r_grams) < CONTAINMENT
+    # The number itself, because the length-aware window must not move it: at
+    # 146 tokens this item is screened at the FULL window, exactly as before.
+    assert window_for(len(tokens(question))) == NGRAM
+    assert round(containment(q_grams, r_grams), 4) == 0.1045
 
     kept, drops, _ = decontaminate_items(items(row(row_text)), index_of(question))
     assert len(kept) == 1 and not drops
@@ -388,13 +515,14 @@ def test_a_statute_quotation_both_sides_quote_is_not_contamination():
 def test_a_short_eval_question_is_invisible_to_the_ngram_level_and_the_short_rule_carries_it():
     question = "what is the punishment for criminal breach of trust"
     assert len(tokens(question)) < NGRAM
-    # The premise, stated as a fact about the fixture: level 1 has NOTHING to
-    # match on here, so a drop can only come from level 2.
+    # The premise, stated as a fact about the fixture: the full window has
+    # NOTHING to match on here, so a drop can only come from the short rule.
     assert gram_hashes(tokens(question), NGRAM) == frozenset()
 
     leaked = prose(41, 300) + " " + question + " " + prose(42, 300)
     index = index_of(question)
-    assert index.candidates(gram_hashes(tokens(leaked), NGRAM)) == {}
+    assert index.windows == [len(tokens(question))]
+    assert NGRAM not in index.by_gram
 
     kept, drops, _ = decontaminate_items(items(row(leaked)), index)
     assert not kept
@@ -424,14 +552,15 @@ def test_an_eval_item_at_exactly_the_floor_is_still_matched():
 
 def test_the_window_length_decides_which_level_carries_an_item():
     """A behavioural pin on 13, from both sides: a 13-token question is
-    n-grammable and a 12-token one is not, so the constant decides which rule
-    an eval item is screened by - and the fixture states the two lengths as
-    literals rather than reading them off the constant under test."""
+    n-grammable (at a narrowed window) and a 12-token one is not, so the
+    constant decides which rule an eval item is screened by - and the fixture
+    states the two lengths as literals rather than reading them off the
+    constant under test."""
     thirteen = "which of the following is the correct measure of damages in this case"
     twelve = "which of the following is the correct measure of damages in case"
     assert (len(tokens(thirteen)), len(tokens(twelve))) == (13, 12)
 
-    for question, expected in ((thirteen, LEVEL_TEXT), (twelve, LEVEL_SHORT)):
+    for question, expected in ((thirteen, LEVEL_NARROW), (twelve, LEVEL_SHORT)):
         leaked = prose(47, 150) + " " + question + " " + prose(48, 150)
         _, drops, _ = decontaminate_items(items(row(leaked)), index_of(question))
         assert drops[0]["reason"] == f"{expected}:bbl", question
@@ -444,7 +573,7 @@ def test_short_items_of_different_lengths_are_each_screened():
     five = "criminal breach of trust punishment"
     nine = "what is the punishment for criminal breach of trust"
     index = index_of(five, nine)
-    assert sorted(index.short) == [5, 9], "the premise: two different short lengths"
+    assert sorted(index.by_gram) == [5, 9], "the premise: two different short lengths"
 
     for question in (five, nine):
         leaked = prose(49, 150) + " " + question + " " + prose(50, 150)
@@ -481,7 +610,8 @@ def test_an_eval_item_under_the_floor_is_counted_not_silently_ignored():
     kept, _, stats = decontaminate_items(items(row(row_text)), index)
     assert len(kept) == 1
     manifest = manifest_of(stats, {}, index, inputs=[], semantic="x")
-    assert manifest["unmatchable_eval_items"] == 1
+    assert manifest["unmatchable_eval_items"] == {"bbl": 1}
+    assert manifest["unmatchable_eval_items_total"] == 1
 
 
 # --------------------------------------------------------------------------
@@ -495,10 +625,9 @@ def test_same_judgment_different_question_is_caught_only_by_the_case_identifier_
     row_text = "summarise the reasoning of the bench in " + prose(62, 400)
     index = EvalIndex([EvalItem("iltur", "iltur#0", eval_text, frozenset({"cnr:ESCR010004512020"}))])
 
-    # Premise: the text levels have nothing to say about this pair.
-    grams = gram_hashes(tokens(row_text), NGRAM)
-    assert index.candidates(grams) == {}
-    assert index.short_candidates(tokens(row_text)) == []
+    # Premise: the text levels have nothing to say about this pair, at ANY
+    # window the index holds.
+    assert index.candidates(index.query(tokens(row_text))) == {}
 
     item = item_of(row(row_text, cnr="ESCR01-000451-2020"), "fixture#0")
     assert "cnr:ESCR010004512020" in item.identifiers
@@ -909,7 +1038,8 @@ def test_an_accepted_generation_that_leaks_an_eval_question_is_dropped(tmp_path)
     loaded = list(store_items(store))
     store.close()
     kept, drops, _ = decontaminate_items(loaded, index_of(question))
-    assert not kept and drops[0]["reason"].startswith(LEVEL_TEXT)
+    assert not kept
+    assert drops[0]["reason"] == f"{level_for(len(tokens(question)))}:bbl"
 
 
 def test_nothing_read_exits_1(tmp_path, capsys):

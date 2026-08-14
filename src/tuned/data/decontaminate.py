@@ -38,18 +38,68 @@ THE LEVELS, and the case each one alone must carry
 --------------------------------------------------
 1. TEXT CONTAINMENT - the share of an eval item's 13-grams that appear in the
    row is >= CONTAINMENT (0.5). Catches the eval question quoted, verbatim or
-   near-verbatim, inside a much longer training row.
-2. SHORT-ITEM CONTAINMENT - an eval item SHORTER than the n-gram window has
-   NO 13-grams at all and is invisible to level 1 in principle. Such an item
-   is matched by whole-sequence containment instead. Items below
-   SHORT_MIN_TOKENS (5) are matchable by nothing here and are COUNTED as
-   `unmatchable` in the manifest, because a 3-token question would otherwise
-   match half the corpus.
-3. CASE-IDENTIFIER OVERLAP - CNR, neutral/reporter citation, or normalised
+   near-verbatim, inside a much longer training row. Applies to items of 38
+   tokens or more; below that the 13-gram window cannot deliver "near".
+2. NARROW-WINDOW CONTAINMENT - the same rule at a SMALLER window, for items
+   between 13 and 37 tokens. See THE WINDOW IS LENGTH-AWARE below: this is
+   the band BhashaBench-Legal lives in, and at a fixed 13 the rule there is an
+   exact-match rule wearing a near-match label.
+3. SHORT-ITEM CONTAINMENT - an eval item shorter than 13 tokens has no
+   13-grams at all. It is matched WHOLE, and nothing less than the whole of it
+   counts. Items below SHORT_MIN_TOKENS (5) are matchable by nothing here and
+   are COUNTED as `unmatchable`, per set, because a 3-token question would
+   otherwise match half the corpus - and a set whose items are ALL unmatchable
+   is a refusal, not a clean run.
+4. CASE-IDENTIFIER OVERLAP - CNR, neutral/reporter citation, or normalised
    case title shared between a row and an eval item. This is the level that
    catches SAME JUDGMENT, DIFFERENT QUESTION, which no n-gram method can ever
    see (PredEx and IL-TUR CJPE draw on the same appellate pools), and it is
-   the cheapest and most certain of the three.
+   the cheapest and most certain of the four.
+
+THE WINDOW IS LENGTH-AWARE, and the measurement that forced it
+---------------------------------------------------------------
+One substituted token destroys every gram covering it - up to n of them. An
+item of L tokens has G = L - n + 1 grams, so after one central edit its
+containment in a row carrying the rest is (G - n)/G, which reaches 0.5 only
+when L >= 3n - 1. At n = 13 that is L >= 38 tokens. Measured:
+
+    item tokens  |  13     25     29     35     38     50     150
+    C after 1 edit  0.000  0.000  0.235  0.435  0.500  0.658  0.906
+
+So at a fixed 13 the rule is EXACT MATCH below ~38 tokens, whatever the
+threshold says - and BBL is 24,365 MCQ questions, most of them shorter than
+that. The window is therefore the largest one that survives a single central
+edit at this item's length:
+
+    window_for(L) = min(13, (L + 1) // 3)        for L >= 13
+                  = L      (whole sequence)      for 5 <= L < 13
+                  = nothing                      below 5
+
+which puts C after one edit at or above 0.5 at EVERY length from 13 up, and
+leaves items of 38 tokens and more exactly where they were.
+
+WHAT IT COSTS, because it is a real cost and run one has to read it. The
+weakest evidence the rule will accept is one contiguous run of (L + n - 1)/2
+tokens shared with the row. At a fixed 13 that run is (L + 12)/2; length-aware
+it is (2L - 1)/3, i.e. two thirds of the item at every length:
+
+    item tokens      13    16    20    25    30    38+
+    run needed @13   12.5  14.5  16.0  18.5  21.0  unchanged
+    run needed now    8.3  10.3  13.0  16.0  19.0  unchanged
+
+So the exposure widens by at most ~4.5 tokens, and only for items under 38.
+The new false-positive class is a SHORT eval question two thirds of which is a
+statutory phrase a training row also quotes. That is the same trade the
+statute exception is calibrated on, one length band down, and it is why the
+narrow level is counted separately: if `narrow` drops dominate run one, the
+calibrated relaxation is to raise the divisor (3 -> 2.5 costs the one-edit
+guarantee below ~20 tokens and buys two tokens of evidence back). Do not
+change it before reading that count.
+
+Still NOT delivered, and the docstring says so rather than implying otherwise:
+a 5% word-level paraphrase measures C ~ 0.33 at every length from 40 to 1,200
+tokens and is not caught by any exact rule at this threshold. That is what the
+semantic layer is for, and the semantic layer is optional and unverified.
 
 WHERE THIS DEPARTS FROM THE PLAN, and the measurement that forced it
 --------------------------------------------------------------------
@@ -140,8 +190,9 @@ MANIFEST_FILENAME = "decontamination.json"
 #    the manifest happens to sit in.
 DECON_VERSION = 2
 
-# The n-gram window. 13 tokens is long enough that ordinary legal phrasing
-# does not collide by accident and short enough to survive light editing.
+# The n-gram window AT ITS WIDEST. 13 tokens is long enough that ordinary
+# legal phrasing does not collide by accident; window_for narrows it for items
+# too short to tolerate an edit at 13.
 NGRAM = 13
 # Share of an eval item's grams that must appear in the row. See the docstring
 # for why this is containment and not Jaccard, and why it is not "one shared
@@ -154,13 +205,14 @@ SHORT_MIN_TOKENS = 5
 TITLE_MIN_TOKENS = 4
 
 LEVEL_TEXT = "text"
+LEVEL_NARROW = "narrow"
 LEVEL_SHORT = "short"
 LEVEL_CASE_ID = "case_id"
 LEVEL_SEMANTIC = "semantic"
 # The order they are reported in: cheapest and most certain first. The
 # semantic layer is not in NGRAM_LEVELS because it is not part of the exact
 # screen - it only ever adds drops on top of it.
-NGRAM_LEVELS = (LEVEL_CASE_ID, LEVEL_TEXT, LEVEL_SHORT)
+NGRAM_LEVELS = (LEVEL_CASE_ID, LEVEL_TEXT, LEVEL_NARROW, LEVEL_SHORT)
 LEVELS = NGRAM_LEVELS + (LEVEL_SEMANTIC,)
 
 
@@ -223,6 +275,55 @@ def gram_hashes(toks: Sequence[str], n: int = NGRAM) -> frozenset[int]:
         window = (window * _BASE - hs[i - n] * power + hs[i]) & _MASK
         out.append(window)
     return frozenset(out)
+
+
+def window_for(length: int, *, n: int = NGRAM, short_min: int = SHORT_MIN_TOKENS) -> int:
+    """The n-gram window an eval item of `length` tokens is screened at.
+
+    0 means NOTHING here can match it (the item is under the floor).
+
+    THE DERIVATION, not a tuning knob. One substituted token destroys every
+    gram covering it - n of them, centrally. An item of L tokens has
+    G = L - n + 1 grams, so a row carrying the rest of it holds (G - n)/G of
+    them, which is >= CONTAINMENT (0.5) exactly when G >= 2n, i.e. when
+
+        L >= 3n - 1.
+
+    Turned round, the widest window that still tolerates one edit at length L
+    is (L + 1) // 3. Above 3*NGRAM - 1 = 38 tokens that bound exceeds NGRAM
+    and the cap takes over, so long items are screened exactly as before; the
+    cap is what keeps a 1,200-token IL-TUR judgment from being gramed at 400,
+    where three edits anywhere would take its containment to zero.
+
+    Below NGRAM an item has no grams at all, so it is matched WHOLE - the
+    window is its own length and nothing short of all of it counts. Below
+    `short_min` it is matchable by nothing: `unmatchable`, counted per set,
+    and a set that is entirely unmatchable is a refusal.
+    """
+    if length < short_min:
+        return 0
+    if length < n:
+        return length
+    return min(n, (length + 1) // 3)
+
+
+def level_for(length: int, *, n: int = NGRAM, short_min: int = SHORT_MIN_TOKENS) -> str | None:
+    """Which text level screens an item of this length, or None for nothing.
+
+    Three bands, and each carries a case the others cannot:
+    `text` a 150-token judgment summary quoted at 55% of its grams;
+    `narrow` a 20-token MCQ question with ONE word changed (containment 0.000
+    at a fixed 13, and not a whole-sequence match either);
+    `short` a 9-token question reproduced entire.
+    """
+    window = window_for(length, n=n, short_min=short_min)
+    if not window:
+        return None
+    if window >= n:
+        return LEVEL_TEXT
+    if length < n:
+        return LEVEL_SHORT
+    return LEVEL_NARROW
 
 
 def jaccard_from(shared: int, n_a: int, n_b: int) -> float:
@@ -705,13 +806,18 @@ REFUSAL_HEADER = (
 # --------------------------------------------------------------------------
 
 class EvalIndex:
-    """Inverted index over eval-item n-grams, plus the short-item index.
+    """Inverted index over eval-item n-grams, ONE TABLE PER WINDOW.
 
-    EXACT: containment > 0 requires at least one shared gram, so every pair
-    the arithmetic could drop is generated here. Nothing approximate (LSH,
-    embeddings) stands between an eval item and its candidate row - the error
-    direction of an approximation is missed pairs, which is the one direction
-    this module may not have.
+    EXACT: containment > 0 requires at least one shared gram AT THAT ITEM'S
+    WINDOW, so every pair the arithmetic could drop is generated here. Nothing
+    approximate (LSH, embeddings) stands between an eval item and its
+    candidate row - the error direction of an approximation is missed pairs,
+    which is the one direction this module may not have.
+
+    The window is a property of the ITEM (see window_for), so the index is
+    keyed by it and a row is gramed once per window the index actually holds.
+    A corpus of BBL-length questions occupies a handful of windows; the walk
+    costs one pass over the row per window and nothing per item.
     """
 
     def __init__(self, items: Iterable[EvalItem], *, n: int = NGRAM,
@@ -725,33 +831,43 @@ class EvalIndex:
         # IL-TUR judgment as a Python set costs ~60 bytes each, which is the
         # difference between an index that fits and one that does not.
         self.gram_counts: list[int] = []
-        self.by_gram: dict[int, list[int]] = {}
-        # length -> {whole-sequence hash -> item indexes}
-        self.short: dict[int, dict[int, list[int]]] = {}
+        self.windows: list[int] = []
+        self.token_counts: list[int] = []
+        # window -> {gram -> item indexes}
+        self.by_gram: dict[int, dict[int, list[int]]] = {}
         self.unmatchable: list[str] = []
         self.by_identifier: dict[str, list[int]] = {}
         for ix, item in enumerate(items):
             toks = tokens(item.text)
             self.items.append(item)
-            grams = gram_hashes(toks, n)
+            self.token_counts.append(len(toks))
+            window = window_for(len(toks), n=n, short_min=short_min)
+            self.windows.append(window)
+            grams = gram_hashes(toks, window) if window else frozenset()
             self.gram_counts.append(len(grams))
-            for gram in grams:
-                self.by_gram.setdefault(gram, []).append(ix)
-            if not grams:
-                if len(toks) >= short_min:
-                    whole = next(iter(gram_hashes(toks, len(toks))))
-                    self.short.setdefault(len(toks), {}).setdefault(whole, []).append(ix)
-                else:
-                    # Too short for any rule here. NOT silently ignored: it is
-                    # a hole in the screen and the manifest counts it.
-                    self.unmatchable.append(item.item_id)
+            if window:
+                table = self.by_gram.setdefault(window, {})
+                for gram in grams:
+                    table.setdefault(gram, []).append(ix)
+            else:
+                # Too short for any rule here. NOT silently ignored: it is
+                # a hole in the screen and the manifest counts it, per set.
+                self.unmatchable.append(item.item_id)
             for identifier in item.identifiers:
                 self.by_identifier.setdefault(identifier, []).append(ix)
 
     def __len__(self) -> int:
         return len(self.items)
 
-    def candidates(self, grams: frozenset[int]) -> dict[int, int]:
+    def query(self, toks: Sequence[str]) -> dict[int, frozenset[int]]:
+        """The row's grams at every window this index holds.
+
+        Built once per row and handed to both `candidates` and the Jaccard
+        diagnostic, so a row is never gramed twice at the same window.
+        """
+        return {window: gram_hashes(toks, window) for window in self.by_gram}
+
+    def candidates(self, query: dict[int, frozenset[int]]) -> dict[int, int]:
         """Every eval item sharing >=1 gram with the row -> how many it shares.
 
         The count IS the intersection size (grams are a set on both sides), so
@@ -761,19 +877,41 @@ class EvalIndex:
         cost 5,000 set intersections per row.
         """
         found: dict[int, int] = {}
-        for gram in grams:
-            for ix in self.by_gram.get(gram, ()):
-                found[ix] = found.get(ix, 0) + 1
+        for window, grams in query.items():
+            table = self.by_gram.get(window)
+            if not table:
+                continue
+            for gram in grams:
+                for ix in table.get(gram, ()):
+                    found[ix] = found.get(ix, 0) + 1
         return found
 
-    def short_candidates(self, toks: Sequence[str]) -> list[int]:
-        """Eval items shorter than the window whose whole token sequence
-        appears in the row."""
-        found: set[int] = set()
-        for length, table in self.short.items():
-            for window in gram_hashes(toks, length):
-                found.update(table.get(window, ()))
-        return sorted(found)
+    def level_of(self, ix: int) -> str | None:
+        return level_for(self.token_counts[ix], n=self.n, short_min=self.short_min)
+
+    def length_report(self) -> dict[str, dict]:
+        """PER SET: how many items each level screens, and the token spread.
+
+        A pooled count cannot tell an operator WHICH set is blind, and the
+        window calibration above is an argument until this table is read
+        against a real download - which is why it is in the manifest and on
+        the first-run checklist rather than in a comment. `unmatchable` is the
+        hole: items nothing here can match.
+        """
+        out: dict[str, dict] = {}
+        for ix, item in enumerate(self.items):
+            entry = out.setdefault(
+                item.set_key,
+                {LEVEL_TEXT: 0, LEVEL_NARROW: 0, LEVEL_SHORT: 0, "unmatchable": 0, "_t": []},
+            )
+            entry[self.level_of(ix) or "unmatchable"] += 1
+            entry["_t"].append(self.token_counts[ix])
+        for entry in out.values():
+            spread = sorted(entry.pop("_t"))
+            entry["min_tokens"] = spread[0]
+            entry["median_tokens"] = spread[len(spread) // 2]
+            entry["max_tokens"] = spread[-1]
+        return dict(sorted(out.items()))
 
     def identifier_candidates(self, identifiers: Iterable[str]) -> list[tuple[str, int]]:
         out: list[tuple[str, int]] = []
@@ -804,39 +942,48 @@ def hits_for(item: Item, index: EvalIndex, *, threshold: float = CONTAINMENT) ->
     """
     found: list[Hit] = []
     toks = tokens(item.text)
-    grams = gram_hashes(toks, index.n)
+    query = index.query(toks)
 
     for identifier, ix in index.identifier_candidates(item.identifiers):
         hit = index.items[ix]
         found.append(Hit(LEVEL_CASE_ID, hit.set_key, hit.item_id, {"identifier": identifier}))
         break
 
-    best: tuple[float, int, int] | None = None
-    for ix, shared in sorted(index.candidates(grams).items()):
+    # The best hit PER LEVEL, not one overall: the levels are a union and the
+    # counts are the instrument that says whether each branch is carrying
+    # cases of its own on real data. One pooled "best" would hide a level that
+    # never fires behind one that always does.
+    best: dict[str, tuple[float, int, int]] = {}
+    for ix, shared in sorted(index.candidates(query).items()):
         share = containment_from(shared, index.gram_counts[ix])
-        if share >= threshold and (best is None or share > best[0]):
-            best = (share, ix, shared)
-    if best is not None:
-        share, ix, shared = best
+        if share < threshold:
+            continue
+        level = index.level_of(ix)
+        if level is not None and (level not in best or share > best[level][0]):
+            best[level] = (share, ix, shared)
+    for level in (LEVEL_TEXT, LEVEL_NARROW, LEVEL_SHORT):
+        if level not in best:
+            continue
+        share, ix, shared = best[level]
         hit = index.items[ix]
+        window = index.windows[ix]
         found.append(
             Hit(
-                LEVEL_TEXT, hit.set_key, hit.item_id,
+                level, hit.set_key, hit.item_id,
                 # Jaccard rides along as a diagnostic: it is the number the
                 # plan asked for as a rule, and recording it is how the first
-                # real run shows how far below 0.8 a genuine leak scores.
+                # real run shows how far below 0.8 a genuine leak scores. The
+                # window and the item's length ride along because the level a
+                # drop is filed under is a fact about the ITEM's length, and
+                # the first run has to be able to read the two together.
                 {"containment": round(share, 4),
-                 "jaccard": round(jaccard_from(shared, index.gram_counts[ix], len(grams)), 4)},
+                 "jaccard": round(
+                     jaccard_from(shared, index.gram_counts[ix], len(query.get(window, ()))), 4
+                 ),
+                 "window": window,
+                 "eval_tokens": index.token_counts[ix]},
             )
         )
-
-    for ix in index.short_candidates(toks):
-        hit = index.items[ix]
-        found.append(
-            Hit(LEVEL_SHORT, hit.set_key, hit.item_id,
-                {"eval_tokens": len(tokens(hit.text))})
-        )
-        break
 
     return sorted(found, key=lambda h: NGRAM_LEVELS.index(h.level))
 
@@ -1134,6 +1281,7 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
     from tuned.data.store import utcnow
 
     coverage = stats["with_identifier"] / stats["total"] if stats["total"] else 0.0
+    lengths = index.length_report()
     return {
         "stage": "decontaminate",
         "decon_version": DECON_VERSION,
@@ -1146,6 +1294,10 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
             "ngram": index.n,
             "containment": threshold,
             "short_min_tokens": index.short_min,
+            # Below this many tokens an item is screened at a NARROWER window
+            # than `ngram` - see window_for. The number an operator reading a
+            # `narrow` drop count needs beside it.
+            "full_ngram_from_tokens": 3 * index.n - 1,
             "title_min_tokens": TITLE_MIN_TOKENS,
             "case_ids_from_text": ids_from_text,
         },
@@ -1165,6 +1317,9 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
                 "items": len(corpus.items),
                 "text_field": corpus.text_field,
                 "detail": corpus.detail,
+                # The token-length histogram, by the level that screens each
+                # band. Read this against the window calibration on run one.
+                "item_tokens": lengths.get(key),
             }
             for key, corpus in sorted(corpora.items())
         },
@@ -1175,7 +1330,12 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
         # only looked at the stream files must not be indistinguishable, years
         # later, from one that looked at everything.
         "generations_screened": any(str(i).startswith("store:") for i in inputs),
-        "unmatchable_eval_items": len(index.unmatchable),
+        # PER SET. A pooled number cannot tell the operator which set is
+        # blind, and the refusal above needs the per-set count anyway.
+        "unmatchable_eval_items": {
+            key: entry["unmatchable"] for key, entry in sorted(lengths.items())
+        },
+        "unmatchable_eval_items_total": len(index.unmatchable),
         "case_identifier_coverage": round(coverage, 4),
         "case_identifier_level_inert": not stats["with_identifier"] or not index.by_identifier,
         "eval_identifiers": len(index.by_identifier),
@@ -1290,11 +1450,25 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
             print(f"read {len(items)} stream rows (generations NOT screened: --no-generated)")
 
         index = EvalIndex([item for c in corpora.values() for item in c.items])
+        manifest_bands = index.length_report()
         for key in sorted(corpora):
             corpus = corpora[key]
             state = corpus.status if corpus.ok else f"{corpus.status} (WAIVED)"
             print(f"  eval {key:<6} {len(corpus.items):>7} items  {state}"
                   f"{'  <- ' + corpus.text_field if corpus.text_field else ''}")
+            bands = manifest_bands.get(key)
+            if bands:
+                # The token-length histogram, printed where the operator is
+                # already looking: which level each set is actually screened
+                # by is what decides whether the window calibration holds.
+                print(
+                    f"    tokens: median {bands['median_tokens']}"
+                    f" (min {bands['min_tokens']}, max {bands['max_tokens']})"
+                    f"  screened by: {LEVEL_TEXT} {bands[LEVEL_TEXT]},"
+                    f" {LEVEL_NARROW} {bands[LEVEL_NARROW]},"
+                    f" {LEVEL_SHORT} {bands[LEVEL_SHORT]},"
+                    f" unmatchable {bands['unmatchable']}"
+                )
             if corpus.ok and len(corpus.items) < corpus.rows:
                 # Some rows of a set that IS loaded carried none of the
                 # candidate column names. Screening against 10% of BBL while
@@ -1338,11 +1512,12 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
                 " or seed.neutral_citation today; populate them, or accept that this run was"
                 " screened on text alone (the manifest says which)."
             )
-        if manifest["unmatchable_eval_items"]:
-            print(
-                f"    {manifest['unmatchable_eval_items']} eval items are under "
-                f"{SHORT_MIN_TOKENS} tokens and NOTHING here can match them"
-            )
+        for key, count in sorted(manifest["unmatchable_eval_items"].items()):
+            if count:
+                print(
+                    f"    {key}: {count} eval items are under {SHORT_MIN_TOKENS} tokens and "
+                    f"NOTHING here can match them"
+                )
         if stats["empty_text"]:
             print(
                 f"    {stats['empty_text']} candidate rows carried NO USABLE TEXT - they can "
