@@ -1724,6 +1724,40 @@ def test_more_rows_than_the_eval_surface_holds_is_printed_as_a_surplus(
     assert "9 rows against 3 expected - 6 MORE than the eval surface" in out
 
 
+def test_a_shortfall_of_zero_says_whether_it_was_measured(tmp_path, monkeypatch, capsys):
+    """`row_shortfall: 0` was two different facts wearing one number: "the
+    download is complete" and "there is no verified count to compare it
+    against, so the instrument is off". aibe reads the first and IL-TUR the
+    second, and nothing in the manifest told them apart."""
+    # aibe shrunk to a fixture-sized expectation so a COMPLETE download - the
+    # first of the two facts - is reachable in a test at all.
+    monkeypatch.setitem(
+        EVAL_SETS, "aibe",
+        replace(EVAL_SETS["aibe"], parts=(EvalPart("default", "train", 1),)),
+    )
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "s.jsonl", [row(prose(918, 60))])
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf")
+    store.close()
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    sets = json.loads(
+        (paths.out_dir / "decontamination.json").read_text(encoding="utf-8")
+    )["eval_sets"]
+
+    # COMPLETE: zero short of a count that was actually read.
+    assert sets["aibe"]["row_shortfall"] == 0
+    assert sets["aibe"]["row_shortfall_measured"] is True
+    assert sets["aibe"]["expect_rows"] == 1
+    # INSTRUMENT OFF: the same zero, meaning nothing at all.
+    assert sets["iltur"]["row_shortfall"] == 0
+    assert sets["iltur"]["row_shortfall_measured"] is False
+    assert sets["iltur"]["expect_rows"] is None
+    # ... and the operator's screen says the same thing for the second one.
+    assert "no verified row count for this set" in capsys.readouterr().out
+
+
 def test_an_unverified_part_turns_the_expectation_off_rather_than_guessing():
     """A None anywhere in a set's parts means the sum would be a guess, and a
     floor denominated against a guess refuses correct downloads."""

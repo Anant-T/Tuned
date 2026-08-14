@@ -133,6 +133,12 @@ class HfSource:
     key: str
     repo_id: str
     license: str
+    # DOCUMENTATION, not a switch. Nothing in this module or downstream reads
+    # `gated` to decide anything: the Hub answers with a 401/403 and the
+    # gated-source remedy is printed off THAT, not off this flag. It records
+    # what the Hub reported at the last check so a reader of these entries
+    # knows which repos need an accepted licence before the first pull, and a
+    # wrong value here changes no behaviour.
     gated: bool
     allow_patterns: tuple[str, ...] | None = None
 

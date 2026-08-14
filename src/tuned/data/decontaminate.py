@@ -91,7 +91,7 @@ So the exposure widens by at most 5 tokens, and only for items under 38. (The
 closed form (2L - 1)/3 quoted here before is the approximation you get by
 substituting w = (L + 1)/3 and it is wrong by up to a token in both
 directions - at L = 25 it says 16.3 where the rule actually needs 16, and at
-L = 30 it says 19.7 where the rule needs 20.)
+L = 30 it says 19.667 where the rule needs 20.)
 
 THE FALSE-POSITIVE CLASS THIS BUYS, named from measurement rather than from
 first principles: it is QUESTION BOILERPLATE AT 13-16 TOKENS, not statutory
@@ -139,6 +139,14 @@ WHAT IS STILL NOT DELIVERED, stated rather than implied:
   lightly reworded question inside a row of any length, and it does NOT catch
   a heavy paraphrase without also collapsing questions about the same section.
   See SEMANTIC_THRESHOLD for the table.
+* THE SEMANTIC LAYER IS LATIN-SCRIPT ONLY on the shipped embedding model, and
+  the manifest says so per script rather than implying otherwise.
+  `potion-base-8M` scores two unrelated Hindi sentences at 0.956 and an
+  English legal question against an English recipe at -0.046, so its Hindi
+  half is not weak, it is inverted - an index holding one Hindi eval question
+  drops 4 of 4 clean Hindi rows at every threshold from 0.6 to 0.95. 7,318 of
+  BhashaBench-Legal's 24,365 questions are Hindi, and every one of them is
+  screened by the exact stack alone. See dominant_script.
 
 WHERE THIS DEPARTS FROM THE PLAN, and the measurement that forced it
 --------------------------------------------------------------------
@@ -229,7 +237,9 @@ WHAT THIS MODULE CANNOT SEE (read before trusting a green run)
 * A PARAPHRASED eval question. n-grams are defeated by rewriting; the
   semantic layer (semhash) is the intended answer and is optional - its
   status is recorded in the manifest either way, and `--require-semantic`
-  turns its absence into a refusal.
+  turns its absence into a refusal. Its status is PER SCRIPT
+  (`semantic_scripts`), because a layer that ran over the English two thirds
+  of BBL and not the Hindi third is not the same screen as one that ran.
 * An eval item under 5 tokens (counted PER SET - and a set whose items
   are all under it is refused, because a screen that compared against
   nothing is not a screen).
@@ -741,7 +751,8 @@ class EvalSet:
 
         Not the whole repo: `rows` is counted after the split filter, so a
         whole-repo expectation makes a correct, complete download read short on
-        every run - and first-run check #1 keys off exactly that line.
+        every run - and the SHORT line the CLI prints below is what an
+        operator reads to decide whether a config or a shard is missing.
         """
         counts = [part.rows for part in self.parts]
         return sum(counts) if counts and None not in counts else None
@@ -776,7 +787,7 @@ class EvalSet:
 # THE ROW COUNTS ARE PER CONFIG AND SPLIT, and that is the whole point of the
 # shape: `rows` is counted AFTER the split filter, so an expectation that
 # describes the whole repo makes a correct, complete download print a
-# shortfall on every run - which is the line first-run check #1 reads.
+# shortfall on every run - which is the SHORT line the CLI prints per set.
 EVAL_SETS = {
     "bbl": EvalSet(
         key="bbl",
@@ -1382,7 +1393,7 @@ class EvalIndex:
         A pooled count cannot tell an operator WHICH set is blind, and the
         window calibration above is an argument until this table is read
         against a real download - which is why it is in the manifest and on
-        the first-run checklist rather than in a comment. `unmatchable` is the
+        the manifest rather than in a comment. `unmatchable` is the
         hole: items nothing here can match.
         """
         out: dict[str, dict] = {}
@@ -1434,8 +1445,8 @@ def hits_for(item: Item, index: EvalIndex, *, threshold: float = CONTAINMENT) ->
     # ONE hit for the level, whatever it matched. A row that shares three
     # identifiers with four eval items is one contaminated row, and appending a
     # Hit per (identifier, item) pair would inflate `by_level["case_id"]` -
-    # the instrument first-run check #4 reads to decide whether this branch is
-    # carrying cases of its own - by the size of the citation graph.
+    # the instrument that says whether this branch is carrying cases of its
+    # own on real data - by the size of the citation graph.
     #
     # EVERY MATCHING IDENTIFIER IS BLAMED, though, and that is a different
     # question from which one the drop is filed under. `top_identifiers` exists
@@ -2102,8 +2113,12 @@ class SemanticFilter:
 
     So a whole-row seam has no operating point at all: every threshold either
     sees nothing or drops everything. Cost of the windows, measured against a
-    20,000-item index: 85 ms/row whole, 198 ms/row windowed, i.e. ~25 min
-    against ~59 min over an 18,000-row corpus.
+    20,000-item index at the previous 20/10 geometry: 85 ms/row whole, 198
+    ms/row windowed, i.e. ~25 min against ~59 min over an 18,000-row corpus.
+    Widening the window to 30 did not move that: the query count is one per
+    window and a wider window at the same stride produces exactly one FEWER
+    (9 against 10 at 100 words, 29/30 at 300, 129/130 at 1,300). The stride is
+    the cost lever, and it was not touched.
 
     THERE IS ONE INDEX PER SCRIPT and a probe only ever meets the index for its
     own dominant script - see dominant_script for the measurement that forced
@@ -2476,6 +2491,11 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
                 "expect_rows": corpus.spec.expect_rows,
                 "expect_verified_at": EVAL_COUNTS_VERIFIED_AT if corpus.spec.parts else None,
                 "row_shortfall": corpus.shortfall,
+                # `row_shortfall: 0` is otherwise two different facts wearing
+                # one number - "the download is complete" and "there is no
+                # verified count to compare it against, so the instrument is
+                # off". This says which.
+                "row_shortfall_measured": corpus.spec.expect_rows is not None,
                 "row_surplus": corpus.surplus,
                 "items": len(corpus.items),
                 "text_field": corpus.text_field,
