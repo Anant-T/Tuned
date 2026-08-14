@@ -532,15 +532,101 @@ def test_the_manifest_carries_an_upstream_waiver_forward(tmp_path, capsys):
 
 
 def test_an_input_that_never_went_through_decontamination_is_recorded_as_such(tmp_path, capsys):
-    cfg = temp_config(tmp_path)
-    paths = paths_for(tmp_path)
+    """The misreading this exists to reject is CONSTRUCTED, not assumed away:
+    a real decontamination pass has run and left its manifest in out/, and the
+    input is a different file that never went through it. Reading the manifest
+    from the OUTPUT's directory instead of the input's - which is what the
+    code comment claimed to prevent - finds that manifest here, so the two
+    readings no longer agree and the fixture can tell them apart."""
+    text = prose(121, 120)
+    cfg, paths = _decontaminated(tmp_path, [row(text), row(prose(122, 120))])
+    capsys.readouterr()
+    assert (paths.out_dir / "decontamination.json").exists(), "the premise: a manifest exists"
+
     raw = paths.corpus_dir / "unscreened.jsonl"
-    write_jsonl(raw, [row(prose(121, 120))])
+    write_jsonl(raw, [row(prose(123, 120))])
     assert dedupe_main(["--config", cfg, "--in", str(raw)]) == 0
     out = capsys.readouterr().out
     manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
     assert manifest["decontamination"] is None
+    assert manifest["decontamination_check"]["status"] == "no_manifest"
+    assert manifest["decontamination_check"]["manifest"] is None
     assert "NO DECONTAMINATION MANIFEST" in out
+
+
+def test_rows_that_are_not_the_screened_rows_do_not_inherit_the_manifest(tmp_path, capsys):
+    """Reproduced end to end before it was fixed: never-screened rows shipped
+    beside a manifest asserting a decontamination pass over OTHER rows, exit 0,
+    and the NO DECONTAMINATION MANIFEST banner did not print. The counts
+    visibly disagreed and nothing looked. Custody is bound to the digest of
+    the bytes decontaminate.py wrote, so a manifest in the same directory
+    cannot be inherited by rows it does not describe."""
+    cfg, paths = _decontaminated(tmp_path, [row(prose(124, 120)), row(prose(125, 120))])
+    capsys.readouterr()
+    upstream = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+    assert upstream["output"]["rows"] == 2
+    assert upstream["output"]["sha256"]
+
+    # Four never-screened rows, dropped into the very directory the screened
+    # pair and its manifest live in.
+    smuggled = paths.out_dir / "smuggled.jsonl"
+    write_jsonl(smuggled, [row(prose(126 + i, 120)) for i in range(4)])
+    assert dedupe_main(["--config", cfg, "--in", str(smuggled)]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["decontamination"] is None
+    check = manifest["decontamination_check"]
+    assert check["status"] == "content_mismatch"
+    assert check["manifest"].endswith("decontamination.json")
+    assert check["input_sha256"] != check["manifest_output"]["sha256"]
+    assert "DESCRIBES DIFFERENT ROWS" in out
+
+
+def test_the_screened_rows_themselves_do_verify(tmp_path, capsys):
+    """The other half: the real output of the real pass carries its record
+    forward, so the check above is rejecting a mismatch rather than rejecting
+    everything."""
+    cfg, paths = _decontaminated(tmp_path, [row(prose(128, 120)), row(prose(129, 120))])
+    capsys.readouterr()
+    assert dedupe_main(["--config", cfg]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    check = manifest["decontamination_check"]
+    assert check["status"] == "verified"
+    assert check["input_sha256"] == check["manifest_output"]["sha256"]
+    assert manifest["decontamination"]["counts"]["kept"] == 2
+    assert "NO DECONTAMINATION MANIFEST" not in capsys.readouterr().out
+
+
+def test_a_manifest_with_no_output_digest_is_not_inherited_either(tmp_path, capsys):
+    """A manifest written by an older decon_version cannot say whether it
+    describes these rows, and 'cannot tell' is not 'yes'."""
+    cfg, paths = _decontaminated(tmp_path, [row(prose(130, 120)), row(prose(131, 120))])
+    capsys.readouterr()
+    path = paths.out_dir / "decontamination.json"
+    stale = json.loads(path.read_text(encoding="utf-8"))
+    stale.pop("output")
+    stale["decon_version"] = 1
+    path.write_text(json.dumps(stale), encoding="utf-8")
+
+    assert dedupe_main(["--config", cfg]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["decontamination"] is None
+    assert manifest["decontamination_check"]["status"] == "no_output_digest"
+    assert "NO OUTPUT DIGEST" in out
+
+
+def test_several_inputs_cannot_all_be_the_screened_output(tmp_path, capsys):
+    cfg, paths = _decontaminated(tmp_path, [row(prose(132, 120)), row(prose(133, 120))])
+    capsys.readouterr()
+    other = paths.out_dir / "extra.jsonl"
+    write_jsonl(other, [row(prose(134, 120))])
+    screened = paths.out_dir / "decontaminated.jsonl"
+    assert dedupe_main(["--config", cfg, "--in", str(screened), "--in", str(other)]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["decontamination"] is None
+    assert manifest["decontamination_check"]["status"] == "several_inputs"
+    assert "SEVERAL INPUTS" in capsys.readouterr().out
 
 
 def test_the_cli_writes_rows_drops_and_a_manifest(tmp_path, capsys):

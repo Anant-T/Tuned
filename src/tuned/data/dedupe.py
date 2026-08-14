@@ -136,7 +136,9 @@ OUT_FILENAME = "deduped.jsonl"
 DROPS_FILENAME = "dedupe_drops.jsonl"
 MANIFEST_FILENAME = "dedupe.json"
 
-DEDUPE_VERSION = 1
+# 2: the manifest gained `decontamination_check` - the chain of custody is
+#    bound to the upstream output's DIGEST, not to the directory it sits in.
+DEDUPE_VERSION = 2
 
 # Shorter window than decontamination's 13: this is a similarity question
 # between two rows of comparable length, not a "did this text appear inside
@@ -602,8 +604,90 @@ def read_decontamination_manifest(path: Path) -> dict | None:
         return None
 
 
+CUSTODY_VERIFIED = "verified"
+CUSTODY_NO_MANIFEST = "no_manifest"
+CUSTODY_MISMATCH = "content_mismatch"
+CUSTODY_NO_DIGEST = "no_output_digest"
+CUSTODY_SEVERAL_INPUTS = "several_inputs"
+
+CUSTODY_BANNERS = {
+    CUSTODY_NO_MANIFEST: (
+        "NO DECONTAMINATION MANIFEST beside this input - these rows may never have been"
+        " screened against the eval sets, and the manifest records that as"
+        " decontamination: null"
+    ),
+    CUSTODY_MISMATCH: (
+        "THE DECONTAMINATION MANIFEST BESIDE THIS INPUT DESCRIBES DIFFERENT ROWS - its"
+        " output digest does not match the bytes read here, so these rows were NOT the"
+        " ones screened. The record is NOT inherited: decontamination: null"
+    ),
+    CUSTODY_NO_DIGEST: (
+        "THE DECONTAMINATION MANIFEST BESIDE THIS INPUT CARRIES NO OUTPUT DIGEST (it"
+        " predates decon_version 2), so nothing here can tell whether it describes these"
+        " rows. Not inherited: decontamination: null. Re-run decontaminate.py"
+    ),
+    CUSTODY_SEVERAL_INPUTS: (
+        "SEVERAL INPUTS were read, so at most one of them can be the decontamination"
+        " pass's output and no manifest describes the whole. Not inherited:"
+        " decontamination: null"
+    ),
+}
+
+
+def custody_of(inputs: Sequence[Path]) -> tuple[dict | None, dict]:
+    """(the upstream manifest to carry forward, the custody record).
+
+    BOUND TO CONTENT, NOT TO A DIRECTORY. The manifest is still looked for
+    beside the input - the question it answers is "were THESE rows screened" -
+    but finding one is no longer enough to inherit it: the digest
+    decontaminate.py recorded for its own output has to match the bytes read
+    here. Without that check, four never-screened rows shipped under a
+    manifest asserting a five-row decontamination pass, exit 0, with the
+    counts visibly disagreeing and nothing looking at them; and every
+    `decontaminate --out elsewhere/x.jsonl` left a stale pair in out/ for a
+    later bare `dedupe` to adopt.
+
+    A path that differs is NOT a failure - the same bytes under another name
+    are still the screened rows - so only the digest decides. Every non-verified
+    outcome is its own status, because they send the operator to different
+    places, and the record travels into the manifest so `decontamination: null`
+    always says WHY.
+    """
+    from tuned.data.acquire import sha256_file
+
+    paths = [Path(p) for p in inputs]
+    record = {
+        "status": CUSTODY_NO_MANIFEST,
+        "manifest": None,
+        "input": str(paths[0]) if paths else None,
+        "input_sha256": None,
+        "manifest_output": None,
+    }
+    if len(paths) != 1:
+        record["status"] = CUSTODY_SEVERAL_INPUTS
+        record["input"] = [str(p) for p in paths]
+        return None, record
+    manifest_path = paths[0].parent / DECON_MANIFEST_FILENAME
+    upstream = read_decontamination_manifest(manifest_path)
+    if upstream is None:
+        return None, record
+    record["manifest"] = str(manifest_path)
+    output = upstream.get("output") or {}
+    record["manifest_output"] = {k: output.get(k) for k in ("path", "rows", "sha256")}
+    if not output.get("sha256"):
+        record["status"] = CUSTODY_NO_DIGEST
+        return None, record
+    record["input_sha256"] = sha256_file(paths[0])
+    if record["input_sha256"] != output["sha256"]:
+        record["status"] = CUSTODY_MISMATCH
+        return None, record
+    record["status"] = CUSTODY_VERIFIED
+    return upstream, record
+
+
 def manifest_of(stats: dict, *, inputs: Sequence[str], upstream: dict | None,
-                semantic: str, thresholds: dict, semantic_detail: str = "") -> dict:
+                semantic: str, thresholds: dict, semantic_detail: str = "",
+                custody: dict | None = None) -> dict:
     from tuned.data.store import utcnow
 
     upstream_summary = None
@@ -639,8 +723,11 @@ def manifest_of(stats: dict, *, inputs: Sequence[str], upstream: dict | None,
         "semantic_detail": semantic_detail,
         # The chain of custody. `null` here means this input was NOT the
         # decontamination pass's output, which is the one thing a reader of
-        # the dataset card must be able to tell.
+        # the dataset card must be able to tell - and `decontamination_check`
+        # says WHICH way it failed, so a null is never mistaken for a missing
+        # field and a mismatch is never mistaken for a missing manifest.
         "decontamination": upstream_summary,
+        "decontamination_check": custody,
     }
 
 
@@ -682,10 +769,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
-    # Beside the INPUT, not beside the output: the question the manifest
-    # answers is "were THESE rows screened", and an --in from somewhere else
-    # must not inherit a manifest that describes different rows.
-    upstream = read_decontamination_manifest(inputs[0].parent / DECON_MANIFEST_FILENAME)
+    # Beside the INPUT and MATCHING ITS BYTES: the question the manifest
+    # answers is "were THESE rows screened", and a manifest found next to an
+    # --in from somewhere else describes different rows.
+    upstream, custody = custody_of(inputs)
     items = list(stream_items(inputs))
     semantic, semantic_status, semantic_detail = None, SEMANTIC_UNAVAILABLE, ""
     if semhash_available():
@@ -707,6 +794,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         upstream=upstream,
         semantic=semantic_status,
         semantic_detail=semantic_detail,
+        custody=custody,
         thresholds={
             "ngram": NGRAM,
             "prompt_jaccard": PROMPT_JACCARD,
@@ -737,13 +825,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"    {semantic_detail}")
     if upstream is None:
         # The order is a correctness property, so an input that did not come
-        # through decontamination is stated, not assumed away.
-        print(
-            f"  NO DECONTAMINATION MANIFEST beside this input - these rows may never have been"
-            f" screened against the eval sets, and the manifest records that as"
-            f" decontamination: null"
-        )
+        # through decontamination is stated, not assumed away - and WHICH way
+        # the custody check failed is stated too, because "there is no
+        # manifest here" and "the manifest here is about other rows" send the
+        # operator to different places.
+        print(f"  {CUSTODY_BANNERS[custody['status']]}")
     else:
+        # The timestamp is printed because a verified digest says these rows
+        # ARE the screened rows, not that they were screened recently: a
+        # refusal leaves the previous success's output and manifest in place,
+        # self-consistent, and this is what makes that visible.
+        print(
+            f"  decontamination verified: {upstream.get('at')} "
+            f"(decon_version {upstream.get('decon_version')}, "
+            f"{(upstream.get('counts') or {}).get('kept')} rows screened)"
+        )
         waived = sorted(
             key for key, value in (upstream.get("eval_sets") or {}).items()
             if value.get("allowed_missing")

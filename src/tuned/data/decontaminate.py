@@ -134,7 +134,11 @@ MANIFEST_FILENAME = "decontamination.json"
 
 # Bump when a rule changes: the manifest records it, so a dataset card can say
 # which decontamination rules produced the corpus it describes.
-DECON_VERSION = 1
+#
+# 2: the manifest gained an `output` block (path, rows, sha256) and dedupe.py
+#    binds its chain of custody to that DIGEST rather than to the directory
+#    the manifest happens to sit in.
+DECON_VERSION = 2
 
 # The n-gram window. 13 tokens is long enough that ordinary legal phrasing
 # does not collide by accident and short enough to survive light editing.
@@ -1101,10 +1105,25 @@ def store_items(store, cfg=None, *, state: str = "accepted",
 # The manifest: what this pass could and could not see.
 # --------------------------------------------------------------------------
 
+def output_record(path: Path, rows: int) -> dict:
+    """What this pass wrote, identified by CONTENT.
+
+    The chain of custody downstream cannot be a directory: dedupe.py used to
+    read the manifest beside its input and inherit whatever it found there, so
+    an --in from anywhere else adopted a manifest describing OTHER ROWS and
+    shipped never-screened rows under a decontamination stamp. A digest of the
+    bytes actually written is the only claim that cannot be inherited by a
+    file that was not screened.
+    """
+    from tuned.data.acquire import sha256_file
+
+    return {"path": str(path), "rows": rows, "sha256": sha256_file(path)}
+
+
 def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *,
                 inputs: Sequence[str], semantic: str, semantic_detail: str = "",
-                threshold: float = CONTAINMENT, ids_from_text: bool = True,
-                top: int = 20) -> dict:
+                output: dict | None = None, threshold: float = CONTAINMENT,
+                ids_from_text: bool = True, top: int = 20) -> dict:
     """The record that has to outlive this run.
 
     Every waived eval set, every hole in the screen and every threshold is in
@@ -1120,6 +1139,9 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
         "decon_version": DECON_VERSION,
         "at": utcnow(),
         "inputs": list(inputs),
+        # The rows this pass produced, by content. dedupe.py verifies its own
+        # input against this and refuses to inherit the record otherwise.
+        "output": output,
         "thresholds": {
             "ngram": index.n,
             "containment": threshold,
@@ -1285,11 +1307,14 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
                 )
 
         kept, drops, stats = decontaminate_items(items, index, semantic=semantic_fn)
+        # Written FIRST, so the manifest can carry the digest of the bytes
+        # that actually landed rather than of the bytes this pass intended.
+        written = write_jsonl(out_path, [item.row for item in kept])
         manifest = manifest_of(
             stats, corpora, index, inputs=input_names, semantic=semantic_status,
             semantic_detail=semantic_detail, ids_from_text=ids_from_text,
+            output=output_record(out_path, written),
         )
-        written = write_jsonl(out_path, [item.row for item in kept])
         write_jsonl(out_path.parent / DROPS_FILENAME, drops)
         write_manifest(out_path.parent / MANIFEST_FILENAME, manifest)
         store.log_event("decontamination", manifest)
