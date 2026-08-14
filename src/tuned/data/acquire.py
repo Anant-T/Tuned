@@ -166,6 +166,28 @@ HF_SOURCES = {
     "injudgements": HfSource(
         key="injudgements", repo_id=INJUDGEMENTS_SOURCE_ID, license="Apache-2.0", gated=True
     ),
+    # The eval corpora. NEVER TRAINED ON - they are here because
+    # decontaminate.py screens the dataset against them and REFUSES to run
+    # without them, so "is it on disk" has to be an acquire-time fact like
+    # every other input. IL-TUR and AIBE are NC/ND and are read-only for that
+    # screen; BBL is the forgetting guard the charter's headline number comes
+    # from, which is exactly why a leak of it into training is unrecoverable.
+    #
+    # THESE THREE REPO IDS HAVE NEVER BEEN CHECKED AGAINST THE HUB - P0 did
+    # not enumerate them and this build has no network. A wrong id fails here,
+    # loudly, and then fails decontaminate.py as `not_acquired`, which is a
+    # refusal. It cannot fail quietly.
+    "bbl": HfSource(
+        key="bbl", repo_id="bharatgenai/BhashaBench-Legal", license="CC-BY-4.0", gated=False
+    ),
+    "iltur": HfSource(
+        key="iltur", repo_id="Exploration-Lab/IL-TUR",
+        license="non-commercial (EVAL/DECONTAMINATION ONLY)", gated=False,
+    ),
+    "aibe": HfSource(
+        key="aibe", repo_id="opennyaiorg/aibe",
+        license="no-derivatives (EVAL/DECONTAMINATION ONLY)", gated=False,
+    ),
 }
 
 

@@ -774,6 +774,34 @@ class Store:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    def latest_generations(self, where_state: str | None = None) -> list[dict]:
+        """The newest generation of every task, joined to its task row.
+
+        Newest only: a task's disposition is about the answer it currently
+        stands on, so a pass that reads superseded attempts would judge a task
+        by a draft that was already replaced.
+
+        Lives here rather than in the caller because two passes now read it -
+        verify.py re-gates these rows and the assembly pass (decontaminate/
+        dedupe) reads them as candidate dataset rows - and a second copy of
+        this join is a second answer to "which generation is the row".
+        """
+        clause = "WHERE t.state = ?" if where_state else ""
+        params: tuple = (where_state,) if where_state else ()
+        return [
+            dict(row)
+            for row in self._conn.execute(
+                "SELECT g.*, t.stream, t.seed_id, t.task_type, t.prompt_id, t.prompt_sha, "
+                "       t.sample_ix, t.arm, t.state AS task_state "
+                "FROM generation g "
+                "JOIN task t ON t.task_id = g.task_id "
+                "JOIN (SELECT task_id, MAX(attempt) AS a FROM generation GROUP BY task_id) m "
+                "  ON m.task_id = g.task_id AND m.a = g.attempt "
+                f"{clause} ORDER BY g.gen_id",
+                params,
+            ).fetchall()
+        ]
+
     # ------------------------------------------------------------------ budget
 
     def reserve_budget(

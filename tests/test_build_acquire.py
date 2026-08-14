@@ -851,7 +851,11 @@ def test_a_transient_hub_failure_does_not_cost_the_days_long_pdf_pull_either(tmp
     for key, body in objects.items():
         assert (paths.corpus_dir / "sc" / key).read_bytes() == body
     with Store.open(paths.state_db) as opened:
-        assert len(opened.events("acquire_failed")) == 3  # one per registered snapshot
+        # One per registered snapshot, read off the registry rather than
+        # frozen as a literal: the eval corpora decontaminate.py refuses to
+        # run without are snapshots too, and this test is about "every one of
+        # them was counted", not about how many there happen to be.
+        assert len(opened.events("acquire_failed")) == len(HF_SOURCES)
 
 
 def test_a_run_that_lost_objects_does_not_report_success(tmp_path, capsys):

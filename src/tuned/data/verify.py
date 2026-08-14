@@ -117,20 +117,12 @@ def latest_generations(store, *, where_state: str | None = None) -> list[dict]:
     Newest only: a task's disposition is about the answer it currently
     stands on, and re-gating superseded attempts would demote a task for a
     draft that was already replaced.
+
+    The join itself lives in store.py (all SQL does), and the assembly pass
+    reads the same rows through the same method - so "which generation is the
+    row" has one answer, not one per caller.
     """
-    clause = "WHERE t.state = ?" if where_state else ""
-    params: tuple = (where_state,) if where_state else ()
-    rows = store.conn.execute(
-        "SELECT g.*, t.stream, t.seed_id, t.task_type, t.prompt_id, t.prompt_sha, "
-        "       t.sample_ix, t.arm, t.state AS task_state "
-        "FROM generation g "
-        "JOIN task t ON t.task_id = g.task_id "
-        "JOIN (SELECT task_id, MAX(attempt) AS a FROM generation GROUP BY task_id) m "
-        "  ON m.task_id = g.task_id AND m.a = g.attempt "
-        f"{clause} ORDER BY g.gen_id",
-        params,
-    ).fetchall()
-    return [dict(row) for row in rows]
+    return store.latest_generations(where_state)
 
 
 def content_for(cfg, gen: dict) -> tuple[str, str]:
