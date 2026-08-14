@@ -2898,6 +2898,42 @@ def test_an_english_row_quoting_a_few_devanagari_words_is_not_dropped_by_them(mo
     assert report[SCRIPT_DEVANAGARI]["unscreened_rows"] == 2
 
 
+def test_a_code_switched_EVAL_ITEM_is_indexed_in_every_script_it_carries(monkeypatch):
+    """BOTH SIDES ARE PARTITIONED, and this is the half that is easy to leave
+    out. A code-switched eval question - a Hindi stem carrying an English
+    clause, which is what a BhashaBench hindi-config row looks like when it
+    quotes a statute - is Devanagari-DOMINANT, so indexing it whole files it
+    under a script this model cannot read and its English clause is screened by
+    nobody. Partitioning the item too puts that clause in the Latin index,
+    where the control passed, and a row quoting it is caught.
+
+    Filed under both scripts on purpose: the Devanagari half of the same item
+    is still counted as the unscreened hole it is."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    clause = "criminal breach of trust by a public servant"
+    item = EvalItem("bbl", "bbl#mixed", f"{HINDI_QUESTION} {clause}", frozenset())
+    assert dominant_script(item.text) == SCRIPT_DEVANAGARI, "the item is Hindi-dominant"
+    assert set(script_partition(item.text)) == {SCRIPT_DEVANAGARI, SCRIPT_LATIN}
+
+    seam = SemanticFilter([item], screened=[SCRIPT_LATIN])
+    report = seam.script_report()
+    assert report[SCRIPT_LATIN]["eval_items"] == 1, (
+        "the English clause of a Hindi-dominant eval item reached no index at all"
+    )
+    assert report[SCRIPT_LATIN]["screened"] is True
+    assert report[SCRIPT_DEVANAGARI]["eval_items"] == 1
+    assert report[SCRIPT_DEVANAGARI]["screened"] is False
+
+    # ... and a row quoting that clause is caught, in English, by an item whose
+    # own dominant script is one this layer cannot read.
+    hit = seam.match(f"{clause} was the charge")
+    assert hit is not None and hit.item_id == "bbl#mixed"
+    assert hit.detail["script"] == SCRIPT_LATIN
+    # The index holds the CLAUSE, not the whole item: the Devanagari words are
+    # not in the Latin index's text either, or they would dilute it there.
+    assert all(dominant_script(text) == SCRIPT_LATIN for text in seam.item_by_text)
+
+
 def test_a_row_screened_in_one_script_is_not_counted_as_screened_by_nothing(monkeypatch):
     """The banner's two row counts. `unscreened_rows` is every row carrying a
     word this layer could not read; `wholly_unscreened_rows` is the rows where
@@ -3758,7 +3794,7 @@ def test_a_code_switched_leak_survives_the_hindi_words_inside_it(monkeypatch):
 
     assert [missed(k, split=False) for k in (0, 1, 2, 3, 4)] == [0, 0, 1, 5, 5]
     assert [missed(k, split=True) for k in (0, 1, 2, 3, 4)] == [0, 0, 0, 1, 1]
-    assert seam.threshold == SEMANTIC_THRESHOLD
+    assert seam.threshold == 0.8
 
 
 def test_the_price_of_splitting_the_probe_is_a_hindi_row_about_the_same_section(monkeypatch):
