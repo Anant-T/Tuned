@@ -150,7 +150,11 @@ MANIFEST_FILENAME = "dedupe.json"
 
 # 2: the manifest gained `decontamination_check` - the chain of custody is
 #    bound to the upstream output's DIGEST, not to the directory it sits in.
-DEDUPE_VERSION = 2
+# 3: the semantic self-dedupe is scoped to one question form (unguarded, it
+#    collapsed four tasks built on one seed into one at every threshold), its
+#    threshold is recorded, and its drops name the form. The emitted set moves
+#    wherever that layer runs.
+DEDUPE_VERSION = 3
 
 # Shorter window than decontamination's 13: this is a similarity question
 # between two rows of comparable length, not a "did this text appear inside

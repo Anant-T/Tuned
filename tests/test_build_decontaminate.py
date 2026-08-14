@@ -12,6 +12,7 @@ from pipeline_fakes import open_store, paths_for, temp_config
 
 from tuned.data.decontaminate import (
     CONTAINMENT,
+    DECON_VERSION,
     EVAL_COUNTS_VERIFIED_AT,
     EVAL_EMPTY,
     EVAL_MIN_SHARE,
@@ -1826,6 +1827,10 @@ def test_the_cli_writes_the_rows_the_drops_and_the_manifest(tmp_path, capsys):
     assert manifest["counts"] == {"total": 2, "kept": 1, "dropped": 1, "empty_text": 0}
     assert manifest["thresholds"]["containment"] == CONTAINMENT
     assert manifest["thresholds"]["ngram"] == NGRAM
+    # The version travels with the shape: a manifest that changed what it says
+    # while still claiming the old number cannot be read years later.
+    assert manifest["decon_version"] == DECON_VERSION == 3
+    assert "split" not in manifest["eval_sets"]["bbl"], "replaced by `selection`"
     assert "screened 2  kept 1  dropped 1" in out
 
 

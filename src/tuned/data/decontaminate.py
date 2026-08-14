@@ -263,7 +263,15 @@ MANIFEST_FILENAME = "decontamination.json"
 # 2: the manifest gained an `output` block (path, rows, sha256) and dedupe.py
 #    binds its chain of custody to that DIGEST rather than to the directory
 #    the manifest happens to sit in.
-DECON_VERSION = 2
+# 3: the eval sets carry per-config+split expectations and a `selection`
+#    record (what was screened against, what was left out, and why) in place
+#    of a single `split` string; the semantic layer probes a row in windows at
+#    a measured threshold and both are recorded in `thresholds`;
+#    `identifier_drops` counts every identifier a drop matched rather than the
+#    sorted-first one; and the tokeniser keeps combining marks inside a word,
+#    which moves Devanagari items between levels. The rules moved AND the
+#    manifest changed shape.
+DECON_VERSION = 3
 
 # The n-gram window AT ITS WIDEST. 13 tokens is long enough that ordinary
 # legal phrasing does not collide by accident; window_for narrows it for items

@@ -31,6 +31,7 @@ from tuned.data.decontaminate import (
 from tuned.data.decontaminate import main as decon_main
 from tuned.data.dedupe import (
     CNR_CAP,
+    DEDUPE_VERSION,
     NGRAM,
     PROMPT_JACCARD,
     REASON_CAP,
@@ -874,6 +875,7 @@ def test_the_cli_writes_rows_drops_and_a_manifest(tmp_path, capsys):
         "row_jaccard": ROW_JACCARD, "cap": CNR_CAP, "case_ids_from_text": True,
         "semantic": SEMANTIC_THRESHOLD,
     }
+    assert manifest["dedupe_version"] == DEDUPE_VERSION == 3
     assert manifest["counts"]["total"] == 3
     assert "drop[exact]: 1" in out
     event = json.loads(Store.open(paths.state_db).events("dedupe")[0]["detail_json"])
