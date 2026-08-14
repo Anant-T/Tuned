@@ -2181,7 +2181,14 @@ def test_two_runs_under_different_hash_seeds_are_byte_identical(tmp_path):
     """Run it twice for real rather than reading the source for sorted():
     survivor selection and index iteration are exactly where PYTHONHASHSEED
     leaks in, and downstream a shifting survivor set shifts split.py's
-    train/test boundary."""
+    train/test boundary.
+
+    WHAT THIS TEST STRUCTURALLY CANNOT SEE: the subprocess runs with an
+    ImportError stub for semhash, so the semantic layer never executes here and
+    the approximate index's choice among near-tied eval items - which is what
+    `by_eval_set` and the drop log record - is out of reach. That half is
+    test_the_semantic_attribution_is_the_same_on_every_run, cache-gated,
+    against the real library."""
     cfg = temp_config(tmp_path)
     paths = paths_for(tmp_path)
     question = prose(111, 120)

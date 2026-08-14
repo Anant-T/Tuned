@@ -892,11 +892,20 @@ def test_the_cli_writes_rows_drops_and_a_manifest(tmp_path, capsys):
     manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
     assert len(kept) == 2 and len(drops) == 1
     assert json.loads(kept[0]) == row(text)
+    # PINNED AS LITERALS, the way decontaminate's already are. Comparing the
+    # dict to the constants that produced it is invariant to a change in the
+    # constants by construction: SEMANTIC_THRESHOLD 0.9 -> 0.8 and 0.9 -> 0.5
+    # both survived this assertion, and 0.5 would collapse within-form rows
+    # corpus-wide on a comparison the docstring's own table says is well
+    # behaved at 0.9. An operating point that is only checked against itself is
+    # not checked.
     assert manifest["thresholds"] == {
-        "ngram": NGRAM, "prompt_jaccard": PROMPT_JACCARD,
-        "row_jaccard": ROW_JACCARD, "cap": CNR_CAP, "case_ids_from_text": True,
-        "semantic": SEMANTIC_THRESHOLD,
+        "ngram": 5, "prompt_jaccard": 0.85, "row_jaccard": 0.90,
+        "cap": 3, "case_ids_from_text": True, "semantic": 0.9,
     }
+    assert (NGRAM, PROMPT_JACCARD, ROW_JACCARD, CNR_CAP, SEMANTIC_THRESHOLD) == (
+        5, 0.85, 0.90, 3, 0.9
+    )
     assert manifest["dedupe_version"] == DEDUPE_VERSION == 3
     assert manifest["counts"]["total"] == 3
     assert "drop[exact]: 1" in out
