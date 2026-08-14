@@ -259,9 +259,13 @@ def gram_hashes(toks: Sequence[str], n: int = NGRAM) -> frozenset[int]:
     rolling polynomial over it is what keeps this one multiply per token
     rather than n.
 
-    A collision can only ever ADD a candidate (which the exact containment
-    arithmetic then rejects), never remove one, so the error direction is the
-    safe one.
+    A 64-bit collision can only ever ADD to a posting count, never remove
+    from one, so the error direction is the safe one - it can cost a row, not
+    hide a leak. It is NOT rejected downstream, though: the posting count IS
+    the intersection size the arithmetic divides, so a collision inflates
+    containment directly rather than proposing a candidate something later
+    throws out. (The comment here used to claim the latter, which would have
+    been a stronger guarantee than the code gives.)
     """
     if n <= 0:
         raise ValueError(f"n must be positive, got {n}")

@@ -319,13 +319,15 @@ def dedupe_candidates(
     rows do not have, and dedupe is not the stage that ranks quality - the
     per-case cap is.
     """
+    # No "semantic" counter here: this function does not run that layer, and
+    # the count it used to hold was incremented in dedupe_items and read by
+    # nobody. by_reason is the one answer to "how many did each rule drop".
     stats = {
         "total": len(candidates),
         "kept": 0,
         "exact": 0,
         "near_prompt": 0,
         "near_row": 0,
-        "semantic": 0,
     }
     drops: list[dict] = []
     kept: list[Candidate] = []
@@ -568,7 +570,6 @@ def dedupe_items(
             survivors = []
             for candidate in kept:
                 if candidate.key in flagged:
-                    stats["semantic"] += 1
                     drops.append(
                         _drop(candidate, REASON_SEMANTIC, flagged[candidate.key], {})
                     )
@@ -576,7 +577,10 @@ def dedupe_items(
                     survivors.append(candidate)
             kept = survivors
     if cap is None:
-        stats.update(capped=0, uncapped_rows=0, cases=0, cases_over_cap=0, cap=None)
+        # NULL, not 0. `uncapped_rows: 0, cases: 0, cases_over_cap: 0` is
+        # byte-identical to "the cap ran and reached every row", which is the
+        # opposite of what --no-cap did.
+        stats.update(capped=None, uncapped_rows=None, cases=None, cases_over_cap=None, cap=None)
     else:
         kept, cap_drops, cap_stats = apply_cap(kept, cap=cap)
         drops += cap_drops
@@ -847,10 +851,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"read {stats['total']} rows from {', '.join(str(p) for p in inputs)}")
     for reason, count in sorted(stats["by_reason"].items()):
         print(f"    drop[{reason}]: {count}")
-    print(
-        f"  {stats['cases']} cases carried an identifier, {stats['cases_over_cap']} over the cap;"
-        f" {stats['uncapped_rows']} rows carry NO case identifier and were never capped"
-    )
+    if stats["cap"] is None:
+        print("  THE PER-CASE CAP DID NOT RUN (--no-cap): one judgment may hold any number of "
+              "rows, and the manifest records the cap counts as null rather than as zero")
+    else:
+        print(
+            f"  {stats['cases']} cases carried an identifier, {stats['cases_over_cap']} over the"
+            f" cap; {stats['uncapped_rows']} rows carry NO case identifier and were never capped"
+        )
     if semantic_status != SEMANTIC_RAN:
         print(f"  semantic self-dedupe did NOT run ({semantic_status})")
         if semantic_detail:

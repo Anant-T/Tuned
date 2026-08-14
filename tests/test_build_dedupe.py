@@ -336,6 +336,31 @@ def test_the_cap_can_be_switched_off_without_touching_the_rest():
     assert len(dedupe_items(items(*rows))[0]) == CNR_CAP
 
 
+def test_a_cap_that_did_not_run_is_null_and_not_zero(tmp_path, capsys):
+    """`uncapped_rows: 0, cases: 0, cases_over_cap: 0` is byte-identical to
+    "the cap ran and reached every row" - the opposite of what --no-cap did.
+    Years later, that is the difference between a dataset one judgment may
+    dominate and one it cannot."""
+    rows = case_rows(5, forms=list("abcde"))
+    cfg, paths = _decontaminated(tmp_path, rows)
+    capsys.readouterr()
+
+    assert dedupe_main(["--config", cfg, "--no-cap"]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["counts"]["kept"] == 5
+    for key in ("uncapped_rows", "cases", "cases_over_cap"):
+        assert manifest["counts"][key] is None, key
+    assert manifest["thresholds"]["cap"] is None
+    assert "THE PER-CASE CAP DID NOT RUN" in out
+
+    # ... and the run that DID cap reports numbers, so null is a statement and
+    # not the shape of every run.
+    assert dedupe_main(["--config", cfg]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert (manifest["counts"]["cases"], manifest["counts"]["uncapped_rows"]) == (1, 0)
+
+
 def test_apply_cap_writes_rows_back_in_input_order():
     rows = case_rows(4, forms=["a", "b", "c", "d"], scores=[1, 4, 3, 2])
     candidates = [candidate_of(i) for i in items(*rows)]
@@ -348,6 +373,26 @@ def test_score_of_reads_the_judge_score_and_survives_junk():
     assert score_of(item_of(row("q", score=4.25), "x#0")) == 4.25
     assert score_of(item_of(row("q", score="not a number"), "x#1")) is None
     assert score_of(item_of(row("q"), "x#2")) is None
+
+
+def test_an_unscored_row_is_not_a_row_that_scored_zero():
+    """The docstring says "None is NOT zero" and the [None, 3, None, 4]
+    fixture cannot show it: every judge score is positive, so reading None as
+    0 sorts it last too and both readings keep the same three rows. It takes a
+    row that genuinely scored 0 - which three zeroed judge dimensions produce
+    - and a cap of one.
+
+    The content keys are sha256 of the row, so the fixture's seeds are chosen
+    (not arranged) to put the unscored row's key FIRST: under "None is zero"
+    the two tie and the key hands the slot to the unscored one.
+    """
+    scored, unscored = items(
+        row("zzz " + prose(301, 40), "a", cnr="DLHC010001232020", form="f", score=0.0),
+        row("aaa " + prose(307, 40), "b", cnr="DLHC010001232020", form="f"),
+    )
+    group = [candidate_of(scored), candidate_of(unscored)]
+    assert candidate_of(unscored).key < candidate_of(scored).key, "the premise: the tie-break"
+    assert [c.score for c in cap_survivors(group, cap=1)] == [0.0]
 
 
 # --------------------------------------------------------------------------
@@ -749,3 +794,54 @@ def test_the_decontamination_window_and_the_dedupe_window_are_different_constant
     """Not one shared knob: 13 grams answers 'did this text appear inside
     that one', 5 answers 'are these two rows the same example'."""
     assert (NGRAM, DECON_NGRAM) == (5, 13)
+
+
+def _scattered(text: str, k: int, seed: int = 7) -> str:
+    """`text` with `k` substitutions spread evenly through it.
+
+    A TAIL variant (the `variant` helper above) barely moves with the window -
+    the two texts differ at one seam, so only ~n grams change whatever n is.
+    Scattered edits are what the window size actually decides about, because
+    each one destroys n grams.
+    """
+    rng = random.Random(seed)
+    words = text.split()
+    step = len(words) / (k + 1)
+    for i in range(k):
+        words[int(step * (i + 1))] = "xreplacedx" + str(rng.randrange(10_000))
+    return " ".join(words)
+
+
+def test_the_five_gram_window_decides_in_both_directions():
+    """The window had no behavioural pin: its only killer was a test naming
+    the constant, which is satisfied by any implementation that also names it.
+
+    Two pairs of prompts either side of PROMPT_JACCARD AT FIVE, chosen so that
+    a WIDER window would keep the first pair and a NARROWER one would drop the
+    second - a wider window is more fragile under scattered edits and a
+    narrower one more forgiving, so a fixture that only drops can never pin
+    the narrowing direction.
+    """
+    base = prose(1001, 400)
+    dropped = _scattered(base, 6)     # J = 0.859 at 5, 0.833 at 6
+    survives = _scattered(base, 7)    # J = 0.868 at 4, 0.838 at 5
+    measured = {
+        n: (jaccard(gram_hashes(tokens(base), n), gram_hashes(tokens(dropped), n)),
+            jaccard(gram_hashes(tokens(base), n), gram_hashes(tokens(survives), n)))
+        for n in (4, NGRAM, 6)
+    }
+    assert measured[NGRAM][0] >= PROMPT_JACCARD > measured[6][0], "a wider window keeps the pair"
+    assert measured[4][1] >= PROMPT_JACCARD > measured[NGRAM][1], "a narrower window drops it"
+
+    # ... and the whole rows are far enough apart that rule 3 is not what is
+    # deciding either of these.
+    for other in (dropped, survives):
+        assert jaccard(grams(f"{base}\nanswer one"), grams(f"{other}\nanswer two")) < ROW_JACCARD
+
+    kept, drops, _ = dedupe_items(items(row(base, "answer one", form="f"),
+                                        row(dropped, "answer two", form="f")))
+    assert len(kept) == 1 and drops[0]["reason"] == REASON_NEAR_PROMPT
+
+    kept, drops, _ = dedupe_items(items(row(base, "answer one", form="f"),
+                                        row(survives, "answer two", form="f")))
+    assert len(kept) == 2 and not drops
