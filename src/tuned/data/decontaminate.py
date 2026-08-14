@@ -731,6 +731,15 @@ def eval_item_texts(record: dict) -> tuple[list[str], str | None]:
     return texts, winner
 
 
+_NAME_PART = re.compile(r"[^a-z0-9]+")
+
+
+def _name_parts(key: str) -> set[str]:
+    """The alphanumeric runs of an object key - `data/test-00000.parquet` ->
+    {data, test, 00000, parquet}, and `latest.parquet` -> {latest, parquet}."""
+    return set(_NAME_PART.split(key.lower()))
+
+
 def eval_corpus(store, spec: EvalSet, *, reader=read_rows) -> EvalCorpus:
     """Load one eval set from what acquire.py landed, or say exactly why not.
 
@@ -753,7 +762,12 @@ def eval_corpus(store, spec: EvalSet, *, reader=read_rows) -> EvalCorpus:
         # Prefer the named split when the layout names it, but never filter
         # everything away: an unmatched split leaves the whole set in, which
         # over-screens (safe) rather than screening nothing (not safe).
-        split_paths = [p for p in paths if spec.split in p[0].lower()]
+        #
+        # A NAME COMPONENT, not a substring: `latest.parquet` contains "test",
+        # and a bare substring test would select it and silently screen
+        # against the wrong file. Over-screening is safe; screening the wrong
+        # file is not.
+        split_paths = [p for p in paths if spec.split in _name_parts(p[0])]
         paths = split_paths or paths
     if not paths:
         return EvalCorpus(

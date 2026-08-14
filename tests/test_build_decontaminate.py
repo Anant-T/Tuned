@@ -374,23 +374,33 @@ def _row_sharing(question_words, share: int, filler: int = 60):
 
 
 def test_the_containment_threshold_decides_in_both_directions():
+    """The module's most important constant, pinned to +/-0.02 in BOTH
+    directions.
+
+    The old fixture sat at 0.3981 and 0.7500 while its comment claimed to
+    straddle closely: 0.55, 0.60, 0.65 and 0.70 all survived, and LOOSENING is
+    the dangerous direction - it is the one that lets a leak through.
+    """
     words = prose(21, 120).split()
     question = " ".join(words)
     q_grams = gram_hashes(tokens(question), NGRAM)
 
-    heavy = _row_sharing(words, 93)
-    light = _row_sharing(words, 55)
+    heavy = _row_sharing(words, 68)   # 56 of 108 grams
+    light = _row_sharing(words, 64)   # 52 of 108 grams
+    exact = _row_sharing(words, 66)   # 54 of 108 grams - the constant itself
     heavy_share = containment(q_grams, gram_hashes(tokens(heavy), NGRAM))
     light_share = containment(q_grams, gram_hashes(tokens(light), NGRAM))
-    # The fixture STRADDLES the constant closely on both sides - it is neither
-    # "identical vs unrelated" nor so far from the line that loosening the
-    # threshold would go unnoticed.
+    exact_share = containment(q_grams, gram_hashes(tokens(exact), NGRAM))
     assert light_share < CONTAINMENT < heavy_share
-    assert 0.35 < light_share < 0.45 and 0.6 < heavy_share < 0.85
+    assert 0.46 < light_share and heavy_share < 0.54
+    assert exact_share == CONTAINMENT == 0.5
 
     index = index_of(question)
     assert decontaminate_items(items(row(heavy)), index)[0] == []
     assert len(decontaminate_items(items(row(light)), index)[0]) == 1
+    # The boundary is INCLUSIVE, and it is reachable: 54/108 lands on it
+    # exactly, so `>= threshold` is not interchangeable with `> threshold`.
+    assert decontaminate_items(items(row(exact)), index)[0] == []
 
 
 def _edited(words, k, seed=7):
@@ -682,9 +692,18 @@ def test_a_citation_is_normalised_before_it_is_compared():
 
 
 def test_a_title_too_generic_to_join_on_is_not_an_identifier():
-    assert title_key("State v Kumar") is None
-    assert len(tokens("State v Kumar")) < TITLE_MIN_TOKENS + 1
-    assert title_key("Kesavananda Bharati v State of Kerala") is not None
+    """The floor pinned on both sides, and measured with the function the RULE
+    reads - title_key counts words of landmark_key(...), not tokens(...), and
+    a premise stated in the wrong units can be true of a fixture the rule sees
+    differently."""
+    from tuned.data.select import landmark_key
+
+    three = "State v Kumar"
+    four = "Kesavananda Bharati v Kerala"
+    assert len(landmark_key(three).split()) == TITLE_MIN_TOKENS - 1 == 3
+    assert len(landmark_key(four).split()) == TITLE_MIN_TOKENS == 4
+    assert title_key(three) is None
+    assert title_key(four) is not None
 
 
 def test_an_identifier_in_the_answer_is_not_what_the_row_is_about():
@@ -1060,11 +1079,35 @@ def test_read_rows_dispatches_on_the_suffix(tmp_path):
         for r in read_rows(tmp_path / name)
     ]
     assert seen == ["one", "two", "three", "four", "five", "six"]
+
+    # The parquet branch, EXECUTED rather than named: pyarrow is not installed
+    # in this worktree, so what the first real run gets out of it is an
+    # ImportError - which eval_corpus turns into EVAL_NO_READER, a refusal
+    # with the right remedy, never an empty set. (`assert ".parquet" in
+    # _READABLE_SUFFIXES` said nothing: the tuple two lines above it is the
+    # only thing that could have made it false.)
     assert ".parquet" in _READABLE_SUFFIXES
+    (tmp_path / "g.parquet").write_bytes(b"PAR1")
+    with pytest.raises(ImportError):
+        list(read_rows(tmp_path / "g.parquet"))
+
+
+def test_the_split_filter_matches_a_name_component_and_not_a_substring(store, tmp_path):
+    """`latest.parquet` contains "test". A bare substring filter selects it,
+    drops the real split, and screens against the wrong file - which
+    over-screens nothing and under-screens everything."""
+    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
+    eval_snapshot(store, tmp_path, "bbl", [{"question": "the real split " + prose(6, 30)}],
+                  name="data/test-00000-of-00001.jsonl")
+    eval_snapshot(store, tmp_path, "bbl", [{"question": "a rolling export " + prose(7, 30)}],
+                  name="data/latest.jsonl")
+    corpus = eval_corpus(store, spec)
+    assert corpus.files == 1
+    assert corpus.items[0].text.startswith("the real split")
 
 
 def test_the_split_filter_prefers_the_named_split_but_never_empties_the_set(store, tmp_path):
-    spec = EVAL_SETS["bbl"]
+    spec = replace(EVAL_SETS["bbl"], expect_rows=None)
     eval_snapshot(store, tmp_path, "bbl", [{"question": "train only " + prose(1, 30)}],
                   name="data/train-0.jsonl")
     eval_snapshot(store, tmp_path, "bbl", [{"question": "test only " + prose(2, 30)}],
