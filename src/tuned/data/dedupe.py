@@ -104,6 +104,7 @@ Build:  python -m tuned.data.dedupe --config configs/data_law_v1.yaml
 import array
 import json
 import math
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -115,11 +116,16 @@ from tuned.data.decontaminate import (
     OUT_FILENAME as DECON_OUT_FILENAME,
 )
 from tuned.data.decontaminate import (
+    SEMANTIC_CONTROL_NEGATIVE,
+    SEMANTIC_RAN,
     SEMANTIC_UNAVAILABLE,
+    SEMANTIC_UNUSABLE,
     Item,
+    SemanticSeamError,
     gram_hashes,
     jaccard_from,
     row_prov,
+    selected_records,
     semhash_available,
     stream_items,
     tokens,
@@ -470,24 +476,73 @@ def apply_cap(
 # The whole pass.
 # --------------------------------------------------------------------------
 
-def semantic_self_dedupe(candidates: Sequence[Candidate], *, threshold: float = 0.9):
-    """semhash self-deduplication over the surviving rows, or None.
+def flagged_indexes(texts: Sequence[str], *, threshold: float = 0.9) -> list[int]:
+    """Which of `texts` semhash's self-deduplication did NOT keep.
 
-    UNVERIFIED AGAINST A REAL INSTALL, exactly as decontaminate.semantic_filter
+    UNVERIFIED AGAINST A REAL INSTALL, exactly as decontaminate.SemanticFilter
     is: semhash lives in the [build] extra, is not installed in this worktree,
     and this function's use of its API has never executed. It is written
     against the documented `SemHash.from_records(...).self_deduplicate()`
-    shape. Nothing in the exact stack depends on it - it can only ever ADD
-    drops - and the manifest records whether it ran, so a run without it does
-    not read like a run with it.
+    shape, and the survivors are read through decontaminate.selected_records,
+    which RAISES rather than defaulting when that shape is not what came back.
+    The default this replaced (`getattr(result, "selected", texts)`) read as
+    "semhash kept everything" and so recorded a clean corpus indistinguishable
+    from a screened one.
+
+    Survivors are matched back BY COUNT, not by set membership: two candidates
+    can carry the same text (item_key hashes the prompt and the answer
+    separately, so "a\\nb" + "c" and "a" + "b\\nc" are different rows with the
+    same joined text), and a set makes those two rows unflaggable no matter
+    what semhash says about them.
     """
     from semhash import SemHash  # local import: absence is a status, not a crash
 
+    result = SemHash.from_records(records=list(texts)).self_deduplicate(threshold=threshold)
+    budget = Counter(str(record) for record in selected_records(result))
+    flagged = []
+    for ix, text in enumerate(texts):
+        if budget[text] > 0:
+            budget[text] -= 1
+        else:
+            flagged.append(ix)
+    return flagged
+
+
+def semantic_self_dedupe(candidates: Sequence[Candidate], *, threshold: float = 0.9):
+    """semhash self-deduplication over the surviving rows -> {key: twin key}."""
     texts = [c.item.text for c in candidates]
-    result = SemHash.from_records(records=texts).self_deduplicate(threshold=threshold)
-    kept_texts = set(getattr(result, "selected", texts))
-    return {c.key: None for c, text in zip(candidates, texts, strict=True)
-            if text not in kept_texts}
+    return {candidates[ix].key: None for ix in flagged_indexes(texts, threshold=threshold)}
+
+
+# A duplicate pair whose answer is not in doubt (byte-identical), plus a
+# stranger. Any embedding model collapses the first two and keeps the third.
+SEMANTIC_CONTROL_TEXTS = (
+    "the appellant was convicted under section 302 of the penal code and sentenced to "
+    "imprisonment for life by the court of sessions",
+    "the appellant was convicted under section 302 of the penal code and sentenced to "
+    "imprisonment for life by the court of sessions",
+    SEMANTIC_CONTROL_NEGATIVE,
+)
+
+
+def semantic_control(*, threshold: float = 0.9) -> None:
+    """Raise unless the seam is OBSERVED collapsing a duplicate and only it.
+
+    `semantic: "ran"` has to mean "this layer ran and worked", not "the import
+    succeeded". The failure that made this necessary was silent in the
+    permissive direction - a drifted result shape flagged NOTHING and the
+    manifest and the dataset card both said `ran` over an unscreened corpus -
+    so the control pins the count exactly: one of the two copies goes, the
+    stranger stays.
+    """
+    flagged = flagged_indexes(list(SEMANTIC_CONTROL_TEXTS), threshold=threshold)
+    if flagged != [1]:
+        raise SemanticSeamError(
+            f"semhash self-deduplication flagged {flagged} of a control of two identical "
+            f"records and one unrelated one; the only correct answer is [1]. A seam that "
+            f"flags nothing here would record `semantic: ran` over rows it never compared, "
+            f"and one that flags everything would delete the corpus."
+        )
 
 
 def dedupe_items(
@@ -548,7 +603,7 @@ def read_decontamination_manifest(path: Path) -> dict | None:
 
 
 def manifest_of(stats: dict, *, inputs: Sequence[str], upstream: dict | None,
-                semantic: str, thresholds: dict) -> dict:
+                semantic: str, thresholds: dict, semantic_detail: str = "") -> dict:
     from tuned.data.store import utcnow
 
     upstream_summary = None
@@ -578,7 +633,10 @@ def manifest_of(stats: dict, *, inputs: Sequence[str], upstream: dict | None,
             for key in ("total", "kept", "dropped", "uncapped_rows", "cases", "cases_over_cap")
         },
         "by_reason": dict(sorted(stats["by_reason"].items())),
+        # "ran" means the seam was OBSERVED collapsing a control duplicate, not
+        # that semhash imported. See semantic_control.
         "semantic": semantic,
+        "semantic_detail": semantic_detail,
         # The chain of custody. `null` here means this input was NOT the
         # decontamination pass's output, which is the one thing a reader of
         # the dataset card must be able to tell.
@@ -629,7 +687,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     # must not inherit a manifest that describes different rows.
     upstream = read_decontamination_manifest(inputs[0].parent / DECON_MANIFEST_FILENAME)
     items = list(stream_items(inputs))
-    semantic = semantic_self_dedupe if semhash_available() else None
+    semantic, semantic_status, semantic_detail = None, SEMANTIC_UNAVAILABLE, ""
+    if semhash_available():
+        try:
+            semantic_control()
+        except SemanticSeamError as exc:
+            # Installed, called, and wrong. NOT "ran": the whole point of that
+            # word in the manifest is that it distinguishes a layer that
+            # compared rows from a layer that was merely invoked.
+            semantic_status, semantic_detail = SEMANTIC_UNUSABLE, str(exc)
+        else:
+            semantic, semantic_status = semantic_self_dedupe, SEMANTIC_RAN
     kept, drops, stats = dedupe_items(
         items, cap=None if args.no_cap else CNR_CAP, semantic=semantic
     )
@@ -637,7 +705,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         stats,
         inputs=[str(p) for p in inputs],
         upstream=upstream,
-        semantic="ran" if semantic is not None else SEMANTIC_UNAVAILABLE,
+        semantic=semantic_status,
+        semantic_detail=semantic_detail,
         thresholds={
             "ngram": NGRAM,
             "prompt_jaccard": PROMPT_JACCARD,
@@ -662,6 +731,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"  {stats['cases']} cases carried an identifier, {stats['cases_over_cap']} over the cap;"
         f" {stats['uncapped_rows']} rows carry NO case identifier and were never capped"
     )
+    if semantic_status != SEMANTIC_RAN:
+        print(f"  semantic self-dedupe did NOT run ({semantic_status})")
+        if semantic_detail:
+            print(f"    {semantic_detail}")
     if upstream is None:
         # The order is a correctness property, so an input that did not come
         # through decontamination is stated, not assumed away.

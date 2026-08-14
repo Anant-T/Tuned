@@ -6,14 +6,17 @@ from pipeline_fakes import paths_for, temp_config
 from test_build_decontaminate import (
     _cli_bytes,
     all_eval_snapshots,
+    install_fake_semhash,
     items,
     prose,
     row,
+    shuffled,
 )
 
 from tuned.data import dedupe as dedupe_module
 from tuned.data.decontaminate import (
     EVAL_SETS,
+    SEMANTIC_UNUSABLE,
     EvalIndex,
     EvalItem,
     NGRAM as DECON_NGRAM,
@@ -40,6 +43,7 @@ from tuned.data.dedupe import (
     cap_survivors,
     case_id_of,
     dedupe_items,
+    flagged_indexes,
     prefix_length,
     score_of,
 )
@@ -401,6 +405,69 @@ def test_a_semantic_backend_only_ever_adds_drops_and_names_them():
     assert drops[0]["reason"] == REASON_SEMANTIC
     assert drops[0]["duplicate_of"] == candidates[0].key
     assert stats["by_reason"] == {REASON_SEMANTIC: 1}
+
+
+def test_the_real_seam_drops_a_semantic_duplicate_and_records_that_it_ran(tmp_path, monkeypatch, capsys):
+    """The seam itself, not a hand-written callable standing in for it: the
+    two `semantic=` tests below inject their own function, so before this the
+    only code that ever touched semhash's API had never been executed by
+    anything."""
+    text = prose(161, 200)
+    cfg, paths = _decontaminated(tmp_path, [row(text, "a"), row(shuffled(text, 162), "b"),
+                                            row(prose(163, 200), "c")])
+    capsys.readouterr()
+    install_fake_semhash(monkeypatch)
+    assert dedupe_main(["--config", cfg]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    drops = [json.loads(line) for line in
+             (paths.out_dir / "dedupe_drops.jsonl").read_text().splitlines()]
+    assert manifest["semantic"] == "ran"
+    assert [d["reason"] for d in drops] == [REASON_SEMANTIC]
+    assert manifest["counts"]["kept"] == 2
+
+
+def test_a_drifted_semhash_result_never_reads_as_a_deduplicated_corpus(tmp_path, monkeypatch, capsys):
+    """The silent half of the seam, reproduced: with survivors named
+    `.deduplicated`, the old `getattr(result, "selected", texts)` default read
+    as 'semhash kept everything', so the pass flagged NOTHING and the manifest
+    said `semantic: ran` over a corpus the layer never compared. The two
+    directions were opposite in the two modules and neither was pinned."""
+    text = prose(161, 200)
+    cfg, paths = _decontaminated(tmp_path, [row(text, "a"), row(shuffled(text, 162), "b"),
+                                            row(prose(163, 200), "c")])
+    capsys.readouterr()
+    install_fake_semhash(monkeypatch, attr="deduplicated")
+    assert dedupe_main(["--config", cfg]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE
+    assert manifest["semantic"] != "ran"
+    assert ".selected" in manifest["semantic_detail"]
+    assert "semantic self-dedupe did NOT run" in out
+    assert manifest["counts"]["kept"] == 3  # the exact stack still ran
+
+
+@pytest.mark.parametrize("answer", ["keep-everything", "keep-nothing"])
+def test_a_seam_that_ignores_its_input_fails_the_control_in_either_direction(
+    tmp_path, monkeypatch, capsys, answer
+):
+    text = prose(161, 200)
+    cfg, paths = _decontaminated(tmp_path, [row(text, "a"), row(shuffled(text, 162), "b")])
+    capsys.readouterr()
+    install_fake_semhash(monkeypatch, answer=answer)
+    assert dedupe_main(["--config", cfg]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE
+    assert "the only correct answer is [1]" in manifest["semantic_detail"]
+
+
+def test_two_candidates_carrying_the_same_text_are_both_reachable(monkeypatch):
+    """Survivors are matched back BY COUNT: under set membership, two rows
+    with the same joined text are both unflaggable no matter what semhash
+    says, because the survivor's own text is in the set."""
+    install_fake_semhash(monkeypatch)
+    duplicate = prose(171, 60)
+    assert flagged_indexes([duplicate, duplicate, prose(172, 60)]) == [1]
 
 
 def test_the_semantic_layer_runs_after_the_exact_stack_not_instead_of_it():

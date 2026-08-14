@@ -20,10 +20,12 @@ from tuned.data.decontaminate import (
     LEVEL_SHORT,
     LEVEL_TEXT,
     NGRAM,
+    SEMANTIC_UNUSABLE,
     SHORT_MIN_TOKENS,
     TITLE_MIN_TOKENS,
     EvalIndex,
     EvalItem,
+    SemanticSeamError,
     containment,
     decontaminate_items,
     eval_corpora,
@@ -37,6 +39,7 @@ from tuned.data.decontaminate import (
     manifest_of,
     refusals,
     row_form,
+    selected_records,
     store_items,
     title_key,
     tokens,
@@ -102,6 +105,86 @@ def all_eval_snapshots(store, root: Path, records_by_key=None):
     records_by_key = records_by_key or {}
     for key in EVAL_SETS:
         eval_snapshot(store, root, key, records_by_key.get(key, [{"question": prose(900 + ord(key[0]), 40)}]))
+
+
+# --------------------------------------------------------------------------
+# A fake `semhash`. The real one is in the [build] extra and is NOT installed,
+# so both seams are written against its documented API and neither has ever
+# executed - which is exactly why the SHAPE of its answer is faked here in
+# every direction it could drift, including the one that used to read as a
+# clean corpus.
+# --------------------------------------------------------------------------
+
+def _near(text: str, others, threshold: float) -> bool:
+    """Stand-in for semantic similarity: token-set Jaccard.
+
+    Not a claim about how semhash decides - a way to give the fake a decision
+    that responds to its input, so a seam that ignores its input is
+    distinguishable from one that reads it.
+    """
+    a = set(tokens(text))
+    for other in others:
+        b = set(tokens(other))
+        if a and b and len(a & b) / len(a | b) >= threshold:
+            return True
+    return False
+
+
+def install_fake_semhash(monkeypatch, *, attr="selected", answer="real"):
+    """Put a `semhash` module in sys.modules.
+
+    `attr` is what the result object names its survivors - the documented name
+    is `selected`, and a build that renames it is the drift both seams have to
+    fail loudly on rather than default around. `answer` is "real" (decide by
+    similarity), "keep-everything" (nothing is ever a duplicate) or
+    "keep-nothing" (everything is).
+    """
+    import sys
+    import types
+
+    class Result:
+        def __init__(self, kept):
+            setattr(self, attr, list(kept))
+
+    class SemHash:
+        def __init__(self, records):
+            self.records = list(records)
+
+        @classmethod
+        def from_records(cls, records):
+            return cls(records)
+
+        def _kept(self, records, against, threshold):
+            if answer == "keep-everything":
+                return list(records)
+            if answer == "keep-nothing":
+                return []
+            kept = []
+            seen = list(against)
+            for record in records:
+                if not _near(record, seen, threshold):
+                    kept.append(record)
+                    seen.append(record)
+            return kept
+
+        def deduplicate(self, records, threshold=0.9):
+            return Result(self._kept(records, self.records, threshold))
+
+        def self_deduplicate(self, threshold=0.9):
+            return Result(self._kept(self.records, [], threshold))
+
+    module = types.ModuleType("semhash")
+    module.SemHash = SemHash
+    monkeypatch.setitem(sys.modules, "semhash", module)
+    return module
+
+
+def shuffled(text: str, seed: int) -> str:
+    """The same words in a different order - token-set identical, so the fake
+    semantic layer calls it a duplicate while the n-gram levels cannot."""
+    words = text.split()
+    random.Random(seed).shuffle(words)
+    return " ".join(words)
 
 
 # --------------------------------------------------------------------------
@@ -912,6 +995,121 @@ def test_two_runs_under_different_hash_seeds_are_byte_identical(tmp_path):
     left.pop("at"), right.pop("at")
     assert left == right
     assert left["counts"]["dropped"] >= 1, "a run that drops nothing cannot show determinism"
+
+
+# --------------------------------------------------------------------------
+# The semantic seam. It has never executed against the real library, so what
+# is pinned here is the SHAPE of the answer it is written against - and both
+# ways a different shape could be read as "nothing was contaminated".
+# --------------------------------------------------------------------------
+
+def _semantic_run(tmp_path, monkeypatch, *, attr="selected", answer="real", extra=()):
+    """A CLI run whose eval side holds one question and whose input holds a
+    row that is a WORD-ORDER shuffle of it: invisible to every n-gram level,
+    a duplicate to the semantic one."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    question = prose(301, 40)
+    # A second, unrelated row: without one, a working seam empties the input
+    # and the CLI's own "EVERYTHING WAS DROPPED" backstop fires instead.
+    write_jsonl(
+        paths.streams_dir / "replay.jsonl",
+        [row(shuffled(question, 302)), row(prose(303, 60))],
+    )
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf", {"bbl": [{"question": question}]})
+    store.close()
+    install_fake_semhash(monkeypatch, attr=attr, answer=answer)
+    code = decon_main(["--config", cfg, "--no-generated", *extra])
+    manifest_path = paths.out_dir / "decontamination.json"
+    manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
+    )
+    return code, manifest, paths
+
+
+def test_the_semantic_layer_catches_the_paraphrase_the_ngram_levels_cannot(tmp_path, monkeypatch):
+    """The premise first: a word-order shuffle shares NO 13-gram with its
+    source, so this drop can only have come from the semantic layer."""
+    question = prose(301, 40)
+    paraphrase = shuffled(question, 302)
+    assert containment(
+        gram_hashes(tokens(question), NGRAM), gram_hashes(tokens(paraphrase), NGRAM)
+    ) == 0.0
+
+    code, manifest, paths = _semantic_run(tmp_path, monkeypatch)
+    assert code == 0
+    assert manifest["semantic"] == "ran"
+    assert manifest["counts"]["dropped"] == 1
+    drops = [
+        json.loads(line)
+        for line in (paths.out_dir / "decontamination_drops.jsonl").read_text().splitlines()
+    ]
+    assert drops[0]["reason"] == "semantic:*"
+
+
+def test_a_semhash_that_names_its_survivors_something_else_never_reads_as_screened(
+    tmp_path, monkeypatch, capsys
+):
+    """The seam's own failure, in the direction that used to be invisible: a
+    result object carrying `.deduplicated` instead of `.selected`. The old
+    `getattr(result, "selected", None)` read that as 'not a duplicate' for
+    every row, so the pass flagged nothing and the manifest - and the dataset
+    card behind it - said the corpus had been semantically screened."""
+    code, manifest, _ = _semantic_run(tmp_path, monkeypatch, attr="deduplicated")
+    out = capsys.readouterr().out
+    assert code == 0
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE
+    assert manifest["semantic"] != "ran"
+    assert ".selected" in manifest["semantic_detail"]
+    assert "semantic layer did NOT run" in out
+    # ... and it did not quietly drop things either.
+    assert manifest["counts"]["dropped"] == 0
+
+
+def test_a_semantic_seam_that_flags_everything_is_caught_before_it_empties_the_corpus(
+    tmp_path, monkeypatch
+):
+    """The opposite drift, which fails loudly by ruining the yield instead of
+    the screen. The control's negative half is what separates the two."""
+    code, manifest, _ = _semantic_run(tmp_path, monkeypatch, answer="keep-nothing")
+    assert code == 0
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE
+    assert "nothing to do with Indian law" in manifest["semantic_detail"]
+    assert manifest["counts"]["dropped"] == 0
+
+
+def test_a_semantic_seam_that_flags_nothing_is_caught_too(tmp_path, monkeypatch):
+    code, manifest, _ = _semantic_run(tmp_path, monkeypatch, answer="keep-everything")
+    assert code == 0
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE
+    assert "did not flag an eval item against its own index" in manifest["semantic_detail"]
+
+
+def test_require_semantic_refuses_when_the_layer_is_installed_but_not_working(
+    tmp_path, monkeypatch, capsys
+):
+    """An operator who asked for the semantic layer gets a refusal, not a
+    layer that was called and did nothing."""
+    code, manifest, _ = _semantic_run(
+        tmp_path, monkeypatch, attr="deduplicated", extra=("--require-semantic",)
+    )
+    assert code == 2
+    assert manifest is None  # nothing was written
+    assert "REFUSING TO DECONTAMINATE" in capsys.readouterr().out
+
+
+def test_selected_records_raises_instead_of_defaulting():
+    """The seam-level statement of the same fact, so a future caller cannot
+    reintroduce the default without deleting this."""
+    class Drifted:
+        deduplicated = ["a"]
+
+    with pytest.raises(SemanticSeamError) as exc:
+        selected_records(Drifted())
+    assert ".selected" in str(exc.value)
+    assert selected_records(type("R", (), {"selected": ["a", "b"]})()) == ["a", "b"]
+    assert selected_records(type("R", (), {"selected": None})()) == []
 
 
 def test_row_form_falls_back_through_the_identity_fields():

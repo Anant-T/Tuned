@@ -909,6 +909,30 @@ def decontaminate_items(
 # --------------------------------------------------------------------------
 
 SEMANTIC_UNAVAILABLE = "semhash-not-installed"
+# The seam answered in a shape this code cannot read, or answered wrongly on a
+# pair whose answer is not in doubt. NOT "ran": see semantic_control.
+SEMANTIC_UNUSABLE = "semhash-control-failed"
+SEMANTIC_NO_ITEMS = "no-eval-items-to-compare"
+SEMANTIC_RAN = "ran"
+
+# The negative half of the control. Nothing in an Indian-law eval set is
+# semantically near this, so a seam that flags it flags everything - which is
+# the drift direction that would empty the corpus rather than pass it.
+SEMANTIC_CONTROL_NEGATIVE = (
+    "the sourdough starter doubled overnight so I shaped the loaf and baked it at "
+    "two hundred and thirty degrees with steam for the first fifteen minutes"
+)
+
+
+class SemanticSeamError(RuntimeError):
+    """semhash answered in a shape or a direction this code cannot use.
+
+    Raised rather than defaulted around. A permissive `getattr(result,
+    "selected", <something>)` on an API THIS PROJECT HAS NEVER EXECUTED is
+    exactly the assertion the brief forbids: under a result object that names
+    its survivors anything else, the default decides the answer and the run
+    records a semantic layer that never compared anything.
+    """
 
 
 def semhash_available() -> bool:
@@ -919,29 +943,82 @@ def semhash_available() -> bool:
     return True
 
 
-def semantic_filter(eval_texts: Sequence[str], *, threshold: float = 0.9):
-    """A callable flagging rows semantically close to an eval item, or None.
+def selected_records(result) -> list:
+    """`result.selected`, or a named error naming what came back instead.
 
-    UNVERIFIED AGAINST A REAL INSTALL. semhash is in the [build] extra and is
-    not installed in this worktree, so this function's use of its API has
-    never executed - it is written against the documented
-    `SemHash.from_records(...).deduplicate(records=...)` shape and is the
-    first thing to check on a machine that has the extra. Everything the
-    no-false-negative guarantee rests on (the n-gram levels and the
-    case-identifier level) is pure Python above and is exercised offline;
+    UNVERIFIED AGAINST A REAL INSTALL (semhash is in the [build] extra and is
+    not installed here), which is precisely why there is no default: the
+    attribute name is the one thing about this API that could be wrong, and a
+    default turns being wrong about it into a silent clean bill of health.
+    """
+    try:
+        selected = result.selected
+    except AttributeError as exc:
+        raise SemanticSeamError(
+            f"semhash returned a {type(result).__name__} with no `.selected` "
+            f"(it carries {sorted(vars(result))[:8] if hasattr(result, '__dict__') else 'no __dict__'}). "
+            f"The API this module is written against is documented as "
+            f"`SemHash.from_records(...).deduplicate(...).selected`; if the installed "
+            f"version renames it, fix selected_records - do NOT default it, because a "
+            f"default here reads as 'nothing was semantically similar'."
+        ) from exc
+    if selected is None:
+        return []
+    return list(selected)
+
+
+class SemanticFilter:
+    """Flags rows semantically close to an eval item.
+
+    UNVERIFIED AGAINST A REAL INSTALL: written against the documented
+    `SemHash.from_records(...).deduplicate(records=...)` shape, so the FIRST
+    thing a machine with the extra must do is watch `semantic_control` pass.
+    Everything the no-false-negative guarantee rests on (the n-gram levels and
+    the case-identifier level) is pure Python above and is exercised offline;
     this layer only ever ADDS drops.
     """
-    from semhash import SemHash  # local import: absence is a status, not a crash
 
-    index = SemHash.from_records(records=list(eval_texts))
+    def __init__(self, eval_texts: Sequence[str], *, threshold: float = 0.9):
+        from semhash import SemHash  # local import: absence is a status, not a crash
 
-    def flag(item: Item):
-        result = index.deduplicate(records=[item.text], threshold=threshold)
-        if getattr(result, "selected", None):
-            return ()
-        return (Hit("semantic", "*", "semhash", {"threshold": threshold}),)
+        self.threshold = threshold
+        self.index = SemHash.from_records(records=list(eval_texts))
 
-    return flag
+    def matches(self, text: str) -> bool:
+        """Is this text a semantic duplicate of something in the eval index?"""
+        result = self.index.deduplicate(records=[text], threshold=self.threshold)
+        return not selected_records(result)
+
+    def __call__(self, item: Item):
+        if self.matches(item.text):
+            return (Hit(LEVEL_SEMANTIC, "*", "semhash", {"threshold": self.threshold}),)
+        return ()
+
+
+def semantic_control(seam: SemanticFilter, positive: str) -> None:
+    """Raise unless the seam is OBSERVED working, in both directions.
+
+    `semantic: "ran"` in the manifest has to mean "this layer compared rows to
+    eval items and the comparison worked", not "the call did not raise". The
+    two ways it can be wrong point in opposite directions and both are silent:
+    a result object whose survivors are named something else makes every row
+    look like a duplicate (drops everything), and the reverse default makes
+    every row look clean (drops nothing, which is this module's catastrophic
+    direction). So the control pins both ends against answers that are not in
+    doubt - an eval item is a duplicate of itself, and a bread recipe is not.
+    """
+    if not seam.matches(positive):
+        raise SemanticSeamError(
+            "the semantic layer did not flag an eval item against its own index. "
+            "A layer that cannot recognise an exact copy cannot recognise a paraphrase, "
+            "and recording it as having run would put a screen in the manifest that "
+            "never screened anything."
+        )
+    if seam.matches(SEMANTIC_CONTROL_NEGATIVE):
+        raise SemanticSeamError(
+            "the semantic layer flagged text with nothing to do with Indian law, so it "
+            "flags everything - every row would be dropped as contaminated."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1025,8 +1102,9 @@ def store_items(store, cfg=None, *, state: str = "accepted",
 # --------------------------------------------------------------------------
 
 def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *,
-                inputs: Sequence[str], semantic: str, threshold: float = CONTAINMENT,
-                ids_from_text: bool = True, top: int = 20) -> dict:
+                inputs: Sequence[str], semantic: str, semantic_detail: str = "",
+                threshold: float = CONTAINMENT, ids_from_text: bool = True,
+                top: int = 20) -> dict:
     """The record that has to outlive this run.
 
     Every waived eval set, every hole in the screen and every threshold is in
@@ -1079,7 +1157,11 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
         "case_identifier_coverage": round(coverage, 4),
         "case_identifier_level_inert": not stats["with_identifier"] or not index.by_identifier,
         "eval_identifiers": len(index.by_identifier),
+        # "ran" here means OBSERVED WORKING - semantic_control passed on a pair
+        # whose answer is not in doubt - not merely "called". See
+        # semantic_control for the two silent directions it pins.
         "semantic": semantic,
+        "semantic_detail": semantic_detail,
         "top_identifiers": sorted(
             stats["identifier_drops"].items(), key=lambda kv: (-kv[1], kv[0])
         )[:top],
@@ -1145,14 +1227,25 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
             print("  nothing was written; no output carries a decontaminated stamp.")
             return 2
 
-        semantic_fn, semantic_status = None, SEMANTIC_UNAVAILABLE
-        if semhash_available():
-            texts = [i.text for c in corpora.values() for i in c.items]
-            semantic_fn, semantic_status = semantic_filter(texts), "ran"
-        elif args.require_semantic:
+        semantic_fn, semantic_status, semantic_detail = None, SEMANTIC_UNAVAILABLE, ""
+        texts = [i.text for c in corpora.values() for i in c.items]
+        if semhash_available() and texts:
+            try:
+                seam = SemanticFilter(texts)
+                semantic_control(seam, texts[0])
+            except SemanticSeamError as exc:
+                # NOT recorded as "ran". The seam is installed and answered;
+                # it answered in a way that means nothing was compared.
+                semantic_status, semantic_detail = SEMANTIC_UNUSABLE, str(exc)
+            else:
+                semantic_fn, semantic_status = seam, SEMANTIC_RAN
+        elif semhash_available():
+            semantic_status = SEMANTIC_NO_ITEMS
+        if args.require_semantic and semantic_status != SEMANTIC_RAN:
             print(
-                "REFUSING TO DECONTAMINATE: --require-semantic was passed and semhash is not "
-                "installed.\n  run: pip install -e .[build]"
+                f"REFUSING TO DECONTAMINATE: --require-semantic was passed and the semantic "
+                f"layer is {semantic_status}.\n"
+                f"  {semantic_detail or 'run: pip install -e .[build]'}"
             )
             return 2
 
@@ -1194,7 +1287,7 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
         kept, drops, stats = decontaminate_items(items, index, semantic=semantic_fn)
         manifest = manifest_of(
             stats, corpora, index, inputs=input_names, semantic=semantic_status,
-            ids_from_text=ids_from_text,
+            semantic_detail=semantic_detail, ids_from_text=ids_from_text,
         )
         written = write_jsonl(out_path, [item.row for item in kept])
         write_jsonl(out_path.parent / DROPS_FILENAME, drops)
@@ -1240,11 +1333,13 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
             print("  identifiers that cost the most rows (read this before trusting the yield):")
             for identifier, count in manifest["top_identifiers"][:5]:
                 print(f"    {identifier:<48} {count}")
-        if semantic_status != "ran":
+        if semantic_status != SEMANTIC_RAN:
             print(
                 f"  semantic layer did NOT run ({semantic_status}) - paraphrased eval questions"
                 f" are not screened. Recorded in the manifest."
             )
+            if semantic_detail:
+                print(f"    {semantic_detail}")
         for key in sorted(corpora):
             if corpora[key].allowed_missing:
                 print(f"  WAIVED: {key} was not screened against ({corpora[key].status}) - "
