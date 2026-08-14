@@ -155,6 +155,21 @@ def _near(text: str, others, threshold: float) -> bool:
     return False
 
 
+@pytest.fixture(autouse=True)
+def _the_semantic_layer_is_opt_in(monkeypatch):
+    """No test here runs the REAL semhash unless it says so.
+
+    The [build] extra may or may not be installed on any given machine, and a
+    suite whose drop counts depend on that is not a suite - with semhash
+    present the seam runs inside every CLI test, fetches a model, and flags
+    rows the exact stack did not. `sys.modules[name] = None` is the documented
+    way to make `import semhash` raise ImportError, which is precisely the
+    state semhash_available() exists to report; install_fake_semhash overrides
+    this entry for the tests that pin the seam itself.
+    """
+    monkeypatch.setitem(sys.modules, "semhash", None)
+
+
 def install_fake_semhash(monkeypatch, *, attr="selected", answer="real"):
     """Put a `semhash` module in sys.modules.
 
@@ -1175,16 +1190,31 @@ def test_read_rows_dispatches_on_the_suffix(tmp_path):
     ]
     assert seen == ["one", "two", "three", "four", "five", "six"]
 
-    # The parquet branch, EXECUTED rather than named: pyarrow is not installed
-    # in this worktree, so what the first real run gets out of it is an
-    # ImportError - which eval_corpus turns into EVAL_NO_READER, a refusal
-    # with the right remedy, never an empty set. (`assert ".parquet" in
-    # _READABLE_SUFFIXES` said nothing: the tuple two lines above it is the
-    # only thing that could have made it false.)
+    # The parquet branch, EXECUTED rather than named, either way round.
+    # (`assert ".parquet" in _READABLE_SUFFIXES` said nothing: the tuple two
+    # lines above it is the only thing that could have made it false.)
+    #
+    # Without the [build] extra the branch raises ImportError, which
+    # eval_corpus turns into EVAL_NO_READER - a refusal with the right
+    # remedy, never an empty set. With it, the branch actually reads, and this
+    # is the only place in the suite that proves it: HF snapshots are usually
+    # parquet, so it is what the first real run depends on.
     assert ".parquet" in _READABLE_SUFFIXES
-    (tmp_path / "g.parquet").write_bytes(b"PAR1")
-    with pytest.raises(ImportError):
-        list(read_rows(tmp_path / "g.parquet"))
+    try:
+        import pyarrow
+        import pyarrow.parquet as pq
+    except ImportError:
+        (tmp_path / "g.parquet").write_bytes(b"PAR1")
+        with pytest.raises(ImportError):
+            list(read_rows(tmp_path / "g.parquet"))
+    else:
+        pq.write_table(
+            pyarrow.table({"question": ["seven", "eight"], "answer": ["a", "b"]}),
+            tmp_path / "g.parquet",
+        )
+        rows = list(read_rows(tmp_path / "g.parquet"))
+        assert [r["question"] for r in rows] == ["seven", "eight"]
+        assert rows[0]["answer"] == "a", "rows come back as dicts, which eval_item_texts reads"
 
 
 def test_the_split_filter_matches_a_name_component_and_not_a_substring(store, tmp_path):
@@ -1232,7 +1262,7 @@ def test_the_cli_refuses_and_writes_nothing_when_an_eval_set_is_missing(tmp_path
     assert decon_main(["--config", cfg]) == 2
     out = capsys.readouterr().out
     assert "REFUSING TO DECONTAMINATE" in out
-    assert "opennyaiorg/aibe" in out
+    assert "opennyaiorg/aibe_dataset" in out
     assert not (paths.out_dir / "decontaminated.jsonl").exists()
     assert not (paths.out_dir / "decontamination.json").exists()
 
@@ -1400,8 +1430,28 @@ def test_the_cli_writes_the_rows_the_drops_and_the_manifest(tmp_path, capsys):
 
 def _cli_bytes(tmp_path, seed: str, module: str, args) -> dict:
     """Run a CLI in a subprocess under a chosen PYTHONHASHSEED; return the
-    bytes of everything it wrote."""
-    env = {**os.environ, "PYTHONHASHSEED": seed}
+    bytes of everything it wrote.
+
+    The subprocess is out of monkeypatch's reach, so the semantic layer is
+    switched off the only way a separate interpreter can be told: a `semhash`
+    module on the path that refuses to import. Without it these runs compare
+    the bytes of a pass that ran a model, on machines that happen to have the
+    [build] extra and not on others.
+    """
+    stub = tmp_path / "no_semhash"
+    stub.mkdir(exist_ok=True)
+    (stub / "semhash.py").write_text(
+        'raise ImportError("semhash is switched off for this test")\n', encoding="utf-8"
+    )
+    env = {
+        **os.environ,
+        "PYTHONHASHSEED": seed,
+        # PREPENDED, never replaced: the mutation sandbox puts its own src on
+        # PYTHONPATH and a subprocess that loses it tests the installed copy.
+        "PYTHONPATH": os.pathsep.join(
+            [str(stub), *([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])]
+        ),
+    }
     result = subprocess.run(
         [sys.executable, "-m", module, *args],
         capture_output=True, text=True, env=env, cwd=str(Path(__file__).parent.parent),

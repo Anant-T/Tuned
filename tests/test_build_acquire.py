@@ -606,6 +606,12 @@ def test_the_snapshot_registry_is_exactly_these_six_repos():
     passed the whole suite. decontaminate.py REFUSES to run without the eval
     sets and prints the repo id as the thing to fix, so a silent edit to one
     of them is exactly the wrong gap to leave open.
+
+    THE THREE EVAL IDS WERE VERIFIED AGAINST THE HUB ON 2026-08-14 and this
+    pin holds the verified spellings, so an edit to one of them is a decision
+    and not a typo-fix. `opennyaiorg/aibe` was a 404 at that check - the real
+    id is `opennyaiorg/aibe_dataset` - which is exactly the failure this pin
+    exists to make loud.
     """
     assert {key: source.repo_id for key, source in HF_SOURCES.items()} == {
         "predex": "L-NLProc/PredEx_Instruction-Tuning_Pred-Exp",
@@ -613,7 +619,7 @@ def test_the_snapshot_registry_is_exactly_these_six_repos():
         "injudgements": "opennyaiorg/InJudgements_dataset",
         "bbl": "bharatgenai/BhashaBench-Legal",
         "iltur": "Exploration-Lab/IL-TUR",
-        "aibe": "opennyaiorg/aibe",
+        "aibe": "opennyaiorg/aibe_dataset",
     }
     # Every key is its own entry's key, so a copy-paste in the registry cannot
     # leave two entries pointing at one source.
@@ -629,7 +635,7 @@ def test_every_eval_set_decontamination_refuses_without_is_a_registered_snapshot
 
     assert set(EVAL_SETS) <= set(HF_SOURCES)
     assert {EVAL_SETS[key].repo_id for key in EVAL_SETS} == {
-        "bharatgenai/BhashaBench-Legal", "Exploration-Lab/IL-TUR", "opennyaiorg/aibe",
+        "bharatgenai/BhashaBench-Legal", "Exploration-Lab/IL-TUR", "opennyaiorg/aibe_dataset",
     }
 
 FAKE_SOURCE = HfSource(

@@ -813,11 +813,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if semhash_available():
         try:
             semantic_control()
-        except SemanticSeamError as exc:
+        except Exception as exc:
             # Installed, called, and wrong. NOT "ran": the whole point of that
             # word in the manifest is that it distinguishes a layer that
-            # compared rows from a layer that was merely invoked.
-            semantic_status, semantic_detail = SEMANTIC_UNUSABLE, str(exc)
+            # compared rows from a layer that was merely invoked. Broad for
+            # decontaminate.py's reason - semhash fetches a model, so on a
+            # machine with the extra and no network this raises something else
+            # entirely, and nothing in this module refuses a run.
+            semantic_status = SEMANTIC_UNUSABLE
+            semantic_detail = (
+                str(exc) if isinstance(exc, SemanticSeamError)
+                else f"{type(exc).__name__}: {exc}"
+            )
         else:
             semantic, semantic_status = semantic_self_dedupe, SEMANTIC_RAN
     kept, drops, stats = dedupe_items(

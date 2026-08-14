@@ -579,9 +579,10 @@ class EvalSet:
 
 
 # The three eval corpora the charter is judged against. Their repo ids live in
-# acquire.HF_SOURCES and HAVE NEVER BEEN CHECKED against the Hub - so a wrong
-# one shows up here as `not_acquired`, which is a REFUSAL with the id printed,
-# never a quiet skip.
+# acquire.HF_SOURCES and were checked against the Hub on 2026-08-14 - one of
+# the three was wrong at that check (opennyaiorg/aibe -> aibe_dataset), which
+# is exactly what a wrong id does here: `not_acquired`, a REFUSAL with the id
+# printed, never a quiet skip. The ROW COUNTS below are still unverified.
 EVAL_SETS = {
     "bbl": EvalSet(
         key="bbl",
@@ -872,9 +873,9 @@ def eval_corpora(store, *, allow_missing: Iterable[str] = (), reader=read_rows,
 def _acquire_remedy(key: str, spec: EvalSet) -> str:
     return (
         f"python -m tuned.data.acquire --kind hf --hf-source {key}\n"
-        f"               (accept the terms at {spec.url} first if it is gated;\n"
-        f"                if that repo id is wrong, fix EVAL_SETS - it has never\n"
-        f"                been checked against the Hub)"
+        f"               (all three eval sets report gated=auto, so accept the terms\n"
+        f"                at {spec.url} and set HF_TOKEN;\n"
+        f"                the repo id itself was verified against the Hub 2026-08-14)"
     )
 
 
@@ -1567,10 +1568,23 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
             try:
                 seam = SemanticFilter(texts)
                 semantic_control(seam, texts[0])
-            except SemanticSeamError as exc:
+            except Exception as exc:
                 # NOT recorded as "ran". The seam is installed and answered;
                 # it answered in a way that means nothing was compared.
-                semantic_status, semantic_detail = SEMANTIC_UNUSABLE, str(exc)
+                #
+                # Broad on purpose, and only around CONSTRUCTION plus the
+                # control: semhash builds an embedding index and fetches a
+                # model, so on a machine with the extra installed and no
+                # network this raises something that is not a SemanticSeamError
+                # - and the module's contract is that this layer's absence is a
+                # STATUS, not a crash that kills a decontamination run the
+                # refusal ladder has already cleared. Once the control passes,
+                # the shape is confirmed and the per-row path is not wrapped.
+                semantic_status = SEMANTIC_UNUSABLE
+                semantic_detail = (
+                    str(exc) if isinstance(exc, SemanticSeamError)
+                    else f"{type(exc).__name__}: {exc}"
+                )
             else:
                 semantic_fn, semantic_status = seam, SEMANTIC_RAN
         elif semhash_available():

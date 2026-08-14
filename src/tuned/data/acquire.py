@@ -173,10 +173,12 @@ HF_SOURCES = {
     # screen; BBL is the forgetting guard the charter's headline number comes
     # from, which is exactly why a leak of it into training is unrecoverable.
     #
-    # THESE THREE REPO IDS HAVE NEVER BEEN CHECKED AGAINST THE HUB - P0 did
-    # not enumerate them and this build has no network. A wrong id fails here,
-    # loudly, and then fails decontaminate.py as `not_acquired`, which is a
-    # refusal. It cannot fail quietly.
+    # ALL THREE REPO IDS WERE CHECKED AGAINST THE HUB ON 2026-08-14 and all
+    # three resolve. `opennyaiorg/aibe` was a 404 - the real id is
+    # `opennyaiorg/aibe_dataset` - which is what a wrong id looks like: it
+    # fails here, loudly, and then fails decontaminate.py as `not_acquired`,
+    # which is a refusal. It cannot fail quietly. All three report
+    # gated="auto", so the first pull needs HF_TOKEN and an accepted licence.
     "bbl": HfSource(
         key="bbl", repo_id="bharatgenai/BhashaBench-Legal", license="CC-BY-4.0", gated=False
     ),
@@ -184,8 +186,11 @@ HF_SOURCES = {
         key="iltur", repo_id="Exploration-Lab/IL-TUR",
         license="non-commercial (EVAL/DECONTAMINATION ONLY)", gated=False,
     ),
+    # One file, `data/train-00000-of-00001-*.parquet`: there is NO test split
+    # here, which is why the split preference must fall back to the whole set
+    # rather than empty it (see decontaminate.eval_corpus).
     "aibe": HfSource(
-        key="aibe", repo_id="opennyaiorg/aibe",
+        key="aibe", repo_id="opennyaiorg/aibe_dataset",
         license="no-derivatives (EVAL/DECONTAMINATION ONLY)", gated=False,
     ),
 }

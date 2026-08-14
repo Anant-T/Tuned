@@ -52,6 +52,18 @@ from tuned.data.jsonl import write_jsonl
 from tuned.data.store import Store
 
 
+@pytest.fixture(autouse=True)
+def _the_semantic_layer_is_opt_in(monkeypatch):
+    """Same reason as the decontaminate module's copy of this: with the
+    [build] extra installed the real seam runs inside every CLI test and the
+    suite's drop counts start depending on which machine it is running on.
+    Autouse fixtures do not cross module boundaries, so this is stated in both
+    places rather than imported."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "semhash", None)
+
+
 def grams(text: str) -> frozenset[int]:
     return gram_hashes(tokens(text), NGRAM)
 
