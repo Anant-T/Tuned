@@ -3187,6 +3187,10 @@ def test_no_semantic_threshold_separates_a_leak_from_a_same_stem_sibling(monkeyp
     assert SEMANTIC_THRESHOLD <= min(leaks)
     # Clean rows are nowhere near it, at any point in the band.
     assert max(clean) < 0.75
+    # The RANGES the docstring quotes, pinned - a range written in a comment
+    # and checked nowhere is how both of this module's threshold tables drifted.
+    assert (round(min(leaks), 3), round(max(leaks), 3)) == (0.819, 0.915)
+    assert (round(min(stems), 3), round(max(stems), 3)) == (0.714, 0.847)
 
 
 def test_the_devanagari_control_half_fails_against_the_shipped_model(monkeypatch):
@@ -3211,14 +3215,71 @@ def test_the_devanagari_control_half_fails_against_the_shipped_model(monkeypatch
         [EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset())],
         screened=[SCRIPT_DEVANAGARI],
     )
-    assert seam.matches(HINDI_UNRELATED), (
-        "the model has gained Devanagari power; re-derive the gate from measurement"
+    # AT EVERY THRESHOLD, which is the sentence dominant_script's comment makes
+    # and the reason there is no operating point to choose in this script.
+    hindi_clean = [
+        HINDI_UNRELATED,
+        " ".join(SEMANTIC_CONTROLS[1].filler[:60]),
+        " ".join(SEMANTIC_CONTROLS[1].filler[20:80]),
+        SEMANTIC_CONTROLS[1].negative,
+    ]
+    english_clean = list(CLEAN_ROWS)
+    for point in (0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95):
+        hindi = decon.SemanticFilter(
+            [EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset())],
+            threshold=point, screened=[SCRIPT_DEVANAGARI],
+        )
+        english = decon.SemanticFilter(
+            [EvalItem("bbl", "bbl#en", EVAL_QUESTIONS[0], frozenset())],
+            threshold=point, screened=[SCRIPT_LATIN],
+        )
+        assert sum(bool(hindi.matches(t)) for t in hindi_clean) == 4, (
+            f"at {point} the Hindi index no longer drops every clean Hindi row - the model "
+            f"has gained Devanagari power and the gate should be re-derived"
+        )
+        assert sum(bool(english.matches(t)) for t in english_clean) == 0, point
+
+
+def test_ten_devanagari_words_used_to_drop_an_english_row_and_no_longer_do(monkeypatch):
+    """The fault, reproduced through the code path that had it: ONE index over
+    every script, which is what this module did before the per-script split.
+
+    A 300-word English row carrying ten quoted Devanagari words - a quoted FIR,
+    a line of statute, ordinary in this corpus - is dropped by it against an
+    index that holds Hindi, and kept against one that does not. Its exact
+    containment against the Hindi eval item is zero: nothing about this row is
+    contaminated."""
+    real_semhash(monkeypatch)
+    import tuned.data.decontaminate as decon
+
+    quote = " ".join(HINDI_UNRELATED.split()[:10])
+    words = CLEAN_ROWS[0].split()
+    row_text = " ".join([*words[:100], quote, *words[100:]])
+    probes = decon.probe_texts(row_text)
+
+    mixed = decon.semhash_index([HINDI_QUESTION, *EVAL_QUESTIONS])
+    english_only = decon.semhash_index(list(EVAL_QUESTIONS))
+    dropped_by_mixed = len(
+        decon.selected_records(mixed.deduplicate(records=probes, threshold=SEMANTIC_THRESHOLD))
+    ) < len(probes)
+    dropped_by_english = len(
+        decon.selected_records(
+            english_only.deduplicate(records=probes, threshold=SEMANTIC_THRESHOLD)
+        )
+    ) < len(probes)
+    assert dropped_by_mixed and not dropped_by_english, (
+        "the single-index fault no longer reproduces; the per-script split may be "
+        "carrying nothing and should be re-argued rather than kept on faith"
     )
-    # The English shape of the same test, for contrast: no false positive.
-    english = decon.SemanticFilter(
-        [EvalItem("bbl", "bbl#en", EVAL_QUESTIONS[0], frozenset())], screened=[SCRIPT_LATIN],
+
+    # ... and the shipped, per-script layer keeps it.
+    seam = decon.SemanticFilter(
+        [EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset()),
+         *(EvalItem("bbl", f"bbl#{i}", t, frozenset())
+           for i, t in enumerate(EVAL_QUESTIONS))],
+        screened=[SCRIPT_LATIN],
     )
-    assert not english.matches(CLEAN_ROWS[0])
+    assert seam.match(row_text) is None
 
 
 def test_the_control_cosines_are_what_this_module_says_they_are(monkeypatch):
