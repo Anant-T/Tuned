@@ -629,6 +629,68 @@ def test_several_inputs_cannot_all_be_the_screened_output(tmp_path, capsys):
     assert "SEVERAL INPUTS" in capsys.readouterr().out
 
 
+def test_the_case_id_lever_carries_through_from_the_screen_to_the_cap(tmp_path, capsys):
+    """`--no-case-id-from-text` is the approved remedy for the case-identifier
+    level's false-positive risk, and it only worked on one of the two passes:
+    stream_items always asked for identifiers from text, so the screen and the
+    cap disagreed about which case a row was about.
+
+    Four rows naming ONE landmark citation in their grounding and nothing in
+    _prov: with the lever off they are one case and the cap takes three; with
+    it on they carry no identifier at all and none of them is capped.
+    """
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    rows = [row(f"as held in 2020 INSC 484 {prose(180 + i, 200)}", f"answer {i}")
+            for i in range(4)]
+    write_jsonl(paths.streams_dir / "stream.jsonl", rows)
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf")
+    store.close()
+
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    capsys.readouterr()
+    assert dedupe_main(["--config", cfg]) == 0
+    capsys.readouterr()
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["thresholds"]["case_ids_from_text"] is True
+    assert manifest["counts"]["kept"] == CNR_CAP
+    assert manifest["counts"]["cases"] == 1
+
+    # Now with the lever, passed to the SCREEN only - dedupe inherits it from
+    # the manifest, so the two passes cannot disagree.
+    assert decon_main(["--config", cfg, "--no-generated", "--no-case-id-from-text"]) == 0
+    capsys.readouterr()
+    assert dedupe_main(["--config", cfg]) == 0
+    capsys.readouterr()
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["thresholds"]["case_ids_from_text"] is False
+    assert manifest["counts"]["kept"] == 4
+    assert manifest["counts"]["cases"] == 0
+    assert manifest["counts"]["uncapped_rows"] == 4
+
+
+def test_the_lever_can_be_passed_to_dedupe_directly_too(tmp_path, capsys):
+    """An input with no verifiable custody has no upstream setting to inherit,
+    so the flag has to work on its own."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    raw = paths.corpus_dir / "unscreened.jsonl"
+    write_jsonl(raw, [row(f"as held in 2020 INSC 484 {prose(190 + i, 200)}", f"answer {i}")
+                      for i in range(4)])
+    assert dedupe_main(["--config", cfg, "--in", str(raw)]) == 0
+    capsys.readouterr()
+    assert json.loads(
+        (paths.out_dir / "dedupe.json").read_text(encoding="utf-8")
+    )["counts"]["kept"] == CNR_CAP
+
+    assert dedupe_main(["--config", cfg, "--in", str(raw), "--no-case-id-from-text"]) == 0
+    capsys.readouterr()
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["thresholds"]["case_ids_from_text"] is False
+    assert manifest["counts"]["kept"] == 4
+
+
 def test_the_cli_writes_rows_drops_and_a_manifest(tmp_path, capsys):
     text = prose(131, 200)
     cfg, paths = _decontaminated(tmp_path, [row(text), row(text), row(prose(132, 200))])
@@ -642,7 +704,7 @@ def test_the_cli_writes_rows_drops_and_a_manifest(tmp_path, capsys):
     assert json.loads(kept[0]) == row(text)
     assert manifest["thresholds"] == {
         "ngram": NGRAM, "prompt_jaccard": PROMPT_JACCARD,
-        "row_jaccard": ROW_JACCARD, "cap": CNR_CAP,
+        "row_jaccard": ROW_JACCARD, "cap": CNR_CAP, "case_ids_from_text": True,
     }
     assert manifest["counts"]["total"] == 3
     assert "drop[exact]: 1" in out

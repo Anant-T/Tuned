@@ -685,6 +685,26 @@ def custody_of(inputs: Sequence[Path]) -> tuple[dict | None, dict]:
     return upstream, record
 
 
+def ids_from_text_for(upstream: dict | None, *, override: bool = False) -> bool:
+    """Whether a row's case identifiers may come from the citations it names.
+
+    `--no-case-id-from-text` is the lever that answers the case-identifier
+    level's false-positive risk (one landmark citation matching an eval item
+    can cost hundreds of rows). It was passed to decontaminate.py and dropped
+    here - stream_items always asked for identifiers from text - so the screen
+    and the per-case cap disagreed about which case a row belonged to, and the
+    lever only half worked.
+
+    The upstream manifest is the answer when it is verified, because a row's
+    identity must not depend on which command last looked at it; the flag
+    overrides it, and False is the default the flag turns off.
+    """
+    if override:
+        return False
+    recorded = (upstream or {}).get("thresholds", {}).get("case_ids_from_text")
+    return True if recorded is None else bool(recorded)
+
+
 def manifest_of(stats: dict, *, inputs: Sequence[str], upstream: dict | None,
                 semantic: str, thresholds: dict, semantic_detail: str = "",
                 custody: dict | None = None) -> dict:
@@ -751,6 +771,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", default=None, help=f"default out/{OUT_FILENAME}")
     parser.add_argument("--no-cap", action="store_true",
                         help=f"skip the {CNR_CAP}-rows-per-case cap")
+    parser.add_argument("--no-case-id-from-text", action="store_true",
+                        help="take a row's case identifiers from _prov only, not from the "
+                             "citations its grounding names. DEFAULTS TO WHAT "
+                             "decontaminate.py RECORDED for the same rows - the cap and the "
+                             "screen must not disagree about what case a row is about")
     args = parser.parse_args(argv)
 
     cfg = load_build_config(args.config)
@@ -773,7 +798,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     # answers is "were THESE rows screened", and a manifest found next to an
     # --in from somewhere else describes different rows.
     upstream, custody = custody_of(inputs)
-    items = list(stream_items(inputs))
+    # INHERITED FROM THE SCREEN, overridable but never silently disagreeing:
+    # `--no-case-id-from-text` is the approved remedy for the case-identifier
+    # level's false-positive risk, and a lever that moves one of the two
+    # passes is not a remedy. When custody could not be verified there is
+    # nothing to inherit and the default stands.
+    ids_from_text = ids_from_text_for(upstream, override=args.no_case_id_from_text)
+    items = list(stream_items(inputs, ids_from_text=ids_from_text))
     semantic, semantic_status, semantic_detail = None, SEMANTIC_UNAVAILABLE, ""
     if semhash_available():
         try:
@@ -800,6 +831,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "prompt_jaccard": PROMPT_JACCARD,
             "row_jaccard": ROW_JACCARD,
             "cap": None if args.no_cap else CNR_CAP,
+            "case_ids_from_text": ids_from_text,
         },
     )
 

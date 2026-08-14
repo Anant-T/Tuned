@@ -42,6 +42,25 @@ _TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
 # second copy elsewhere is a fence that silently disagrees with the fencing.
 DEFAULT_LEASE_S = 900
 
+# Every state a task row can hold, owned here because the task table is. A
+# reader that takes a state from the operator (decontaminate.py's --state)
+# validates against this, so a typo is a refusal rather than a zero-row read
+# that still reports the generations as screened. generate.py and judge.py own
+# the transitions; test_build_store pins their constants against this list, so
+# a new state that is not added here fails there rather than here.
+TASK_STATES = (
+    "pending",
+    "generating",
+    "judging",
+    "judging_active",
+    "accepted",
+    "rejected",
+    "gen_unroutable",
+    "judge_skipped",
+    "judge_error",
+    "judge_unroutable",
+)
+
 # ORDER IS LOAD-BEARING: busy_timeout must be armed BEFORE journal_mode=WAL.
 # Switching the journal mode needs a brief exclusive lock, and with the default
 # timeout of 0 a second worker opening the same DB at the same moment fails
@@ -785,9 +804,27 @@ class Store:
         verify.py re-gates these rows and the assembly pass (decontaminate/
         dedupe) reads them as candidate dataset rows - and a second copy of
         this join is a second answer to "which generation is the row".
+
+        `where_state=None` means EVERY state; `where_state=""` means the state
+        whose name is the empty string, i.e. nothing. Truthiness here made
+        `--state ''` silently disable the filter and ship rejected
+        generations, which is not a reading anyone asked for.
+
+        ORDER BY g.gen_id ASCENDING IS DATASET-DEFINING, not cosmetic. It was
+        inert while verify.py was the only caller (rerun_gates re-gates each
+        row independently), but decontaminate.store_items now feeds these rows
+        into dedupe, which keeps the FIRST row of a duplicate cluster and the
+        first three rows of a case - so this ORDER BY decides WHICH rows ship,
+        not merely the order they ship in. Ascending gen_id is chosen because
+        gen_id is a monotonic rowid that never changes, which makes the
+        survivor set stable in two senses: identical between two runs over the
+        same store, and unchanged by LATER waves - a generation recorded
+        tomorrow sorts after everything that already shipped and cannot
+        displace it. Under DESC the pipeline yields the same COUNT and a
+        different SET.
         """
-        clause = "WHERE t.state = ?" if where_state else ""
-        params: tuple = (where_state,) if where_state else ()
+        clause = "WHERE t.state = ?" if where_state is not None else ""
+        params: tuple = (where_state,) if where_state is not None else ()
         return [
             dict(row)
             for row in self._conn.execute(

@@ -486,6 +486,66 @@ def test_latest_generation_and_counts(store):
     assert store.accepted_count("drafting") == 0
 
 
+def test_latest_generations_come_back_in_ascending_gen_id_order(store):
+    """The ORDER BY became DATASET-DEFINING in the assembly refactor and
+    nothing defended it: decontaminate.store_items feeds these rows to dedupe,
+    which keeps the FIRST row of a duplicate cluster and the first three rows
+    of a case, so this order decides WHICH rows ship. Under DESC the pipeline
+    yields the same count and a different set.
+
+    The fixture is built so the two candidate orders DISAGREE: the tasks are
+    recorded back to front, so gen_id order is the reverse of task_id order
+    and a query with no ORDER BY at all cannot accidentally agree with it.
+    """
+    _populate(store, n=3)
+    for task_id in ("t2", "t1", "t0"):
+        store.record_generation(_gen_envelope(task_id, 1, raw_path="a", raw_offset=0))
+    for task_id in ("t0", "t1", "t2"):
+        store.set_task_state(task_id, "accepted")
+
+    rows = store.latest_generations("accepted")
+    assert [r["task_id"] for r in rows] == ["t2", "t1", "t0"]
+    assert [r["gen_id"] for r in rows] == sorted(r["gen_id"] for r in rows)
+    # ... and ascending gen_id is stable UNDER APPENDS, which is why it is the
+    # one chosen: a later wave cannot displace a row that already shipped.
+    store.record_generation(_gen_envelope("t0", 2, raw_path="a", raw_offset=99))
+    store.set_task_state("t0", "accepted")
+    after = store.latest_generations("accepted")
+    assert [r["task_id"] for r in after] == ["t2", "t1", "t0"]
+
+
+def test_an_empty_state_filter_is_a_state_and_not_the_absence_of_one(store):
+    """`--state ''` shipped a REJECTED generation into the dataset: the clause
+    was keyed on truthiness, so an empty string read as "no filter" and the
+    assembly pass took every state there was."""
+    _populate(store, n=2)
+    store.record_generation(_gen_envelope("t0", 1, raw_path="a", raw_offset=0))
+    store.record_generation(_gen_envelope("t1", 1, raw_path="a", raw_offset=10))
+    store.set_task_state("t0", "accepted")
+    store.set_task_state("t1", "rejected")
+
+    assert len(store.latest_generations()) == 2           # None: every state
+    assert len(store.latest_generations("accepted")) == 1
+    assert store.latest_generations("") == []             # a state nothing holds
+
+
+def test_the_task_states_the_workers_use_are_the_ones_the_store_lists():
+    """TASK_STATES is what decontaminate.py validates --state against, so a
+    state a worker can write but this tuple does not name would be refused at
+    the CLI while sitting in the table."""
+    from tuned.data import generate, judge, verify
+    from tuned.data.store import TASK_STATES
+
+    written = {
+        generate.JUDGING_STATE, generate.PENDING_STATE, generate.REJECTED_STATE,
+        generate.GEN_UNROUTABLE_STATE, judge.JUDGE_STATE_FROM, judge.JUDGE_STATE_TO,
+        judge.ACCEPTED_STATE, judge.REJECTED_STATE, judge.SKIPPED_STATE,
+        judge.ERROR_STATE, judge.UNROUTABLE_STATE, verify.REJECTED_STATE,
+    }
+    assert written <= set(TASK_STATES)
+    assert len(TASK_STATES) == len(set(TASK_STATES))
+
+
 def test_gates_round_trip(store):
     _populate(store, n=1)
     gen_id = store.record_generation(_gen_envelope("t0", 1, raw_path="a", raw_offset=0))

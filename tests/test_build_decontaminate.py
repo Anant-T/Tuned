@@ -784,21 +784,57 @@ def test_the_cli_says_when_the_generations_were_not_screened(tmp_path, capsys):
     cfg = temp_config(tmp_path)
     paths = paths_for(tmp_path)
     write_jsonl(paths.streams_dir / "replay.jsonl", [row(prose(98, 40))])
-    store = Store.open(paths.state_db)
+    store = open_store(tmp_path, n_seeds=1, db_path=paths.state_db)
     all_eval_snapshots(store, tmp_path / "hf")
+    _accept_generation(store, answer="an accepted answer")
     store.close()
 
     assert decon_main(["--config", cfg, "--no-generated"]) == 0
     out = capsys.readouterr().out
     manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
     assert manifest["generations_screened"] is False
+    assert manifest["generations"] == {"screened": False, "state": None, "read": 0}
     assert "THE ACCEPTED GENERATIONS WERE NOT SCREENED" in out
 
     assert decon_main(["--config", cfg]) == 0
     out = capsys.readouterr().out
     manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
     assert manifest["generations_screened"] is True
+    assert manifest["generations"] == {"screened": True, "state": "accepted", "read": 1}
     assert "THE ACCEPTED GENERATIONS WERE NOT SCREENED" not in out
+
+
+def test_asking_for_a_state_the_store_holds_none_of_is_not_a_screened_run(tmp_path, capsys):
+    """`true` used to mean only that --no-generated was absent, so a run that
+    read NOTHING from the store recorded its generations as screened - and a
+    typo'd --state was exactly that run."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "replay.jsonl", [row(prose(98, 40))])
+    store = open_store(tmp_path, n_seeds=1, db_path=paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf")
+    _accept_generation(store, answer="an accepted answer")
+    store.close()
+
+    assert decon_main(["--config", cfg, "--state", "rejected"]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+    assert manifest["generations_screened"] is False
+    assert manifest["generations"] == {"screened": False, "state": "rejected", "read": 0}
+    assert "NO GENERATIONS IN STATE 'rejected'" in out
+
+
+@pytest.mark.parametrize("state", ["", "acceptedd", "ACCEPTED"])
+def test_a_state_that_is_not_a_task_state_is_refused_by_the_parser(tmp_path, state):
+    """`--state ''` shipped a REJECTED generation: the store's filter was
+    keyed on truthiness, so an empty string disabled it and the pass read
+    EVERY state. A typo read zero rows and reported them screened. Neither is
+    reachable now, in the parser and in the store."""
+    cfg = temp_config(tmp_path)
+    paths_for(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        decon_main(["--config", cfg, "--state", state])
+    assert exc.value.code == 2
 
 
 def test_eval_rows_that_carry_no_question_column_are_reported_even_when_the_set_loads(
@@ -1213,6 +1249,20 @@ def test_a_generated_rows_text_is_its_grounding_and_not_the_prompt_template(tmp_
     assert "my answer" in loaded[0].answer and "my reasoning" in loaded[0].answer
     assert loaded[0].row["_prov"]["score"] == 4.0
     assert loaded[0].form == "irac_analysis"
+
+
+def test_the_generations_reach_the_assembly_pass_in_gen_id_order(tmp_path):
+    """The store's ORDER BY only decides which rows ship if the assembly pass
+    preserves it - dedupe keeps the FIRST row of a cluster and the first three
+    of a case, and this is the stage that fixes what "first" means."""
+    store = open_store(tmp_path, n_seeds=3)
+    for i in (2, 1, 0):
+        _accept_generation(store, seed_id=f"seed{i:03d}", task_id=f"t{i}", answer=f"answer {i}")
+    loaded = list(store_items(store))
+    store.close()
+    gen_ids = [item.row["_prov"]["gen_id"] for item in loaded]
+    assert gen_ids == sorted(gen_ids)
+    assert [item.row["_prov"]["seed_id"] for item in loaded] == ["seed002", "seed001", "seed000"]
 
 
 def test_the_cli_screens_the_generations_by_default_and_says_so_when_it_does_not(tmp_path, capsys):

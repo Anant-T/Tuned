@@ -1398,8 +1398,9 @@ def output_record(path: Path, rows: int) -> dict:
 
 def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *,
                 inputs: Sequence[str], semantic: str, semantic_detail: str = "",
-                output: dict | None = None, threshold: float = CONTAINMENT,
-                ids_from_text: bool = True, top: int = 20) -> dict:
+                output: dict | None = None, generations: dict | None = None,
+                threshold: float = CONTAINMENT, ids_from_text: bool = True,
+                top: int = 20) -> dict:
     """The record that has to outlive this run.
 
     Every waived eval set, every hole in the screen and every threshold is in
@@ -1459,8 +1460,10 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
         # never met level 3.
         # Whether the accepted generations were screened at all. A run that
         # only looked at the stream files must not be indistinguishable, years
-        # later, from one that looked at everything.
-        "generations_screened": any(str(i).startswith("store:") for i in inputs),
+        # later, from one that looked at everything - and neither must a run
+        # that asked for them and got none back.
+        "generations_screened": bool((generations or {}).get("screened")),
+        "generations": generations or {"screened": False, "state": None, "read": 0},
         # PER SET. A pooled number cannot tell the operator which set is
         # blind, and the refusal above needs the per-set count anyway.
         "unmatchable_eval_items": {
@@ -1503,7 +1506,7 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
     from tuned.data.config import load_build_config
     from tuned.data.jsonl import write_jsonl
     from tuned.data.paths import build_paths
-    from tuned.data.store import Store
+    from tuned.data.store import TASK_STATES, Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="configs/data_law_v1.yaml")
@@ -1521,7 +1524,11 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
                              "citations its grounding names")
     parser.add_argument("--require-semantic", action="store_true",
                         help="refuse to run when semhash is unavailable")
-    parser.add_argument("--state", default="accepted", help="task state to read (default accepted)")
+    parser.add_argument("--state", default="accepted", choices=TASK_STATES,
+                        help="task state to read (default accepted). Validated: a typo'd "
+                             "state used to read zero generations and still record them "
+                             "as screened, and --state '' used to disable the filter "
+                             "entirely and ship REJECTED generations")
     args = parser.parse_args(argv)
 
     cfg = load_build_config(args.config)
@@ -1572,11 +1579,25 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
 
         items = list(stream_items(inputs, ids_from_text=ids_from_text))
         input_names = [str(p) for p in inputs]
+        generations = {"screened": False, "state": None, "read": 0}
         if not args.no_generated:
             generated = list(store_items(store, cfg, state=args.state, ids_from_text=ids_from_text))
             print(f"read {len(items)} stream rows and {len(generated)} {args.state} generations")
             items += generated
             input_names.append(f"store:{args.state}")
+            # What ACTUALLY happened, not what was asked for: `true` used to
+            # mean only that --no-generated was absent, so a run that read
+            # nothing at all from the store recorded the generations as
+            # screened.
+            generations = {
+                "screened": bool(generated), "state": args.state, "read": len(generated),
+            }
+            if not generated:
+                print(
+                    f"    NO GENERATIONS IN STATE {args.state!r} - the store side of this run "
+                    f"screened NOTHING, and the manifest records generations_screened: false. "
+                    f"If tasks have been accepted, check --state."
+                )
         else:
             print(f"read {len(items)} stream rows (generations NOT screened: --no-generated)")
 
@@ -1627,7 +1648,7 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
         manifest = manifest_of(
             stats, corpora, index, inputs=input_names, semantic=semantic_status,
             semantic_detail=semantic_detail, ids_from_text=ids_from_text,
-            output=output_record(out_path, written),
+            output=output_record(out_path, written), generations=generations,
         )
         write_jsonl(out_path.parent / DROPS_FILENAME, drops)
         write_manifest(out_path.parent / MANIFEST_FILENAME, manifest)
