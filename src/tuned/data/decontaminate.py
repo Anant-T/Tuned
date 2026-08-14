@@ -325,10 +325,6 @@ NGRAM_LEVELS = (LEVEL_CASE_ID, LEVEL_TEXT, LEVEL_NARROW, LEVEL_SHORT)
 LEVELS = NGRAM_LEVELS + (LEVEL_SEMANTIC,)
 
 
-class DecontaminationError(RuntimeError):
-    """The pass cannot run as asked. Actionable by construction: the message
-    says what to do, not what raised."""
-
 
 # --------------------------------------------------------------------------
 # Text primitives. dedupe.py imports these - ONE definition of what a row's
@@ -1960,9 +1956,6 @@ SEMANTIC_CONTROLS = (
         filler=tuple(_SEMANTIC_CONTROL_FILLER_DEVANAGARI),
     ),
 )
-# The Latin half's row, kept under its old name because it is what the
-# whole-row and exact-match seam tests feed.
-SEMANTIC_CONTROL_ROW = SEMANTIC_CONTROLS[0].row
 
 
 class SemanticSeamError(RuntimeError):
@@ -2157,9 +2150,6 @@ class SemanticFilter:
         self.unscreened_probes: dict[str, int] = {}
         self.unscreened_rows: dict[str, int] = {}
 
-    @property
-    def eval_items_by_script(self) -> dict[str, int]:
-        return {script: len(items) for script, items in sorted(self.items_by_script.items())}
 
     def script_report(self) -> dict[str, dict]:
         """What this layer screened and what it did not, by script."""
