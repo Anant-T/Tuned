@@ -164,8 +164,9 @@ WHAT THIS MODULE CANNOT SEE (read before trusting a green run)
   are all under it is refused, because a screen that compared against
   nothing is not a screen).
 * A row whose case identity nothing records. `case_identifier_coverage` in
-  the manifest is that instrument: if it reads 0, level 3 did not run, and
-  the run says so loudly rather than reporting clean. NOTHING in the pipeline
+  the manifest is that instrument: if it reads 0, the case-identifier level
+  did not run, and the run says so loudly rather than reporting clean. NOTHING
+  in the pipeline
   populates seed.cnr or seed.neutral_citation today (grep-verified), so on
   the first real build this level rests entirely on identifiers found in the
   row text and on `_prov`.
@@ -1472,7 +1473,7 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
         },
         # The holes, named. An eval item too short for any rule is not
         # screened against, and a corpus whose rows carry no case identifier
-        # never met level 3.
+        # never met the case-identifier level.
         # Whether the accepted generations were screened at all. A run that
         # only looked at the stream files must not be indistinguishable, years
         # later, from one that looked at everything - and neither must a run
