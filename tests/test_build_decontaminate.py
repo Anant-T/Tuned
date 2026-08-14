@@ -851,6 +851,92 @@ def test_a_devanagari_question_is_screened_and_not_reduced_to_its_digits():
     assert stats["empty_text"] == 0
 
 
+# A 16-word Hindi question. Every claim below is measured on it.
+_HINDI_QUESTION = (
+    "भारतीय दंड संहिता की धारा तीन सौ दो के अंतर्गत हत्या के लिए दंड क्या है"
+)
+# The English equivalent, same number of words, as the control: whatever the
+# tokeniser does to Hindi it must already be doing to this.
+_ENGLISH_EQUIVALENT = (
+    "under which section of the indian penal code is the punishment for murder "
+    "prescribed and what is it"
+)
+
+
+def test_a_hindi_word_is_one_token_and_not_one_token_per_matra():
+    """Devanagari vowel signs and the virama are categories Mn/Mc, which `\\w`
+    does not match, so `[^\\W_]+` split every Hindi word at every matra:
+    `भारतीय` came out as 3 tokens and `दंड` as 2. Nothing about that is
+    cosmetic - the token count decides which LEVEL screens an item."""
+    assert tokens("भारतीय दंड संहिता की धारा") == (
+        "भारतीय", "दंड", "संहिता", "की", "धारा",
+    )
+    assert len(tokens(_HINDI_QUESTION)) == len(_HINDI_QUESTION.split()) == 16
+    # The English side is untouched by the change.
+    assert tokens("Section 302, I.P.C. -- **held**: NO.") == (
+        "section", "302", "i", "p", "c", "held", "no",
+    )
+    # A combining mark only ever joins the word BEFORE it; it cannot start one.
+    assert tokens("ा भारतीय") == ("भारतीय",)
+
+
+def test_one_edited_hindi_word_still_drops_at_every_position():
+    """The one-edit guarantee is denominated in TOKENS with zero margin, so an
+    inflated Hindi token count spent it two or three times over on a single
+    edited word. Measured under the old class: 3 of these 16 positions
+    survived (a leak reported clean); on the English equivalent, 0 of 18."""
+    words = _HINDI_QUESTION.split()
+    survived = []
+    for i in range(len(words)):
+        edited = [*words[:i], "बदलाव", *words[i + 1 :]]
+        leaked = prose(400, 150) + " " + " ".join(edited) + " " + prose(401, 150)
+        kept, _, _ = decontaminate_items(items(row(leaked)), index_of(_HINDI_QUESTION))
+        if kept:
+            survived.append(i)
+    assert survived == [], f"one edited Hindi word survived at word positions {survived}"
+
+    english = _ENGLISH_EQUIVALENT.split()
+    survived_en = []
+    for i in range(len(english)):
+        edited = [*english[:i], "changed", *english[i + 1 :]]
+        leaked = prose(402, 150) + " " + " ".join(edited) + " " + prose(403, 150)
+        kept, _, _ = decontaminate_items(items(row(leaked)), index_of(_ENGLISH_EQUIVALENT))
+        if kept:
+            survived_en.append(i)
+    assert survived_en == []
+
+
+def test_a_two_word_hindi_phrase_is_as_unmatchable_as_its_english_twin():
+    """`अपील खारिज` read as FIVE tokens under the old class, cleared the
+    5-token floor and became matchable - so a stock phrase two words long
+    could drop rows, while English "appeal dismissed" (2 tokens) correctly
+    could not. The floor has to mean the same thing in both scripts."""
+    assert window_for(len(tokens("अपील खारिज"))) == 0
+    assert window_for(len(tokens("appeal dismissed"))) == 0
+    index = index_of("अपील खारिज", "appeal dismissed")
+    assert len(index.unmatchable) == 2
+    kept, _, _ = decontaminate_items(
+        items(row("अपील खारिज की गई " + prose(404, 60) + " appeal dismissed")), index
+    )
+    assert len(kept) == 1
+
+
+def test_the_length_histogram_reads_the_same_band_for_a_question_in_either_script():
+    """The instrument has to move with the rule: an inflated Hindi token count
+    filed a 16-word question under `text` (29 tokens) while its English twin
+    read `narrow`, so the table the window calibration is decided from was
+    ~2x wrong on 7,318 of BBL's 24,365 questions."""
+    index = EvalIndex(
+        [
+            EvalItem("bbl", "hi#0", _HINDI_QUESTION, frozenset()),
+            EvalItem("bbl", "en#0", _ENGLISH_EQUIVALENT, frozenset()),
+        ]
+    )
+    bands = index.length_report()["bbl"]
+    assert bands[LEVEL_NARROW] == 2 and bands[LEVEL_TEXT] == 0
+    assert bands["min_tokens"] == 16 and bands["max_tokens"] == 18
+
+
 def test_the_cli_says_when_the_generations_were_not_screened(tmp_path, capsys):
     cfg = temp_config(tmp_path)
     paths = paths_for(tmp_path)

@@ -239,12 +239,50 @@ class DecontaminationError(RuntimeError):
 # text is, so the two passes cannot disagree about it.
 # --------------------------------------------------------------------------
 
-# `[^\W_]+` and NOT `[a-z0-9]+`: an ASCII-only class drops every Devanagari
-# word, so a Hindi BhashaBench question leaked verbatim into a row would
-# compare as a handful of digits, match nothing, and the row would pass this
-# screen by being unreadable rather than by being clean. BhashaBench-Legal
-# ships Hindi, so that is a leak this module would have reported as healthy.
-_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+# A WORD IS ITS LETTERS PLUS ITS COMBINING MARKS, and getting that wrong is
+# not a cosmetic bug in this module - it moves an item between levels.
+#
+# `[a-z0-9]+` drops every Devanagari word outright (a Hindi BhashaBench
+# question would compare as a handful of digits). `[^\W_]+` reads the letters
+# but SPLITS AT EVERY MATRA: Devanagari vowel signs and the virama are
+# categories Mn/Mc, which Python's `\w` does not include, so `भारतीय` came out
+# as 3 tokens and `दंड` as 2. Measured on a 16-word Hindi question: 29 tokens
+# instead of 16.
+#
+# That inflation is not a rounding error here. The window design guarantees
+# survival of exactly one TOKEN edit (window_for), so one edited Hindi WORD
+# was 2-3 token edits and the guarantee evaporated - measured 3 of 16 word
+# positions missed against 0 of 18 on the English equivalent. It also made a
+# two-word Hindi stock phrase (`अपील खारिज`, 5 tokens inflated) clear the
+# 5-token floor and become matchable, where English "appeal dismissed" (2
+# tokens) correctly cannot match anything. And it miscalibrated the
+# item-length histogram at ~2x on the Hindi half of BBL - 7,318 of its 24,365
+# questions.
+#
+# The class is derived from unicodedata rather than hand-listed, over the BMP
+# ranges that carry Indic and diacritic marks (U+0300-U+1AFF covers combining
+# diacriticals through every Indic block; U+A8E0-U+A8FF is Devanagari
+# Extended). Measured at import: under a millisecond.
+def _combining_marks() -> str:
+    """The body of a regex character class holding every combining mark."""
+    import unicodedata
+
+    ranges: list[list[int]] = []
+    for code in [*range(0x0300, 0x1B00), *range(0xA8E0, 0xA900)]:
+        if unicodedata.category(chr(code)).startswith("M"):
+            if ranges and code == ranges[-1][1] + 1:
+                ranges[-1][1] = code
+            else:
+                ranges.append([code, code])
+    return "".join(
+        chr(lo) if lo == hi else f"{chr(lo)}-{chr(hi)}" for lo, hi in ranges
+    )
+
+
+# A token STARTS with a letter or digit and may carry marks after it: a lone
+# matra following punctuation is not a word, and requiring the first character
+# to be alphanumeric is what keeps that out without a second rule.
+_TOKEN = re.compile(rf"[^\W_](?:[^\W_]|[{_combining_marks()}])*", re.UNICODE)
 _MASK = (1 << 64) - 1
 _BASE = 1_000_003
 
@@ -255,7 +293,8 @@ def tokens(text: str) -> tuple[str, ...]:
     Punctuation, markup and whitespace are dropped, so a row that differs
     from an eval item only in typesetting still matches it. Digits are KEPT:
     section numbers and years are most of what distinguishes one legal
-    question from another.
+    question from another. COMBINING MARKS STAY INSIDE THE WORD THEY MODIFY -
+    see _TOKEN for the measurement that forced it.
     """
     return tuple(_TOKEN.findall((text or "").lower()))
 
