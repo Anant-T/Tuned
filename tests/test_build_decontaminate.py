@@ -524,6 +524,35 @@ def test_capping_the_window_at_the_constant_is_what_keeps_long_items_screenable(
     assert not kept and drops[0]["reason"] == f"{LEVEL_TEXT}:bbl"
 
 
+def test_a_row_that_leaks_two_lengths_of_item_is_counted_against_both_levels():
+    """The levels are a union and by_level is the instrument that says whether
+    each branch is carrying cases of its own on real data - the first-run
+    check is literally "if `short` and `case_id` are both 0 the union
+    collapsed to one rule". A single best hit across all levels reports the
+    strongest one and files the row under that level alone, so the instrument
+    under-counts exactly the branch it exists to watch. Found by mutation: the
+    per-level structure survived the whole suite as one pooled best.
+    """
+    long_question = prose(431, 150)
+    short_question = "what is the punishment for criminal breach of trust"
+    assert level_for(len(tokens(long_question))) == LEVEL_TEXT
+    assert level_for(len(tokens(short_question))) == LEVEL_SHORT
+
+    words = long_question.split()
+    leaked = " ".join(words[:100]) + " " + prose(432, 200) + " " + short_question
+    index = index_of(long_question, short_question)
+    _, drops, stats = decontaminate_items(items(row(leaked)), index)
+    assert len(drops) == 1
+    levels = [hit["level"] for hit in drops[0]["hits"]]
+    assert levels == [LEVEL_TEXT, LEVEL_SHORT]
+    assert stats["by_level"][LEVEL_TEXT] == stats["by_level"][LEVEL_SHORT] == 1
+    # The short item scores higher, so a pooled best would have reported IT
+    # and filed the row under `short`.
+    containments = {h["level"]: h["containment"] for h in drops[0]["hits"]}
+    assert containments[LEVEL_SHORT] > containments[LEVEL_TEXT] >= CONTAINMENT
+    assert drops[0]["reason"] == f"{LEVEL_TEXT}:bbl"
+
+
 def test_a_short_question_that_shares_a_statutory_phrase_has_a_boundary_too():
     """The statute exception, one length band down - the false-positive price
     the narrow window is paid for with, pinned on BOTH sides.
