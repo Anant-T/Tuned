@@ -1296,10 +1296,32 @@ def hits_for(item: Item, index: EvalIndex, *, threshold: float = CONTAINMENT) ->
     toks = tokens(item.text)
     query = index.query(toks)
 
-    for identifier, ix in index.identifier_candidates(item.identifiers):
+    # ONE hit for the level, whatever it matched. A row that shares three
+    # identifiers with four eval items is one contaminated row, and appending a
+    # Hit per (identifier, item) pair would inflate `by_level["case_id"]` -
+    # the instrument first-run check #4 reads to decide whether this branch is
+    # carrying cases of its own - by the size of the citation graph.
+    #
+    # EVERY MATCHING IDENTIFIER IS BLAMED, though, and that is a different
+    # question from which one the drop is filed under. `top_identifiers` exists
+    # to answer "which citation is costing rows", asked in order to decide
+    # whether to pass --no-case-id-from-text; that lever removes a whole
+    # channel, so the operator has to see every identifier that would have
+    # caused this drop, including the redundant ones. Blaming only the
+    # sorted-first hid exactly that redundancy - and since "cit:" sorts before
+    # "cnr:", a row matched on both its own CNR and a landmark citation always
+    # named the citation.
+    matching = index.identifier_candidates(item.identifiers)
+    if matching:
+        identifier, ix = matching[0]
         hit = index.items[ix]
-        found.append(Hit(LEVEL_CASE_ID, hit.set_key, hit.item_id, {"identifier": identifier}))
-        break
+        found.append(
+            Hit(
+                LEVEL_CASE_ID, hit.set_key, hit.item_id,
+                {"identifier": identifier,
+                 "identifiers": sorted({name for name, _ in matching})},
+            )
+        )
 
     # The best hit PER LEVEL, not one overall: the levels are a union and the
     # counts are the instrument that says whether each branch is carrying
@@ -1389,8 +1411,12 @@ def decontaminate_items(
             stats["by_level"][hit.level] = stats["by_level"].get(hit.level, 0) + 1
             stats["by_eval_set"][hit.eval_set] = stats["by_eval_set"].get(hit.eval_set, 0) + 1
             if hit.level == LEVEL_CASE_ID:
-                key = hit.detail["identifier"]
-                stats["identifier_drops"][key] = stats["identifier_drops"].get(key, 0) + 1
+                # Every identifier that matched, not just the one the drop is
+                # filed under: this is a count of ROW-MATCHES per identifier
+                # and it sums to at least the number of drops, by design. See
+                # hits_for for why the lever this feeds needs all of them.
+                for key in hit.detail["identifiers"]:
+                    stats["identifier_drops"][key] = stats["identifier_drops"].get(key, 0) + 1
         drops.append(
             {
                 "key": item.key,
@@ -1862,6 +1888,11 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
         # semantic_control for the two silent directions it pins.
         "semantic": semantic,
         "semantic_detail": semantic_detail,
+        # ROW-MATCHES per identifier, so this sums to at least `dropped`: a row
+        # that shares two identifiers with the eval side is blamed on both,
+        # because --no-case-id-from-text removes a whole channel and the
+        # operator deciding whether to pass it has to see every identifier
+        # that would have cost this row.
         "top_identifiers": sorted(
             stats["identifier_drops"].items(), key=lambda kv: (-kv[1], kv[0])
         )[:top],

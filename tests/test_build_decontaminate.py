@@ -739,6 +739,48 @@ def test_the_identifiers_that_cost_the_most_rows_are_listed_first():
     assert manifest["top_identifiers"] == [("cit:2020 INSC 484", 3), ("cit:2019 INSC 12", 1)]
 
 
+def test_one_row_is_one_case_identifier_hit_however_many_pairs_matched():
+    """The `break` had no case. A row sharing two identifiers with three eval
+    items each is ONE contaminated row, and a Hit per (identifier, item) pair
+    inflates `by_level["case_id"]` - which first-run check #4 reads to decide
+    whether this branch carries cases of its own - by the size of the citation
+    graph rather than by the number of rows."""
+    index = EvalIndex([
+        EvalItem("iltur", f"iltur#{i}", prose(560 + i, 40),
+                 frozenset({"cit:2020 INSC 484", "cnr:DLHC010001232020"}))
+        for i in range(3)
+    ])
+    leaky = row(prose(563, 30), citation="2020 INSC 484", cnr="DLHC010001232020")
+    _, drops, stats = decontaminate_items(items(leaky), index)
+    assert stats["by_level"][LEVEL_CASE_ID] == 1
+    assert [h["level"] for h in drops[0]["hits"]] == [LEVEL_CASE_ID]
+    assert stats["dropped"] == 1
+
+
+def test_a_drop_blames_every_identifier_that_matched_and_not_just_the_first():
+    """`identifier_drops` fed `top_identifiers`, which is first-run check #3
+    and the instrument the --no-case-id-from-text decision is made on. It
+    blamed the SORTED-FIRST matching identifier only - and "cit:" sorts before
+    "cnr:", so a row matched on both its own case number and a landmark
+    citation always named the citation and never the case. That lever removes
+    a whole channel, so the operator has to see every identifier that would
+    have cost the row, redundant ones included."""
+    index = EvalIndex([
+        EvalItem("iltur", "iltur#0", prose(570, 40),
+                 frozenset({"cit:2020 INSC 484", "cnr:DLHC010001232020"})),
+    ])
+    both = row(prose(571, 30), citation="2020 INSC 484", cnr="DLHC010001232020")
+    only_citation = row(prose(572, 30), citation="2020 INSC 484")
+    _, drops, stats = decontaminate_items(items(both, only_citation), index)
+    assert stats["identifier_drops"] == {"cit:2020 INSC 484": 2, "cnr:DLHC010001232020": 1}
+    # The drop record carries both, and still files the row under one reason.
+    assert drops[0]["hits"][0]["identifiers"] == ["cit:2020 INSC 484", "cnr:DLHC010001232020"]
+    assert drops[0]["reason"] == f"{LEVEL_CASE_ID}:iltur"
+    # It is a count of ROW-MATCHES, so it sums to at least the drop count.
+    manifest = manifest_of(stats, {}, index, inputs=[], semantic="x")
+    assert sum(count for _, count in manifest["top_identifiers"]) >= stats["dropped"]
+
+
 def test_an_eval_item_under_the_floor_is_counted_not_silently_ignored():
     """A 3-token question would match half the corpus, so nothing here can use
     it - and that hole is COUNTED, because an unusable eval item that nobody
@@ -1031,6 +1073,21 @@ def test_a_state_that_is_not_a_task_state_is_refused_by_the_parser(tmp_path, sta
     with pytest.raises(SystemExit) as exc:
         decon_main(["--config", cfg, "--state", state])
     assert exc.value.code == 2
+
+
+def test_every_real_task_state_is_still_accepted_by_the_parser(tmp_path):
+    """The other direction of the same guard, which had no case: a `choices`
+    list narrowed to one literal state refuses `--state rejected` and reads as
+    the validation working. The parser's list has to be the store's."""
+    from tuned.data.store import TASK_STATES
+
+    cfg = temp_config(tmp_path)
+    paths_for(tmp_path)
+    assert len(TASK_STATES) > 1
+    for state in TASK_STATES:
+        # It gets past the parser and fails later on the missing eval sets,
+        # which is a refusal (2) with the eval banner rather than a usage error.
+        assert decon_main(["--config", cfg, "--state", state, "--no-generated"]) == 2
 
 
 def test_eval_rows_that_carry_no_question_column_are_reported_even_when_the_set_loads(
@@ -1853,6 +1910,78 @@ def test_require_semantic_refuses_when_the_layer_is_installed_but_not_working(
     assert code == 2
     assert manifest is None  # nothing was written
     assert "REFUSING TO DECONTAMINATE" in capsys.readouterr().out
+
+
+def test_the_item_length_histogram_reaches_the_manifest_and_the_screen(tmp_path, capsys):
+    """I2(d)'s whole point: this table is what turns the window calibration
+    from an argument into a decision on run one. It was printed and recorded
+    and NOTHING read either, so a histogram of zeros - or one that counted a
+    band twice - passed the suite."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "s.jsonl", [row(prose(940, 60))])
+    store = Store.open(paths.state_db)
+    # One item per band, plus one under the floor that nothing can match.
+    # iltur, because it carries no verified row count and so no floor filler:
+    # the histogram under test would otherwise be the filler's.
+    all_eval_snapshots(store, tmp_path / "hf", {"iltur": [
+        {"question": prose(941, 60)},   # text
+        {"question": prose(942, 20)},   # narrow
+        {"question": prose(943, 8)},    # short
+        {"question": "far too short"},  # unmatchable (3 tokens)
+    ]})
+    store.close()
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+
+    bands = manifest["eval_sets"]["iltur"]["item_tokens"]
+    assert bands[LEVEL_TEXT] == 1 and bands[LEVEL_NARROW] == 1
+    assert bands[LEVEL_SHORT] == 1 and bands["unmatchable"] == 1
+    assert (bands["min_tokens"], bands["max_tokens"]) == (3, 60)
+    assert bands["median_tokens"] == 20
+    assert sum(bands[k] for k in (LEVEL_TEXT, LEVEL_NARROW, LEVEL_SHORT, "unmatchable")) == 4
+    # ... and the same numbers are on the operator's screen, under that set.
+    assert (f"tokens: median {bands['median_tokens']} (min {bands['min_tokens']},"
+            f" max {bands['max_tokens']})") in out
+    assert (f"screened by: {LEVEL_TEXT} 1, {LEVEL_NARROW} 1, {LEVEL_SHORT} 1,"
+            f" unmatchable 1") in out
+    assert manifest["unmatchable_eval_items"]["iltur"] == 1
+    # The band boundary the histogram is read against, in the same manifest.
+    assert manifest["thresholds"]["full_ngram_from_tokens"] == 3 * NGRAM - 1 == 38
+    assert window_for(38) == NGRAM and window_for(37) < NGRAM
+
+
+def test_a_row_with_no_usable_text_reaches_the_manifest_counts_and_the_screen(tmp_path, capsys):
+    """`empty_text` counts rows that pass by being unreadable rather than by
+    being clean. Forcing it to 0 in the manifest survived the suite, so the
+    hole could be counted internally and reported as none."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "s.jsonl", [
+        row(prose(950, 60)),
+        {"messages": [{"role": "user", "content": "--- *** ,,,"}], "_prov": {}},
+    ])
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf")
+    store.close()
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+    assert manifest["counts"]["empty_text"] == 1
+    assert manifest["counts"]["total"] == 2 and manifest["counts"]["kept"] == 2
+    assert "1 candidate rows carried NO USABLE TEXT" in out
+
+
+def test_the_content_key_separates_the_prompt_from_the_answer():
+    """`item_key` hashes prompt and answer with a NUL between them. Join them
+    with a newline instead and ("a\\nb", "c") and ("a", "b\\nc") become the same
+    row - two different rows that dedupe would then treat as one, silently."""
+    from tuned.data.decontaminate import item_key
+
+    assert item_key("a\nb", "c") != item_key("a", "b\nc")
+    assert item_key("a", "b") == item_key("a", "b")
+    assert "\x00" not in item_key("a", "b")  # the separator is in the payload, not the key
 
 
 def test_this_module_cannot_reach_the_network():

@@ -741,6 +741,29 @@ def test_the_screened_rows_themselves_do_verify(tmp_path, capsys):
     assert "NO DECONTAMINATION MANIFEST" not in capsys.readouterr().out
 
 
+def test_the_same_bytes_under_another_name_are_still_the_screened_rows(tmp_path, capsys):
+    """The positive claim the custody design makes and nothing tested: a
+    DIFFERING PATH IS NOT A FAILURE - only the digest decides. Bind custody to
+    the path as well and every legitimate `--out elsewhere/x.jsonl` followed by
+    a copy back reads `content_mismatch`, which is a false alarm on the one
+    banner an operator has to be able to trust."""
+    cfg, paths = _decontaminated(tmp_path, [row(prose(140, 120)), row(prose(141, 120))])
+    capsys.readouterr()
+    screened = paths.out_dir / "decontaminated.jsonl"
+    renamed = paths.out_dir / "renamed.jsonl"
+    renamed.write_bytes(screened.read_bytes())
+    upstream = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+    assert upstream["output"]["path"] != str(renamed), "the premise: the path differs"
+
+    assert dedupe_main(["--config", cfg, "--in", str(renamed)]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    check = manifest["decontamination_check"]
+    assert check["status"] == "verified"
+    assert check["input"] == str(renamed) != check["manifest_output"]["path"]
+    assert manifest["decontamination"] is not None
+    assert "NO DECONTAMINATION MANIFEST" not in capsys.readouterr().out
+
+
 def test_a_manifest_with_no_output_digest_is_not_inherited_either(tmp_path, capsys):
     """A manifest written by an older decon_version cannot say whether it
     describes these rows, and 'cannot tell' is not 'yes'."""
