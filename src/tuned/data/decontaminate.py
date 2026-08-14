@@ -209,7 +209,15 @@ Two things follow, and both are recorded rather than implied:
 * Selection matches the SPLIT NAME as a path component, never a config name.
   The config names were not verified against the Hub and a guessed one would
   silently exclude a whole task. `manifest["eval_sets"][key]["selection"]`
-  lists every object read and every object left out WITH THE REASON.
+  lists every object read and every object left out WITH THE REASON, and an
+  EXCLUDED name beats an included one in the same key.
+* If NO object names a screened split, that is a REFUSAL (`no_screened_split`),
+  decided before a single row is read. It used to read the whole repo instead,
+  on the argument that over-screening is safe - which stopped being true the
+  moment the eval surface became a few thousand rows of a 488,000-row repo,
+  since "read everything" is the ~20 GB of index this section exists to avoid.
+  A set with NO filter (aibe) is untouched by that rung: reading everything is
+  its normal path rather than a fallback from anything.
 * No per-config+split row count has been read for IL-TUR, so its floor and its
   shortfall line are OFF and the run says so. BBL (17,047 + 7,318 = 24,365
   across two configs of `test`) and aibe (1,157, single `train` split, which
@@ -815,6 +823,25 @@ EVAL_UNMATCHABLE = "unmatchable"
 # Loaded, and far smaller than the set is documented to be - a fragment, a
 # single shard, or a repo id that resolved to something else.
 EVAL_TOO_FEW = "too_few_rows"
+# The set has a SPLIT FILTER and no object on disk names a screened split.
+#
+# This used to be a silent fallback to "read everything", justified as
+# "over-screening is safe". It is not safe here and the arithmetic says why:
+# IL-TUR is ~488,000 rows across 8 heterogeneous configs and the eval surface
+# chosen for it is a few thousand of them, so reading everything is ~20 GB of
+# index on a machine that does not have it - the OOM this module's own
+# docstring rejects, arrived at from the other side. Worse, the fallback
+# OVERWROTE `record["excluded"] = []`, so the manifest read "selected all,
+# excluded nothing" while ~488,000 training rows became the eval surface, and
+# its designated tell - `surplus` - is structurally 0 for the one set with
+# fallback risk, because IL-TUR has no verified row count.
+#
+# So a filtered set whose filter selects nothing is a REFUSAL, the same regime
+# as every other "loaded but useless" state, and the remedy names the layout it
+# saw against the layout it expected. A set with NO filter (aibe, whose single
+# `train` split IS the set) never reaches this: reading everything is its
+# normal path, not a fallback.
+EVAL_NO_SPLIT = "no_screened_split"
 
 # The floor is a HUNDREDTH of the expected count, not a half. The counts are
 # verified now (EVAL_COUNTS_VERIFIED_AT), but a shard that has not finished
@@ -889,9 +916,17 @@ class EvalCorpus:
 
     @property
     def surplus(self) -> int:
-        """Rows ABOVE the expectation - the tell that the filter selected more
-        than the eval surface (usually because the fallback fired and a train
-        split is being screened against as well)."""
+        """Rows ABOVE the expectation for the splits this set is screened against.
+
+        The tell that the filter selected MORE than the eval surface: a shard
+        counted twice, a config that is not in `parts`, or an object whose name
+        happens to carry a screened split. It used to be described as the
+        fallback's tell, which it never was and now could not be - the fallback
+        is a refusal (EVAL_NO_SPLIT) and IL-TUR, the only set with fallback
+        risk, has no verified count for this to be denominated against at all.
+        It fires for BBL and aibe, whose counts are verified, and it is OFF and
+        says so where they are not.
+        """
         expect = self.spec.expect_rows
         return max(0, self.rows - expect) if expect else 0
 
@@ -979,11 +1014,15 @@ def select_split_files(spec: EvalSet, paths: Sequence[tuple[str, Path]]):
     bare substring test would select it and silently screen against the wrong
     file.
 
-    An unmatched filter leaves the WHOLE SET in rather than screening nothing -
-    over-screening is safe, screening nothing is the failure this module
-    exists to prevent - and the fallback is recorded and printed, because a
-    layout whose files do not name their splits means the row count is being
-    compared against the wrong expectation.
+    EXCLUDE BEATS INCLUDE, so `train_test-00000.parquet` is excluded: a name
+    carrying both is ambiguous and the safe reading of an ambiguous name is the
+    one that does not put a training split into the eval surface.
+
+    A filter that selects nothing is NOT a fallback to reading everything - see
+    EVAL_NO_SPLIT for the arithmetic. `no_screened_split` says so and the
+    exclusion record is left intact, because "selected all, excluded nothing"
+    is exactly the sentence the manifest must never be able to write about a
+    layout nobody recognised.
     """
     include, exclude = set(spec.include_splits), set(spec.exclude_splits)
     record = {
@@ -992,9 +1031,11 @@ def select_split_files(spec: EvalSet, paths: Sequence[tuple[str, Path]]):
         "note": spec.selection_note,
         "selected": [],
         "excluded": [],
-        "fallback_all_files": False,
+        "no_screened_split": False,
     }
     if not include and not exclude:
+        # No filter at all: the whole repo IS the eval surface (aibe). Reading
+        # everything here is the normal path and not a fallback from anything.
         record["selected"] = [key for key, _ in paths]
         return list(paths), record
     selected = []
@@ -1008,10 +1049,8 @@ def select_split_files(spec: EvalSet, paths: Sequence[tuple[str, Path]]):
             selected.append((key, path))
             record["selected"].append(key)
     if not selected:
-        record["fallback_all_files"] = True
-        record["selected"] = [key for key, _ in paths]
-        record["excluded"] = []
-        return list(paths), record
+        record["no_screened_split"] = True
+        return [], record
     return selected, record
 
 
@@ -1037,7 +1076,20 @@ def eval_corpus(store, spec: EvalSet, *, reader=read_rows) -> EvalCorpus:
         return EvalCorpus(
             spec, EVAL_NO_FILES, detail=f"{len(index)} objects, none of {_READABLE_SUFFIXES}"
         )
+    seen = sorted({part for key, _ in paths for part in _name_parts(key)})
     paths, selection = select_split_files(spec, paths)
+    if selection["no_screened_split"]:
+        # BEFORE a single row is read. The banner this replaced printed after
+        # eval_corpus had materialised every row and both indexes were built -
+        # i.e. after the ~20 GB the docstring says does not fit.
+        return EvalCorpus(
+            spec, EVAL_NO_SPLIT, files=0, selection=selection,
+            detail=(
+                f"{len(selection['excluded'])} objects, none naming any of "
+                f"{list(spec.include_splits)} as a path component. The names carry "
+                f"{seen[:12]}"
+            ),
+        )
 
     items: list[EvalItem] = []
     rows = 0
@@ -1162,6 +1214,16 @@ def _remedy(key: str, corpus: EvalCorpus) -> str:
             "read the column that was chosen - an item under 5 tokens is an answer\n"
             "               key or a label, not a question, so _EVAL_TEXT_FIELDS is\n"
             "               probably matching the wrong column"
+        )
+    if corpus.status == EVAL_NO_SPLIT:
+        return (
+            f"check the layout under {spec.url} against this set's split filter\n"
+            f"               (expected a path component from {list(spec.include_splits)};\n"
+            f"                {corpus.detail}.\n"
+            f"                Fix include_splits in EVAL_SETS for the real layout - this is\n"
+            f"                NOT read-everything-instead: {spec.key} is ~488,000 rows across\n"
+            f"                8 configs and the whole repo is tens of GB of index, so an\n"
+            f"                unrecognised layout means the eval surface is unknown, not wide)"
         )
     if corpus.status == EVAL_TOO_FEW:
         return (
@@ -2608,12 +2670,19 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
                     f" - {corpus.surplus} MORE than the eval surface. The split filter"
                     f" selected more than it should have; check `selection` in the manifest"
                 )
-            if corpus.selection.get("fallback_all_files"):
+            excluded = corpus.selection.get("excluded") or []
+            if excluded:
+                # PARTIAL exclusion, which only the manifest recorded before:
+                # the count and the reasons are what say whether the filter cut
+                # the training splits or cut a whole task by accident.
+                whys: dict[str, int] = {}
+                for entry in excluded:
+                    whys[entry["why"]] = whys.get(entry["why"], 0) + 1
                 print(
-                    f"    NO FILE OF THIS SET NAMES A SCREENED SPLIT"
-                    f" {corpus.spec.include_splits} - every file was read instead, so this"
-                    f" set may be screened against its TRAINING split too and the row count"
-                    f" is being compared against the wrong expectation"
+                    f"    {len(excluded)} of {len(excluded) + len(corpus.selection['selected'])}"
+                    f" objects left out of the eval surface"
+                    f" ({', '.join(f'{why} {n}' for why, n in sorted(whys.items()))})"
+                    f" - `selection` in the manifest names every one"
                 )
             if corpus.ok and corpus.spec.expect_rows is None:
                 print(

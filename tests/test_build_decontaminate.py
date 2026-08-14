@@ -18,6 +18,7 @@ from tuned.data.decontaminate import (
     EVAL_MIN_SHARE,
     EVAL_NO_FILES,
     EVAL_NO_READER,
+    EVAL_NO_SPLIT,
     EVAL_NO_TEXT_COLUMN,
     EVAL_NOT_ACQUIRED,
     EVAL_OK,
@@ -1353,11 +1354,13 @@ def test_each_way_an_eval_set_comes_back_short_has_its_own_status(
             spec.source_id, "README.md", local_path=path, size_bytes=8, sha256="0" * 64
         )
     else:
-        path = tmp_path / "bbl" / "data.jsonl"
+        # Named for a screened split, so the file really is IN the eval
+        # surface and the status under test is the parse and not the filter.
+        path = tmp_path / "bbl" / "data" / "test-0.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{not json at all\n", encoding="utf-8")
         store.record_artifact(
-            spec.source_id, "data.jsonl", local_path=path, size_bytes=8, sha256="0" * 64
+            spec.source_id, "data/test-0.jsonl", local_path=path, size_bytes=8, sha256="0" * 64
         )
     corpus = eval_corpus(store, spec)
     assert corpus.status == expected
@@ -1545,21 +1548,104 @@ def test_iltur_is_screened_against_its_test_splits_and_the_manifest_names_which(
         "rr/dev-00000-of-00001.jsonl",
     }
     assert {e["why"] for e in corpus.selection["excluded"]} == {"train", "fold", "dev"}
-    assert not corpus.selection["fallback_all_files"]
+    assert not corpus.selection["no_screened_split"]
     # No verified per-split counts for this set, so the floor and the shortfall
     # instrument are OFF rather than denominated against a number nobody read.
     assert spec.expect_rows is None and corpus.shortfall == 0
 
 
-def test_a_layout_that_names_no_split_reads_everything_and_says_so(store, tmp_path):
-    """Over-screening is safe; screening nothing is the failure this module
-    exists to prevent. But the fallback also means the row count is being
-    compared against the wrong expectation, so it is recorded and printed."""
+def test_an_excluded_split_beats_an_included_one_in_the_same_name(store, tmp_path):
+    """`train_test-00000.parquet` carries both. The safe reading of an
+    ambiguous name is the one that does not put a training split into the eval
+    surface, and inverting the two branches - include first - survived the
+    suite before this."""
+    spec = EVAL_SETS["iltur"]
+    eval_snapshot(store, tmp_path, "iltur", [{"question": prose(913, 40)}],
+                  name="cjpe/train_test-00000-of-00001.jsonl")
+    eval_snapshot(store, tmp_path, "iltur", [{"question": prose(914, 40)}],
+                  name="cjpe/test-00000-of-00001.jsonl")
+    corpus = eval_corpus(store, spec)
+    assert corpus.selection["selected"] == ["cjpe/test-00000-of-00001.jsonl"]
+    assert corpus.selection["excluded"] == [
+        {"key": "cjpe/train_test-00000-of-00001.jsonl", "why": "train"}
+    ]
+    assert corpus.files == 1 and corpus.rows == 1
+
+
+def test_a_layout_that_names_no_split_is_a_refusal_and_not_a_read_everything(
+    store, tmp_path, capsys
+):
+    """The all-or-nothing fallback defeated the decision it implemented.
+
+    It read the WHOLE repo - ~488,000 rows and tens of GB of index for IL-TUR,
+    the OOM this module's own docstring rejects - printed its banner AFTER
+    every row had been materialised and both indexes built, and overwrote
+    `record["excluded"] = []` so the manifest read "selected all, excluded
+    nothing" while the training splits became the eval surface. Its designated
+    tell, `surplus`, is structurally 0 for IL-TUR because that set has no
+    verified row count: the one set with fallback risk was the one set whose
+    tell could not fire.
+
+    A filtered set whose filter selects nothing is now a refusal, named before
+    a single row is read."""
     spec = EVAL_SETS["iltur"]
     eval_snapshot(store, tmp_path, "iltur", [{"question": prose(912, 40)}], name="rows.jsonl")
     corpus = eval_corpus(store, spec)
-    assert corpus.files == 1 and corpus.selection["fallback_all_files"] is True
-    assert corpus.selection["excluded"] == []
+    assert corpus.status == EVAL_NO_SPLIT == "no_screened_split"
+    assert corpus.selection["no_screened_split"] is True
+    # NOTHING WAS READ. Not "read and then rejected" - the refusal is before
+    # materialisation, which is the whole point on a 20 GB repo.
+    assert corpus.files == 0 and corpus.rows == 0 and corpus.items == []
+    # The exclusion record is intact: the manifest can never say "excluded
+    # nothing" about a layout nobody recognised.
+    assert [e["key"] for e in corpus.selection["excluded"]] == ["rows.jsonl"]
+    assert corpus.selection["selected"] == []
+    # ... and it is a refusal with a remedy that names both layouts.
+    blocked = refusals({"iltur": corpus})
+    assert len(blocked) == 1
+    assert "no_screened_split" in blocked[0]
+    assert "['test', 'expert']" in blocked[0], "the layout it expected"
+    assert "jsonl" in blocked[0] and "rows" in blocked[0], "the layout it saw"
+    assert "NOT read-everything-instead" in blocked[0]
+
+
+def test_a_set_with_no_split_filter_reads_everything_and_that_is_not_a_fallback(
+    store, tmp_path
+):
+    """aibe's single split is named `train` and IS the eval set, so it carries
+    no filter at all and reading everything is its normal path. The refusal
+    above must not reach it."""
+    spec = replace(EVAL_SETS["aibe"], parts=())
+    assert not spec.include_splits and not spec.exclude_splits
+    eval_snapshot(store, tmp_path, "aibe", [{"question": prose(915, 40)}], name="rows.jsonl")
+    corpus = eval_corpus(store, spec)
+    assert corpus.status == EVAL_OK
+    assert corpus.selection["no_screened_split"] is False
+    assert corpus.selection["selected"] == ["rows.jsonl"]
+
+
+def test_more_rows_than_the_eval_surface_holds_is_printed_as_a_surplus(
+    tmp_path, monkeypatch, capsys
+):
+    """`surplus` had no firing case at all - and the set it was described as
+    guarding (IL-TUR, via the fallback) structurally could not fire it, because
+    IL-TUR has no verified row count. It fires where the counts ARE verified: a
+    shard counted twice, or a config that is not in `parts`."""
+    small = replace(EVAL_SETS["bbl"], parts=(EvalPart("english", "test", 3),))
+    monkeypatch.setitem(EVAL_SETS, "bbl", small)
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "s.jsonl", [row(prose(916, 60))])
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf",
+                       {"bbl": [{"question": prose(917 + i, 40)} for i in range(9)]})
+    store.close()
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+    assert manifest["eval_sets"]["bbl"]["row_surplus"] == 6
+    assert manifest["eval_sets"]["bbl"]["row_shortfall"] == 0
+    assert "9 rows against 3 expected - 6 MORE than the eval surface" in out
 
 
 def test_an_unverified_part_turns_the_expectation_off_rather_than_guessing():
@@ -1743,11 +1829,15 @@ def test_the_split_filter_prefers_the_named_split_but_never_empties_the_set(stor
     assert corpus.files == 1 and len(corpus.items) == 1
     assert corpus.items[0].text.startswith("test only")
 
-    # A layout that does not name the split at all keeps EVERYTHING, which
-    # over-screens (safe) rather than screening nothing (not safe).
+    # A layout that names no screened split at all is a REFUSAL rather than a
+    # read-everything: see EVAL_NO_SPLIT for why over-screening stopped being
+    # the safe reading once the eval surface became a subset of a 488,000-row
+    # repo. Nothing is read and the training split is not adopted.
     other = open_store(tmp_path / "other", n_seeds=0, db_path=tmp_path / "other.sqlite3")
     eval_snapshot(other, tmp_path / "o", "bbl", [{"question": prose(3, 30)}], name="rows.jsonl")
-    assert eval_corpus(other, spec).files == 1
+    unnamed = eval_corpus(other, spec)
+    assert unnamed.status == EVAL_NO_SPLIT
+    assert unnamed.files == 0 and unnamed.items == []
     other.close()
 
 
