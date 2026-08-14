@@ -26,8 +26,12 @@ test_running_dedupe_first_loses_the_clean_twin_as_well.
 
 THE STACK
 ---------
-1. EXACT - sha256 of the normalised (prompt, answer) pair. First occurrence in
-   input order wins.
+1. EXACT - sha256 of the (prompt, answer) pair AS WRITTEN, with a NUL between
+   the two halves so that a row whose prompt ends where another's answer
+   begins is not the same key. NOTHING IS NORMALISED here (it used to say
+   "normalised", which is a stronger claim than item_key makes): this rule is
+   byte identity, and rules 2-3 are what catch everything softer. First
+   occurrence in input order wins.
 2. NEAR-PROMPT - Jaccard >= 0.85 over 5-grams of the prompt, WITHIN ONE
    QUESTION FORM (see the deviation below).
 3. NEAR-ROW - Jaccard >= 0.90 over 5-grams of prompt+answer, across forms.
@@ -51,8 +55,8 @@ test_the_prefix_index_finds_every_pair_brute_force_finds.)
 That is a strict improvement on LSH for this corpus rather than a
 substitution of convenience: LSH's error direction is missed pairs, exactness
 costs nothing at 18k rows (measured: see the benchmark in the task report),
-and it removes a dependency that is not installed and could not have been
-exercised. datasketch is NOT imported by this module.
+and it removes a dependency nothing here imports - datasketch has been taken
+out of the [build] extra to match.
 
 WHERE THIS DEPARTS FROM THE PLAN'S THRESHOLDS, and the measurement for it
 --------------------------------------------------------------------------
@@ -90,12 +94,16 @@ how much of the corpus the cap could not reach.
 
 DETERMINISM
 -----------
-Two runs over the same input produce byte-identical output. Everything that
-decides a survivor is either input order or a content hash; nothing iterates
-a set or a dict of hashes to make a decision, and the gram hashes themselves
-are crc32-based rather than `hash()` (see decontaminate.gram_hashes). Pinned
-by running the whole pass twice under different PYTHONHASHSEEDs and comparing
-bytes, not by reading the code for sorted().
+Two runs over the same input produce byte-identical output WITH THE SEMANTIC
+LAYER OFF, and that qualification is not a formality: everything the EXACT
+stack decides is input order or a content hash, nothing iterates a set or a
+dict of hashes to make a decision, and the gram hashes are crc32-based rather
+than `hash()` (see decontaminate.gram_hashes) - but semhash searches an
+approximate-nearest-neighbour index whose determinism this project has not
+measured. The determinism test runs the whole pass twice under different
+PYTHONHASHSEEDs and compares bytes, with the layer off and with a fake; the
+REAL semhash path is a first-run item. If it turns out to be unstable, the
+manifest's `semantic` field is what says which runs it touched.
 
 Build:  python -m tuned.data.dedupe --config configs/data_law_v1.yaml
         [--in PATH] [--out PATH] [--no-cap]

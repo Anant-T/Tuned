@@ -419,7 +419,9 @@ def test_the_gram_index_finds_every_pair_brute_force_finds():
 
 
 # --------------------------------------------------------------------------
-# Level 1: text containment, both sides of the threshold.
+# The text levels: containment at the full window and at the narrow one,
+# both sides of the threshold. (The module numbers four levels and these
+# comments used to number themselves separately, which drifted apart.)
 # --------------------------------------------------------------------------
 
 def _row_sharing(question_words, share: int, filler: int = 60):
@@ -524,19 +526,23 @@ def test_the_narrow_level_carries_a_case_neither_of_the_others_can():
 
 
 def test_the_narrow_band_tolerates_exactly_one_edit_and_no_more():
-    """Its control, and a limitation worth stating rather than discovering.
+    """Its control, and the limitation stated at the strength it actually has.
 
-    The window is chosen so that G = L - w + 1 lands on 2w, which is what
-    makes one central edit score exactly CONTAINMENT. The arithmetic of that
-    is a CLIFF, not a slope: two edits destroy 2w >= G grams and containment
-    goes to ZERO, with no band in between. So below 38 tokens the rule buys
-    one substituted token and nothing else - measured here, because a fixture
-    that assumed a gentle slope would have been asserting a property this
-    design does not have.
+    The window is chosen so that G = L - w + 1 lands on 2w, which is what makes
+    one EVENLY SPREAD edit score exactly CONTAINMENT and two of them score
+    zero. That is the worst case, and this docstring used to generalise it into
+    a cliff - "two edits destroy 2w >= G grams and containment goes to ZERO,
+    with no band in between". Swept over every placement instead, the module is
+    MORE sensitive than that: 63 of the 190 two-edit placements at L = 20 still
+    drop, and 140 of the 1,140 three-edit ones. The survivors are edits near an
+    END of the item, where a token is covered by fewer windows.
 
-    Above 38 tokens the window stops shrinking and the slope returns: a
-    100-token item still scores 0.85 after one edit and 0.26 after five.
+    Above 38 tokens the window stops shrinking and the slope is gentle
+    everywhere: a 100-token item still scores 0.85 after one edit and 0.26
+    after five.
     """
+    import itertools
+
     words = prose(401, 20).split()
     question = " ".join(words)
     window = window_for(20)
@@ -545,7 +551,26 @@ def test_the_narrow_band_tolerates_exactly_one_edit_and_no_more():
                     gram_hashes(tokens(" ".join(_edited(words, k))), window))
         for k in (1, 2, 3)
     ]
-    assert scores == [CONTAINMENT, 0.0, 0.0]
+    assert scores == [CONTAINMENT, 0.0, 0.0], "evenly spread: the worst case"
+
+    # ... and the whole placement sweep, which is what the prose now claims.
+    item_grams = gram_hashes(tokens(question), window)
+
+    def edited_at(positions):
+        out = list(words)
+        for p in positions:
+            out[p] = f"xreplacedx{p}"
+        return containment(item_grams, gram_hashes(tokens(" ".join(out)), window))
+
+    swept = {
+        k: [edited_at(c) for c in itertools.combinations(range(20), k)] for k in (1, 2, 3)
+    }
+    dropped = {k: sum(1 for s in v if s >= CONTAINMENT) for k, v in swept.items()}
+    assert dropped == {1: 20, 2: 63, 3: 140}
+    assert (round(min(swept[2]), 3), round(max(swept[2]), 3)) == (0.0, 0.857)
+    # The survivors are the ones near an end: two edits at the item's head
+    # destroy far fewer grams than two in the middle.
+    assert edited_at((0, 1)) > CONTAINMENT > edited_at((9, 10))
 
     leaked = prose(404, 300) + " " + " ".join(_edited(words, 2)) + " " + prose(405, 300)
     kept, drops, _ = decontaminate_items(items(row(leaked)), index_of(question))
@@ -559,6 +584,66 @@ def test_the_narrow_band_tolerates_exactly_one_edit_and_no_more():
         for k in (1, 5)
     ]
     assert slope == [0.85, 0.26], "above the cap the rule degrades gradually again"
+
+
+def test_the_cost_table_in_the_docstring_is_what_the_rule_actually_charges():
+    """The weakest evidence the rule accepts, at each length, measured on both
+    windows - because the docstring's table is what a reader deciding whether
+    to move the divisor works from, and it was quoting a closed form that is
+    wrong by up to a token in both directions."""
+    def shortest_run(length, window):
+        item = tokens(prose(430, length))[:length]
+        return next(
+            (r for r in range(1, length + 1)
+             if containment(gram_hashes(item, window), gram_hashes(item[:r], window))
+             >= CONTAINMENT),
+            None,
+        )
+
+    lengths = (13, 16, 20, 25, 30, 38, 50)
+    assert [shortest_run(L, NGRAM) for L in lengths] == [13, 14, 16, 19, 21, 25, 31]
+    assert [shortest_run(L, window_for(L)) for L in lengths] == [8, 10, 13, 16, 20, 25, 31]
+    # The band edges, and the sharpest discontinuity in the design: 12 -> 13,
+    # where an item stops being matched WHOLE and starts needing 62% of itself.
+    assert shortest_run(12, window_for(12)) == 12
+    assert shortest_run(13, window_for(13)) == 8
+    assert all(shortest_run(L, window_for(L)) >= 11 for L in range(17, 25))
+
+
+def test_the_narrow_bands_false_positive_class_is_question_boilerplate():
+    """Named from measurement, because the docstring named statutory quotation
+    and that is not what collides down here. An MCQ stem is mostly stem: two of
+    these three drop against rows that merely share ordinary legal phrasing,
+    where the fixed 13-gram window scores them 0.000."""
+    stems = [
+        "under which section of the indian penal code is criminal breach of trust punishable",
+        "which of the following is not an essential ingredient of the offence of theft",
+        "what is the limitation period prescribed for filing an appeal against a decree",
+    ]
+    rows = [
+        "the question before this court is under which section of the indian penal code "
+        "criminal breach of trust by a public servant is punishable and what the sentence is",
+        "counsel argued which of the following is not an essential ingredient of the offence "
+        "and the court held that dishonest intention is",
+        "the limitation period prescribed for filing an appeal against a decree of the civil "
+        "court is thirty days from the date of the decree",
+    ]
+    narrow_drops, fixed_drops = 0, 0
+    for stem in stems:
+        item = tokens(stem)
+        assert NGRAM <= len(item) <= 16, "the band this class lives in"
+        for text in rows:
+            row_toks = tokens(text)
+            window = window_for(len(item))
+            narrow_drops += (
+                containment(gram_hashes(item, window), gram_hashes(row_toks, window))
+                >= CONTAINMENT
+            )
+            fixed_drops += (
+                containment(gram_hashes(item, NGRAM), gram_hashes(row_toks, NGRAM))
+                >= CONTAINMENT
+            )
+    assert narrow_drops == 2 and fixed_drops == 0
 
 
 def test_capping_the_window_at_the_constant_is_what_keeps_long_items_screenable():
@@ -651,7 +736,7 @@ def test_a_statute_quotation_both_sides_quote_is_not_contamination():
 
 
 # --------------------------------------------------------------------------
-# Level 2: the short-item rule, and the case only it can carry.
+# The short-item rule, and the case only it can carry.
 # --------------------------------------------------------------------------
 
 def test_a_short_eval_question_is_invisible_to_the_ngram_level_and_the_short_rule_carries_it():
@@ -799,7 +884,7 @@ def test_an_eval_item_under_the_floor_is_counted_not_silently_ignored():
 
 
 # --------------------------------------------------------------------------
-# Level 3: case identifiers - the level no n-gram method can replace.
+# The case-identifier level - the one no n-gram method can replace.
 # --------------------------------------------------------------------------
 
 def test_same_judgment_different_question_is_caught_only_by_the_case_identifier_level():
@@ -1488,9 +1573,11 @@ def test_an_answer_key_too_short_to_screen_does_not_become_an_item(store, tmp_pa
 def test_read_rows_dispatches_on_the_suffix(tmp_path):
     """The snapshot layouts this has to survive. jsonl/json/csv/tsv are read
     in pure Python and exercised here; .parquet - what HF snapshots usually
-    ship - is behind a lazy pyarrow import that has never executed in this
-    worktree, and a reader that raises is caught as EVAL_UNREADABLE (a
-    refusal), never as an empty set."""
+    ship - is behind a lazy pyarrow import which DOES now execute where the
+    [build] extra is installed (round-tripped in the parquet test below), and
+    where it is not, the ImportError is EVAL_NO_READER: its own rung, whose
+    remedy is `pip install -e .[build]` rather than EVAL_UNREADABLE's "the file
+    is corrupt, re-download it". Either way a refusal, never an empty set."""
     from tuned.data.decontaminate import _READABLE_SUFFIXES, read_rows
 
     (tmp_path / "a.jsonl").write_text('{"question": "one"}\n\n{"question": "two"}\n',

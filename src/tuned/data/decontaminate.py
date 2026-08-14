@@ -79,37 +79,66 @@ which puts C after one edit at or above 0.5 at EVERY length from 13 up, and
 leaves items of 38 tokens and more exactly where they were.
 
 WHAT IT COSTS, because it is a real cost and run one has to read it. The
-weakest evidence the rule will accept is one contiguous run of (L + n - 1)/2
-tokens shared with the row. At a fixed 13 that run is (L + 12)/2; length-aware
-it is (2L - 1)/3, i.e. two thirds of the item at every length:
+weakest evidence the rule will accept is one contiguous run of ceil((L + w -
+1)/2) tokens shared with the row, where w is the window at that length. All
+measured, not derived from the approximation:
 
     item tokens      13    16    20    25    30    38+
-    run needed @13   12.5  14.5  16.0  18.5  21.0  unchanged
-    run needed now    8.3  10.3  13.0  16.0  19.0  unchanged
+    run needed @13   13    14    16    19    21    unchanged
+    run needed now    8    10    13    16    20    unchanged
 
-So the exposure widens by at most ~4.5 tokens, and only for items under 38.
-The new false-positive class is a SHORT eval question two thirds of which is a
-statutory phrase a training row also quotes. That is the same trade the
-statute exception is calibrated on, one length band down, and it is why the
-narrow level is counted separately: if `narrow` drops dominate run one, the
-calibrated relaxation is to raise the divisor (3 -> 2.5 costs the one-edit
-guarantee below ~20 tokens and buys two tokens of evidence back). Do not
-change it before reading that count.
+So the exposure widens by at most 5 tokens, and only for items under 38. (The
+closed form (2L - 1)/3 quoted here before is the approximation you get by
+substituting w = (L + 1)/3 and it is wrong by up to a token in both
+directions - at L = 25 it says 16.3 where the rule actually needs 16, and at
+L = 30 it says 19.7 where the rule needs 20.)
+
+THE FALSE-POSITIVE CLASS THIS BUYS, named from measurement rather than from
+first principles: it is QUESTION BOILERPLATE AT 13-16 TOKENS, not statutory
+quotation. Three realistic MCQ stems - "under which section of the indian
+penal code is criminal breach of trust punishable" (14 tokens), "what is the
+limitation period prescribed for filing an appeal against a decree" (13) -
+score C = 0.800 against unrelated rows that merely share ordinary legal
+phrasing, where at a fixed 13 they score 0.000. The stem, not the subject
+matter, is what collides.
+
+That is why the narrow level is counted separately: if `narrow` drops dominate
+run one, the calibrated relaxation is to raise the divisor (3 -> 2.5 costs the
+one-edit guarantee below ~20 tokens and buys two tokens of evidence back). Do
+not change it before reading that count.
+
+The band edges, because a reader deciding whether to move the divisor needs
+them: at L = 13 the bar is 8 contiguous tokens, from L = 17 it is 11 or more,
+and the sharpest discontinuity in the whole design is at 12/13 - where an item
+goes from needing 100% of itself (the `short` rule matches whole) to needing
+62% - and not at the 37/38 window cap.
 
 WHAT IS STILL NOT DELIVERED, stated rather than implied:
 
-* Below 38 tokens the tolerance is EXACTLY ONE substituted token and it is a
-  CLIFF, not a slope. The window is chosen so an item's gram count lands on
-  2*window, which is what makes one central edit score exactly 0.5 - and two
-  edits then destroy 2*window >= all of them, so containment goes straight to
-  ZERO with no band in between. Above 38 the window stops shrinking and the
-  slope returns (a 100-token item scores 0.85 after one edit and 0.26 after
+* Below 38 tokens the guarantee is ONE substituted token ANYWHERE, and after
+  that placement decides. It is not the cliff this docstring used to claim.
+  Measured over every placement at L = 20 (window 7, 14 grams):
+
+      1 edit    20 of 20 placements drop      C 0.500 - 0.929
+      2 edits   63 of 190 placements drop     C 0.000 - 0.857
+      3 edits  140 of 1,140 placements drop   C 0.000 - 0.786
+
+  The survivors are the edits within ~5 tokens of an END of the item, where a
+  token is covered by fewer windows and so destroys fewer grams: two edits at
+  positions 0 and 1 leave C = 0.857, two in the middle leave 0.429. So the
+  module is MORE sensitive than it was documented to be, in the direction that
+  matters. Above 38 the window stops shrinking and the slope is gentle
+  everywhere (a 100-token item scores 0.85 after one edit and 0.26 after
   five). Measured in
   test_the_narrow_band_tolerates_exactly_one_edit_and_no_more.
 * A 5% word-level paraphrase measures C ~ 0.33 at 400 tokens and above, ~0.26
   at 100 and ~0.07 at 40 - i.e. it is never caught by any exact rule at this
   threshold, and SHORTER items are worse, not better. That is what the
-  semantic layer is for, and the semantic layer is optional and unverified.
+  semantic layer is for. It is OPTIONAL, and what it delivers is now measured
+  rather than assumed: at the shipped threshold it catches a verbatim or
+  lightly reworded question inside a row of any length, and it does NOT catch
+  a heavy paraphrase without also collapsing questions about the same section.
+  See SEMANTIC_THRESHOLD for the table.
 
 WHERE THIS DEPARTS FROM THE PLAN, and the measurement that forced it
 --------------------------------------------------------------------
@@ -771,9 +800,11 @@ EVAL_UNMATCHABLE = "unmatchable"
 # single shard, or a repo id that resolved to something else.
 EVAL_TOO_FEW = "too_few_rows"
 
-# The floor is a HUNDREDTH of the documented count, not a half, and the reason
-# is that the documented count comes from the same unverified source as the
-# repo ids. A floor that refuses a CORRECT download would push the operator
+# The floor is a HUNDREDTH of the expected count, not a half. The counts are
+# verified now (EVAL_COUNTS_VERIFIED_AT), but a shard that has not finished
+# downloading is a legitimate mid-pull state and the FILE LAYOUT that decides
+# which of them are read is not verified at all - so a floor that refuses a
+# CORRECT download would push the operator
 # straight to `--allow-missing-eval bbl`, which is the exact outcome this
 # module exists to prevent - so the refusal is sized to catch a set that is
 # obviously not the set, and the SHORTFALL against expect_rows is printed and
@@ -854,8 +885,10 @@ def read_rows(path: Path) -> Iterator[dict]:
 
     jsonl/json/csv/tsv are read here in pure Python so the load path is
     exercised offline. Parquet - what HF snapshots usually ship - is behind a
-    lazy pyarrow import and HAS NEVER EXECUTED in this worktree (pyarrow is in
-    the [build] extra and is not installed); see the module residuals.
+    lazy pyarrow import, and it HAS executed: the test round-trips a real
+    pyarrow file where the [build] extra is present and keeps the ImportError
+    path (EVAL_NO_READER, a refusal with `pip install -e .[build]` as the
+    remedy) where it is not.
     """
     suffix = path.suffix.lower()
     if suffix in (".jsonl", ".ndjson"):

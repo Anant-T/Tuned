@@ -148,6 +148,10 @@ class HfSource:
         return self.repo_id
 
 
+# When every repo id in the registry below was last resolved against the Hub.
+# An edit to one of them is a decision, not a typo-fix.
+HF_IDS_VERIFIED_AT = "2026-08-14"
+
 # Snapshotted because the corpus phase reads them more than once and they
 # are small. The bulk replay sources (WildChat-4.8M, OpenThoughts-114k,
 # smoltalk2, Nemotron-v2) are deliberately NOT here: replay.py streams them
@@ -173,25 +177,30 @@ HF_SOURCES = {
     # screen; BBL is the forgetting guard the charter's headline number comes
     # from, which is exactly why a leak of it into training is unrecoverable.
     #
-    # ALL THREE REPO IDS WERE CHECKED AGAINST THE HUB ON 2026-08-14 and all
-    # three resolve. `opennyaiorg/aibe` was a 404 - the real id is
-    # `opennyaiorg/aibe_dataset` - which is what a wrong id looks like: it
-    # fails here, loudly, and then fails decontaminate.py as `not_acquired`,
-    # which is a refusal. It cannot fail quietly. All three report
-    # gated="auto", so the first pull needs HF_TOKEN and an accepted licence.
+    # ALL THREE REPO IDS WERE CHECKED AGAINST THE HUB (HF_IDS_VERIFIED_AT) and
+    # all three resolve. `opennyaiorg/aibe` was a 404 at that check - the real
+    # id is `opennyaiorg/aibe_dataset` - which is what a wrong id looks like:
+    # it fails here, loudly, and then fails decontaminate.py as
+    # `not_acquired`, which is a refusal. It cannot fail quietly.
+    #
+    # All three report gated="auto" on the Hub, so the first pull needs
+    # HF_TOKEN and an accepted licence: `gated=True`, exactly as injudgements
+    # carries for the identical situation. This field is what the operator
+    # queue is read off, so `False` beside a comment saying "auto" left the
+    # three sets that BLOCK decontamination out of the list of grants to make.
     "bbl": HfSource(
-        key="bbl", repo_id="bharatgenai/BhashaBench-Legal", license="CC-BY-4.0", gated=False
+        key="bbl", repo_id="bharatgenai/BhashaBench-Legal", license="CC-BY-4.0", gated=True
     ),
     "iltur": HfSource(
         key="iltur", repo_id="Exploration-Lab/IL-TUR",
-        license="non-commercial (EVAL/DECONTAMINATION ONLY)", gated=False,
+        license="non-commercial (EVAL/DECONTAMINATION ONLY)", gated=True,
     ),
     # One file, `data/train-00000-of-00001-*.parquet`: there is NO test split
     # here, which is why the split preference must fall back to the whole set
     # rather than empty it (see decontaminate.eval_corpus).
     "aibe": HfSource(
         key="aibe", repo_id="opennyaiorg/aibe_dataset",
-        license="no-derivatives (EVAL/DECONTAMINATION ONLY)", gated=False,
+        license="no-derivatives (EVAL/DECONTAMINATION ONLY)", gated=True,
     ),
 }
 
@@ -716,9 +725,9 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
     token = os.environ.get("HF_TOKEN")
     # Counted separately, because the exit code has to tell them apart. A
     # gated source is the EXPECTED first-run state and its remedy is a click
-    # on a dataset page; a FAILED one may be a wrong repo id - and the three
-    # eval repo ids have never been checked against the Hub, so that is the
-    # live first-run failure. `code = 2` used to be an assignment rather than
+    # on a dataset page; a FAILED one is a wrong repo id, a hub 5xx or a
+    # missing client library, and its remedy is none of those things.
+    # `code = 2` used to be an assignment rather
     # a max, and gating sorted after the failures either way, so three FAILED
     # lines scrolled above a six-line access-grant block and left an exit code
     # identical to ordinary gating.
@@ -802,13 +811,20 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
             for line in failed:
                 print(f"  {line}")
             print(
-                "  a repo id that does not resolve fails exactly like this. The three eval "
-                "repo ids have never been checked against the Hub."
+                "  a repo id that does not resolve fails exactly like this. All six were "
+                f"checked against the Hub on {HF_IDS_VERIFIED_AT} and all six resolved, so a "
+                "failure here is the network, the hub, or an edit to the registry."
             )
         if gated:
             print(f"GATED ({len(gated)}): {', '.join(gated)} - accept the terms on each "
                   f"dataset page and re-run with HF_TOKEN set")
-        if not failed and not gated:
+        if args.dry_run:
+            # NOTHING WAS ACQUIRED. "no failures" over a run that fetched
+            # nothing reads exactly like a clean real run, on the command whose
+            # whole point is that it did not touch anything.
+            print("DRY RUN: nothing was downloaded, indexed or checked - no run can pass "
+                  "or fail here, and the index above is whatever a previous run left")
+        elif not failed and not gated:
             print("no failures")
     finally:
         store.close()

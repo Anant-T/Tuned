@@ -26,7 +26,8 @@ build = [
     "datasets",
     "pyarrow",
     "boto3",
-    "datasketch",
+    # NO datasketch: dedupe.py's candidate generator is an exact prefix-filter
+    # index, not MinHashLSH, and nothing in the tree imports it.
     "semhash",
     "pymupdf4llm",
     "huggingface_hub",

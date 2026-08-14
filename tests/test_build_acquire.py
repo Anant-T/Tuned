@@ -17,6 +17,7 @@ from pipeline_fakes import temp_config
 
 from tuned.data.acquire import (
     DEV_YEARS,
+    HF_IDS_VERIFIED_AT,
     HF_SOURCES,
     PART_SUFFIX,
     SC_BUCKET,
@@ -746,8 +747,12 @@ def test_re_indexing_a_snapshot_adds_nothing_but_a_changed_file_is_re_read(store
 
 
 def test_the_gated_sources_are_the_ones_the_operator_queue_names():
+    """All four gated repos, not just the one. The three eval sets report
+    gated="auto" on the Hub - the same situation injudgements is in - and
+    carried `gated=False` beside a comment saying so, which left the three sets
+    that BLOCK decontamination out of the list of access grants to make."""
     gated = {key for key, src in HF_SOURCES.items() if src.gated}
-    assert "injudgements" in gated
+    assert gated == {"injudgements", "bbl", "iltur", "aibe"}
     assert HF_SOURCES["injudgements"].repo_id == "opennyaiorg/InJudgements_dataset"
 
 
@@ -826,6 +831,24 @@ def test_cli_acquires_pdfs_into_the_build_corpus(tmp_path, capsys):
         assert opened.artifact_count(SC_SOURCE_ID) == 2
 
 
+def test_a_dry_run_does_not_report_itself_as_a_clean_run(tmp_path, capsys):
+    """`--dry-run` acquired NOTHING and printed "no failures" and exited 0 -
+    byte-identical to a real run in which everything landed, on the one command
+    whose whole point is that it did not touch anything."""
+    config = temp_config(tmp_path)
+
+    def snapshot(**kwargs):
+        raise AssertionError("a dry run must not call the snapshot seam")
+
+    code = main(["--config", config, "--kind", "hf", "--dry-run"], snapshot_fn=snapshot)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "no failures" not in out
+    assert "DRY RUN: nothing was downloaded, indexed or checked" in out
+    for source in HF_SOURCES.values():
+        assert f"would snapshot {source.repo_id}" in out
+
+
 def test_cli_reports_a_gated_dataset_and_exits_nonzero(tmp_path, capsys):
     def snapshot(**kwargs):
         raise GatedRepoError("403")
@@ -840,9 +863,8 @@ def test_cli_reports_a_gated_dataset_and_exits_nonzero(tmp_path, capsys):
 
 
 def test_a_run_that_lost_sources_is_not_reported_as_ordinary_first_run_gating(tmp_path, capsys):
-    """A wrong repo id fails exactly like a hub 5xx, and the three eval repo
-    ids have never been checked against the Hub - so this is a live first-run
-    failure. It used to be indistinguishable from the BENIGN case: `code = 2`
+    """A wrong repo id fails exactly like a hub 5xx. It used to be
+    indistinguishable from the BENIGN case: `code = 2`
     was an assignment rather than a max, gating sorted after the failures, and
     the summary line mentioned no failures at all. Three FAILED lines scrolled
     above a six-line access-grant block under an exit code that means 'go and
@@ -859,7 +881,11 @@ def test_a_run_that_lost_sources_is_not_reported_as_ordinary_first_run_gating(tm
     assert code == 1, "a lost source outranks a gate: the remedies are different"
     assert f"FAILED ({len(HF_SOURCES) - 1})" in out
     assert "GATED (1): injudgements" in out
-    assert "never been checked against the Hub" in out
+    # And it no longer tells the operator the eval ids are unchecked: they
+    # were checked, by the same commit that added that line, and pointing at
+    # the one thing that had been verified is worse than saying nothing.
+    assert "never been checked against the Hub" not in out
+    assert f"checked against the Hub on {HF_IDS_VERIFIED_AT} and all six resolved" in out
     # The summary is BELOW the access-grant block, which is what stops it
     # scrolling away.
     assert out.index(f"FAILED ({len(HF_SOURCES) - 1})") > out.index("Agree and access repository")
