@@ -3221,6 +3221,64 @@ def test_the_devanagari_control_half_fails_against_the_shipped_model(monkeypatch
     assert not english.matches(CLEAN_ROWS[0])
 
 
+def test_the_control_cosines_are_what_this_module_says_they_are(monkeypatch):
+    """The four numbers dominant_script's comment is argued from, re-run
+    against the real model. They are cosines between constants THIS MODULE
+    defines, so a reader can check the argument rather than take it - and the
+    version this replaced quoted numbers measured on fixtures that were never
+    committed, two of which did not reproduce.
+
+    The finding is the GAP, not the levels: in Latin the rewording sits 0.87
+    above the unrelated text, in Devanagari 0.03. A model that cannot put those
+    two on opposite sides of any threshold has no operating point in that
+    script, which is the whole reason the gate is per script."""
+    real_semhash(monkeypatch)
+    import numpy as np
+    from model2vec import StaticModel
+
+    model = StaticModel.from_pretrained("minishlab/potion-base-8M")
+
+    def cos(a, b):
+        va, vb = model.encode([a, b])
+        return float(va @ vb / (np.linalg.norm(va) * np.linalg.norm(vb)))
+
+    latin, devanagari = SEMANTIC_CONTROLS
+    assert cos(devanagari.item, devanagari.paraphrase) == pytest.approx(0.990, abs=0.01)
+    assert cos(devanagari.item, devanagari.negative) == pytest.approx(0.962, abs=0.01)
+    assert cos(latin.item, latin.paraphrase) == pytest.approx(0.955, abs=0.01)
+    assert cos(latin.item, latin.negative) == pytest.approx(0.089, abs=0.01)
+
+    latin_gap = cos(latin.item, latin.paraphrase) - cos(latin.item, latin.negative)
+    dev_gap = cos(devanagari.item, devanagari.paraphrase) - cos(
+        devanagari.item, devanagari.negative
+    )
+    assert latin_gap == pytest.approx(0.866, abs=0.02)
+    assert dev_gap == pytest.approx(0.028, abs=0.02)
+    assert dev_gap < 0.1 < latin_gap, (
+        "the Devanagari half has separated; re-derive the per-script gate from "
+        "measurement before turning Hindi screening on"
+    )
+    # Cross-script similarity is near zero, which is what makes routing a
+    # mixed probe to ONE index safe in the only direction that matters.
+    assert abs(cos(devanagari.item, latin.item)) < 0.1
+
+
+def test_the_same_stem_siblings_are_rows_the_exact_stack_keeps(monkeypatch):
+    """The price the threshold buys is only a price if the exact stack would
+    have kept these rows. It would: their containment against the eval item is
+    far under CONTAINMENT. The docstring said 0.000, which is not what they
+    measure - they are ordinary near-misses, not disjoint text."""
+    scores = []
+    for question, sibling in zip(EVAL_QUESTIONS, SAME_STEM_SIBLINGS, strict=True):
+        window = window_for(len(tokens(question)))
+        scores.append(containment(
+            gram_hashes(tokens(question), window),
+            gram_hashes(tokens(leak_row(sibling, worst=False)), window),
+        ))
+    assert all(score < CONTAINMENT for score in scores)
+    assert 0.05 < min(scores) and max(scores) < 0.4, [round(s, 4) for s in scores]
+
+
 def test_the_latin_control_has_a_ceiling_against_the_shipped_model(monkeypatch):
     """Round 1 rejected a control for passing at 0.95. This one is measured
     both ways: it passes at the shipped point and FAILS above it, so a

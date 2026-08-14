@@ -141,9 +141,11 @@ WHAT IS STILL NOT DELIVERED, stated rather than implied:
   See SEMANTIC_THRESHOLD for the table.
 * THE SEMANTIC LAYER IS LATIN-SCRIPT ONLY on the shipped embedding model, and
   the manifest says so per script rather than implying otherwise.
-  `potion-base-8M` scores two unrelated Hindi sentences at 0.956 and an
-  English legal question against an English recipe at -0.046, so its Hindi
-  half is not weak, it is inverted - an index holding one Hindi eval question
+  `potion-base-8M` cannot separate a rewording from an unrelated sentence in
+  Devanagari at all: measured on this module's own control constants, the
+  Hindi item scores 0.990 against its own rewording and 0.962 against a
+  cricket report - a gap of 0.028 - where the English pair is 0.955 against
+  0.089, a gap of 0.866. Its Hindi half is not weak, it is inverted
   drops 4 of 4 clean Hindi rows at every threshold from 0.6 to 0.95. 7,318 of
   BhashaBench-Legal's 24,365 questions are Hindi, and every one of them is
   screened by the exact stack alone. See dominant_script.
@@ -1623,8 +1625,10 @@ SEMANTIC_RAN = "ran"
 # and the same-stem siblings span 0.714-0.847, so the two distributions
 # OVERLAP on [0.819, 0.847]: any threshold in that band both misses a leak and
 # drops a sibling. 0.8 sits below the overlap and therefore buys every leak at
-# a MEASURED, NAMED price - 2 of 5 same-stem siblings, exact containment 0.000
-# on both, rows the exact stack rightly keeps. That price is the right one
+# a MEASURED, NAMED price - 2 of 5 same-stem siblings. Their exact containment
+# against the eval item is 0.06-0.38 across the five, well under the 0.5 the
+# exact stack requires, so these are rows it rightly keeps. That price is the
+# right one
 # under this module's asymmetry (a false negative is invisible, permanent and
 # flatters the headline number; a false positive costs one row of ~18,000),
 # and the per-Hit provenance recorded below is what makes the real rate
@@ -1756,18 +1760,26 @@ def worst_alignment_offset(target_words: int, row_words: int, *,
 # The embedding model is potion-base-8M, and it has no discriminative power
 # outside Latin script. Measured cache-only against the installed library:
 #
-#     cos(Hindi legal question, Hindi CRICKET report)  = 0.956
-#     cos(Hindi legal question, Hindi RECIPE)          = 0.928
-#     cos(English legal question, English recipe)      = -0.046
+#     cos(Hindi item, its own REWORDING)      = 0.990   <- must be far apart
+#     cos(Hindi item, an unrelated CRICKET report) = 0.962   <- and they are not
+#     cos(English item, its own REWORDING)    = 0.955
+#     cos(English item, an unrelated SOURDOUGH recipe) = 0.089
+#
+# 0.028 of separation in Devanagari against 0.866 in Latin, on the four
+# strings this module defines as its own control. Every one of those numbers
+# is re-run by test_the_control_cosines_are_what_this_module_says_they_are.
 #
 # End to end that is not a degradation, it is an inversion: an index holding
-# ONE Hindi eval question drops 4 of 4 clean Hindi rows at EVERY threshold from
-# 0.6 to 0.95, where the same shape in English drops 0 of 4 at all of them. A
+# ONE Hindi eval question drops 4 of 4 clean Hindi rows at EVERY threshold
+# from 0.6 to 0.95, where the same shape in English drops 0 of 4 at all of
+# them. A
 # 300-word English row carrying as few as TEN quoted Devanagari words - a
 # quoted FIR, a line of statute, ordinary in this corpus - drops at 0.8 against
 # an index that holds Hindi, and is kept against one that does not. And a
-# Telugu row embeds to the ZERO VECTOR (every character is [UNK]), so a Telugu
-# index flags a verbatim leak and an unrelated row identically.
+# Telugu row with no ASCII in it at all embeds to the ZERO VECTOR (every
+# character is [UNK]; one that happens to carry a section number does not, and
+# is then driven entirely by the digits), so a Telugu index flags a verbatim
+# leak and an unrelated row identically.
 #
 # 7,318 of BhashaBench-Legal's 24,365 questions are Hindi, so the index WILL
 # hold Devanagari on the first real run.
@@ -1833,7 +1845,8 @@ def dominant_script(text: str) -> str:
 
     That is the safe direction and it is a deliberate choice rather than an
     accident: an index of another script scores near zero against this text
-    (measured, cos(Hindi legal, English legal) = 0.050), so a mis-routed probe
+    (measured on this module's own control items, cos(Devanagari, Latin) =
+    0.032), so a mis-routed probe
     yields a false negative for the minority script and never a false positive
     - and the minority script here is one the exact stack still carries
     verbatim. The alternative, routing a probe to every script it touches, is
@@ -1892,7 +1905,8 @@ _SEMANTIC_CONTROL_PARAPHRASE_DEVANAGARI = (
     "आजीवन कारावास से दंडनीय है"
 )
 # A cricket report. The Devanagari counterpart of the sourdough loaf, and the
-# half this model cannot tell from a judgment: cos = 0.956.
+# half this model cannot tell from a judgment: it scores 0.962 against the item,
+# where that item's own rewording scores 0.990.
 _SEMANTIC_CONTROL_NEGATIVE_DEVANAGARI = (
     "कल के मुकाबले में भारतीय टीम ने शानदार बल्लेबाजी करते हुए तीन विकेट से जीत हासिल की और "
     "कप्तान ने नाबाद शतक लगाकर दर्शकों का दिल जीत लिया"
