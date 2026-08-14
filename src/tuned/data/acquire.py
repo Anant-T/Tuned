@@ -709,7 +709,16 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
     corpus = paths.corpus_dir
     store = Store.open(paths.state_db)
     token = os.environ.get("HF_TOKEN")
-    code = 0
+    # Counted separately, because the exit code has to tell them apart. A
+    # gated source is the EXPECTED first-run state and its remedy is a click
+    # on a dataset page; a FAILED one may be a wrong repo id - and the three
+    # eval repo ids have never been checked against the Hub, so that is the
+    # live first-run failure. `code = 2` used to be an assignment rather than
+    # a max, and gating sorted after the failures either way, so three FAILED
+    # lines scrolled above a six-line access-grant block and left an exit code
+    # identical to ordinary gating.
+    failed: list[str] = []
+    gated: list[str] = []
     try:
         # min/max, not first/last: --years takes a comma list, and printing
         # "2020-2011" for "2020,2010-2011" would misdescribe the run.
@@ -737,7 +746,7 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
                         # and must not wait on an access grant.
                         print(f"hf:{key:<23}GATED - not acquired")
                         print(str(exc))
-                        code = 2
+                        gated.append(key)
                         continue
                     except Exception as exc:
                         # Nor is a hub 5xx, a DNS blip or a missing client
@@ -756,7 +765,7 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
                                 "error": f"{type(exc).__name__}: {exc}",
                             },
                         )
-                        code = max(code, 1)
+                        failed.append(f"{key} ({source.repo_id}): {type(exc).__name__}")
                         continue
                     print(
                         f"hf:{key:<23}indexed {stats['indexed']:>7}  "
@@ -778,11 +787,29 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
             )
             _print_object_stats(f"{kind}:{args.language}", stats, verify=args.verify)
             if stats["failed"]:
-                code = max(code, 1)
+                failed.append(f"{kind}:{args.language} ({stats['failed']} objects)")
         print(f"artifacts indexed -> {store.artifact_count()} ({paths.state_db})")
+        # The summary is the last thing on screen for a reason: a gated
+        # source's remedy is six lines long, so anything printed before it
+        # scrolls away.
+        if failed:
+            print(f"FAILED ({len(failed)}) - not acquired, and NOT a gating problem:")
+            for line in failed:
+                print(f"  {line}")
+            print(
+                "  a repo id that does not resolve fails exactly like this. The three eval "
+                "repo ids have never been checked against the Hub."
+            )
+        if gated:
+            print(f"GATED ({len(gated)}): {', '.join(gated)} - accept the terms on each "
+                  f"dataset page and re-run with HF_TOKEN set")
+        if not failed and not gated:
+            print("no failures")
     finally:
         store.close()
-    return code
+    # A real failure outranks gating: exiting 2 for a run that also lost
+    # sources would send the operator to a dataset page over a wrong repo id.
+    return 1 if failed else (2 if gated else 0)
 
 
 if __name__ == "__main__":

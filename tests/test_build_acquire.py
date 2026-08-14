@@ -597,6 +597,41 @@ def test_entries_for_drops_objects_that_are_not_this_kinds_payload(kind, payload
 # HuggingFace snapshots.
 # --------------------------------------------------------------------------
 
+def test_the_snapshot_registry_is_exactly_these_six_repos():
+    """The literal pin that was lost when a count became len(HF_SOURCES).
+
+    That change was right for what it was doing - the left side there is DB
+    event rows from the production loop - but it stopped pinning the registry
+    itself: dropping a source, or a typo in one of the three eval repo ids,
+    passed the whole suite. decontaminate.py REFUSES to run without the eval
+    sets and prints the repo id as the thing to fix, so a silent edit to one
+    of them is exactly the wrong gap to leave open.
+    """
+    assert {key: source.repo_id for key, source in HF_SOURCES.items()} == {
+        "predex": "L-NLProc/PredEx_Instruction-Tuning_Pred-Exp",
+        "tathyanyaya": "L-NLProc/TathyaNyaya-and-FactLegalLlama-NyayaFacts-Datasets",
+        "injudgements": "opennyaiorg/InJudgements_dataset",
+        "bbl": "bharatgenai/BhashaBench-Legal",
+        "iltur": "Exploration-Lab/IL-TUR",
+        "aibe": "opennyaiorg/aibe",
+    }
+    # Every key is its own entry's key, so a copy-paste in the registry cannot
+    # leave two entries pointing at one source.
+    assert all(key == source.key for key, source in HF_SOURCES.items())
+    assert len({s.source_id for s in HF_SOURCES.values()}) == len(HF_SOURCES)
+
+
+def test_every_eval_set_decontamination_refuses_without_is_a_registered_snapshot():
+    """The join between the two registries: decontaminate.py names the set,
+    acquire.py owns where it comes from, and the refusal it prints is an
+    `acquire --hf-source KEY` command that has to exist."""
+    from tuned.data.decontaminate import EVAL_SETS
+
+    assert set(EVAL_SETS) <= set(HF_SOURCES)
+    assert {EVAL_SETS[key].repo_id for key in EVAL_SETS} == {
+        "bharatgenai/BhashaBench-Legal", "Exploration-Lab/IL-TUR", "opennyaiorg/aibe",
+    }
+
 FAKE_SOURCE = HfSource(
     key="fake",
     repo_id="somebody/a-gated-corpus",
@@ -796,6 +831,63 @@ def test_cli_reports_a_gated_dataset_and_exits_nonzero(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 2
     assert HF_SOURCES["injudgements"].url in out
+
+
+def test_a_run_that_lost_sources_is_not_reported_as_ordinary_first_run_gating(tmp_path, capsys):
+    """A wrong repo id fails exactly like a hub 5xx, and the three eval repo
+    ids have never been checked against the Hub - so this is a live first-run
+    failure. It used to be indistinguishable from the BENIGN case: `code = 2`
+    was an assignment rather than a max, gating sorted after the failures, and
+    the summary line mentioned no failures at all. Three FAILED lines scrolled
+    above a six-line access-grant block under an exit code that means 'go and
+    accept some terms'."""
+    config = temp_config(tmp_path)
+
+    def snapshot(*, repo_id, **kwargs):
+        if repo_id == HF_SOURCES["injudgements"].repo_id:
+            raise GatedRepoError("403")
+        raise ConnectionError("Repository Not Found for url")
+
+    code = main(["--config", config, "--kind", "hf"], snapshot_fn=snapshot)
+    out = capsys.readouterr().out
+    assert code == 1, "a lost source outranks a gate: the remedies are different"
+    assert f"FAILED ({len(HF_SOURCES) - 1})" in out
+    assert "GATED (1): injudgements" in out
+    assert "never been checked against the Hub" in out
+    # The summary is BELOW the access-grant block, which is what stops it
+    # scrolling away.
+    assert out.index(f"FAILED ({len(HF_SOURCES) - 1})") > out.index("Agree and access repository")
+    # Every lost source is named, not just counted.
+    for key in set(HF_SOURCES) - {"injudgements"}:
+        assert HF_SOURCES[key].repo_id in out
+
+
+def test_a_run_with_nothing_but_a_gate_still_exits_two(tmp_path, capsys):
+    """The other side: gating alone keeps its own exit code and says so."""
+    config = temp_config(tmp_path)
+
+    def snapshot(*, repo_id, local_dir, **kwargs):
+        if repo_id == HF_SOURCES["injudgements"].repo_id:
+            raise GatedRepoError("403")
+        return _write_snapshot(local_dir, {"data/train-0.parquet": b"rows"})
+
+    code = main(["--config", config, "--kind", "hf"], snapshot_fn=snapshot)
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "GATED (1): injudgements" in out
+    assert "FAILED" not in out
+
+
+def test_a_clean_run_says_there_were_no_failures(tmp_path, capsys):
+    """The summary reads on a clean run too: an operator who has learned to
+    look for it must not have to infer its absence."""
+    def snapshot(*, local_dir, **kwargs):
+        return _write_snapshot(local_dir, {"data/train-0.parquet": b"rows"})
+
+    code = main(["--config", temp_config(tmp_path), "--kind", "hf"], snapshot_fn=snapshot)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "no failures" in out
 
 
 def _corpus_paths(config):
