@@ -35,10 +35,14 @@ from tuned.data.decontaminate import (
     SCRIPT_DEVANAGARI,
     SCRIPT_LATIN,
     SCRIPT_NONE,
+    SCRIPT_PARTITION_FLOOR,
+    SCRIPT_UNLISTED,
     SEMANTIC_CONTROL_ROW_WORDS,
     SEMANTIC_CONTROLS,
     SEMANTIC_COVERED_SPAN,
     SEMANTIC_NO_ITEMS,
+    SEMANTIC_NO_SCREENABLE_ITEMS,
+    SEMANTIC_RAN,
     SEMANTIC_NO_MODEL,
     SEMANTIC_PROBE_STRIDE,
     SEMANTIC_PROBE_WORDS,
@@ -68,6 +72,8 @@ from tuned.data.decontaminate import (
     manifest_of,
     probe_texts,
     probe_windows,
+    script_of,
+    script_partition,
     refusals,
     row_form,
     selected_records,
@@ -2767,7 +2773,7 @@ TELUGU_UNRELATED = (
 
 
 def test_the_dominant_script_of_a_text_is_what_routes_it():
-    """Coarse on purpose - one block per probe, no per-word analysis - but
+    """Coarse on purpose - one block per word, no morphological analysis - but
     every branch of the routing rests on it."""
     assert dominant_script("the appellant was convicted") == SCRIPT_LATIN
     assert dominant_script(HINDI_QUESTION) == SCRIPT_DEVANAGARI
@@ -2779,11 +2785,36 @@ def test_the_dominant_script_of_a_text_is_what_routes_it():
     # nothing - a probe of nothing but those is screened by nobody.
     assert dominant_script("302 -- 1973 (2)") == SCRIPT_NONE
     assert dominant_script("") == SCRIPT_NONE
-    # Ties are deterministic (alphabetical), because a routing that depended on
-    # dict order would move the dataset between runs.
-    assert dominant_script("abcd भारती") == dominant_script("भारती abcd") == SCRIPT_DEVANAGARI
-    # Devanagari Extended is Devanagari, not "other".
-    assert dominant_script("꣠꣡꣢") == SCRIPT_DEVANAGARI
+    # A GENUINE TIE, five letters against five. The fixture this replaced was
+    # "abcd भारती" - 4 Latin letters against 3 Devanagari letters and 2 matras -
+    # so Devanagari won on plurality in both orders and the tie-break it claimed
+    # to pin was never exercised. Ties are alphabetical because a routing that
+    # depended on dict order would move the dataset between runs.
+    assert len("abcde") == len("कखगघङ") == 5
+    assert dominant_script("abcde कखगघङ") == dominant_script("कखगघङ abcde") == SCRIPT_DEVANAGARI
+    # ... and one letter either way decides it, in both directions - which is
+    # what says this is plurality and not a hard-coded preference.
+    assert dominant_script("abcdef कखगघङ") == SCRIPT_LATIN
+    assert dominant_script("abcde कखगघङच") == SCRIPT_DEVANAGARI
+    # EVIDENCE IS LETTERS. A matra is not a letter, so it neither counts for
+    # Devanagari nor against Latin - which is what makes "abcd भारती" 4 against
+    # 3 rather than 4 against 5.
+    assert dominant_script("abcd भारती") == SCRIPT_LATIN
+    assert dominant_script("ािी") == SCRIPT_NONE
+    # Devanagari Extended is Devanagari, not "other" - asserted on the LETTERS
+    # in that block (U+A8F2-A8F7), because most of A8E0-A8FF is combining marks.
+    assert dominant_script("ꣲꣳꣴ") == SCRIPT_DEVANAGARI
+    # Two scheduled Indian scripts that used to read as letterless, i.e. as
+    # "there was nothing here to screen".
+    assert dominant_script("ꯃꯤꯇꯩ ꯃꯌꯦꯛ") == "meitei_mayek"
+    assert dominant_script("ᱚᱞ ᱪᱤᱠᱤ") == "ol_chiki"
+    # A letter in a block this module does not name is a HOLE, not a nothing.
+    assert dominant_script("ႠႡႢ") == SCRIPT_UNLISTED
+    assert script_of("Ⴀ") == SCRIPT_UNLISTED and script_of("7") is None
+    # The Latin block RANGE, both ends. Lower-casing the start un-Latins A-Z,
+    # and an all-caps heading is ordinary here.
+    assert dominant_script("IN THE SUPREME COURT OF INDIA") == SCRIPT_LATIN
+    assert script_of("A") == script_of("z") == script_of("ÿ") == SCRIPT_LATIN
 
 
 def test_an_index_that_holds_hindi_cannot_drop_an_unrelated_hindi_row(monkeypatch):
@@ -2806,6 +2837,10 @@ def test_an_index_that_holds_hindi_cannot_drop_an_unrelated_hindi_row(monkeypatc
     report = seam.script_report()
     assert report[SCRIPT_DEVANAGARI] == {
         "screened": False, "eval_items": 1, "unscreened_probes": 2, "unscreened_rows": 2,
+        # BOTH rows are entirely in this script, so both were carried by the
+        # exact stack alone - which is a different fact from a row that merely
+        # QUOTES some Devanagari, and the banner says which.
+        "wholly_unscreened_rows": 2,
     }
     assert report[SCRIPT_LATIN]["screened"] is True
 
@@ -2833,16 +2868,47 @@ def test_an_english_row_quoting_a_few_devanagari_words_is_not_dropped_by_them(mo
     words = prose(881, 300).split()
     row_text = " ".join([*words[:100], quote, *words[100:]])
     assert seam.match(row_text) is None
-    # A ten-word quote does not even dominate the window it sits in, so it
-    # never reaches a Hindi index and there is nothing to record: the row is
-    # screened normally, in English, exactly as an all-English row is.
-    assert seam.script_report()[SCRIPT_DEVANAGARI]["unscreened_probes"] == 0
+    # The English of this row is screened in English and the Hindi quote is
+    # RECORDED as unread, per script and per row. The version this replaced
+    # asserted `unscreened_probes == 0` here - the quote rode along inside a
+    # Latin-routed probe, diluting it, and the instrument said the screen had
+    # no hole in it while the hole was doing the damage.
+    report = seam.script_report()
+    assert report[SCRIPT_DEVANAGARI]["unscreened_probes"] > 0
+    assert report[SCRIPT_DEVANAGARI]["unscreened_rows"] == 1
 
     # A row that IS mostly Hindi is a different fact and is recorded as one -
     # the windows it cannot screen are counted rather than silently skipped.
     assert seam.match(" ".join([HINDI_UNRELATED] * 4)) is None
-    assert seam.script_report()[SCRIPT_DEVANAGARI]["unscreened_probes"] >= 2
-    assert seam.script_report()[SCRIPT_DEVANAGARI]["unscreened_rows"] == 1
+    report = seam.script_report()
+    assert report[SCRIPT_DEVANAGARI]["unscreened_probes"] >= 2
+    assert report[SCRIPT_DEVANAGARI]["unscreened_rows"] == 2
+
+
+def test_a_row_screened_in_one_script_is_not_counted_as_screened_by_nothing(monkeypatch):
+    """The banner's two row counts. `unscreened_rows` is every row carrying a
+    word this layer could not read; `wholly_unscreened_rows` is the rows where
+    that was ALL of it. Printing the first as the second overstates the hole -
+    an English row quoting ten Devanagari words was screened, with a hole in it,
+    not "compared by the exact stack ONLY"."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    seam = SemanticFilter(
+        [EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset()),
+         EvalItem("bbl", "bbl#en", prose(884, 40), frozenset())],
+        screened=[SCRIPT_LATIN],
+    )
+    quote = " ".join(HINDI_UNRELATED.split()[:10])
+    words = prose(881, 300).split()
+    assert seam.match(" ".join([*words[:100], quote, *words[100:]])) is None
+    report = seam.script_report()
+    assert report[SCRIPT_DEVANAGARI]["unscreened_rows"] == 1
+    assert report[SCRIPT_DEVANAGARI]["wholly_unscreened_rows"] == 0
+
+    # ... and a row with nothing but Devanagari in it IS one of those rows.
+    assert seam.match(" ".join([HINDI_UNRELATED] * 4)) is None
+    report = seam.script_report()
+    assert report[SCRIPT_DEVANAGARI]["unscreened_rows"] == 2
+    assert report[SCRIPT_DEVANAGARI]["wholly_unscreened_rows"] == 1
 
 
 def test_a_script_whose_control_fails_is_recorded_as_an_unscreened_hole(
@@ -2876,7 +2942,114 @@ def test_a_script_whose_control_fails_is_recorded_as_an_unscreened_hole(
     # Nothing Hindi was dropped by a layer that cannot read Hindi.
     assert manifest["counts"]["dropped"] == 0
     assert "SEMANTIC SCREENING IS OFF FOR DEVANAGARI" in out
-    assert "1 eval items and 1 candidate rows" in out
+    assert "1 eval items and 1 candidate rows carried text this layer could not read" in out
+    # The row counts are printed as the two different facts they are: this run's
+    # one Hindi row was carried by the exact stack alone, and the banner says so
+    # rather than saying it of every row that merely quotes some Devanagari.
+    assert "(1 of those rows were compared by the exact stack ONLY" in out
+
+
+def test_a_letterless_window_and_an_unlisted_script_are_different_holes(
+    tmp_path, monkeypatch, capsys
+):
+    """The `none` bucket was the `other:` bucket the block table exists to
+    prevent. It held two facts: a window with no letters in it - a table of
+    section numbers, benign, there is no question in it to miss - and a window
+    in a script this module does not list, which is a leak it cannot see. Meitei
+    Mayek and Ol Chiki are both scheduled Indian scripts and both used to read
+    as the first when they are the second."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    numbers = " ".join(f"{n} ({n % 7}) [{n}]" for n in range(302, 372))
+    meitei = " ".join(["ꯃꯤꯇꯩ ꯃꯌꯦꯛ ꯑꯦ ꯂꯣꯟ ꯀꯨꯝꯖ"] * 12)
+    write_jsonl(paths.streams_dir / "s.jsonl", [row(numbers), row(meitei), row(prose(885, 60))])
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf")
+    store.close()
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    out = capsys.readouterr().out
+    scripts = json.loads(
+        (paths.out_dir / "decontamination.json").read_text(encoding="utf-8")
+    )["semantic_scripts"]
+
+    # The letterless row is not a hole and is not reported as one.
+    assert SCRIPT_NONE not in scripts
+    assert "SEMANTIC SCREENING IS OFF FOR NONE" not in out
+    # The Meitei row is, by name.
+    assert scripts["meitei_mayek"]["screened"] is False
+    assert scripts["meitei_mayek"]["eval_items"] == 0
+    assert scripts["meitei_mayek"]["unscreened_rows"] == 1
+    assert scripts["meitei_mayek"]["wholly_unscreened_rows"] == 1
+    assert scripts["meitei_mayek"]["control"] == "no control half for this script"
+    assert "SEMANTIC SCREENING IS OFF FOR MEITEI_MAYEK" in out
+    # And a script in no listed block at all is named `unlisted` rather than
+    # silently joining the benign bucket.
+    assert script_of("Ⴀ") == SCRIPT_UNLISTED
+    assert dominant_script(numbers) == SCRIPT_NONE
+
+
+def test_a_run_with_no_eval_item_in_a_screenable_script_did_not_run(tmp_path, monkeypatch, capsys):
+    """The missing rung. A Hindi-only partial pull of BhashaBench is 7,318
+    items - it clears every floor above this line - and against this model it
+    builds NO index at all. `ran` has to mean "this layer could have found a
+    reworded eval question", and a layer with no index could not have."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "s.jsonl", [row(HINDI_UNRELATED), row(prose(886, 60))])
+    store = Store.open(paths.state_db)
+    # EVERY eval item is Hindi, filler included - a partial pull of BBL's
+    # hindi config and nothing else. The usual filler is English prose, which
+    # would leave a Latin index behind and hide the rung being tested.
+    hindi_words = HINDI_QUESTION.split() + HINDI_UNRELATED.split()
+    for key, spec in EVAL_SETS.items():
+        floor = math.ceil((spec.expect_rows or 0) * EVAL_MIN_SHARE)
+        eval_snapshot(store, tmp_path / "hf", key, [
+            {"question": " ".join(hindi_words[i % 7:] + hindi_words[: i % 7])}
+            for i in range(max(1, floor))
+        ])
+    store.close()
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+
+    assert manifest["semantic"] == SEMANTIC_NO_SCREENABLE_ITEMS
+    assert "no index was built" in manifest["semantic_detail"]
+    assert "semantic layer did NOT run" in out
+    # The per-script record survives the rung, because it is the only thing
+    # that says WHY - the eval-item counts are what an operator acts on.
+    assert manifest["semantic_scripts"][SCRIPT_DEVANAGARI]["eval_items"] >= 1
+    assert manifest["semantic_scripts"][SCRIPT_LATIN]["screened"] is False
+    assert manifest["semantic_scripts"][SCRIPT_LATIN]["control"] == "passed"
+    # ... and --require-semantic refuses it, which `ran` would not have.
+    assert decon_main(["--config", cfg, "--no-generated", "--require-semantic"]) == 2
+
+
+def test_screened_means_the_control_passed_and_an_index_holds_items():
+    """ONE definition, and it used to be two. The manifest wrote
+    `screened: true` for a script whose control passed over ZERO eval items - a
+    screen that cannot find anything, recorded as one that can."""
+    _, _, stats = decontaminate_items(items(row(prose(887, 40))), EvalIndex([]))
+    empty = manifest_of(
+        stats, {}, EvalIndex([]), inputs=[], semantic=SEMANTIC_RAN,
+        semantic_layer=None, semantic_controls={SCRIPT_LATIN: "", SCRIPT_DEVANAGARI: "no power"},
+    )["semantic_scripts"]
+    # A control that passed over nothing is not a screen.
+    assert empty[SCRIPT_LATIN] == {
+        "control": "passed", "control_passed": True, "screened": False, "index": False,
+        "eval_items": 0, "unscreened_probes": 0, "unscreened_rows": 0,
+        "wholly_unscreened_rows": 0,
+    }
+    # A failing control is never `screened`, and the three reasons the block
+    # used to be written as `{}` are now three different readings.
+    assert empty[SCRIPT_DEVANAGARI]["screened"] is False
+    assert empty[SCRIPT_DEVANAGARI]["control"] == "no power"
+    assert set(empty) == {SCRIPT_LATIN, SCRIPT_DEVANAGARI}
+    assert manifest_of(
+        stats, {}, EvalIndex([]), inputs=[], semantic=SEMANTIC_UNAVAILABLE,
+        semantic_layer=None, semantic_controls=None,
+    )["semantic_scripts"] == {}
 
 
 def test_a_semantic_layer_with_no_working_script_at_all_is_control_failed(
@@ -2999,7 +3172,6 @@ def test_the_provenance_breaks_a_score_TIE_by_the_item_and_not_by_index_order():
     assert duplicate_provenance(
         _filtered(("p", [("zzz item", 0.9), ("aaa item", 0.87)]))
     )[0] == "zzz item"
-
 
 
 # --------------------------------------------------------------------------
@@ -3414,6 +3586,241 @@ def test_the_latin_control_has_a_ceiling_against_the_shipped_model(monkeypatch):
     for too_high in (0.9, 0.95):
         why = decon.semantic_controls(threshold=too_high)[SCRIPT_LATIN]
         assert "REWORDED copy" in why, f"the control has no ceiling at {too_high}"
+
+
+def _hindi_row(target: str, *, at: int = 100, words: int = 300) -> str:
+    """`target` quoted whole inside a Devanagari-dominant row - a Hindi
+    judgment carrying an English question, which is what an ordinary
+    code-switched row in this corpus looks like. `at` moves the quote so the
+    window that holds it holds a different number of Devanagari words with it,
+    which is the axis the dilution runs along."""
+    pool = list(HINDI_UNRELATED.split()) * 60
+    body = target.split()
+    return " ".join([*pool[:at], *body, *pool[at:words - len(body)]])
+
+
+def test_the_script_dilution_table_collapses_when_the_probe_is_split(monkeypatch):
+    """THE DILUTION MEASUREMENT, in the repo and re-runnable.
+
+    Cross-script words INSIDE a probe text dilute its embedding whether or not
+    the probe routed to the right index, so a handful of Devanagari words hid an
+    English leak in a Latin-routed window and the instrument recorded
+    `latin: screened, unscreened rows 0` over exactly those rows. Measured
+    against the shipped model on this file's own fixtures:
+
+        a reworded leak alone in a window        0.948
+        ... with two Devanagari words beside it  0.893
+        ... with three                           0.729
+        ... with four                            0.706
+
+    and end to end, an English eval question quoted VERBATIM inside a
+    Devanagari-dominant row scored 0.40-0.59 and was KEPT, five of five.
+
+    Splitting each window into its scripts and probing each index with that
+    script's words alone collapses the table back: the same five verbatim leaks
+    score 1.000 and none survive. If this test ever goes green in the other
+    direction, the split is carrying nothing and should be re-argued."""
+    seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
+    import tuned.data.decontaminate as decon
+
+    for at in (95, 100, 103, 107):
+        rows = [_hindi_row(q, at=at) for q in EVAL_QUESTIONS]
+        assert sum(bool(seam.match(t)) for t in rows) == 5, (
+            f"a verbatim English eval question quoted in Hindi at offset {at} is not caught"
+        )
+        reworded = [_hindi_row(q, at=at) for q in REWORDED_LEAKS]
+        assert sum(bool(seam.match(t)) for t in reworded) == 5
+
+    # THE FAULT, through the code path that had it: route the whole window by
+    # its dominant script and probe with the window's own text.
+    original = decon.script_partition
+    try:
+        decon.script_partition = lambda text, **kw: (
+            {decon.dominant_script(text): text} if decon.dominant_script(text) != SCRIPT_NONE
+            else {}
+        )
+        undiluted = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
+        missed = sum(not undiluted.match(_hindi_row(q)) for q in EVAL_QUESTIONS)
+    finally:
+        decon.script_partition = original
+    assert missed == 5, (
+        "routing the window whole no longer loses these leaks; the dilution the split "
+        "exists for has stopped reproducing and the design should be re-derived"
+    )
+    # ... and the routed-whole layer said nothing was wrong with Latin while it
+    # was losing them, which is the half of the fault that made it silent.
+    assert undiluted.script_report()[SCRIPT_LATIN]["unscreened_rows"] == 0
+
+
+def test_a_code_switched_leak_survives_the_hindi_words_inside_it(monkeypatch):
+    """The adjacency cost, measured. Interleaving Devanagari words INTO a
+    reworded leak takes the plain layer from 0 of 5 missed to 5 of 5 at three
+    words; with the probe split it is 0 of 5 at two and at most 1 of 5 beyond
+    that - and the one is the weakest leak of the five, which clears the shipped
+    threshold by 0.019 undiluted and is a geometry residual rather than a
+    dilution one (interleaving widens the leak's span past the 21 words the
+    window geometry guarantees to hold whole)."""
+    seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
+    import tuned.data.decontaminate as decon
+
+    def switched(text, k):
+        hindi, out, used = HINDI_UNRELATED.split(), [], 0
+        for i, word in enumerate(text.split()):
+            out.append(word)
+            if used < k and i % 5 == 4:
+                out.append(hindi[used])
+                used += 1
+        return " ".join([*out, *hindi[used:k]])
+
+    def missed(k, split):
+        original = decon.script_partition
+        if not split:
+            decon.script_partition = lambda text, **kw: (
+                {decon.dominant_script(text): text}
+                if decon.dominant_script(text) != SCRIPT_NONE else {}
+            )
+        try:
+            at = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
+            return sum(
+                not at.match(leak_row(switched(q, k), worst=True)) for q in REWORDED_LEAKS
+            )
+        finally:
+            decon.script_partition = original
+
+    assert [missed(k, split=False) for k in (0, 1, 2, 3, 4)] == [0, 0, 1, 5, 5]
+    assert [missed(k, split=True) for k in (0, 1, 2, 3, 4)] == [0, 0, 0, 1, 1]
+    assert seam.threshold == SEMANTIC_THRESHOLD
+
+
+def test_the_price_of_splitting_the_probe_is_a_hindi_row_about_the_same_section(monkeypatch):
+    """THE COST, named and asserted rather than described as zero - the same
+    shape as the same-stem sibling price one script over.
+
+    A Hindi row is dropped when its ENGLISH terms of art co-occur inside one
+    window and together carry the eval question's content. That is a row about
+    the same provision, not a leak: its exact containment against the eval item
+    is 0.000 and the exact stack keeps it. It is bought because a false negative
+    here is invisible and permanent while a false positive costs one row of
+    ~18,000 - the asymmetry this whole module is built around.
+
+    The price is BOUNDED BY LOCALITY, which is what the whole-row probe is
+    excluded from the split for: spread the same terms over 12 words of Hindi
+    each and the row is kept."""
+    seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
+    terms = ["section", "indian penal code", "criminal breach of trust",
+             "public servant", "punishable", "imprisonment for life"]
+
+    def hindi_about(terms, gap):
+        pool, at, out = list(HINDI_UNRELATED.split()) * 60, 0, []
+        for term in terms:
+            out.extend(pool[at:at + gap])
+            at += gap
+            out.extend(term.split())
+        while len(out) < 300:
+            out.extend(pool[at:at + gap])
+            at += gap
+        return " ".join(out[:300])
+
+    assert bool(seam.match(hindi_about(terms, 4))) is True
+    assert bool(seam.match(hindi_about(terms, 8))) is True
+    assert bool(seam.match(hindi_about(terms, 12))) is False
+    assert bool(seam.match(hindi_about(terms, 25))) is False
+    # An ordinary Hindi legal row - English terms of art that are not this
+    # question's - is kept at every spacing.
+    ordinary = ["high court", "section 138", "negotiable instruments act", "trial court",
+                "appeal", "acquittal", "complainant", "cheque", "notice of demand"]
+    assert not any(seam.match(hindi_about(ordinary, gap)) for gap in (4, 8, 12))
+    # ... and the exact stack keeps every one of them, so this IS a price.
+    window = window_for(len(tokens(EVAL_QUESTIONS[0])))
+    assert containment(
+        gram_hashes(tokens(EVAL_QUESTIONS[0]), window),
+        gram_hashes(tokens(hindi_about(terms, 4)), window),
+    ) == 0.0
+
+
+def test_the_whole_row_probe_is_not_split_and_the_measurement_says_why(monkeypatch):
+    """The boundary of the split, measured on the side that decides it. This
+    model is order-insensitive, so the Latin RESIDUE of a whole 300-word Hindi
+    row scores the same whether its English terms sit four words apart, twenty
+    five apart, or in the wrong order entirely - 0.979 in all three. That is the
+    whole-row seam's own defect (no operating point at any threshold, round 2)
+    arriving through a side door, and it is why the split is applied to the
+    windows, whose residues still carry locality."""
+    real_semhash(monkeypatch)
+    import tuned.data.decontaminate as decon
+
+    index = decon.semhash_index(list(EVAL_QUESTIONS))
+
+    def residue_score(text):
+        part = decon.script_partition(text)[SCRIPT_LATIN]
+        _, score, _ = duplicate_provenance(
+            index.deduplicate(records=[part], threshold=0.05)
+        )
+        return round(score, 3)
+
+    def hindi_about(terms, gap):
+        pool, at, out = list(HINDI_UNRELATED.split()) * 60, 0, []
+        for term in terms:
+            out.extend(pool[at:at + gap])
+            at += gap
+            out.extend(term.split())
+        while len(out) < 300:
+            out.extend(pool[at:at + gap])
+            at += gap
+        return " ".join(out[:300])
+
+    terms = ["section", "indian penal code", "criminal breach of trust",
+             "public servant", "punishable", "imprisonment for life"]
+    assert residue_score(hindi_about(terms, 4)) == 0.979
+    assert residue_score(hindi_about(terms, 25)) == 0.979
+    assert residue_score(hindi_about(list(reversed(terms)), 4)) == 0.979
+    # The layer does not do this: the whole-row probe keeps its dominant-script
+    # routing, so a Hindi row's whole-row probe goes to the Devanagari index
+    # (where it is recorded unscreened) and never to the Latin one.
+    seam = decon.SemanticFilter(
+        [EvalItem("bbl", f"bbl#{i}", t, frozenset()) for i, t in enumerate(EVAL_QUESTIONS)],
+        screened=[SCRIPT_LATIN],
+    )
+    row = hindi_about(terms, 25)
+    assert row not in seam.route(row).get(SCRIPT_LATIN, [])
+    assert seam.route(row)[SCRIPT_DEVANAGARI][0] == row
+
+
+def test_the_semantic_attribution_is_the_same_on_every_run(monkeypatch):
+    """THE MANIFEST IS A COUNTER, NOT A DIAGNOSTIC ASIDE. `by_eval_set` and the
+    drop log's `item_id` decide what an operator reads on run one, and the
+    argument for shipping 0.8 was that provenance makes the real rate readable
+    then - so two runs of the same input must blame the same eval items.
+
+    The existing determinism test stubs semhash and structurally cannot see
+    this: it compares OUTPUT BYTES, which are the kept rows, and the attribution
+    lives in the drops. This one runs the real approximate index against
+    near-tied eval items - the same question in two eval sets, and a third that
+    restates it - which is the shape where an ANN has a choice to make."""
+    real_semhash(monkeypatch)
+    import tuned.data.decontaminate as decon
+
+    items = []
+    for i, question in enumerate(EVAL_QUESTIONS):
+        items.append(EvalItem("bbl", f"bbl#{i}", question, frozenset()))
+        items.append(EvalItem("aibe", f"aibe#{i}", question, frozenset()))
+        items.append(EvalItem("iltur", f"iltur#{i}", question + " under indian law", frozenset()))
+    rows = [leak_row(q, worst=True) for q in (*EVAL_QUESTIONS, *REWORDED_LEAKS)]
+
+    def attribution():
+        seam = decon.SemanticFilter(items, screened=[SCRIPT_LATIN])
+        return [
+            (hit.eval_set, hit.item_id, hit.detail.get("score"))
+            if (hit := seam.match(text)) else None
+            for text in rows
+        ]
+
+    runs = [attribution() for _ in range(5)]
+    assert all(run == runs[0] for run in runs), runs
+    assert all(hit is not None for hit in runs[0])
+    # Every one of them names an eval item rather than degrading to `*`, which
+    # is what makes by_eval_set readable at all.
+    assert {hit[0] for hit in runs[0]} == {"bbl"}
 
 
 def test_a_verbatim_leak_in_a_single_probe_row_does_not_crash_the_run(monkeypatch):

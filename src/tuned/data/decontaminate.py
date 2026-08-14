@@ -149,6 +149,13 @@ WHAT IS STILL NOT DELIVERED, stated rather than implied:
   drops 4 of 4 clean Hindi rows at every threshold from 0.6 to 0.95. 7,318 of
   BhashaBench-Legal's 24,365 questions are Hindi, and every one of them is
   screened by the exact stack alone. See dominant_script.
+* A MIXED-SCRIPT ROW IS SPLIT, NOT ROUTED WHOLE, and that is what keeps the
+  sentence above from being a lie by omission. Cross-script words inside a
+  probe text dilute its embedding even when the probe reached the right index,
+  so an English eval question quoted verbatim in a Hindi row was KEPT five
+  times out of five while the manifest recorded no hole in the English screen.
+  Each window is now probed with one script's words at a time and every script
+  it could not read is counted per row. See script_partition.
 
 WHERE THIS DEPARTS FROM THE PLAN, and the measurement that forced it
 --------------------------------------------------------------------
@@ -264,6 +271,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import zlib
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -291,7 +299,8 @@ MANIFEST_FILENAME = "decontamination.json"
 #    sorted-first one; and the tokeniser keeps combining marks inside a word,
 #    which moves Devanagari items between levels. The rules moved AND the
 #    manifest changed shape.
-# 4: the semantic layer is PER SCRIPT - one index per script, screening only
+# 4: the semantic layer is PER SCRIPT - one index per script, every window
+#    SPLIT into the scripts it carries rather than routed whole, screening only
 #    the scripts whose own control half passes, with `semantic_scripts`
 #    recording every script it could not screen and why; every semantic drop
 #    now names the eval set and item it matched and the score, where it used to
@@ -325,7 +334,6 @@ LEVEL_SEMANTIC = "semantic"
 # screen - it only ever adds drops on top of it.
 NGRAM_LEVELS = (LEVEL_CASE_ID, LEVEL_TEXT, LEVEL_NARROW, LEVEL_SHORT)
 LEVELS = NGRAM_LEVELS + (LEVEL_SEMANTIC,)
-
 
 
 # --------------------------------------------------------------------------
@@ -1252,7 +1260,7 @@ def _remedy(key: str, corpus: EvalCorpus) -> str:
         return (
             f"check the layout under {spec.url} against this set's split filter\n"
             f"               (expected a path component from {list(spec.include_splits)};\n"
-            f"                {corpus.detail}.\n"
+            f"                the layout it actually saw is printed above.\n"
             f"                Fix include_splits in EVAL_SETS for the real layout - this is\n"
             f"                NOT read-everything-instead: {spec.key} is ~488,000 rows across\n"
             f"                8 configs and the whole repo is tens of GB of index, so an\n"
@@ -1595,6 +1603,14 @@ SEMANTIC_UNUSABLE = "semhash-control-failed"
 # which was false on exactly the machine this module was written on.
 SEMANTIC_NO_MODEL = "semhash-model-unavailable"
 SEMANTIC_NO_ITEMS = "no-eval-items-to-compare"
+# There were eval items, and not one of them is in a script whose control
+# passed - a Hindi-only partial pull of BBL is 7,318 items and clears every
+# floor above this line. The missing rung: `ran` has to mean "this layer could
+# have found a reworded eval question", and a layer that built no index at all
+# could not have. Distinct from `no-eval-items-to-compare` (nothing downloaded)
+# and from `semhash-control-failed` (the seam has no power anywhere), because
+# the remedy is a different one again: a multilingual embedding model.
+SEMANTIC_NO_SCREENABLE_ITEMS = "no-eval-items-in-a-screenable-script"
 SEMANTIC_RAN = "ran"
 
 # THE OPERATING POINT, chosen by measurement against the installed library
@@ -1792,14 +1808,20 @@ def worst_alignment_offset(target_words: int, row_words: int, *,
 # Devanagari since round 2, still carries those rows, and it is the guarantee
 # that matters. A future multilingual model turns Hindi back on by PASSING THE
 # CONTROL, not by anybody asserting that it should be on.
+#
+# AND THE SECOND HALF OF THE RULE, which the first half is worthless without: a
+# probe is SPLIT into the scripts it carries, never routed whole. Routing whole
+# left the minority script's words INSIDE the majority script's probe text,
+# where they diluted the embedding without ever being screened themselves - so
+# the layer lost English leaks to Hindi neighbours while recording that English
+# was fully screened. See script_partition for the table.
 # --------------------------------------------------------------------------
 
 SCRIPT_LATIN = "latin"
 SCRIPT_DEVANAGARI = "devanagari"
-# Coarse on purpose - one dominant block per probe, no per-word analysis. The
-# blocks are named rather than lumped into "other" so the manifest can say
-# WHICH script went unscreened; an operator reading `other: 4,000 rows` cannot
-# act on it.
+# Coarse on purpose - one block per WORD, no morphological analysis. The blocks
+# are named rather than lumped into "other" so the manifest can say WHICH script
+# went unscreened; an operator reading `other: 4,000 rows` cannot act on it.
 _SCRIPT_BLOCKS = (
     (0x0041, 0x024F, SCRIPT_LATIN),      # Latin, Latin-1 Supplement, Extended-A/B
     (0x0370, 0x03FF, "greek"),
@@ -1818,39 +1840,61 @@ _SCRIPT_BLOCKS = (
     (0x0D00, 0x0D7F, "malayalam"),
     (0x0D80, 0x0DFF, "sinhala"),
     (0x0E00, 0x0E7F, "thai"),
+    # Both scheduled Indian languages, and both used to land in `none` - the
+    # bucket that says "there was nothing here to screen". Meitei (Manipuri) and
+    # Santali are written in these, so a row in either read as letterless.
+    (0x1C50, 0x1C7F, "ol_chiki"),
+    (0xABC0, 0xABFF, "meitei_mayek"),
     (0x4E00, 0x9FFF, "han"),
 )
-# A probe with no letters at all in any known block - digits, punctuation, an
-# emoji. It is not screened by anything and it is not evidence of anything.
+# A probe with no LETTERS at all - a section-number table, a citation list, an
+# emoji. Nothing that short of a letter can carry an eval question, so this is
+# benign rather than a hole, and the banner says so.
 SCRIPT_NONE = "none"
+# Letters in a block this table does not name. NOT the same fact as `none` and
+# that distinction is the whole reason for the table: `none` means "there was
+# nothing here to screen", `unlisted` means "there was something here and this
+# module cannot say what script it is in", which is an unscreened hole.
+SCRIPT_UNLISTED = "unlisted"
 
 
 def script_of(char: str) -> str | None:
-    """The script one character belongs to, or None for digits/punctuation."""
+    """The script one character belongs to, or None if it is not a LETTER.
+
+    EVIDENCE IS LETTERS (Unicode general category L*), and nothing else. The
+    version this replaced counted whatever fell inside a block range, which made
+    the routing asymmetric in two directions at once: ASCII digits and ASCII
+    punctuation (`_ [ ] | ~ °` all sit inside 0x41-0x24F) counted as Latin
+    evidence while their Devanagari counterparts counted as Devanagari, and a
+    Devanagari digit or a bare combining mark counted as script evidence where
+    an ASCII digit counted as none. A section-number table read as a Latin
+    probe; `abcd भारती` read 4-5 for Devanagari because the two matras counted.
+
+    A letter in no listed block is SCRIPT_UNLISTED rather than None: it is
+    something to screen that this module cannot name, which is a hole, where a
+    digit is not.
+    """
+    if not unicodedata.category(char).startswith("L"):
+        return None
     code = ord(char)
     for low, high, name in _SCRIPT_BLOCKS:
         if low <= code <= high:
             return name
-    return None
+    return SCRIPT_UNLISTED
 
 
 def dominant_script(text: str) -> str:
     """The script MOST OF this text is written in.
 
-    PLURALITY, not majority, and ties go to the alphabetically first script -
-    deterministic, cheap, and coarse, which is all the routing needs. A
-    mixed-script probe therefore goes to ONE index, the one for whichever
-    script contributes the most letters, and the minority script in it is not
-    semantically screened at all.
+    PLURALITY of LETTERS, not majority, and ties go to the alphabetically first
+    script - deterministic, cheap, and coarse. This is what routes a WORD into
+    a script partition (see script_partition) and what routes the whole-row
+    probe; the window probes are partitioned per script rather than routed
+    whole, because routing a mixed window whole is what let a handful of
+    Devanagari words hide an English leak inside it.
 
-    That is the safe direction and it is a deliberate choice rather than an
-    accident: an index of another script scores near zero against this text
-    (measured on this module's own control items, cos(Devanagari, Latin) =
-    0.032), so a mis-routed probe
-    yields a false negative for the minority script and never a false positive
-    - and the minority script here is one the exact stack still carries
-    verbatim. The alternative, routing a probe to every script it touches, is
-    what produced the ten-Devanagari-words-drops-an-English-row fault.
+    SCRIPT_NONE for a text with no letters at all - a section-number table, a
+    citation list. That is not a script and it is not a hole.
     """
     counts: dict[str, int] = {}
     for char in text or "":
@@ -1860,6 +1904,64 @@ def dominant_script(text: str) -> str:
     if not counts:
         return SCRIPT_NONE
     return min(sorted(counts), key=lambda name: -counts[name])
+
+
+# The fewest words a script partition must carry before it is embedded at all.
+# DERIVED, not chosen: SHORT_MIN_TOKENS is already the length under which this
+# module refuses to treat an eval item as screenable, so a partition holding
+# fewer tokens than that cannot contain any indexable eval item, in any script.
+# Set it higher and a short eval question stops being findable inside a
+# code-switched row; set it lower and nothing is gained, because there is
+# nothing shorter to find.
+SCRIPT_PARTITION_FLOOR = SHORT_MIN_TOKENS
+
+
+def script_partition(text: str, *, floor: int = SCRIPT_PARTITION_FLOOR) -> dict[str, str]:
+    """{script: the words of `text` written in it, in order, with the digits}.
+
+    WHY THE PROBE IS SPLIT RATHER THAN ROUTED WHOLE. The embedding is over the
+    whole probe text, so cross-script words inside a probe dilute it even when
+    the probe routes to the right index. Measured cache-only against the shipped
+    model, a reworded eval question sitting in a 30-word window scores 0.948
+    against its eval item and 0.893 with two Devanagari words beside it, 0.729
+    with three and 0.706 with four - and an ENGLISH eval question quoted
+    verbatim inside a Hindi-dominant row scored 0.40-0.59 and was KEPT, five
+    times out of five, while the row's Devanagari half was recorded as the only
+    unscreened thing about it. The screen said `latin: screened, unscreened
+    rows 0` over rows whose English leak it had just missed.
+
+    Splitting the probe collapses that: the same five verbatim leaks score
+    1.000 against the Latin index once the Devanagari words are not in the
+    probe text, and the same five reworded leaks that a plain layer misses at
+    three interleaved Hindi words are all caught.
+
+    SCRIPT-NEUTRAL WORDS GO IN EVERY PARTITION. `302`, `1973`, `(2)` are not
+    evidence of any script and they are most of what distinguishes one section
+    from another - dropping them from the Latin partition would throw away the
+    numbers this module's tokeniser was fixed to keep. The consequence is that
+    a MONOLINGUAL text's partition is the text itself, word for word, so the
+    threshold grid and the sibling overlap are unchanged by this split: it only
+    does anything to a probe that was mixed.
+
+    THE FLOOR IS SHORT_MIN_TOKENS, counted in `tokens` over the partition -
+    below it there is no eval item to find. A partition under the floor is
+    dropped and is NOT recorded as a hole, for the same reason the exact stack
+    does not count a 3-token eval item as an item.
+    """
+    words = (text or "").split()
+    scripts: dict[str, int] = {}
+    for word in words:
+        name = dominant_script(word)
+        if name != SCRIPT_NONE:
+            scripts[name] = scripts.get(name, 0) + 1
+    out: dict[str, str] = {}
+    for script in sorted(scripts):
+        part = " ".join(
+            word for word in words if dominant_script(word) in (script, SCRIPT_NONE)
+        )
+        if len(tokens(part)) >= floor:
+            out[script] = part
+    return out
 
 
 # The negative half of the control. Nothing in an Indian-law eval set is
@@ -2165,11 +2267,26 @@ class SemanticFilter:
     (9 against 10 at 100 words, 29/30 at 300, 129/130 at 1,300). The stride is
     the cost lever, and it was not touched.
 
-    THERE IS ONE INDEX PER SCRIPT and a probe only ever meets the index for its
-    own dominant script - see dominant_script for the measurement that forced
-    it. `screened` is the set of scripts whose control half passed; a probe in
-    any other script is counted as UNSCREENED, per script, and reaches the
-    manifest as a named hole rather than as silence.
+    THERE IS ONE INDEX PER SCRIPT, and every probe is SPLIT into the scripts it
+    carries rather than routed whole - see script_partition for the measurement
+    that forced the split and dominant_script for the one that forced the
+    per-script indexes. `screened` is the set of scripts whose control half
+    passed; a partition in any other script is counted as UNSCREENED, per
+    script and per row, and reaches the manifest as a named hole rather than as
+    silence. That count now includes the Devanagari share of an
+    English-dominant row, which the routing-whole version could not see at all.
+
+    THE WHOLE-ROW PROBE IS NOT SPLIT, and that boundary is measured. Its
+    residue would be every English word of a 300-word Hindi judgment strung
+    together, and this embedding model is order-insensitive: a Hindi row merely
+    MENTIONING the six English terms of art of an eval question scored 0.979
+    against it whether they sat four words apart or a hundred and fifty, and
+    whether or not they were in the question's order. That is the whole-row
+    seam's own defect (no operating point at any threshold) arriving through a
+    side door. A WINDOW's residue keeps its locality - the same row's window
+    residues score 0.936 at four words apart, 0.790 at twelve and 0.485 at
+    twenty-five - so the split is applied where locality survives it, and the
+    whole-row probe keeps the dominant-script routing it always had.
 
     This layer only ever ADDS drops; everything the no-false-negative
     guarantee rests on is the pure-Python screen above.
@@ -2178,13 +2295,25 @@ class SemanticFilter:
     def __init__(self, eval_items: Sequence, *, threshold: float = SEMANTIC_THRESHOLD,
                  screened: Iterable[str] | None = None):
         self.threshold = threshold
-        self.items_by_script: dict[str, list[EvalItem]] = {}
+        # BOTH SIDES ARE PARTITIONED THE SAME WAY. An eval item is indexed under
+        # every script it carries a screenable share of, as that script's words
+        # only - so a code-switched eval question is compared against a
+        # code-switched row in one script at a time, rather than each side
+        # diluting the other. A monolingual item indexes as itself.
+        self.items_by_script: dict[str, list[tuple[str, EvalItem]]] = {}
         for entry in eval_items:
             item = (
                 entry if isinstance(entry, EvalItem)
                 else EvalItem("*", "semhash", str(entry), frozenset())
             )
-            self.items_by_script.setdefault(dominant_script(item.text), []).append(item)
+            parts = script_partition(item.text)
+            if not parts:
+                # Under the floor in every script, or letterless. The exact
+                # stack counts these as unmatchable; here they are simply not
+                # indexed, and an item too short to embed is not a hole.
+                continue
+            for script, part in parts.items():
+                self.items_by_script.setdefault(script, []).append((part, item))
         self.screened = (
             frozenset(self.items_by_script) if screened is None else frozenset(screened)
         )
@@ -2194,42 +2323,75 @@ class SemanticFilter:
             if script not in self.screened:
                 continue
             group = self.items_by_script[script]
-            self.indexes[script] = semhash_index([item.text for item in group])
-            for item in group:
-                self.item_by_text.setdefault(item.text, item)
+            self.indexes[script] = semhash_index([part for part, _ in group])
+            for part, item in group:
+                self.item_by_text.setdefault(part, item)
         # Counted, not merely skipped: `probes` is how much of the corpus this
         # layer never looked at, and `rows` is how many rows carried any of it.
         self.unscreened_probes: dict[str, int] = {}
         self.unscreened_rows: dict[str, int] = {}
+        # Rows in which EVERY probe went unscreened, against rows where only
+        # part did. The banner used to call any row with one unscreened window
+        # "compared by the exact stack ONLY", which overstates a row whose other
+        # windows were screened in full.
+        self.wholly_unscreened_rows: dict[str, int] = {}
 
+    def screening_scripts(self) -> frozenset[str]:
+        """The scripts this layer can actually find a leak in.
+
+        Control passed AND an index was built AND that index holds items - one
+        definition of `screened`, read by the manifest, the banner and the
+        ladder in main() alike. The three used to be conflated: the manifest
+        wrote `screened: true` for a script whose control passed over ZERO eval
+        items, which is a screen that cannot find anything, and a run whose eval
+        items were all Devanagari recorded `ran` having built no index at all.
+        """
+        return frozenset(self.indexes)
 
     def script_report(self) -> dict[str, dict]:
         """What this layer screened and what it did not, by script."""
         out: dict[str, dict] = {}
-        for script in sorted(set(self.items_by_script) | set(self.unscreened_probes)):
+        seen = set(self.items_by_script) | set(self.unscreened_probes)
+        for script in sorted(seen):
             out[script] = {
                 "screened": script in self.indexes,
                 "eval_items": len(self.items_by_script.get(script, ())),
                 "unscreened_probes": self.unscreened_probes.get(script, 0),
                 "unscreened_rows": self.unscreened_rows.get(script, 0),
+                "wholly_unscreened_rows": self.wholly_unscreened_rows.get(script, 0),
             }
         return out
+
+    def route(self, text: str) -> dict[str, list[str]]:
+        """{script: the texts of `text` that go to that script's index}.
+
+        The whole row goes to its dominant script whole; every window is split
+        into its scripts. Separated from `match` so the routing can be asserted
+        without a model behind it.
+        """
+        probes = probe_texts(text)
+        if not probes:
+            return {}
+        by_script: dict[str, list[str]] = {dominant_script(probes[0]): [probes[0]]}
+        for probe in probes[1:]:
+            for script, part in script_partition(probe).items():
+                by_script.setdefault(script, []).append(part)
+        return by_script
 
     def match(self, text: str) -> Hit | None:
         """The eval item a window of this text is a semantic duplicate of.
 
-        Probes are grouped by their own script and each group is compared only
-        against that script's index. A group whose script is not screened is
-        counted and skipped - never compared against another script's index,
-        which is what made ten Devanagari words drop a 300-word English row.
+        Each script's share of the row is compared only against that script's
+        index. A share whose script is not screened is counted and skipped -
+        never compared against another script's index, and never left inside
+        another script's probe text, which are the two ways this layer used to
+        lose a leak silently.
         """
-        probes = probe_texts(text)
-        if not probes:
+        by_script = self.route(text)
+        if not by_script:
             return None
-        by_script: dict[str, list[str]] = {}
-        for probe in probes:
-            by_script.setdefault(dominant_script(probe), []).append(probe)
         hit = None
+        screened_here = 0
         for script in sorted(by_script):
             group = by_script[script]
             index = self.indexes.get(script)
@@ -2239,11 +2401,16 @@ class SemanticFilter:
                     # it. Nothing to compare against is not a hole in the
                     # screen, so it is not counted as one.
                     continue
+                if script == SCRIPT_NONE:
+                    # A letterless probe - a table of section numbers. There is
+                    # no eval question in it to miss.
+                    continue
                 self.unscreened_probes[script] = (
                     self.unscreened_probes.get(script, 0) + len(group)
                 )
                 self.unscreened_rows[script] = self.unscreened_rows.get(script, 0) + 1
                 continue
+            screened_here += 1
             if hit is not None:
                 # Already flagged by an earlier script. The remaining queries
                 # cannot change the verdict and this layer's cost is per query.
@@ -2265,6 +2432,12 @@ class SemanticFilter:
                 item.item_id if item else "semhash",
                 detail,
             )
+        if not screened_here:
+            for script in by_script:
+                if script in self.unscreened_rows:
+                    self.wholly_unscreened_rows[script] = (
+                        self.wholly_unscreened_rows.get(script, 0) + 1
+                    )
         return hit
 
     def matches(self, text: str) -> bool:
@@ -2459,17 +2632,45 @@ def semantic_script_record(layer, controls: dict[str, str] | None) -> dict:
     24,365 questions - was screened by the exact stack alone. A dataset card
     that claims a paraphrase screen has to be able to say which scripts it
     covered, and `semantic: ran` alone cannot.
+
+    `screened` MEANS ONE THING HERE: the control passed AND an index was built
+    AND it holds at least one eval item. Two definitions used to be in play and
+    the manifest's was the weaker of them, so a script with zero eval items read
+    `screened: true` - a screen that cannot find anything, recorded as one that
+    can. Without a layer at all (the control itself failed, or semhash is not
+    installed) each script still gets its block, with `index: false`: an empty
+    `semantic_scripts` object was the same shape for "not installed", "no eval
+    items" and "the control failed", which is three facts wearing one silence.
     """
+    report = layer.script_report() if layer is not None else {}
     out: dict[str, dict] = {}
     for script, why in sorted((controls or {}).items()):
-        out[script] = {"control": "passed" if not why else why,
-                       "screened": not why, "eval_items": 0,
-                       "unscreened_probes": 0, "unscreened_rows": 0}
-    for script, entry in (layer.script_report() if layer is not None else {}).items():
+        out[script] = {
+            "control": "passed" if not why else why,
+            "control_passed": not why,
+            "screened": False,
+            "index": False,
+            "eval_items": 0,
+            "unscreened_probes": 0,
+            "unscreened_rows": 0,
+            "wholly_unscreened_rows": 0,
+        }
+    for script, entry in report.items():
         record = out.setdefault(
-            script, {"control": "no control half for this script", "screened": False}
+            script,
+            {"control": "no control half for this script", "control_passed": True,
+             "screened": False, "index": False},
         )
+        index_built = bool(entry["screened"])
         record.update(entry)
+        record["index"] = index_built
+        # ONE definition, and every clause of it is here rather than spread
+        # over three readers. A failing control can never reach an index in
+        # production (main builds the layer from screened_scripts), so the
+        # first clause is a statement this record makes rather than a guess.
+        record["screened"] = bool(
+            record["control_passed"] and index_built and entry["eval_items"]
+        )
     return dict(sorted(out.items()))
 
 
@@ -2711,7 +2912,23 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
                         else f"{type(exc).__name__}: {exc}"
                     )
                 else:
-                    semantic_fn, semantic_status = seam, SEMANTIC_RAN
+                    if seam.screening_scripts():
+                        semantic_fn, semantic_status = seam, SEMANTIC_RAN
+                    else:
+                        # Items, a working control in SOME script, and no index:
+                        # every eval item is in a script this model is blind to.
+                        # The layer is kept for the manifest's per-script record
+                        # and is NOT recorded as having run.
+                        semantic_fn = seam
+                        semantic_status = SEMANTIC_NO_SCREENABLE_ITEMS
+                        semantic_detail = (
+                            f"the control passed for "
+                            f"{', '.join(sorted(screened_scripts(semantic_controls_ran)))} "
+                            f"and every eval item is in another script, so no index was "
+                            f"built and nothing could have been found. See "
+                            f"semantic_scripts for the per-script counts; a multilingual "
+                            f"embedding model is what turns this on."
+                        )
         if args.require_semantic and semantic_status != SEMANTIC_RAN:
             print(
                 f"REFUSING TO DECONTAMINATE: --require-semantic was passed and the semantic "
@@ -2880,10 +3097,20 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
             # A hole with a name and a size. The alternative - and what shipped
             # before this - was a run in which the Hindi third of BBL produced
             # thousands of drops that read exactly like real leaks.
+            #
+            # THE TWO ROW COUNTS ARE DIFFERENT FACTS. A row with one unscreened
+            # Devanagari window and thirty screened English ones was screened,
+            # with a hole in it; a row that is entirely in this script was not
+            # screened at all. Printing the first number as the second is the
+            # overstatement direction, and this instrument's whole job is to
+            # not overstate in either.
+            whole = entry.get("wholly_unscreened_rows", 0)
             print(
                 f"    SEMANTIC SCREENING IS OFF FOR {script.upper()}:"
                 f" {entry['eval_items']} eval items and {entry['unscreened_rows']} candidate"
-                f" rows were compared by the exact stack ONLY."
+                f" rows carried text this layer could not read"
+                f" ({whole} of those rows were compared by the exact stack ONLY;"
+                f" the rest were screened in another script)."
             )
             print(f"      {entry['control']}")
         if semantic_status != SEMANTIC_RAN:
