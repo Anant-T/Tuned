@@ -16,6 +16,8 @@ from test_build_decontaminate import (
 from tuned.data import dedupe as dedupe_module
 from tuned.data.decontaminate import (
     EVAL_SETS,
+    SEMANTIC_NO_MODEL,
+    SEMANTIC_UNAVAILABLE,
     SEMANTIC_UNUSABLE,
     EvalIndex,
     EvalItem,
@@ -37,6 +39,7 @@ from tuned.data.dedupe import (
     REASON_NEAR_ROW,
     REASON_SEMANTIC,
     ROW_JACCARD,
+    SEMANTIC_THRESHOLD,
     PrefixIndex,
     apply_cap,
     candidate_of,
@@ -515,7 +518,91 @@ def test_a_seam_that_ignores_its_input_fails_the_control_in_either_direction(
     assert dedupe_main(["--config", cfg]) == 0
     manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
     assert manifest["semantic"] == SEMANTIC_UNUSABLE
-    assert "the only correct answer is [1]" in manifest["semantic_detail"]
+    assert "exactly one record must go" in manifest["semantic_detail"]
+
+
+def test_a_seam_that_flags_the_wrong_record_fails_the_control(tmp_path, monkeypatch, capsys):
+    """The identity half of the control, which had no case of its own: a seam
+    that keeps BOTH members of the duplicate pair and drops the unrelated
+    record answers the COUNT correctly while being exactly backwards, so
+    `flagged != [1]` collapsed to `len(flagged) != 1` and survived the suite.
+    Decontaminate's two halves each die separately; these now do too."""
+    text = prose(161, 200)
+    cfg, paths = _decontaminated(tmp_path, [row(text, "a"), row(shuffled(text, 162), "b")])
+    capsys.readouterr()
+    install_fake_semhash(monkeypatch, answer="flag-stranger")
+    assert dedupe_main(["--config", cfg]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE
+    assert "rather than record 1" in manifest["semantic_detail"]
+    assert "the count is right and the answer is backwards" in \
+        manifest["semantic_detail"].lower()
+
+
+def test_a_machine_without_semhash_records_that_and_never_reads_as_deduplicated(
+    tmp_path, capsys
+):
+    """`semhash-not-installed` appeared in no test here either, so seeding the
+    status with `ran` survived the suite - and the dedupe manifest is what
+    carries the semantic claim to the dataset card."""
+    text = prose(161, 200)
+    cfg, paths = _decontaminated(tmp_path, [row(text, "a"), row(prose(163, 200), "b")])
+    capsys.readouterr()
+    assert dedupe_main(["--config", cfg]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["semantic"] == SEMANTIC_UNAVAILABLE == "semhash-not-installed"
+    assert manifest["semantic"] != "ran"
+    assert "semantic self-dedupe did NOT run (semhash-not-installed)" in capsys.readouterr().out
+
+
+def test_a_model_that_cannot_be_fetched_is_its_own_status_here_too(
+    tmp_path, monkeypatch, capsys
+):
+    """Same split as decontaminate.py, same reason: 'get network or warm the
+    cache' and 'the API drifted' are different instructions."""
+    text = prose(161, 200)
+    cfg, paths = _decontaminated(tmp_path, [row(text, "a"), row(prose(163, 200), "b")])
+    capsys.readouterr()
+    install_fake_semhash(monkeypatch, answer="no-model")
+    assert dedupe_main(["--config", cfg]) == 0
+    manifest = json.loads((paths.out_dir / "dedupe.json").read_text(encoding="utf-8"))
+    assert manifest["semantic"] == SEMANTIC_NO_MODEL == "semhash-model-unavailable"
+    assert manifest["semantic"] != SEMANTIC_UNUSABLE
+    assert "NOT API drift" in manifest["semantic_detail"]
+    assert manifest["counts"]["kept"] == 2  # the exact stack still ran
+
+
+def test_the_semantic_layer_does_not_delete_the_wave_planners_four_forms(monkeypatch):
+    """The prompt rule's own finding, one measure over and previously missed:
+    a generated row's text is the seed's grounding plus an instruction, so four
+    tasks built on one seed are ~95% the same text. Measured against the
+    INSTALLED library, an unguarded semantic self-dedupe flags 3 of the 4 at
+    every threshold from 0.8 to 0.99 - the instruction cannot move a whole-text
+    embedding far enough to matter. Enabling semhash would therefore have
+    deleted three quarters of every seed's tasks."""
+    install_fake_semhash(monkeypatch)
+    grounding = prose(31, 1200)
+    answer = prose(32, 900)
+    forms = ("irac_analysis", "statute_qa", "drafting", "issue_spotting")
+    # Same answer TOKENS in a different order per form: near-identical as text,
+    # and no two of them share enough 5-grams for rule 3 to fire, so what is
+    # under test here is the semantic layer and nothing else.
+    rows = [row(f"{grounding} task: {form}", shuffled(answer, 40 + i), form=form)
+            for i, form in enumerate(forms)]
+    kept, drops, _ = dedupe_items(items(*rows), semantic=dedupe_module.semantic_self_dedupe)
+    assert len(kept) == 4 and not drops, "the four forms of one seed are four examples"
+
+    # ... and the layer still fires WITHIN a form, on a pair the exact rules
+    # cannot see: word-order shuffles share no 5-gram at all, so rules 2 and 3
+    # both pass them and only the semantic layer is left. The guard narrows
+    # this layer to one form; it does not switch it off.
+    text = prose(33, 300)
+    pair = [row(text, "answer", form="one"), row(shuffled(text, 34), "answer", form="one")]
+    assert jaccard(grams(text), grams(shuffled(text, 34))) < 0.05, "the premise"
+    kept, drops, _ = dedupe_items(items(*pair), semantic=dedupe_module.semantic_self_dedupe)
+    assert len(kept) == 1
+    assert [d["reason"] for d in drops] == [REASON_SEMANTIC]
+    assert drops[0]["form"] == "one"
 
 
 def test_two_candidates_carrying_the_same_text_are_both_reachable(monkeypatch):
@@ -762,6 +849,7 @@ def test_the_cli_writes_rows_drops_and_a_manifest(tmp_path, capsys):
     assert manifest["thresholds"] == {
         "ngram": NGRAM, "prompt_jaccard": PROMPT_JACCARD,
         "row_jaccard": ROW_JACCARD, "cap": CNR_CAP, "case_ids_from_text": True,
+        "semantic": SEMANTIC_THRESHOLD,
     }
     assert manifest["counts"]["total"] == 3
     assert "drop[exact]: 1" in out

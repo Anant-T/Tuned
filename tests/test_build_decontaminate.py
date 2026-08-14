@@ -28,6 +28,12 @@ from tuned.data.decontaminate import (
     LEVEL_SHORT,
     LEVEL_TEXT,
     NGRAM,
+    SEMANTIC_NO_ITEMS,
+    SEMANTIC_NO_MODEL,
+    SEMANTIC_PROBE_STRIDE,
+    SEMANTIC_PROBE_WORDS,
+    SEMANTIC_THRESHOLD,
+    SEMANTIC_UNAVAILABLE,
     SEMANTIC_UNUSABLE,
     SHORT_MIN_TOKENS,
     TITLE_MIN_TOKENS,
@@ -46,6 +52,7 @@ from tuned.data.decontaminate import (
     jaccard,
     level_for,
     manifest_of,
+    probe_texts,
     refusals,
     row_form,
     selected_records,
@@ -176,8 +183,19 @@ def install_fake_semhash(monkeypatch, *, attr="selected", answer="real"):
     `attr` is what the result object names its survivors - the documented name
     is `selected`, and a build that renames it is the drift both seams have to
     fail loudly on rather than default around. `answer` is "real" (decide by
-    similarity), "keep-everything" (nothing is ever a duplicate) or
-    "keep-nothing" (everything is).
+    similarity), "keep-everything" (nothing is ever a duplicate),
+    "keep-nothing" (everything is), "flag-stranger" (self-dedupe keeps a
+    duplicate pair and drops the unrelated record instead - the right COUNT
+    and the wrong record), "exact-only" (a seam with NO semantic power at all:
+    it collapses byte-identical records and nothing else) or "no-model"
+    (construction raises the way an installed-but-air-gapped semhash does).
+
+    `deduplicate` compares the query records against the INDEX ONLY and never
+    against each other. That is not a simplification, it is what the installed
+    library does - verified by passing it two byte-identical query records and
+    getting both back - and it matters here because a row's probe windows
+    overlap: a fake that also deduplicated within the query would flag every
+    long row whatever the eval side held.
     """
     import sys
     import types
@@ -188,30 +206,49 @@ def install_fake_semhash(monkeypatch, *, attr="selected", answer="real"):
 
     class SemHash:
         def __init__(self, records):
+            if answer == "no-model":
+                raise OSError(
+                    "We couldn't connect to 'https://huggingface.co' to load the model"
+                )
             self.records = list(records)
 
         @classmethod
         def from_records(cls, records):
             return cls(records)
 
-        def _kept(self, records, against, threshold):
+        def deduplicate(self, records, threshold=0.9):
+            """Query records that are duplicates OF THE INDEX are removed."""
             if answer == "keep-everything":
-                return list(records)
+                return Result(list(records))
             if answer == "keep-nothing":
-                return []
-            kept = []
-            seen = list(against)
-            for record in records:
+                return Result([])
+            if answer == "exact-only":
+                return Result([r for r in records if r not in self.records])
+            return Result(
+                [r for r in records if not _near(r, self.records, threshold)]
+            )
+
+        def self_deduplicate(self, threshold=0.9):
+            if answer == "keep-everything":
+                return Result(list(self.records))
+            if answer == "keep-nothing":
+                return Result([])
+            if answer == "exact-only":
+                kept = []
+                for record in self.records:
+                    if record not in kept:
+                        kept.append(record)
+                return Result(kept)
+            if answer == "flag-stranger":
+                # The right count and the wrong record: both members of the
+                # duplicate pair survive and the unrelated one is dropped.
+                return Result(list(self.records[:-1]))
+            kept, seen = [], []
+            for record in self.records:
                 if not _near(record, seen, threshold):
                     kept.append(record)
                     seen.append(record)
-            return kept
-
-        def deduplicate(self, records, threshold=0.9):
-            return Result(self._kept(records, self.records, threshold))
-
-        def self_deduplicate(self, threshold=0.9):
-            return Result(self._kept(self.records, [], threshold))
+            return Result(kept)
 
     module = types.ModuleType("semhash")
     module.SemHash = SemHash
@@ -1664,7 +1701,7 @@ def test_a_semantic_seam_that_flags_nothing_is_caught_too(tmp_path, monkeypatch)
     code, manifest, _ = _semantic_run(tmp_path, monkeypatch, answer="keep-everything")
     assert code == 0
     assert manifest["semantic"] == SEMANTIC_UNUSABLE
-    assert "did not flag an eval item against its own index" in manifest["semantic_detail"]
+    assert "did not find a REWORDED copy of its control item" in manifest["semantic_detail"]
 
 
 def test_require_semantic_refuses_when_the_layer_is_installed_but_not_working(
@@ -1678,6 +1715,140 @@ def test_require_semantic_refuses_when_the_layer_is_installed_but_not_working(
     assert code == 2
     assert manifest is None  # nothing was written
     assert "REFUSING TO DECONTAMINATE" in capsys.readouterr().out
+
+
+def test_this_module_cannot_reach_the_network():
+    """The guard on the guard. The semantic layer is opt-in here through a
+    fixture, and deleting that fixture left the suite green on an air-gapped
+    machine while making 38 outbound HTTP attempts on a networked one - a
+    suite whose meaning depends on which box it runs on. conftest.py refuses
+    the socket layer for this module, and this is the assertion that says so
+    rather than assuming it."""
+    import socket
+
+    with pytest.raises(Exception) as exc:  # noqa: B017 - the type is conftest's
+        socket.create_connection(("huggingface.co", 443), timeout=1)
+    assert "hermetic" in str(exc.value)
+
+
+def test_a_machine_without_semhash_records_that_and_never_reads_as_screened(tmp_path, capsys):
+    """The state this project was in until the extras landed, and the state
+    every fresh clone is in. `semhash-not-installed` appeared in NO test, so
+    initialising the status to `ran` instead survived the whole suite - and the
+    manifest, the dataset card behind it and the operator's screen would all
+    have said a paraphrase screen ran over a corpus it never touched."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "s.jsonl", [row(prose(510, 60))])
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf")
+    store.close()
+    # No install_fake_semhash here: the autouse fixture leaves `import semhash`
+    # raising ImportError, which is the un-installed machine exactly.
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+    assert manifest["semantic"] == SEMANTIC_UNAVAILABLE == "semhash-not-installed"
+    assert manifest["semantic"] != "ran"
+    assert "semantic layer did NOT run (semhash-not-installed)" in capsys.readouterr().out
+
+
+def test_a_run_that_waived_every_eval_set_has_nothing_to_compare_and_says_so(
+    tmp_path, monkeypatch, capsys
+):
+    """`no-eval-items-to-compare` also appeared in no test, and the branch is
+    unreachable while the opt-in fixture is on - so `ran` here survived too. A
+    run that waived every set must not record a semantic screen."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "s.jsonl", [row(prose(511, 60))])
+    Store.open(paths.state_db).close()  # nothing acquired: every set is missing
+    install_fake_semhash(monkeypatch)
+    waivers = [arg for key in sorted(EVAL_SETS) for arg in ("--allow-missing-eval", key)]
+    assert decon_main(["--config", cfg, "--no-generated", *waivers]) == 0
+    manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+    assert manifest["semantic"] == SEMANTIC_NO_ITEMS == "no-eval-items-to-compare"
+    assert manifest["semantic"] != "ran"
+    assert "semantic layer did NOT run (no-eval-items-to-compare)" in capsys.readouterr().out
+
+
+def test_a_model_that_cannot_be_fetched_is_not_a_drifted_api(tmp_path, monkeypatch, capsys):
+    """Two failures with opposite remedies used to share one status. semhash
+    downloads an embedding model on first use, so an installed-but-air-gapped
+    machine - the state this module was WRITTEN on - recorded
+    `semhash-control-failed`, whose documented reading is "the API drifted, fix
+    selected_records". The instruction was false on that machine.
+
+    This is also what makes the broad `except Exception` load-bearing: narrow
+    it back to SemanticSeamError and this OSError kills a decontamination run
+    the refusal ladder has already cleared."""
+    code, manifest, _ = _semantic_run(tmp_path, monkeypatch, answer="no-model")
+    out = capsys.readouterr().out
+    assert code == 0
+    assert manifest["semantic"] == SEMANTIC_NO_MODEL == "semhash-model-unavailable"
+    assert manifest["semantic"] not in ("ran", SEMANTIC_UNUSABLE)
+    assert "pre-warm the HuggingFace cache" in manifest["semantic_detail"]
+    assert "NOT API drift" in manifest["semantic_detail"]
+    assert "semantic layer did NOT run (semhash-model-unavailable)" in out
+    # The exact stack still ran: this layer's absence is a status, not a crash.
+    assert manifest["counts"]["total"] == 2
+
+
+def test_a_seam_that_only_recognises_an_exact_copy_fails_the_control(tmp_path, monkeypatch):
+    """The control's whole purpose. The one it replaced fed the seam an exact
+    copy of an eval item, which is recognised by a seam with no semantic power
+    whatsoever - measured against the real library, that control passed at
+    every threshold from 0.3 to 0.95, including the 0.9 it shipped at, where
+    the seam caught 0 of 2 paraphrases of an eval question."""
+    code, manifest, _ = _semantic_run(tmp_path, monkeypatch, answer="exact-only")
+    assert code == 0
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE
+    assert "REWORDED copy" in manifest["semantic_detail"]
+
+
+def test_a_seam_that_reads_the_whole_row_and_not_its_windows_fails_the_control(monkeypatch):
+    """The other half of the same fix, and the reason the control's positive is
+    a row rather than a sentence: measured against the installed library, an
+    eval question quoted VERBATIM inside a 288-word row is invisible to a
+    whole-row comparison at every threshold from 0.5 up, and at 0.4 and below a
+    CLEAN row of the same length is flagged too. A whole-row seam has no
+    operating point at all, and the control has to fail for it."""
+    install_fake_semhash(monkeypatch)
+    import tuned.data.decontaminate as decon
+
+    monkeypatch.setattr(decon, "probe_texts", lambda text, **kw: [text] if text else [])
+    with pytest.raises(SemanticSeamError) as exc:
+        decon.semantic_control()
+    assert "REWORDED copy" in str(exc.value)
+
+
+def test_the_probe_windows_cover_every_position_of_the_row():
+    """The geometry the control depends on: no word of the row sits outside
+    every window, and the whole row is a probe in its own right because an
+    IL-TUR judgment item is only comparable to the whole of one."""
+    words = [f"w{i}" for i in range(95)]
+    probes = probe_texts(" ".join(words))
+    assert probes[0] == " ".join(words), "the whole row is always a probe"
+    windows = probes[1:]
+    assert all(len(w.split()) == SEMANTIC_PROBE_WORDS for w in windows)
+    covered = set()
+    for i, window in enumerate(windows):
+        covered.update(range(i * SEMANTIC_PROBE_STRIDE,
+                             i * SEMANTIC_PROBE_STRIDE + SEMANTIC_PROBE_WORDS))
+    assert set(range(len(words))) <= covered
+    # A row no longer than one window is not chopped up.
+    assert probe_texts(" ".join(words[:SEMANTIC_PROBE_WORDS])) == [
+        " ".join(words[:SEMANTIC_PROBE_WORDS])
+    ]
+    assert probe_texts("") == []
+
+
+def test_the_semantic_operating_point_reaches_the_manifest(tmp_path, monkeypatch):
+    """`semantic: ran` at one threshold is not the same screen as `ran` at
+    another, and the dataset card has to be able to say which."""
+    _, manifest, _ = _semantic_run(tmp_path, monkeypatch)
+    assert manifest["thresholds"]["semantic"] == SEMANTIC_THRESHOLD == 0.8
+    assert manifest["thresholds"]["semantic_probe_words"] == SEMANTIC_PROBE_WORDS
+    assert manifest["thresholds"]["semantic_probe_stride"] == SEMANTIC_PROBE_STRIDE
 
 
 def test_selected_records_raises_instead_of_defaulting():

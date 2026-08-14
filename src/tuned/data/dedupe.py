@@ -116,17 +116,21 @@ from tuned.data.decontaminate import (
     OUT_FILENAME as DECON_OUT_FILENAME,
 )
 from tuned.data.decontaminate import (
+    SEMANTIC_CONTROL_ITEM,
     SEMANTIC_CONTROL_NEGATIVE,
+    SEMANTIC_NO_MODEL,
     SEMANTIC_RAN,
     SEMANTIC_UNAVAILABLE,
     SEMANTIC_UNUSABLE,
     Item,
+    SemanticModelError,
     SemanticSeamError,
     gram_hashes,
     jaccard_from,
     row_prov,
     selected_records,
     semhash_available,
+    semhash_index,
     stream_items,
     tokens,
     write_manifest,
@@ -149,6 +153,20 @@ PROMPT_JACCARD = 0.85
 ROW_JACCARD = 0.90
 # At most this many rows per case identifier.
 CNR_CAP = 3
+# The semantic self-dedupe threshold. NOT decontaminate's 0.8: this comparison
+# is row against row - texts of comparable length, which is the regime cosine
+# similarity is well behaved in - rather than a short eval question against a
+# long row. Measured against the installed library (cache-only) on a rewritten
+# 60-word judgment summary and a genuinely different row of the same corpus:
+#
+#   threshold           0.6  0.7  0.75  0.8  0.85  0.9  0.95
+#   reworded row        [1]  [1]  [1]   [1]  [1]   [1]  []
+#   two different rows  []   []   []    []   []    []   []
+#
+# The rewording is collapsed everywhere up to 0.9 and lost at 0.95, and no
+# threshold in the range confuses two different rows, so 0.9 is the tightest
+# point that still catches what this layer is for.
+SEMANTIC_THRESHOLD = 0.9
 
 REASON_EXACT = "exact"
 REASON_NEAR_PROMPT = "near_prompt"
@@ -480,18 +498,17 @@ def apply_cap(
 # The whole pass.
 # --------------------------------------------------------------------------
 
-def flagged_indexes(texts: Sequence[str], *, threshold: float = 0.9) -> list[int]:
+def flagged_indexes(texts: Sequence[str], *, threshold: float = SEMANTIC_THRESHOLD) -> list[int]:
     """Which of `texts` semhash's self-deduplication did NOT keep.
 
-    UNVERIFIED AGAINST A REAL INSTALL, exactly as decontaminate.SemanticFilter
-    is: semhash lives in the [build] extra, is not installed in this worktree,
-    and this function's use of its API has never executed. It is written
-    against the documented `SemHash.from_records(...).self_deduplicate()`
-    shape, and the survivors are read through decontaminate.selected_records,
-    which RAISES rather than defaulting when that shape is not what came back.
-    The default this replaced (`getattr(result, "selected", texts)`) read as
-    "semhash kept everything" and so recorded a clean corpus indistinguishable
-    from a screened one.
+    Written against `SemHash.from_records(...).self_deduplicate()`, and the
+    survivors are read through decontaminate.selected_records, which RAISES
+    rather than defaulting when that shape is not what came back. The default
+    this replaced (`getattr(result, "selected", texts)`) read as "semhash kept
+    everything" and so recorded a clean corpus indistinguishable from a
+    screened one. Index CONSTRUCTION goes through decontaminate.semhash_index,
+    so a model that cannot be fetched is its own status rather than the same
+    one as a drifted API.
 
     Survivors are matched back BY COUNT, not by set membership: two candidates
     can carry the same text (item_key hashes the prompt and the answer
@@ -499,9 +516,7 @@ def flagged_indexes(texts: Sequence[str], *, threshold: float = 0.9) -> list[int
     same joined text), and a set makes those two rows unflaggable no matter
     what semhash says about them.
     """
-    from semhash import SemHash  # local import: absence is a status, not a crash
-
-    result = SemHash.from_records(records=list(texts)).self_deduplicate(threshold=threshold)
+    result = semhash_index(texts).self_deduplicate(threshold=threshold)
     budget = Counter(str(record) for record in selected_records(result))
     flagged = []
     for ix, text in enumerate(texts):
@@ -512,40 +527,83 @@ def flagged_indexes(texts: Sequence[str], *, threshold: float = 0.9) -> list[int
     return flagged
 
 
-def semantic_self_dedupe(candidates: Sequence[Candidate], *, threshold: float = 0.9):
-    """semhash self-deduplication over the surviving rows -> {key: twin key}."""
-    texts = [c.item.text for c in candidates]
-    return {candidates[ix].key: None for ix in flagged_indexes(texts, threshold=threshold)}
+def semantic_self_dedupe(candidates: Sequence[Candidate], *, threshold: float = SEMANTIC_THRESHOLD):
+    """semhash self-deduplication over the surviving rows -> {key: twin key}.
+
+    WITHIN ONE QUESTION FORM, for rule 2's reason and by the same measurement.
+    A generated row's text is the seed's grounding plus an instruction, and the
+    wave planner builds up to PER_SEED_CAP tasks on one seed in different
+    forms; measured against the installed library on the four-forms-one-seed
+    fixture, an unguarded semantic self-dedupe flags 3 of the 4 AT EVERY
+    THRESHOLD FROM 0.8 TO 0.99 - the grounding is 95% of the text and the
+    instruction cannot move a whole-text embedding far enough to matter. So an
+    unguarded layer deletes the wave planner's design the moment semhash is
+    installed, which is the same fault the plan's bare `J >= 0.85 on prompts`
+    had, one measure over. Cross-form duplicates are rule 3's job.
+    """
+    by_form: dict[str, list[int]] = {}
+    for ix, candidate in enumerate(candidates):
+        by_form.setdefault(candidate.item.form, []).append(ix)
+    flagged: dict[str, None] = {}
+    for form in sorted(by_form):
+        group = by_form[form]
+        if len(group) < 2:
+            # Nothing to compare against, and semhash refuses an empty or
+            # single-record set anyway.
+            continue
+        texts = [candidates[ix].item.text for ix in group]
+        for hit in flagged_indexes(texts, threshold=threshold):
+            flagged[candidates[group[hit]].key] = None
+    return flagged
 
 
-# A duplicate pair whose answer is not in doubt (byte-identical), plus a
-# stranger. Any embedding model collapses the first two and keeps the third.
+# A NEAR-DUPLICATE pair - reworded, not byte-identical - plus a stranger. Two
+# identical strings are collapsed by a seam with no semantic power at all, and
+# rule 1 has already removed every byte-identical pair before this layer sees
+# the corpus, so a control on identical text certifies the seam on a case it
+# can never meet. This pair is one clause reordering apart: measured, its
+# 5-gram row Jaccard is 0.714, so RULE 3 DOES NOT CATCH IT - it is exactly the
+# kind of duplicate this layer is added for. Measured against the installed
+# library it collapses to [1] at every threshold from 0.8 to 0.97, and two
+# genuinely different rows of this corpus collapse at none of them.
 SEMANTIC_CONTROL_TEXTS = (
-    "the appellant was convicted under section 302 of the penal code and sentenced to "
-    "imprisonment for life by the court of sessions",
-    "the appellant was convicted under section 302 of the penal code and sentenced to "
-    "imprisonment for life by the court of sessions",
+    f"{SEMANTIC_CONTROL_ITEM} and his appeal against that conviction was dismissed by the "
+    f"high court",
+    "his appeal against that conviction was dismissed by the high court after the appellant "
+    "was convicted under section 302 of the penal code and sentenced to imprisonment for "
+    "life by the court of sessions",
     SEMANTIC_CONTROL_NEGATIVE,
 )
 
 
-def semantic_control(*, threshold: float = 0.9) -> None:
-    """Raise unless the seam is OBSERVED collapsing a duplicate and only it.
+def semantic_control(*, threshold: float = SEMANTIC_THRESHOLD) -> None:
+    """Raise unless the seam is OBSERVED collapsing a near-duplicate and only it.
 
     `semantic: "ran"` has to mean "this layer ran and worked", not "the import
     succeeded". The failure that made this necessary was silent in the
     permissive direction - a drifted result shape flagged NOTHING and the
-    manifest and the dataset card both said `ran` over an unscreened corpus -
-    so the control pins the count exactly: one of the two copies goes, the
-    stranger stays.
+    manifest and the dataset card both said `ran` over an unscreened corpus.
+
+    TWO CHECKS, NOT ONE, because they fail for different reasons and a single
+    `flagged != [1]` let the count stand in for the identity: a seam that flags
+    exactly one WRONG record - keeps both members of the duplicate pair and
+    drops the stranger - answers a count test correctly while being exactly
+    backwards.
     """
     flagged = flagged_indexes(list(SEMANTIC_CONTROL_TEXTS), threshold=threshold)
+    if len(flagged) != 1:
+        raise SemanticSeamError(
+            f"semhash self-deduplication flagged {flagged} of a control of one reworded "
+            f"duplicate pair and one unrelated record; exactly one record must go. A seam "
+            f"that flags nothing here would record `semantic: ran` over rows it never "
+            f"compared, and one that flags everything would delete the corpus."
+        )
     if flagged != [1]:
         raise SemanticSeamError(
-            f"semhash self-deduplication flagged {flagged} of a control of two identical "
-            f"records and one unrelated one; the only correct answer is [1]. A seam that "
-            f"flags nothing here would record `semantic: ran` over rows it never compared, "
-            f"and one that flags everything would delete the corpus."
+            f"semhash self-deduplication flagged record {flagged[0]} of the control rather "
+            f"than record 1: it kept both members of the near-duplicate pair and dropped "
+            f"something else. The count is right and the answer is backwards, which is the "
+            f"reading a count-only check cannot tell from a working seam."
         )
 
 
@@ -571,7 +629,8 @@ def dedupe_items(
             for candidate in kept:
                 if candidate.key in flagged:
                     drops.append(
-                        _drop(candidate, REASON_SEMANTIC, flagged[candidate.key], {})
+                        _drop(candidate, REASON_SEMANTIC, flagged[candidate.key],
+                              {"form": candidate.item.form})
                     )
                 else:
                     survivors.append(candidate)
@@ -813,13 +872,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if semhash_available():
         try:
             semantic_control()
+        except SemanticModelError as exc:
+            # Its own rung, for decontaminate.py's reason: an index that could
+            # not be BUILT is a machine without the model, and the remedy is
+            # network or a warm cache rather than a hunt for API drift.
+            semantic_status, semantic_detail = SEMANTIC_NO_MODEL, str(exc)
         except Exception as exc:
             # Installed, called, and wrong. NOT "ran": the whole point of that
             # word in the manifest is that it distinguishes a layer that
             # compared rows from a layer that was merely invoked. Broad for
-            # decontaminate.py's reason - semhash fetches a model, so on a
-            # machine with the extra and no network this raises something else
-            # entirely, and nothing in this module refuses a run.
+            # decontaminate.py's reason - semhash may raise anything at all
+            # from inside a model it loaded lazily, and nothing in this module
+            # refuses a run.
             semantic_status = SEMANTIC_UNUSABLE
             semantic_detail = (
                 str(exc) if isinstance(exc, SemanticSeamError)
@@ -843,6 +907,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "row_jaccard": ROW_JACCARD,
             "cap": None if args.no_cap else CNR_CAP,
             "case_ids_from_text": ids_from_text,
+            "semantic": SEMANTIC_THRESHOLD,
         },
     )
 

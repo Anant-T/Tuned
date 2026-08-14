@@ -1245,10 +1245,42 @@ def decontaminate_items(
 
 SEMANTIC_UNAVAILABLE = "semhash-not-installed"
 # The seam answered in a shape this code cannot read, or answered wrongly on a
-# pair whose answer is not in doubt. NOT "ran": see semantic_control.
+# control whose answer is not in doubt. NOT "ran": see semantic_control.
 SEMANTIC_UNUSABLE = "semhash-control-failed"
+# Installed, but the embedding index could not be BUILT - semhash fetches a
+# model on first use, so this is what an air-gapped machine with the extra
+# installed reads. Its own rung because its remedy is the opposite of
+# `control-failed`'s: get network or pre-warm the HF cache, do not go looking
+# for API drift. The ledger used to say "control-failed means the API drifted",
+# which was false on exactly the machine this module was written on.
+SEMANTIC_NO_MODEL = "semhash-model-unavailable"
 SEMANTIC_NO_ITEMS = "no-eval-items-to-compare"
 SEMANTIC_RAN = "ran"
+
+# THE OPERATING POINT, chosen by measurement against the installed library
+# (cache-only) and not by taking semhash's default. Probes are the row's
+# windows plus the whole row; rows are ~440 and ~1,300 words:
+#
+#   threshold          0.6   0.65   0.7   0.75   0.8   0.85   0.9
+#   leaks caught       5/5    4/5   4/5    3/5   3/5    3/5   2/5
+#   siblings dropped   4/4    4/4   3/4    0/4   0/4    0/4   0/4
+#   clean rows dropped 4/4    0/4   0/4    0/4   0/4    0/4   0/4
+#
+# "leaks" are an eval question quoted verbatim or lightly reworded inside the
+# row; "siblings" are a DIFFERENT question about the same section or article -
+# the statute-quotation exception one band over, and the false positive that
+# would cost real yield because this corpus is about the same statutes the
+# eval sets are. The safe interval is [0.75, 0.85] and 0.8 is its centre: 0.05
+# from the sibling cliff below and 0.05 from the edge above, where a VERBATIM
+# leak in a 1,300-word row is already missed.
+SEMANTIC_THRESHOLD = 0.8
+# The row is probed in WINDOWS as well as whole. See SemanticFilter.matches
+# for the measurement: a whole-row embedding cannot see a verbatim eval
+# question inside a 288-word row at ANY threshold that does not also drop
+# clean rows. 20 words is BBL question length; stride 10 means every position
+# in the row is covered by a window that holds at least 10 of its neighbours.
+SEMANTIC_PROBE_WORDS = 20
+SEMANTIC_PROBE_STRIDE = 10
 
 # The negative half of the control. Nothing in an Indian-law eval set is
 # semantically near this, so a seam that flags it flags everything - which is
@@ -1257,16 +1289,56 @@ SEMANTIC_CONTROL_NEGATIVE = (
     "the sourdough starter doubled overnight so I shaped the loaf and baked it at "
     "two hundred and thirty degrees with steam for the first fifteen minutes"
 )
+# The positive half. NOT an exact copy: an exact copy is recognised by any
+# seam with no power at all, and the shipped control passed at every threshold
+# from 0.3 to 0.95 while catching 0 of 2 paraphrases at the one it ran at.
+# This is a NEAR-PARAPHRASE - same case, same section, reordered and reworded -
+# EMBEDDED IN A ROW, because that is the shape the layer meets in production
+# and the shape a whole-row seam fails on.
+SEMANTIC_CONTROL_ITEM = (
+    "the appellant was convicted under section 302 of the penal code and sentenced to "
+    "imprisonment for life by the court of sessions"
+)
+# Exactly SEMANTIC_PROBE_WORDS long, so one window can hold all of it.
+_SEMANTIC_CONTROL_PARAPHRASE = (
+    "the accused was convicted under section 302 of the penal code and sentenced to "
+    "life imprisonment by the sessions court"
+)
+_SEMANTIC_CONTROL_FILLER = (
+    "having heard learned counsel for the parties and having perused the material placed "
+    "on the record we are of the considered view that the concurrent findings recorded "
+    "by the courts below do not call for any interference in exercise of the appellate "
+    "jurisdiction vested in this court under the constitution"
+).split()
+# Padded to a WHOLE NUMBER OF STRIDES on the left, so one probe window lands on
+# the paraphrase exactly. The control asks whether the seam can recognise a
+# rewording, not whether a window happened to fall in the right place.
+_SEMANTIC_CONTROL_PAD = (_SEMANTIC_CONTROL_FILLER * 2)[: 4 * SEMANTIC_PROBE_STRIDE]
+SEMANTIC_CONTROL_ROW = " ".join(
+    [*_SEMANTIC_CONTROL_PAD, *_SEMANTIC_CONTROL_PARAPHRASE.split(), *_SEMANTIC_CONTROL_PAD]
+)
 
 
 class SemanticSeamError(RuntimeError):
     """semhash answered in a shape or a direction this code cannot use.
 
     Raised rather than defaulted around. A permissive `getattr(result,
-    "selected", <something>)` on an API THIS PROJECT HAS NEVER EXECUTED is
-    exactly the assertion the brief forbids: under a result object that names
-    its survivors anything else, the default decides the answer and the run
-    records a semantic layer that never compared anything.
+    "selected", <something>)` on an API whose attribute name is the one thing
+    that could be wrong is exactly the assertion the brief forbids: under a
+    result object that names its survivors anything else, the default decides
+    the answer and the run records a semantic layer that never compared
+    anything.
+    """
+
+
+class SemanticModelError(RuntimeError):
+    """The embedding index could not be built.
+
+    A DIFFERENT rung from SemanticSeamError and deliberately not a subclass of
+    it: semhash downloads a model the first time it runs, so this is what an
+    installed-but-air-gapped machine reads, and its remedy ("get network, or
+    pre-warm the HF cache, then re-run") has nothing to do with the API drift
+    a seam error reports.
     """
 
 
@@ -1278,13 +1350,34 @@ def semhash_available() -> bool:
     return True
 
 
+def semhash_index(records: Sequence[str]):
+    """`SemHash.from_records`, with construction failure as its own error.
+
+    Both seams build their index through here so that "the model could not be
+    fetched" and "the API drifted" cannot arrive at the caller as the same
+    exception - they are different statuses with different remedies.
+    """
+    from semhash import SemHash  # local import: absence is a status, not a crash
+
+    try:
+        return SemHash.from_records(records=list(records))
+    except Exception as exc:
+        raise SemanticModelError(
+            f"semhash could not build its embedding index ({type(exc).__name__}: {exc}). "
+            f"It downloads an embedding model on first use, so this is usually a machine "
+            f"with the [build] extra installed and no network: get network once, or "
+            f"pre-warm the HuggingFace cache, and re-run. This is NOT API drift."
+        ) from exc
+
+
 def selected_records(result) -> list:
     """`result.selected`, or a named error naming what came back instead.
 
-    UNVERIFIED AGAINST A REAL INSTALL (semhash is in the [build] extra and is
-    not installed here), which is precisely why there is no default: the
-    attribute name is the one thing about this API that could be wrong, and a
-    default turns being wrong about it into a silent clean bill of health.
+    There is no default because the attribute name is the one thing about this
+    API that could be wrong, and a default turns being wrong about it into a
+    silent clean bill of health. (Both seams have now executed against the
+    real library - `DeduplicationResult.selected` is the name it uses - so
+    this stands as drift protection rather than as a live unknown.)
     """
     try:
         selected = result.selected
@@ -1302,27 +1395,64 @@ def selected_records(result) -> list:
     return list(selected)
 
 
+def probe_texts(text: str, *, size: int = SEMANTIC_PROBE_WORDS,
+                stride: int = SEMANTIC_PROBE_STRIDE) -> list[str]:
+    """The row, plus every `size`-word window of it at `stride`.
+
+    THE WHOLE ROW IS KEPT because the eval side is not all short: an IL-TUR
+    judgment item is hundreds of words and only the whole row is comparable to
+    it. The windows are for the other end, which is most of the eval corpus.
+    """
+    words = (text or "").split()
+    if not words:
+        return []
+    if len(words) <= size:
+        return [text]
+    starts = list(range(0, len(words) - size + 1, stride))
+    # The tail, anchored at the end. Without it the last (len - size) % stride
+    # words of every row sit in no window at all and are screened only by the
+    # whole-row probe, which is the comparison this design has just established
+    # cannot see anything.
+    if starts[-1] != len(words) - size:
+        starts.append(len(words) - size)
+    return [text] + [" ".join(words[i : i + size]) for i in starts]
+
+
 class SemanticFilter:
     """Flags rows semantically close to an eval item.
 
-    UNVERIFIED AGAINST A REAL INSTALL: written against the documented
-    `SemHash.from_records(...).deduplicate(records=...)` shape, so the FIRST
-    thing a machine with the extra must do is watch `semantic_control` pass.
-    Everything the no-false-negative guarantee rests on (the n-gram levels and
-    the case-identifier level) is pure Python above and is exercised offline;
-    this layer only ever ADDS drops.
+    THE ROW IS PROBED IN WINDOWS, and that is not an optimisation - it is the
+    same correction containment made to Jaccard one layer up. Cosine
+    similarity between a 15-word eval question and a 1,800-word row is
+    dominated by the row's own length, exactly as Jaccard was. Measured
+    against the installed library, an eval question quoted VERBATIM inside a
+    288-word row:
+
+        whole row only   flagged at 0.3 and 0.4 - and so was a clean row -
+                         and at NOTHING from 0.5 up
+        windowed         flagged at 0.5 through 0.8, clean row not flagged
+                         above 0.5
+
+    So a whole-row seam has no operating point at all: every threshold either
+    sees nothing or drops everything. Cost of the windows, measured against a
+    20,000-item index: 85 ms/row whole, 198 ms/row windowed, i.e. ~25 min
+    against ~59 min over an 18,000-row corpus.
+
+    This layer only ever ADDS drops; everything the no-false-negative
+    guarantee rests on is the pure-Python screen above.
     """
 
-    def __init__(self, eval_texts: Sequence[str], *, threshold: float = 0.9):
-        from semhash import SemHash  # local import: absence is a status, not a crash
-
+    def __init__(self, eval_texts: Sequence[str], *, threshold: float = SEMANTIC_THRESHOLD):
         self.threshold = threshold
-        self.index = SemHash.from_records(records=list(eval_texts))
+        self.index = semhash_index(eval_texts)
 
     def matches(self, text: str) -> bool:
-        """Is this text a semantic duplicate of something in the eval index?"""
-        result = self.index.deduplicate(records=[text], threshold=self.threshold)
-        return not selected_records(result)
+        """Is any window of this text a semantic duplicate of an eval item?"""
+        probes = probe_texts(text)
+        if not probes:
+            return False
+        result = self.index.deduplicate(records=probes, threshold=self.threshold)
+        return len(selected_records(result)) < len(probes)
 
     def __call__(self, item: Item):
         if self.matches(item.text):
@@ -1330,24 +1460,39 @@ class SemanticFilter:
         return ()
 
 
-def semantic_control(seam: SemanticFilter, positive: str) -> None:
+def semantic_control(*, threshold: float = SEMANTIC_THRESHOLD) -> None:
     """Raise unless the seam is OBSERVED working, in both directions.
 
-    `semantic: "ran"` in the manifest has to mean "this layer compared rows to
-    eval items and the comparison worked", not "the call did not raise". The
+    `semantic: "ran"` in the manifest has to mean "this layer can find a
+    reworded eval question inside a row", not "the call did not raise". The
     two ways it can be wrong point in opposite directions and both are silent:
     a result object whose survivors are named something else makes every row
     look like a duplicate (drops everything), and the reverse default makes
     every row look clean (drops nothing, which is this module's catastrophic
-    direction). So the control pins both ends against answers that are not in
-    doubt - an eval item is a duplicate of itself, and a bread recipe is not.
+    direction).
+
+    THE POSITIVE HALF IS A NEAR-PARAPHRASE INSIDE A ROW, and that is the whole
+    design of this function. The control it replaced fed the seam an exact
+    copy of an eval item, which passed at every threshold from 0.3 to 0.95 -
+    including the one it shipped at, where the seam caught 0 of 2 paraphrases.
+    A control that a power-less seam passes certifies nothing. This one fails
+    for an exact-match seam, fails for a whole-row seam (measured: a verbatim
+    leak in a 288-word row is invisible to one), and fails at a threshold too
+    high to see a rewording.
+
+    It runs against its OWN one-item index rather than the eval corpus: the
+    eval texts are whatever was downloaded, and a control has to be a question
+    whose answer is known before the run.
     """
-    if not seam.matches(positive):
+    seam = SemanticFilter([SEMANTIC_CONTROL_ITEM], threshold=threshold)
+    if not seam.matches(SEMANTIC_CONTROL_ROW):
         raise SemanticSeamError(
-            "the semantic layer did not flag an eval item against its own index. "
-            "A layer that cannot recognise an exact copy cannot recognise a paraphrase, "
-            "and recording it as having run would put a screen in the manifest that "
-            "never screened anything."
+            f"the semantic layer did not find a REWORDED copy of its control item inside a "
+            f"row at threshold {threshold}. A layer that cannot recognise a rewording "
+            f"cannot recognise the paraphrase it exists for, and recording it as having "
+            f"run would put a screen in the manifest that never screened anything. "
+            f"(An exact-match seam, a whole-row seam and a too-high threshold all land "
+            f"here - the semantic_detail beside this says which was asked for.)"
         )
     if seam.matches(SEMANTIC_CONTROL_NEGATIVE):
         raise SemanticSeamError(
@@ -1485,6 +1630,13 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
             "full_ngram_from_tokens": 3 * index.n - 1,
             "title_min_tokens": TITLE_MIN_TOKENS,
             "case_ids_from_text": ids_from_text,
+            # The semantic layer's operating point and probe geometry, recorded
+            # whether or not it ran: `semantic: ran` at one threshold is not the
+            # same screen as `ran` at another, and the dataset card has to be
+            # able to say which.
+            "semantic": SEMANTIC_THRESHOLD,
+            "semantic_probe_words": SEMANTIC_PROBE_WORDS,
+            "semantic_probe_stride": SEMANTIC_PROBE_STRIDE,
         },
         "counts": {k: stats[k] for k in ("total", "kept", "dropped", "empty_text")},
         "by_reason": dict(sorted(stats["by_reason"].items())),
@@ -1604,31 +1756,43 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
 
         semantic_fn, semantic_status, semantic_detail = None, SEMANTIC_UNAVAILABLE, ""
         texts = [i.text for c in corpora.values() for i in c.items]
-        if semhash_available() and texts:
-            try:
-                seam = SemanticFilter(texts)
-                semantic_control(seam, texts[0])
-            except Exception as exc:
-                # NOT recorded as "ran". The seam is installed and answered;
-                # it answered in a way that means nothing was compared.
-                #
-                # Broad on purpose, and only around CONSTRUCTION plus the
-                # control: semhash builds an embedding index and fetches a
-                # model, so on a machine with the extra installed and no
-                # network this raises something that is not a SemanticSeamError
-                # - and the module's contract is that this layer's absence is a
-                # STATUS, not a crash that kills a decontamination run the
-                # refusal ladder has already cleared. Once the control passes,
-                # the shape is confirmed and the per-row path is not wrapped.
-                semantic_status = SEMANTIC_UNUSABLE
-                semantic_detail = (
-                    str(exc) if isinstance(exc, SemanticSeamError)
-                    else f"{type(exc).__name__}: {exc}"
-                )
+        if semhash_available():
+            if not texts:
+                # Every set waived: there is nothing for this layer to compare
+                # against, which is not the same fact as "it did not run" and
+                # must not be recorded as "ran".
+                semantic_status = SEMANTIC_NO_ITEMS
             else:
-                semantic_fn, semantic_status = seam, SEMANTIC_RAN
-        elif semhash_available():
-            semantic_status = SEMANTIC_NO_ITEMS
+                try:
+                    # The control FIRST, on a one-item index: it costs a second
+                    # and it proves the model, the API shape and the seam's
+                    # power before the 20,000-item index is built.
+                    semantic_control()
+                    seam = SemanticFilter(texts)
+                except SemanticModelError as exc:
+                    # Its own rung. The remedy is network or a warm cache, and
+                    # sending an operator to look for API drift instead is the
+                    # wrong instruction on the commonest failure this layer has.
+                    semantic_status, semantic_detail = SEMANTIC_NO_MODEL, str(exc)
+                except Exception as exc:
+                    # NOT recorded as "ran". The seam is installed and
+                    # answered; it answered in a way that means nothing was
+                    # compared.
+                    #
+                    # Broad on purpose, and only around the control plus
+                    # construction: this layer's absence is a STATUS, not a
+                    # crash that kills a decontamination run the refusal ladder
+                    # has already cleared, and semhash is entitled to raise
+                    # anything it likes from inside a model it loaded lazily.
+                    # Once the control passes the shape is confirmed and the
+                    # per-row path is not wrapped.
+                    semantic_status = SEMANTIC_UNUSABLE
+                    semantic_detail = (
+                        str(exc) if isinstance(exc, SemanticSeamError)
+                        else f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    semantic_fn, semantic_status = seam, SEMANTIC_RAN
         if args.require_semantic and semantic_status != SEMANTIC_RAN:
             print(
                 f"REFUSING TO DECONTAMINATE: --require-semantic was passed and the semantic "
