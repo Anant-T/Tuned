@@ -27,9 +27,16 @@ from tuned.data.decontaminate import (
     EVAL_UNREADABLE,
     LEVEL_CASE_ID,
     LEVEL_NARROW,
+    LEVEL_SEMANTIC,
     LEVEL_SHORT,
     LEVEL_TEXT,
     NGRAM,
+    SCRIPT_DEVANAGARI,
+    SCRIPT_LATIN,
+    SCRIPT_NONE,
+    SEMANTIC_CONTROL_ROW_WORDS,
+    SEMANTIC_CONTROLS,
+    SEMANTIC_COVERED_SPAN,
     SEMANTIC_NO_ITEMS,
     SEMANTIC_NO_MODEL,
     SEMANTIC_PROBE_STRIDE,
@@ -42,9 +49,12 @@ from tuned.data.decontaminate import (
     EvalIndex,
     EvalItem,
     EvalPart,
+    SemanticFilter,
     SemanticSeamError,
     containment,
     decontaminate_items,
+    dominant_script,
+    duplicate_provenance,
     eval_corpora,
     eval_corpus,
     gram_hashes,
@@ -56,13 +66,16 @@ from tuned.data.decontaminate import (
     level_for,
     manifest_of,
     probe_texts,
+    probe_windows,
     refusals,
     row_form,
     selected_records,
+    semantic_controls,
     store_items,
     title_key,
     tokens,
     window_for,
+    worst_alignment_offset,
 )
 from tuned.data.decontaminate import main as decon_main
 from tuned.data.jsonl import write_jsonl
@@ -150,19 +163,50 @@ def all_eval_snapshots(store, root: Path, records_by_key=None):
 # clean corpus.
 # --------------------------------------------------------------------------
 
-def _near(text: str, others, threshold: float) -> bool:
-    """Stand-in for semantic similarity: token-set Jaccard.
+def _overlap(text: str, other: str) -> float:
+    """Stand-in for semantic similarity: COSINE over token-count vectors.
 
-    Not a claim about how semhash decides - a way to give the fake a decision
+    Not a claim about how semhash embeds - a way to give the fake a decision
     that responds to its input, so a seam that ignores its input is
-    distinguishable from one that reads it.
+    distinguishable from one that reads it. But it is a cosine, over the one
+    vector space available without a model, and that choice is load-bearing in
+    two directions the token-set Jaccard it replaced got wrong:
+
+    * Jaccard fell too fast with the size of the probe. Widening the window
+      from 20 words to 30 took the control pair from 0.85 to 0.72 and would
+      have failed the control for a seam that works - where the real model
+      scores the same pair 0.955 at 20 words and ~0.87 at 30.
+    * Plain containment does not fall AT ALL, so a whole-row seam - the thing
+      the windowed design exists to reject, measured invisible against the real
+      library - scored 0.947 on a 137-word row and passed the control.
+
+    Measured on this suite's own control material: 30-word window 0.836, whole
+    137-word row 0.673, unrelated 0.376. Those separations are the double's
+    contract and test_the_semantic_double_behaves_like_a_cosine pins them.
     """
-    a = set(tokens(text))
+    import math
+    from collections import Counter
+
+    a, b = Counter(tokens(text)), Counter(tokens(other))
+    if not a or not b:
+        return 0.0
+    shared = sum(a[key] * b[key] for key in a.keys() & b.keys())
+    return shared / (math.sqrt(sum(v * v for v in a.values()))
+                     * math.sqrt(sum(v * v for v in b.values())))
+
+
+def _nearest(text: str, others) -> tuple:
+    """(the closest of `others`, its score) - what the fake's provenance reads."""
+    best, score = None, 0.0
     for other in others:
-        b = set(tokens(other))
-        if a and b and len(a & b) / len(a | b) >= threshold:
-            return True
-    return False
+        value = _overlap(text, other)
+        if value > score:
+            best, score = other, value
+    return best, score
+
+
+def _near(text: str, others, threshold: float) -> bool:
+    return _nearest(text, others)[1] >= threshold
 
 
 @pytest.fixture(autouse=True)
@@ -180,7 +224,7 @@ def _the_semantic_layer_is_opt_in(monkeypatch):
     monkeypatch.setitem(sys.modules, "semhash", None)
 
 
-def install_fake_semhash(monkeypatch, *, attr="selected", answer="real"):
+def install_fake_semhash(monkeypatch, *, attr="selected", answer="real", provenance=True):
     """Put a `semhash` module in sys.modules.
 
     `attr` is what the result object names its survivors - the documented name
@@ -190,8 +234,16 @@ def install_fake_semhash(monkeypatch, *, attr="selected", answer="real"):
     "keep-nothing" (everything is), "flag-stranger" (self-dedupe keeps a
     duplicate pair and drops the unrelated record instead - the right COUNT
     and the wrong record), "exact-only" (a seam with NO semantic power at all:
-    it collapses byte-identical records and nothing else) or "no-model"
+    it collapses byte-identical records and nothing else), "latin-only" (the
+    SHIPPED model, measured: full power in Latin and none at all outside it,
+    where two unrelated Hindi sentences score 0.956) or "no-model"
     (construction raises the way an installed-but-air-gapped semhash does).
+
+    `provenance=False` deletes `DeduplicationResult.filtered`, the attribute a
+    semantic Hit reads to name the eval item it matched. That one must degrade
+    to `*` rather than raise: unlike `.selected`, a missing `.filtered` cannot
+    be misread as "nothing was contaminated", so a default there is honest
+    where a default in selected_records is a silent clean bill of health.
 
     `deduplicate` compares the query records against the INDEX ONLY and never
     against each other. That is not a simplification, it is what the installed
@@ -203,9 +255,29 @@ def install_fake_semhash(monkeypatch, *, attr="selected", answer="real"):
     import sys
     import types
 
+    class DuplicateRecord:
+        """semhash's own provenance shape: the dropped record, and what it
+        matched with what score. `provenance=False` deletes it, which is the
+        drift a semantic Hit must survive by reading `*` rather than by
+        raising - the DECISION never depends on this."""
+
+        def __init__(self, record, duplicates):
+            self.record = record
+            self.exact = False
+            self.duplicates = duplicates
+
     class Result:
-        def __init__(self, kept):
+        def __init__(self, kept, dropped=(), index=()):
             setattr(self, attr, list(kept))
+            if provenance:
+                self.filtered = [
+                    DuplicateRecord(
+                        text,
+                        [(_nearest(text, index)[0] or "", _nearest(text, index)[1])],
+                    )
+                    for text in dropped
+                    if _nearest(text, index)[0] is not None
+                ]
 
     class SemHash:
         def __init__(self, records):
@@ -219,18 +291,38 @@ def install_fake_semhash(monkeypatch, *, attr="selected", answer="real"):
         def from_records(cls, records):
             return cls(records)
 
+        def _result(self, records, kept):
+            keep = list(kept)
+            dropped = []
+            for record in records:
+                if record in keep:
+                    keep.remove(record)
+                else:
+                    dropped.append(record)
+            return Result(kept, dropped, self.records)
+
         def deduplicate(self, records, threshold=0.9):
             """Query records that are duplicates OF THE INDEX are removed."""
             if answer == "raises-at-query":
                 raise RuntimeError("usearch index is corrupt or the model failed to load")
             if answer == "keep-everything":
-                return Result(list(records))
+                return self._result(records, list(records))
             if answer == "keep-nothing":
-                return Result([])
+                return self._result(records, [])
             if answer == "exact-only":
-                return Result([r for r in records if r not in self.records])
-            return Result(
-                [r for r in records if not _near(r, self.records, threshold)]
+                return self._result(records, [r for r in records if r not in self.records])
+            if answer == "latin-only":
+                # potion-base-8M, as measured: full power in Latin script and
+                # NONE outside it, where cos(Hindi legal question, Hindi
+                # cricket report) = 0.956 and every non-Latin record reads as a
+                # duplicate of every other.
+                return self._result(records, [
+                    r for r in records
+                    if dominant_script(r) == SCRIPT_LATIN
+                    and not _near(r, self.records, threshold)
+                ])
+            return self._result(
+                records, [r for r in records if not _near(r, self.records, threshold)]
             )
 
         def self_deduplicate(self, threshold=0.9):
@@ -1833,7 +1925,7 @@ def test_the_cli_writes_the_rows_the_drops_and_the_manifest(tmp_path, capsys):
     assert manifest["thresholds"]["ngram"] == NGRAM
     # The version travels with the shape: a manifest that changed what it says
     # while still claiming the old number cannot be read years later.
-    assert manifest["decon_version"] == DECON_VERSION == 3
+    assert manifest["decon_version"] == DECON_VERSION == 4
     assert "split" not in manifest["eval_sets"]["bbl"], "replaced by `selection`"
     assert "screened 2  kept 1  dropped 1" in out
 
@@ -1954,7 +2046,23 @@ def test_the_semantic_layer_catches_the_paraphrase_the_ngram_levels_cannot(tmp_p
         json.loads(line)
         for line in (paths.out_dir / "decontamination_drops.jsonl").read_text().splitlines()
     ]
-    assert drops[0]["reason"] == "semantic:*"
+    # PROVENANCE. The drop names the eval set, the item and the score it
+    # matched at, because `semantic:*` / `item_id: semhash` on every drop is
+    # what would have made four thousand Devanagari false positives and four
+    # thousand real leaks read identically on run one.
+    assert drops[0]["reason"] == "semantic:bbl"
+    hit = drops[0]["hits"][0]
+    assert hit["level"] == LEVEL_SEMANTIC and hit["eval_set"] == "bbl"
+    # eval_snapshot writes `data/test-0.jsonl` and the leaked question is its
+    # first row, so the id is diagnosable back to the file and the line.
+    assert hit["item_id"] == "data/test-0.jsonl#0"
+    assert hit["script"] == SCRIPT_LATIN and hit["threshold"] == SEMANTIC_THRESHOLD
+    # The score is the MATCHED pair's, so it cannot sit below the threshold
+    # that dropped the row - a provenance that named some other record would.
+    assert SEMANTIC_THRESHOLD <= hit["score"] <= 1.0
+    # A probe is a full window or the whole row, never a fragment of either.
+    assert hit["probe_words"] >= SEMANTIC_PROBE_WORDS
+    assert manifest["by_eval_set"]["bbl"] == 1, "the set is countable, not pooled under *"
 
 
 def test_a_semhash_that_names_its_survivors_something_else_never_reads_as_screened(
@@ -1992,7 +2100,7 @@ def test_a_semantic_seam_that_flags_nothing_is_caught_too(tmp_path, monkeypatch)
     code, manifest, _ = _semantic_run(tmp_path, monkeypatch, answer="keep-everything")
     assert code == 0
     assert manifest["semantic"] == SEMANTIC_UNUSABLE
-    assert "did not find a REWORDED copy of its control item" in manifest["semantic_detail"]
+    assert "did not find a REWORDED copy of its latin control item" in manifest["semantic_detail"]
 
 
 def test_require_semantic_refuses_when_the_layer_is_installed_but_not_working(
@@ -2203,22 +2311,643 @@ def test_a_seam_that_reads_the_whole_row_and_not_its_windows_fails_the_control(m
 def test_the_probe_windows_cover_every_position_of_the_row():
     """The geometry the control depends on: no word of the row sits outside
     every window, and the whole row is a probe in its own right because an
-    IL-TUR judgment item is only comparable to the whole of one."""
-    words = [f"w{i}" for i in range(95)]
-    probes = probe_texts(" ".join(words))
-    assert probes[0] == " ".join(words), "the whole row is always a probe"
-    windows = probes[1:]
-    assert all(len(w.split()) == SEMANTIC_PROBE_WORDS for w in windows)
-    covered = set()
-    for i, window in enumerate(windows):
-        covered.update(range(i * SEMANTIC_PROBE_STRIDE,
-                             i * SEMANTIC_PROBE_STRIDE + SEMANTIC_PROBE_WORDS))
-    assert set(range(len(words))) <= covered
+    IL-TUR judgment item is only comparable to the whole of one.
+
+    COVERAGE IS READ OFF THE WINDOWS THEMSELVES. The version this replaced
+    computed it as `range(i * SEMANTIC_PROBE_STRIDE, ...)` from the LOOP INDEX
+    while binding and discarding the actual window, so it asserted the stride
+    arithmetic against itself: replacing the tail anchor with `starts.append(0)`
+    left it green, and so did doubling the stride. Both are misses of a
+    VERBATIM eval question."""
+    for length in (95, 137, 200, 31):
+        words = [f"w{i}" for i in range(length)]
+        probes = probe_texts(" ".join(words))
+        assert probes[0] == " ".join(words), "the whole row is always a probe"
+        windows = probes[1:]
+        assert windows, "a row longer than one window is chopped up"
+        assert all(len(w.split()) == SEMANTIC_PROBE_WORDS for w in windows)
+        covered = set()
+        for window in windows:
+            # From the CONTENT of the window, so a window that is not where the
+            # loop index says it is cannot be counted as covering anything.
+            positions = [int(w[1:]) for w in window.split()]
+            assert positions == list(range(positions[0], positions[0] + len(positions))), (
+                "a window is a CONTIGUOUS run of the row"
+            )
+            covered.update(positions)
+        assert covered == set(range(length)), (
+            f"row of {length} words: positions {sorted(set(range(length)) - covered)} sit in "
+            f"no window at all and are screened only by the whole-row probe, which is the "
+            f"comparison this design established cannot see anything"
+        )
+        # The tail specifically: the last word of the row is in a window, and
+        # that window ENDS at the row's end.
+        assert any(int(w.split()[-1][1:]) == length - 1 for w in windows)
+
     # A row no longer than one window is not chopped up.
-    assert probe_texts(" ".join(words[:SEMANTIC_PROBE_WORDS])) == [
-        " ".join(words[:SEMANTIC_PROBE_WORDS])
+    assert probe_texts(" ".join(f"w{i}" for i in range(SEMANTIC_PROBE_WORDS))) == [
+        " ".join(f"w{i}" for i in range(SEMANTIC_PROBE_WORDS))
     ]
     assert probe_texts("") == []
+
+
+def test_the_probe_geometry_is_pinned_against_literals_in_both_directions():
+    """Four mutants that each MISS A VERBATIM EVAL QUESTION survived the whole
+    suite before this: the tail anchor replaced by `append(0)` (a 21-word
+    question at the end of a 105-word row), stride 10 -> 20 and 10 -> 15 (5 of
+    10 and 3 of 10 placements leak), and stride 10 -> 5, which silently doubles
+    the cost of the longest pass in the build.
+
+    Nothing derived from the constants can catch that - the control's padding
+    used to be `4 * SEMANTIC_PROBE_STRIDE` and so re-aligned itself onto a
+    window boundary for every stride it was supposed to be guarding. So the
+    numbers are pinned as NUMBERS, and the invariant they exist to deliver is
+    pinned separately below."""
+    assert SEMANTIC_PROBE_WORDS == 30
+    assert SEMANTIC_PROBE_STRIDE == 10
+    assert SEMANTIC_COVERED_SPAN == 21
+    # ... and the two constants really do produce that span, so a reader can
+    # see the arithmetic and a mutant cannot satisfy the literals and break it.
+    assert SEMANTIC_COVERED_SPAN == SEMANTIC_PROBE_WORDS - SEMANTIC_PROBE_STRIDE + 1
+    # The stride is a COST lever as well as a coverage one: halving it doubles
+    # the queries per row, which is why 10 is pinned from below too.
+    assert len(probe_texts(" ".join(f"w{i}" for i in range(300)))) == 29
+
+
+def test_every_span_of_21_words_lies_wholly_inside_one_probe_window():
+    """The geometry's whole promise, asserted at the literal length it
+    promises rather than at `SEMANTIC_PROBE_WORDS - SEMANTIC_PROBE_STRIDE + 1`
+    - an expression that is true of ANY size and stride and so would pass for
+    every mutant of both.
+
+    A BBL MCQ stem is ~20 words. At the previous 20/10 geometry the worst
+    placement left only 11 of those 20 in the best window, and measured
+    cache-only one of five reworded leaks at that alignment scored 0.703 where
+    its best-aligned copy scored 0.932. 30/10 leaves the whole 21 wherever it
+    falls."""
+    for length in (100, 137, 205, 301):
+        windows = probe_windows(length)
+        for offset in range(length - 21 + 1):
+            span = (offset, offset + 21)
+            assert any(start <= span[0] and span[1] <= end for start, end in windows), (
+                f"a 21-word span at offset {offset} of a {length}-word row sits in no single "
+                f"window: it is compared only in pieces, which is how a verbatim eval "
+                f"question survives this layer"
+            )
+    # The boundary, so this is a statement about 21 and not about "any span":
+    # 22 words is NOT guaranteed, and the design says so rather than implying
+    # a coverage it does not have.
+    windows = probe_windows(137)
+    assert not all(
+        any(start <= offset and offset + 22 <= end for start, end in windows)
+        for offset in range(137 - 22 + 1)
+    )
+
+
+def test_the_control_paraphrase_sits_where_this_geometry_holds_it_worst():
+    """The instrument fault this round found, in its own words: the control's
+    padding was `(_SEMANTIC_CONTROL_FILLER * 2)[: 4 * SEMANTIC_PROBE_STRIDE]`,
+    DERIVED FROM THE CONSTANT IT EXISTED TO GUARD. Every stride change moved
+    the paraphrase back onto a window boundary, so the control passed for every
+    geometry - invariant, by construction, to the mutation it was watching.
+
+    The placement is now read back off probe_texts: whichever offset the
+    windows hold worst is where the control goes, ties to the latest, which
+    parks it in the tail that a missing tail anchor drops on the floor."""
+    control = SEMANTIC_CONTROLS[0]
+    words = control.paraphrase.split()
+    row = control.row.split()
+    assert len(row) == SEMANTIC_CONTROL_ROW_WORDS == 137
+    at = next(i for i in range(len(row)) if row[i : i + len(words)] == words)
+    # It is NOT on a stride boundary, and it is NOT a fixed literal either -
+    # it is where THIS geometry is weakest.
+    assert at == worst_alignment_offset(len(words), SEMANTIC_CONTROL_ROW_WORDS)
+    assert at == 117, "the tail, where the anchor is the only window that reaches"
+    # The row length is deliberately not stride-aligned, so the tail anchor is
+    # live in the control rather than coincidentally unnecessary.
+    assert (SEMANTIC_CONTROL_ROW_WORDS - SEMANTIC_PROBE_WORDS) % SEMANTIC_PROBE_STRIDE != 0
+    # And the placement MOVES when the geometry does: under a stride that
+    # cannot cover a 20-word span, the worst offset is a genuinely bad one.
+    assert worst_alignment_offset(20, 137, size=30, stride=20) != at
+    holds = max(
+        min(end, 15 + 20) - max(start, 15)
+        for start, end in probe_windows(137, size=30, stride=20)
+    )
+    assert holds < 20, "a degraded geometry has a placement no window holds whole"
+
+
+def test_the_semantic_double_behaves_like_a_cosine():
+    """The double is the only semantic decision most of this suite ever sees,
+    so the shape of its answer is part of the fixture contract. It replaced a
+    token-set Jaccard that fell too fast with probe size (the control pair went
+    0.85 -> 0.72 when the window widened, failing a working seam) and a plain
+    containment that did not fall at all (a whole-row seam scored 0.947 and
+    PASSED the control it must fail)."""
+    control = SEMANTIC_CONTROLS[0]
+    item = control.item
+    window = max(probe_texts(control.row)[1:], key=lambda w: _overlap(w, item))
+    assert _overlap(window, item) >= SEMANTIC_THRESHOLD > _overlap(control.row, item), (
+        "a window sees the rewording; the whole row does not"
+    )
+    assert _overlap(control.negative, item) < 0.5
+    assert _overlap(" ".join(control.filler[:30]), item) < SEMANTIC_THRESHOLD
+    assert _overlap(item, item) == pytest.approx(1.0)
+    assert _overlap("", item) == 0.0 and _overlap(item, "") == 0.0
+
+
+# --------------------------------------------------------------------------
+# The semantic layer is PER SCRIPT, and the reason is measured rather than
+# defensive: potion-base-8M has no discriminative power over Devanagari at all.
+# --------------------------------------------------------------------------
+
+HINDI_QUESTION = (
+    "भारतीय दंड संहिता की किस धारा के अंतर्गत लोक सेवक द्वारा किए गए आपराधिक न्यासभंग के लिए "
+    "आजीवन कारावास का दंड निर्धारित किया गया है"
+)
+HINDI_UNRELATED = (
+    "कल के मुकाबले में भारतीय टीम ने शानदार बल्लेबाजी करते हुए तीन विकेट से जीत हासिल की और "
+    "कप्तान ने नाबाद शतक लगाकर दर्शकों का दिल जीत लिया"
+)
+TELUGU_UNRELATED = (
+    "నిన్నటి మ్యాచ్ లో భారత జట్టు అద్భుతమైన బ్యాటింగ్ తో మూడు వికెట్ల తేడాతో విజయం సాధించింది"
+)
+
+
+def test_the_dominant_script_of_a_text_is_what_routes_it():
+    """Coarse on purpose - one block per probe, no per-word analysis - but
+    every branch of the routing rests on it."""
+    assert dominant_script("the appellant was convicted") == SCRIPT_LATIN
+    assert dominant_script(HINDI_QUESTION) == SCRIPT_DEVANAGARI
+    assert dominant_script(TELUGU_UNRELATED) == "telugu"
+    # PLURALITY, and the majority script wins whichever side it is on.
+    assert dominant_script("the appellant भारतीय") == SCRIPT_LATIN
+    assert dominant_script("a भारतीय दंड संहिता") == SCRIPT_DEVANAGARI
+    # Digits, punctuation and section numbers carry no script and decide
+    # nothing - a probe of nothing but those is screened by nobody.
+    assert dominant_script("302 -- 1973 (2)") == SCRIPT_NONE
+    assert dominant_script("") == SCRIPT_NONE
+    # Ties are deterministic (alphabetical), because a routing that depended on
+    # dict order would move the dataset between runs.
+    assert dominant_script("abcd भारती") == dominant_script("भारती abcd") == SCRIPT_DEVANAGARI
+    # Devanagari Extended is Devanagari, not "other".
+    assert dominant_script("꣠꣡꣢") == SCRIPT_DEVANAGARI
+
+
+def test_an_index_that_holds_hindi_cannot_drop_an_unrelated_hindi_row(monkeypatch):
+    """THE FAULT, at the layer that had it. Against the shipped model an index
+    holding ONE Hindi eval question drops 4 of 4 clean Hindi rows at EVERY
+    threshold from 0.6 to 0.95, where the same shape in English drops 0 of 4 at
+    all of them - and every one of those drops recorded `eval_set: *`, so on run
+    one they would have been indistinguishable from real leaks.
+
+    With Devanagari unscreened, the row is carried by the exact stack instead
+    and the layer says so instead of guessing."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    items = [
+        EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset()),
+        EvalItem("bbl", "bbl#en", prose(880, 40), frozenset()),
+    ]
+    seam = SemanticFilter(items, screened=[SCRIPT_LATIN])
+    assert seam.match(HINDI_UNRELATED) is None
+    assert seam.match(HINDI_QUESTION) is None, "not even a verbatim Hindi leak - honestly off"
+    report = seam.script_report()
+    assert report[SCRIPT_DEVANAGARI] == {
+        "screened": False, "eval_items": 1, "unscreened_probes": 2, "unscreened_rows": 2,
+    }
+    assert report[SCRIPT_LATIN]["screened"] is True
+
+    # ... and with Devanagari screened by a seam that CAN see it, the same
+    # verbatim leak is caught. The gate is the control, not the script.
+    install_fake_semhash(monkeypatch)
+    seam = SemanticFilter(items, screened=[SCRIPT_LATIN, SCRIPT_DEVANAGARI])
+    hit = seam.match(HINDI_QUESTION)
+    assert hit is not None and hit.item_id == "bbl#hi"
+    assert hit.detail["script"] == SCRIPT_DEVANAGARI
+    assert seam.script_report()[SCRIPT_DEVANAGARI]["unscreened_rows"] == 0
+
+
+def test_an_english_row_quoting_a_few_devanagari_words_is_not_dropped_by_them(monkeypatch):
+    """Measured against the shipped model: a 300-word English row carrying as
+    few as TEN quoted Devanagari words - a quoted FIR, a line of statute,
+    ordinary in this corpus - dropped at 0.75, 0.8 and 0.85 against an index
+    that held Hindi, and was kept against one that did not. The quote is not
+    the eval question and its exact containment against it is zero."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    seam = SemanticFilter(
+        [EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset())], screened=[SCRIPT_LATIN],
+    )
+    quote = " ".join(HINDI_UNRELATED.split()[:10])
+    words = prose(881, 300).split()
+    row_text = " ".join([*words[:100], quote, *words[100:]])
+    assert seam.match(row_text) is None
+    # A ten-word quote does not even dominate the window it sits in, so it
+    # never reaches a Hindi index and there is nothing to record: the row is
+    # screened normally, in English, exactly as an all-English row is.
+    assert seam.script_report()[SCRIPT_DEVANAGARI]["unscreened_probes"] == 0
+
+    # A row that IS mostly Hindi is a different fact and is recorded as one -
+    # the windows it cannot screen are counted rather than silently skipped.
+    assert seam.match(" ".join([HINDI_UNRELATED] * 4)) is None
+    assert seam.script_report()[SCRIPT_DEVANAGARI]["unscreened_probes"] >= 2
+    assert seam.script_report()[SCRIPT_DEVANAGARI]["unscreened_rows"] == 1
+
+
+def test_a_script_whose_control_fails_is_recorded_as_an_unscreened_hole(
+    tmp_path, monkeypatch, capsys
+):
+    """The waiver shape. `semantic: ran` over a corpus 30% of which is in a
+    script the model is blind to is not the same screen as `ran`, and the
+    dataset card behind it has to be able to say which scripts were covered.
+    7,318 of BhashaBench-Legal's 24,365 questions are Hindi, so this is the
+    first real run, not a hypothetical."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    write_jsonl(paths.streams_dir / "s.jsonl", [row(HINDI_UNRELATED), row(prose(882, 60))])
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf", {"bbl": [{"question": HINDI_QUESTION}]})
+    store.close()
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    out = capsys.readouterr().out
+    manifest = json.loads((paths.out_dir / "decontamination.json").read_text(encoding="utf-8"))
+
+    # The layer ran - but it says WHICH scripts it ran over.
+    assert manifest["semantic"] == "ran"
+    scripts = manifest["semantic_scripts"]
+    assert scripts[SCRIPT_LATIN]["screened"] is True
+    assert scripts[SCRIPT_LATIN]["control"] == "passed"
+    assert scripts[SCRIPT_DEVANAGARI]["screened"] is False
+    assert "devanagari" in scripts[SCRIPT_DEVANAGARI]["control"]
+    assert scripts[SCRIPT_DEVANAGARI]["eval_items"] == 1
+    assert scripts[SCRIPT_DEVANAGARI]["unscreened_rows"] == 1
+    # Nothing Hindi was dropped by a layer that cannot read Hindi.
+    assert manifest["counts"]["dropped"] == 0
+    assert "SEMANTIC SCREENING IS OFF FOR DEVANAGARI" in out
+    assert "1 eval items and 1 candidate rows" in out
+
+
+def test_a_semantic_layer_with_no_working_script_at_all_is_control_failed(
+    tmp_path, monkeypatch
+):
+    """The bottom of the ladder is unchanged: a per-script gate is a waiver for
+    ONE script, not a way for a seam with no power anywhere to record `ran`."""
+    code, manifest, _ = _semantic_run(tmp_path, monkeypatch, answer="exact-only")
+    assert code == 0
+    assert manifest["semantic"] == SEMANTIC_UNUSABLE
+    # Every script is recorded as unscreened, each with the reason it failed -
+    # the run reads as "no screen at all", not as "screened in English".
+    scripts = manifest["semantic_scripts"]
+    assert set(scripts) == {SCRIPT_LATIN, SCRIPT_DEVANAGARI}
+    assert not any(entry["screened"] for entry in scripts.values())
+    assert all("REWORDED copy" in entry["control"] for entry in scripts.values())
+
+
+def test_the_control_gate_is_per_script_and_both_halves_are_two_sided():
+    """Each half must FLAG a rewording and NOT flag an unrelated row, and the
+    two halves are gated independently - which is what lets Hindi be off while
+    English is on rather than forcing the whole layer to one answer."""
+    for control in SEMANTIC_CONTROLS:
+        assert dominant_script(control.item) == control.script
+        assert dominant_script(control.row) == control.script
+        assert dominant_script(control.negative) == control.script
+        assert control.paraphrase != control.item, "an exact copy certifies nothing"
+        assert len(control.row.split()) == SEMANTIC_CONTROL_ROW_WORDS
+    assert {c.script for c in SEMANTIC_CONTROLS} == {SCRIPT_LATIN, SCRIPT_DEVANAGARI}
+
+
+def test_the_control_halves_are_gated_independently(monkeypatch):
+    """Under the double the Devanagari half fails by MISSING its rewording and
+    the Latin half passes, which is the shipped state; lower the bar and
+    Devanagari passes too, which is the state a multilingual model would
+    reach. The gate is the measurement, never an assertion about a script."""
+    install_fake_semhash(monkeypatch)
+    shipped = semantic_controls()
+    assert shipped[SCRIPT_LATIN] == ""
+    assert "REWORDED copy of its devanagari control item" in shipped[SCRIPT_DEVANAGARI]
+    assert semantic_controls(threshold=0.6) == {SCRIPT_LATIN: "", SCRIPT_DEVANAGARI: ""}
+
+    # The other failure direction, and the one the SHIPPED model actually has:
+    # the negative half is flagged too, so the seam flags everything it is
+    # given in that script.
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    measured = semantic_controls()
+    assert measured[SCRIPT_LATIN] == ""
+    assert "nothing to do with Indian law" in measured[SCRIPT_DEVANAGARI]
+    assert "devanagari" in measured[SCRIPT_DEVANAGARI]
+
+
+def test_a_semantic_hit_without_provenance_reads_as_unknown_and_does_not_raise(monkeypatch):
+    """`.filtered` is diagnostic, `.selected` is the decision. A build that
+    renames the first must degrade to the `*` this module used to record on
+    EVERY drop; a build that renames the second must raise. Defaulting the
+    second reads as 'nothing was contaminated'; defaulting the first reads as
+    'we do not know which item', which is true."""
+    install_fake_semhash(monkeypatch, provenance=False)
+    items = [EvalItem("bbl", "bbl#0", prose(883, 40), frozenset())]
+    seam = SemanticFilter(items)
+    hit = seam.match(shuffled(items[0].text, 884))
+    assert hit is not None, "the DROP still happens - only the label degrades"
+    assert (hit.eval_set, hit.item_id) == ("*", "semhash")
+    assert "score" not in hit.detail and hit.detail["script"] == SCRIPT_LATIN
+
+    assert duplicate_provenance(object()) == (None, None, None)
+    assert duplicate_provenance(type("R", (), {"filtered": None})()) == (None, None, None)
+    junk = type("R", (), {"filtered": [type("D", (), {"record": "p", "duplicates": [("x",)]})()]})
+    assert duplicate_provenance(junk()) == (None, None, None)
+
+
+# --------------------------------------------------------------------------
+# THE THRESHOLD TABLE, as fixtures rather than as a comment.
+#
+# The comment table this replaced could not be reproduced: its sibling column
+# came out of one placement of one fixture, and independent fixtures gave
+# OVERLAPPING distributions where it claimed a clean gap. So the material now
+# lives here, the operating point is re-derived from it, and the overlap is
+# asserted rather than asserted away.
+#
+# Every LEAK is placed at the worst alignment the probe geometry admits and
+# every SIBLING at the best, so each column is the pessimistic reading of both
+# error directions at once.
+# --------------------------------------------------------------------------
+
+EVAL_QUESTIONS = (
+    "under which section of the indian penal code is criminal breach of trust by a public "
+    "servant made punishable with imprisonment for life",
+    "what is the limitation period prescribed under the limitation act for filing an appeal "
+    "against a decree passed by a district court",
+    "which article of the constitution of india empowers the supreme court to issue writs of "
+    "mandamus for the enforcement of the fundamental rights",
+    "under section 138 of the negotiable instruments act what is the maximum term of "
+    "imprisonment that may be imposed for dishonour of a cheque",
+    "what is the procedure prescribed under section 125 of the code of criminal procedure for "
+    "the grant of maintenance to a divorced wife",
+)
+# The same question, reworded. What the exact stack loses at one edit per few
+# tokens and what this layer exists to catch.
+REWORDED_LEAKS = (
+    "under which provision of the indian penal code is criminal breach of trust committed by a "
+    "public servant punishable with imprisonment for life",
+    "what limitation period does the limitation act prescribe for the filing of an appeal "
+    "against a decree passed by the district court",
+    "which article of the indian constitution empowers the supreme court to issue a writ of "
+    "mandamus for enforcement of the fundamental rights",
+    "under section 138 of the negotiable instruments act what maximum term of imprisonment may "
+    "be imposed for the dishonour of a cheque",
+    "what procedure does section 125 of the code of criminal procedure prescribe for the grant "
+    "of maintenance to a divorced wife",
+)
+# A DIFFERENT question about the same section - the statute-quotation exception
+# one band over. Exact containment against the eval item is 0.000 and the exact
+# stack rightly keeps every one of them.
+SIBLING_QUESTIONS = (
+    "who may lodge a complaint for criminal breach of trust by a public servant and before "
+    "which court must that complaint be filed",
+    "does the limitation act permit the condonation of delay in an appeal and what must the "
+    "appellant show to obtain it",
+    "may a writ of mandamus be issued against a private body discharging a public duty under "
+    "the constitution of india",
+    "is the offence of dishonour of a cheque under the negotiable instruments act compoundable "
+    "between the complainant and the accused",
+    "may an order of maintenance under the code of criminal procedure be varied on proof of a "
+    "change in the circumstances of the parties",
+)
+# The HARD siblings, and the honest name for the false-positive class this
+# layer charges: the SAME question stem carrying a different offence. A row
+# about the neighbouring section reads almost identically to a row about this
+# one, and this is where the yield actually goes.
+SAME_STEM_SIBLINGS = (
+    "under which section of the indian penal code is criminal misappropriation of property by "
+    "a public servant made punishable with imprisonment for a term of years",
+    "what is the limitation period prescribed under the limitation act for filing a suit for "
+    "possession of immovable property against a trespasser",
+    "which article of the constitution of india empowers the high court to issue writs of "
+    "mandamus for the enforcement of any other legal right",
+    "under section 141 of the negotiable instruments act what is the liability of a director "
+    "of a company for the dishonour of a cheque",
+    "what is the procedure prescribed under section 128 of the code of criminal procedure for "
+    "the enforcement of an order of maintenance",
+)
+_JUDGMENT_FILLER = (
+    "having heard learned counsel for the parties at some length and having perused the "
+    "material placed on the record including the depositions of the prosecution witnesses and "
+    "the documents exhibited during the trial we are of the considered view that the "
+    "concurrent findings recorded by the courts below do not call for any interference in the "
+    "exercise of the appellate jurisdiction vested in this court the trial court has recorded "
+    "reasons which are borne out by the evidence on record and the first appellate court has "
+    "adverted to each of the grounds urged before it the submission that the prosecution "
+    "failed to establish the chain of circumstances beyond reasonable doubt has been examined "
+    "with care and stands rejected on a reading of the testimony of the eye witnesses whose "
+    "presence at the place of occurrence has not been shaken in cross examination the delay in "
+    "lodging the first information report has been explained to the satisfaction of both the "
+    "courts below and no prejudice has been shown to have been caused to the defence the "
+    "recovery of the weapon at the instance of the accused stands corroborated by the "
+    "memorandum drawn in the presence of independent witnesses and the report of the forensic "
+    "science laboratory the plea that the sentence is excessive has been considered in the "
+    "light of the age of the appellant and the period already undergone and we see no reason "
+    "to reduce it further in the result the appeal is dismissed and the impugned judgment and "
+    "order of conviction and sentence are affirmed"
+).split()
+CLEAN_ROWS = (
+    " ".join(_JUDGMENT_FILLER[:200]),
+    " ".join(_JUDGMENT_FILLER[40:240]),
+    " ".join(
+        ("the plaintiff instituted the suit for partition claiming a one third share in the "
+         "joint family properties described in schedule a to the plaint and the defendants "
+         "resisted the claim on the plea that a prior partition had already taken place by a "
+         "registered deed the trial court framed issues and on a consideration of the oral and "
+         "documentary evidence held that the alleged prior partition was not proved and passed "
+         "a preliminary decree").split() * 4
+    ),
+    " ".join(
+        ("the workman was appointed as a fitter and his services came to be terminated without "
+         "the issuance of a charge sheet or the holding of any domestic enquiry the industrial "
+         "tribunal on a reference made to it held that the termination amounted to retrenchment "
+         "and that the mandatory requirements of the industrial disputes act had not been "
+         "complied with and directed reinstatement with continuity of service").split() * 5
+    ),
+)
+_TABLE_ROW_WORDS = 300
+
+
+def leak_row(target: str, *, worst: bool) -> str:
+    """`target` inside a 300-word judgment, at the alignment named.
+
+    `worst` is read off the probe geometry rather than hard-coded, so this
+    fixture stays the pessimistic case when the geometry moves."""
+    words = target.split()
+    at = (
+        worst_alignment_offset(len(words), _TABLE_ROW_WORDS)
+        if worst else SEMANTIC_PROBE_STRIDE * 10
+    )
+    pool = list(_JUDGMENT_FILLER)
+    while len(pool) < _TABLE_ROW_WORDS:
+        pool += _JUDGMENT_FILLER
+    pool = pool[: _TABLE_ROW_WORDS - len(words)]
+    return " ".join([*pool[:at], *words, *pool[at:]])
+
+
+def real_semhash(monkeypatch):
+    """The INSTALLED library against the LOCAL cache, or a clean skip.
+
+    Cache-only and never the network: the suite has to mean the same thing on
+    a fresh clone as on this machine, so a missing extra or a cold HF cache
+    skips rather than fails - and nothing here is allowed to fetch."""
+    monkeypatch.delitem(sys.modules, "semhash", raising=False)
+    for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
+        monkeypatch.setenv(name, "1")
+    try:
+        import huggingface_hub.constants as hf_constants
+
+        monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", True, raising=False)
+    except ImportError:  # pragma: no cover - depends on the environment
+        pass
+    try:
+        import semhash
+    except ImportError:  # pragma: no cover - depends on the environment
+        pytest.skip("the [build] extra is not installed")
+    try:
+        semhash.SemHash.from_records(records=["a one record probe of the embedding model"])
+    except Exception as exc:  # pragma: no cover - depends on the environment
+        pytest.skip(f"the embedding model is not in the local HF cache ({type(exc).__name__})")
+    return semhash
+
+
+def _table_seam(monkeypatch, threshold):
+    real_semhash(monkeypatch)
+    import tuned.data.decontaminate as decon
+
+    return decon.SemanticFilter(
+        [EvalItem("bbl", f"bbl#{i}", text, frozenset())
+         for i, text in enumerate(EVAL_QUESTIONS)],
+        threshold=threshold,
+        screened=[SCRIPT_LATIN],
+    )
+
+
+def test_the_semantic_threshold_table_reproduces_at_the_shipped_operating_point(monkeypatch):
+    """The table in SEMANTIC_THRESHOLD's comment, re-run. It exists because the
+    one it replaced did not reproduce: a comment table is an assertion about a
+    measurement nobody can repeat, and this project has now been wrong about
+    one twice."""
+    seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
+    verbatim = sum(bool(seam.matches(leak_row(q, worst=True))) for q in EVAL_QUESTIONS)
+    reworded = sum(bool(seam.matches(leak_row(q, worst=True))) for q in REWORDED_LEAKS)
+    siblings = sum(bool(seam.matches(leak_row(q, worst=False))) for q in SIBLING_QUESTIONS)
+    same_stem = sum(bool(seam.matches(leak_row(q, worst=False))) for q in SAME_STEM_SIBLINGS)
+    clean = sum(bool(seam.matches(text)) for text in CLEAN_ROWS)
+
+    assert (verbatim, reworded, siblings, clean) == (5, 5, 0, 0)
+    # THE PRICE, named and asserted rather than described as zero. These rows
+    # score 0.000 containment against the eval item and the exact stack keeps
+    # them; this layer does not, and the manifest's per-Hit provenance is what
+    # makes the real rate readable on run one.
+    assert same_stem == 2
+
+    # ... and every one of those decisions is reproducible: the seam is queried
+    # twice and answers the same way, which is the ANN backend's determinism
+    # the docstring could previously only claim for the fake.
+    assert [seam.matches(leak_row(q, worst=True)) for q in REWORDED_LEAKS] == [True] * 5
+
+
+def test_no_semantic_threshold_separates_a_leak_from_a_same_stem_sibling(monkeypatch):
+    """The finding the shipped comment table hid. The two distributions
+    OVERLAP, so the operating point is a choice about which error to buy, not a
+    gap to sit in - and this module's asymmetry (an invisible, permanent false
+    negative against one row of ~18,000) decides it."""
+    seam = _table_seam(monkeypatch, 0.05)
+
+    def top(text):
+        probes = probe_texts(text)
+        result = seam.indexes[SCRIPT_LATIN].deduplicate(records=probes, threshold=0.05)
+        _, score, _ = duplicate_provenance(result)
+        return score
+
+    leaks = [top(leak_row(q, worst=True)) for q in REWORDED_LEAKS]
+    stems = [top(leak_row(q, worst=False)) for q in SAME_STEM_SIBLINGS]
+    clean = [top(text) for text in CLEAN_ROWS]
+
+    assert min(leaks) < max(stems), (
+        f"leaks {sorted(round(v, 3) for v in leaks)} against same-stem siblings "
+        f"{sorted(round(v, 3) for v in stems)}: if these ever separate, the docstring's "
+        f"'no threshold cleanly separates' has stopped being true and the operating point "
+        f"should be re-derived rather than inherited"
+    )
+    # The shipped point sits BELOW the overlap, which is the direction the
+    # module's asymmetry requires: every leak, at a measured sibling price.
+    assert SEMANTIC_THRESHOLD <= min(leaks)
+    # Clean rows are nowhere near it, at any point in the band.
+    assert max(clean) < 0.75
+
+
+def test_the_devanagari_control_half_fails_against_the_shipped_model(monkeypatch):
+    """The measurement that turns Hindi screening off, run rather than quoted.
+
+    potion-base-8M scores two unrelated Hindi sentences at 0.956 and an
+    English legal question against an English recipe at -0.046, so the
+    Devanagari half cannot pass and the layer must not pretend otherwise. If
+    this test ever starts failing because the half PASSES, the model has
+    changed and Hindi screening should be turned back on - by this control, not
+    by anyone's assertion."""
+    real_semhash(monkeypatch)
+    import tuned.data.decontaminate as decon
+
+    results = decon.semantic_controls()
+    assert results[SCRIPT_LATIN] == "", "the Latin half must pass, or nothing is screened"
+    assert results[SCRIPT_DEVANAGARI] != ""
+    assert "nothing to do with Indian law" in results[SCRIPT_DEVANAGARI]
+    # ... and the consequence, end to end: an index holding one Hindi question
+    # flags an unrelated Hindi row about cricket.
+    seam = decon.SemanticFilter(
+        [EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset())],
+        screened=[SCRIPT_DEVANAGARI],
+    )
+    assert seam.matches(HINDI_UNRELATED), (
+        "the model has gained Devanagari power; re-derive the gate from measurement"
+    )
+    # The English shape of the same test, for contrast: no false positive.
+    english = decon.SemanticFilter(
+        [EvalItem("bbl", "bbl#en", EVAL_QUESTIONS[0], frozenset())], screened=[SCRIPT_LATIN],
+    )
+    assert not english.matches(CLEAN_ROWS[0])
+
+
+def test_the_latin_control_has_a_ceiling_against_the_shipped_model(monkeypatch):
+    """Round 1 rejected a control for passing at 0.95. This one is measured
+    both ways: it passes at the shipped point and FAILS above it, so a
+    threshold set too high to see a rewording cannot record `ran`."""
+    real_semhash(monkeypatch)
+    import tuned.data.decontaminate as decon
+
+    assert decon.semantic_controls(threshold=SEMANTIC_THRESHOLD)[SCRIPT_LATIN] == ""
+    assert decon.semantic_controls(threshold=0.85)[SCRIPT_LATIN] == ""
+    for too_high in (0.9, 0.95):
+        why = decon.semantic_controls(threshold=too_high)[SCRIPT_LATIN]
+        assert "REWORDED copy" in why, f"the control has no ceiling at {too_high}"
+
+
+def test_the_probe_geometry_closes_the_alignment_gap_against_the_shipped_model(monkeypatch):
+    """The gap the previous 20/10 geometry had, measured on both sides: at
+    20/10 a reworded leak at the worst alignment is MISSED at the shipped
+    threshold, and at 30/10 it is caught. Same fixture, same model, same
+    threshold - only the window."""
+    seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
+    import tuned.data.decontaminate as decon
+
+    caught_now = [seam.matches(leak_row(q, worst=True)) for q in REWORDED_LEAKS]
+    assert all(caught_now)
+
+    original = decon.probe_texts
+    try:
+        decon.probe_texts = lambda text, **kw: original(text, size=20, stride=10)
+        caught_before = [seam.matches(leak_row(q, worst=True)) for q in REWORDED_LEAKS]
+    finally:
+        decon.probe_texts = original
+    assert not all(caught_before), (
+        "the 20/10 geometry used to miss a reworded leak at worst alignment; if it no "
+        "longer does, the widening bought nothing and should be re-argued"
+    )
+    # And the widening is not paid for in queries: it REMOVES windows.
+    assert len(probe_texts(CLEAN_ROWS[0])) < len(original(CLEAN_ROWS[0], size=20, stride=10))
 
 
 def test_the_semantic_operating_point_reaches_the_manifest(tmp_path, monkeypatch):

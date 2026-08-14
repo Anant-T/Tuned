@@ -271,7 +271,15 @@ MANIFEST_FILENAME = "decontamination.json"
 #    sorted-first one; and the tokeniser keeps combining marks inside a word,
 #    which moves Devanagari items between levels. The rules moved AND the
 #    manifest changed shape.
-DECON_VERSION = 3
+# 4: the semantic layer is PER SCRIPT - one index per script, screening only
+#    the scripts whose own control half passes, with `semantic_scripts`
+#    recording every script it could not screen and why; every semantic drop
+#    now names the eval set and item it matched and the score, where it used to
+#    record `*`/`semhash`; the probe window widened from 20 to 30 words so that
+#    every 21-word span of a row lies wholly inside one window at every offset;
+#    and a filtered eval set whose filter selects nothing is a REFUSAL rather
+#    than a silent read-everything fallback.
+DECON_VERSION = 4
 
 # The n-gram window AT ITS WIDEST. 13 tokens is long enough that ordinary
 # legal phrasing does not collide by accident; window_for narrows it for items
@@ -1493,29 +1501,256 @@ SEMANTIC_NO_ITEMS = "no-eval-items-to-compare"
 SEMANTIC_RAN = "ran"
 
 # THE OPERATING POINT, chosen by measurement against the installed library
-# (cache-only) and not by taking semhash's default. Probes are the row's
-# windows plus the whole row; rows are ~440 and ~1,300 words:
+# (cache-only) and not by taking semhash's default. Re-measured at the probe
+# geometry below, with every leak placed at the WORST alignment the geometry
+# admits and every sibling at the best - i.e. each column is the pessimistic
+# reading of both error directions at once. The fixtures are in the repo and
+# the table is re-runnable: test_the_semantic_threshold_table_reproduces.
 #
-#   threshold          0.6   0.65   0.7   0.75   0.8   0.85   0.9
-#   leaks caught       5/5    4/5   4/5    3/5   3/5    3/5   2/5
-#   siblings dropped   4/4    4/4   3/4    0/4   0/4    0/4   0/4
-#   clean rows dropped 4/4    0/4   0/4    0/4   0/4    0/4   0/4
+#   threshold           0.6   0.65   0.7   0.75   0.8   0.85   0.9   0.95
+#   verbatim leaks      5/5    5/5   5/5    5/5   5/5    5/5   5/5    0/5
+#   reworded leaks      5/5    5/5   5/5    5/5   5/5    4/5   2/5    0/5
+#   siblings dropped    3/5    2/5   1/5    0/5   0/5    0/5   0/5    0/5
+#   SAME-STEM siblings  5/5    5/5   5/5    3/5   2/5    0/5   0/5    0/5
+#   clean rows dropped  0/4    0/4   0/4    0/4   0/4    0/4   0/4    0/4
 #
-# "leaks" are an eval question quoted verbatim or lightly reworded inside the
-# row; "siblings" are a DIFFERENT question about the same section or article -
-# the statute-quotation exception one band over, and the false positive that
-# would cost real yield because this corpus is about the same statutes the
-# eval sets are. The safe interval is [0.75, 0.85] and 0.8 is its centre: 0.05
-# from the sibling cliff below and 0.05 from the edge above, where a VERBATIM
-# leak in a 1,300-word row is already missed.
+# "leaks" are an eval question quoted verbatim or lightly reworded inside a
+# 300-word row. "Siblings" are a DIFFERENT question about the same section or
+# article - the statute-quotation exception one band over. "Same-stem
+# siblings" are the harder and more honest version of that class: the SAME
+# question stem carrying a different offence ("...criminal misappropriation of
+# property by a public servant..." against "...criminal breach of trust by a
+# public servant..."). They are the false positive that costs real yield,
+# because this corpus is about the same statutes the eval sets are.
+#
+# THERE IS NO CLEAN SEPARATION, and pretending otherwise is what the previous
+# table did. Measured on these fixtures the reworded leaks span 0.809-0.918
+# and the same-stem siblings span 0.714-0.847, so the two distributions
+# OVERLAP on [0.809, 0.847]: any threshold in that band both misses a leak and
+# drops a sibling. 0.8 sits below the overlap and therefore buys every leak at
+# a MEASURED, NAMED price - 2 of 5 same-stem siblings, exact containment 0.000
+# on both, rows the exact stack rightly keeps. That price is the right one
+# under this module's asymmetry (a false negative is invisible, permanent and
+# flatters the headline number; a false positive costs one row of ~18,000),
+# and the per-Hit provenance recorded below is what makes the real rate
+# readable on run one instead of arguable now.
 SEMANTIC_THRESHOLD = 0.8
-# The row is probed in WINDOWS as well as whole. See SemanticFilter.matches
-# for the measurement: a whole-row embedding cannot see a verbatim eval
-# question inside a 288-word row at ANY threshold that does not also drop
-# clean rows. 20 words is BBL question length; stride 10 means every position
-# in the row is covered by a window that holds at least 10 of its neighbours.
-SEMANTIC_PROBE_WORDS = 20
+# THE PROBE GEOMETRY. The row is probed in WINDOWS as well as whole: see
+# SemanticFilter for the measurement showing a whole-row embedding cannot see
+# a verbatim eval question inside a 288-word row at ANY threshold that does
+# not also drop clean rows.
+#
+# THE SIZE IS SET BY AN ALIGNMENT GUARANTEE, not by eval-question length. A
+# span of L words placed at offset d is held by the window starting at the
+# largest multiple of the stride at or below d, which holds min(L, size - (d
+# mod stride)) of it - so the WORST placement leaves size - stride + 1 words
+# in the best window. At the previous 20/10 that was 11 of a 20-word question
+# and the gap was live: measured, a 19-word verbatim eval question at offset
+# 5 mod 10 inside a 299-word row was NOT dropped at 0.8, and one of five
+# reworded leaks at worst alignment scored 0.703 where the best-aligned copy
+# scored 0.93.
+#
+# So the size is chosen to make the guarantee hold instead:
+#
+#     SEMANTIC_PROBE_WORDS - SEMANTIC_PROBE_STRIDE + 1  >=  a BBL question
+#
+# 30 - 10 + 1 = 21 words, and BBL's MCQ stems are ~20. EVERY span of 21 words
+# or fewer now sits ENTIRELY inside at least one probe, at every offset, and
+# the alignment gap is closed rather than documented. Measured at 30/10 with
+# the leaks at worst alignment: 5 of 5 reworded leaks caught at 0.8 against 4
+# of 5 at 20/10.
+#
+# It is also CHEAPER, which is the part that is easy to disbelieve: the number
+# of windows is about (row - size)/stride, so widening the window at a fixed
+# stride REMOVES windows. Measured on a 300-word row: 29 probes at 30/10
+# against 30 at 20/10. Narrowing the stride is the expensive lever (58 probes
+# at 20/5) and it does NOT close the gap - only widening the window does.
+SEMANTIC_PROBE_WORDS = 30
 SEMANTIC_PROBE_STRIDE = 10
+# The longest span of a row guaranteed to lie WHOLLY inside one probe window,
+# at every offset. Derived from the two constants above and pinned against
+# both a literal and the behaviour of probe_texts, because a geometry that is
+# only pinned by an expression derived from itself is invariant to the change
+# it exists to catch.
+SEMANTIC_COVERED_SPAN = SEMANTIC_PROBE_WORDS - SEMANTIC_PROBE_STRIDE + 1
+
+
+def probe_texts(text: str, *, size: int = SEMANTIC_PROBE_WORDS,
+                stride: int = SEMANTIC_PROBE_STRIDE) -> list[str]:
+    """The row, plus every `size`-word window of it at `stride`.
+
+    THE WHOLE ROW IS KEPT because the eval side is not all short: an IL-TUR
+    judgment item is hundreds of words and only the whole row is comparable to
+    it. The windows are for the other end, which is most of the eval corpus.
+
+    At the shipped size and stride every span of SEMANTIC_COVERED_SPAN words or
+    fewer lies WHOLLY inside at least one returned window, whatever its offset
+    - including a span at the very end of the row, which is what the tail
+    anchor below is for. That guarantee is the geometry's whole point and it is
+    asserted from the returned windows themselves, never from the loop index.
+    """
+    words = (text or "").split()
+    if not words:
+        return []
+    if len(words) <= size:
+        return [text]
+    starts = list(range(0, len(words) - size + 1, stride))
+    # The tail, anchored at the end. Without it the last (len - size) % stride
+    # words of every row sit in no window at all and are screened only by the
+    # whole-row probe, which is the comparison this design has just established
+    # cannot see anything.
+    if starts[-1] != len(words) - size:
+        starts.append(len(words) - size)
+    return [text] + [" ".join(words[i : i + size]) for i in starts]
+
+
+def probe_windows(row_words: int, *, size: int = SEMANTIC_PROBE_WORDS,
+                  stride: int = SEMANTIC_PROBE_STRIDE) -> list[tuple[int, int]]:
+    """The [start, end) word ranges probe_texts ACTUALLY returns for a row of
+    `row_words` words - read back off the probes, not re-derived from `stride`.
+
+    Everything that reasons about the geometry (the control's placement, the
+    coverage assertions) goes through here, so an instrument can never agree
+    with the code by sharing its arithmetic. A window whose start is computed
+    twice is a window that is pinned zero times.
+    """
+    marked = " ".join(f"w{i}" for i in range(row_words))
+    out = []
+    for probe in probe_texts(marked, size=size, stride=stride)[1:]:
+        indexes = [int(word[1:]) for word in probe.split()]
+        out.append((indexes[0], indexes[-1] + 1))
+    return out
+
+
+def worst_alignment_offset(target_words: int, row_words: int, *,
+                           size: int = SEMANTIC_PROBE_WORDS,
+                           stride: int = SEMANTIC_PROBE_STRIDE) -> int:
+    """Where to put a `target_words` span so the probe windows hold it WORST.
+
+    THIS IS WHY THE CONTROL IS NOT ALIGNED TO THE STRIDE. Its padding used to
+    be `(filler * 2)[: 4 * SEMANTIC_PROBE_STRIDE]`, i.e. derived from the very
+    constant it existed to guard: every stride change re-aligned the control's
+    paraphrase back onto a window boundary, so the control passed for every
+    geometry and was invariant to the mutation it was watching for.
+
+    Reading the placement off the windows instead inverts that. A geometry that
+    degrades makes some offset genuinely bad, this finds it, and the control is
+    run THERE - so the control fails when the geometry stops delivering, and a
+    healthy geometry (where every offset is equally good) is free to put it
+    anywhere. Ties go to the LATEST offset, which parks the control in the tail
+    region - the part of the row a missing tail anchor drops on the floor.
+    """
+    windows = probe_windows(row_words, size=size, stride=stride)
+    best_offset, best_hold = 0, None
+    for offset in range(row_words - target_words + 1):
+        hold = max(
+            (max(0, min(end, offset + target_words) - max(start, offset))
+             for start, end in windows),
+            default=0,
+        )
+        if best_hold is None or hold <= best_hold:
+            best_hold, best_offset = hold, offset
+    return best_offset
+
+
+# --------------------------------------------------------------------------
+# WHICH SCRIPT A PROBE IS IN, and why this layer has to know.
+#
+# The embedding model is potion-base-8M, and it has no discriminative power
+# outside Latin script. Measured cache-only against the installed library:
+#
+#     cos(Hindi legal question, Hindi CRICKET report)  = 0.956
+#     cos(Hindi legal question, Hindi RECIPE)          = 0.928
+#     cos(English legal question, English recipe)      = -0.046
+#
+# End to end that is not a degradation, it is an inversion: an index holding
+# ONE Hindi eval question drops 4 of 4 clean Hindi rows at EVERY threshold from
+# 0.6 to 0.95, where the same shape in English drops 0 of 4 at all of them. A
+# 300-word English row carrying as few as TEN quoted Devanagari words - a
+# quoted FIR, a line of statute, ordinary in this corpus - drops at 0.8 against
+# an index that holds Hindi, and is kept against one that does not. And a
+# Telugu row embeds to the ZERO VECTOR (every character is [UNK]), so a Telugu
+# index flags a verbatim leak and an unrelated row identically.
+#
+# 7,318 of BhashaBench-Legal's 24,365 questions are Hindi, so the index WILL
+# hold Devanagari on the first real run.
+#
+# THE RULE: this layer screens a script only when its own control half passes
+# in that script, and says so per script in the manifest when it does not. With
+# this model that means Hindi semantic screening is OFF and the manifest
+# records an honest, named hole - carried like a waiver rather than like a
+# clean bill of health. The exact stack, which is tokeniser-correct in
+# Devanagari since round 2, still carries those rows, and it is the guarantee
+# that matters. A future multilingual model turns Hindi back on by PASSING THE
+# CONTROL, not by anybody asserting that it should be on.
+# --------------------------------------------------------------------------
+
+SCRIPT_LATIN = "latin"
+SCRIPT_DEVANAGARI = "devanagari"
+# Coarse on purpose - one dominant block per probe, no per-word analysis. The
+# blocks are named rather than lumped into "other" so the manifest can say
+# WHICH script went unscreened; an operator reading `other: 4,000 rows` cannot
+# act on it.
+_SCRIPT_BLOCKS = (
+    (0x0041, 0x024F, SCRIPT_LATIN),      # Latin, Latin-1 Supplement, Extended-A/B
+    (0x0370, 0x03FF, "greek"),
+    (0x0400, 0x04FF, "cyrillic"),
+    (0x0590, 0x05FF, "hebrew"),
+    (0x0600, 0x06FF, "arabic"),
+    (0x0900, 0x097F, SCRIPT_DEVANAGARI),
+    (0xA8E0, 0xA8FF, SCRIPT_DEVANAGARI),  # Devanagari Extended
+    (0x0980, 0x09FF, "bengali"),
+    (0x0A00, 0x0A7F, "gurmukhi"),
+    (0x0A80, 0x0AFF, "gujarati"),
+    (0x0B00, 0x0B7F, "odia"),
+    (0x0B80, 0x0BFF, "tamil"),
+    (0x0C00, 0x0C7F, "telugu"),
+    (0x0C80, 0x0CFF, "kannada"),
+    (0x0D00, 0x0D7F, "malayalam"),
+    (0x0D80, 0x0DFF, "sinhala"),
+    (0x0E00, 0x0E7F, "thai"),
+    (0x4E00, 0x9FFF, "han"),
+)
+# A probe with no letters at all in any known block - digits, punctuation, an
+# emoji. It is not screened by anything and it is not evidence of anything.
+SCRIPT_NONE = "none"
+
+
+def script_of(char: str) -> str | None:
+    """The script one character belongs to, or None for digits/punctuation."""
+    code = ord(char)
+    for low, high, name in _SCRIPT_BLOCKS:
+        if low <= code <= high:
+            return name
+    return None
+
+
+def dominant_script(text: str) -> str:
+    """The script MOST OF this text is written in.
+
+    PLURALITY, not majority, and ties go to the alphabetically first script -
+    deterministic, cheap, and coarse, which is all the routing needs. A
+    mixed-script probe therefore goes to ONE index, the one for whichever
+    script contributes the most letters, and the minority script in it is not
+    semantically screened at all.
+
+    That is the safe direction and it is a deliberate choice rather than an
+    accident: an index of another script scores near zero against this text
+    (measured, cos(Hindi legal, English legal) = 0.050), so a mis-routed probe
+    yields a false negative for the minority script and never a false positive
+    - and the minority script here is one the exact stack still carries
+    verbatim. The alternative, routing a probe to every script it touches, is
+    what produced the ten-Devanagari-words-drops-an-English-row fault.
+    """
+    counts: dict[str, int] = {}
+    for char in text or "":
+        name = script_of(char)
+        if name is not None:
+            counts[name] = counts.get(name, 0) + 1
+    if not counts:
+        return SCRIPT_NONE
+    return min(sorted(counts), key=lambda name: -counts[name])
+
 
 # The negative half of the control. Nothing in an Indian-law eval set is
 # semantically near this, so a seam that flags it flags everything - which is
@@ -1534,7 +1769,6 @@ SEMANTIC_CONTROL_ITEM = (
     "the appellant was convicted under section 302 of the penal code and sentenced to "
     "imprisonment for life by the court of sessions"
 )
-# Exactly SEMANTIC_PROBE_WORDS long, so one window can hold all of it.
 _SEMANTIC_CONTROL_PARAPHRASE = (
     "the accused was convicted under section 302 of the penal code and sentenced to "
     "life imprisonment by the sessions court"
@@ -1545,13 +1779,91 @@ _SEMANTIC_CONTROL_FILLER = (
     "by the courts below do not call for any interference in exercise of the appellate "
     "jurisdiction vested in this court under the constitution"
 ).split()
-# Padded to a WHOLE NUMBER OF STRIDES on the left, so one probe window lands on
-# the paraphrase exactly. The control asks whether the seam can recognise a
-# rewording, not whether a window happened to fall in the right place.
-_SEMANTIC_CONTROL_PAD = (_SEMANTIC_CONTROL_FILLER * 2)[: 4 * SEMANTIC_PROBE_STRIDE]
-SEMANTIC_CONTROL_ROW = " ".join(
-    [*_SEMANTIC_CONTROL_PAD, *_SEMANTIC_CONTROL_PARAPHRASE.split(), *_SEMANTIC_CONTROL_PAD]
+
+# The Devanagari half. Same three parts, same shape, in the script that is 30%
+# of BhashaBench-Legal - and it FAILS against potion-base-8M, which is the
+# point of having it. Measured cache-only at every threshold from 0.6 to 0.95:
+# the positive is flagged and so is the cricket report, so the half never
+# passes and Hindi screening is off and says so. This is not a placeholder for
+# a control that will one day be written; it is the instrument that decides.
+_SEMANTIC_CONTROL_ITEM_DEVANAGARI = (
+    "भारतीय दंड संहिता की किस धारा के अंतर्गत लोक सेवक द्वारा किए गए आपराधिक न्यासभंग के लिए "
+    "आजीवन कारावास का दंड निर्धारित किया गया है"
 )
+_SEMANTIC_CONTROL_PARAPHRASE_DEVANAGARI = (
+    "भारतीय दंड संहिता के किस प्रावधान के अंतर्गत लोक सेवक द्वारा किया गया आपराधिक न्यासभंग "
+    "आजीवन कारावास से दंडनीय है"
+)
+# A cricket report. The Devanagari counterpart of the sourdough loaf, and the
+# half this model cannot tell from a judgment: cos = 0.956.
+_SEMANTIC_CONTROL_NEGATIVE_DEVANAGARI = (
+    "कल के मुकाबले में भारतीय टीम ने शानदार बल्लेबाजी करते हुए तीन विकेट से जीत हासिल की और "
+    "कप्तान ने नाबाद शतक लगाकर दर्शकों का दिल जीत लिया"
+)
+_SEMANTIC_CONTROL_FILLER_DEVANAGARI = (
+    "उभय पक्षों के विद्वान अधिवक्ताओं को सुना गया और अभिलेख पर उपलब्ध सामग्री का अवलोकन किया "
+    "गया अभियोजन साक्षियों के बयानों तथा विचारण के दौरान प्रदर्शित दस्तावेजों पर विचार करने के "
+    "पश्चात हम इस निष्कर्ष पर पहुंचे हैं कि नीचे के न्यायालयों द्वारा अभिलिखित समवर्ती "
+    "निष्कर्षों में हस्तक्षेप का कोई आधार नहीं बनता है विचारण न्यायालय ने जो कारण दिए हैं वे "
+    "अभिलेख पर उपलब्ध साक्ष्य से समर्थित हैं तथा प्रथम अपील न्यायालय ने अपने समक्ष उठाए गए "
+    "प्रत्येक आधार पर विचार किया है"
+).split()
+
+# The control row is this long. NOT a multiple of the stride away from the
+# window size - (137 - 30) % 10 = 7 - so the tail anchor is live in the
+# control, and a row long enough that the worst-alignment scan has somewhere
+# genuinely bad to find when the geometry degrades.
+SEMANTIC_CONTROL_ROW_WORDS = 137
+
+
+@dataclass(frozen=True)
+class ScriptControl:
+    """One script's two-sided control: a rewording that must flag, an unrelated
+    row that must not.
+
+    Both halves run against a ONE-ITEM index of `item`, through the same
+    SemanticFilter the corpus goes through, so the control exercises the
+    routing as well as the seam.
+    """
+
+    script: str
+    item: str
+    paraphrase: str
+    negative: str
+    filler: tuple[str, ...]
+
+    @property
+    def row(self) -> str:
+        """The paraphrase inside a row, at the WORST alignment this geometry
+        admits - see worst_alignment_offset for why that is not the stride."""
+        words = self.paraphrase.split()
+        pad = list(self.filler)
+        while len(pad) < SEMANTIC_CONTROL_ROW_WORDS:
+            pad = pad + list(self.filler)
+        pad = pad[: SEMANTIC_CONTROL_ROW_WORDS - len(words)]
+        at = worst_alignment_offset(len(words), SEMANTIC_CONTROL_ROW_WORDS)
+        return " ".join([*pad[:at], *words, *pad[at:]])
+
+
+SEMANTIC_CONTROLS = (
+    ScriptControl(
+        script=SCRIPT_LATIN,
+        item=SEMANTIC_CONTROL_ITEM,
+        paraphrase=_SEMANTIC_CONTROL_PARAPHRASE,
+        negative=SEMANTIC_CONTROL_NEGATIVE,
+        filler=tuple(_SEMANTIC_CONTROL_FILLER),
+    ),
+    ScriptControl(
+        script=SCRIPT_DEVANAGARI,
+        item=_SEMANTIC_CONTROL_ITEM_DEVANAGARI,
+        paraphrase=_SEMANTIC_CONTROL_PARAPHRASE_DEVANAGARI,
+        negative=_SEMANTIC_CONTROL_NEGATIVE_DEVANAGARI,
+        filler=tuple(_SEMANTIC_CONTROL_FILLER_DEVANAGARI),
+    ),
+)
+# The Latin half's row, kept under its old name because it is what the
+# whole-row and exact-match seam tests feed.
+SEMANTIC_CONTROL_ROW = SEMANTIC_CONTROLS[0].row
 
 
 class SemanticSeamError(RuntimeError):
@@ -1630,31 +1942,45 @@ def selected_records(result) -> list:
     return list(selected)
 
 
-def probe_texts(text: str, *, size: int = SEMANTIC_PROBE_WORDS,
-                stride: int = SEMANTIC_PROBE_STRIDE) -> list[str]:
-    """The row, plus every `size`-word window of it at `stride`.
+def duplicate_provenance(result) -> tuple[str | None, float | None, str | None]:
+    """(the indexed text matched, the score, the probe that matched it) - BEST EFFORT.
 
-    THE WHOLE ROW IS KEPT because the eval side is not all short: an IL-TUR
-    judgment item is hundreds of words and only the whole row is comparable to
-    it. The windows are for the other end, which is most of the eval corpus.
+    THE STRONGEST EVIDENCE IN THE RESULT, not the first dropped probe: a row
+    can lose several windows at once and the one that matters to an operator
+    reading the drop log is the closest of them.
+
+    `DeduplicationResult.filtered` carries a DuplicateRecord per dropped probe
+    with the records it matched and their scores, and this pass used to throw
+    all of it away: a semantic Hit recorded `eval_set="*"`, `item_id="semhash"`
+    and nothing else, so on run one four thousand false positives and four
+    thousand real leaks would have read identically in `by_level`.
+
+    DELIBERATELY UNABLE TO RAISE, and that is the difference between this and
+    selected_records. The DECISION is `len(selected) < len(probes)` and it
+    stays there; this only labels a decision already made. A default in
+    selected_records reads as "nothing was contaminated" and has to be an
+    error; a default here reads as "we do not know which item", which is what
+    the old code said about every single drop.
     """
-    words = (text or "").split()
-    if not words:
-        return []
-    if len(words) <= size:
-        return [text]
-    starts = list(range(0, len(words) - size + 1, stride))
-    # The tail, anchored at the end. Without it the last (len - size) % stride
-    # words of every row sit in no window at all and are screened only by the
-    # whole-row probe, which is the comparison this design has just established
-    # cannot see anything.
-    if starts[-1] != len(words) - size:
-        starts.append(len(words) - size)
-    return [text] + [" ".join(words[i : i + size]) for i in starts]
+    best_text, best_score, best_probe = None, None, None
+    try:
+        filtered = list(result.filtered)
+    except (AttributeError, TypeError):
+        return None, None, None
+    for record in filtered:
+        probe = getattr(record, "record", None)
+        for pair in getattr(record, "duplicates", None) or ():
+            try:
+                text, score = pair[0], float(pair[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if best_score is None or score > best_score:
+                best_text, best_score, best_probe = text, score, probe
+    return best_text, best_score, best_probe
 
 
 class SemanticFilter:
-    """Flags rows semantically close to an eval item.
+    """Flags rows semantically close to an eval item, PER SCRIPT.
 
     THE ROW IS PROBED IN WINDOWS, and that is not an optimisation - it is the
     same correction containment made to Jaccard one layer up. Cosine
@@ -1673,30 +1999,122 @@ class SemanticFilter:
     20,000-item index: 85 ms/row whole, 198 ms/row windowed, i.e. ~25 min
     against ~59 min over an 18,000-row corpus.
 
+    THERE IS ONE INDEX PER SCRIPT and a probe only ever meets the index for its
+    own dominant script - see dominant_script for the measurement that forced
+    it. `screened` is the set of scripts whose control half passed; a probe in
+    any other script is counted as UNSCREENED, per script, and reaches the
+    manifest as a named hole rather than as silence.
+
     This layer only ever ADDS drops; everything the no-false-negative
     guarantee rests on is the pure-Python screen above.
     """
 
-    def __init__(self, eval_texts: Sequence[str], *, threshold: float = SEMANTIC_THRESHOLD):
+    def __init__(self, eval_items: Sequence, *, threshold: float = SEMANTIC_THRESHOLD,
+                 screened: Iterable[str] | None = None):
         self.threshold = threshold
-        self.index = semhash_index(eval_texts)
+        self.items_by_script: dict[str, list[EvalItem]] = {}
+        for entry in eval_items:
+            item = (
+                entry if isinstance(entry, EvalItem)
+                else EvalItem("*", "semhash", str(entry), frozenset())
+            )
+            self.items_by_script.setdefault(dominant_script(item.text), []).append(item)
+        self.screened = (
+            frozenset(self.items_by_script) if screened is None else frozenset(screened)
+        )
+        self.indexes: dict[str, object] = {}
+        self.item_by_text: dict[str, EvalItem] = {}
+        for script in sorted(self.items_by_script):
+            if script not in self.screened:
+                continue
+            group = self.items_by_script[script]
+            self.indexes[script] = semhash_index([item.text for item in group])
+            for item in group:
+                self.item_by_text.setdefault(item.text, item)
+        # Counted, not merely skipped: `probes` is how much of the corpus this
+        # layer never looked at, and `rows` is how many rows carried any of it.
+        self.unscreened_probes: dict[str, int] = {}
+        self.unscreened_rows: dict[str, int] = {}
+
+    @property
+    def eval_items_by_script(self) -> dict[str, int]:
+        return {script: len(items) for script, items in sorted(self.items_by_script.items())}
+
+    def script_report(self) -> dict[str, dict]:
+        """What this layer screened and what it did not, by script."""
+        out: dict[str, dict] = {}
+        for script in sorted(set(self.items_by_script) | set(self.unscreened_probes)):
+            out[script] = {
+                "screened": script in self.indexes,
+                "eval_items": len(self.items_by_script.get(script, ())),
+                "unscreened_probes": self.unscreened_probes.get(script, 0),
+                "unscreened_rows": self.unscreened_rows.get(script, 0),
+            }
+        return out
+
+    def match(self, text: str) -> Hit | None:
+        """The eval item a window of this text is a semantic duplicate of.
+
+        Probes are grouped by their own script and each group is compared only
+        against that script's index. A group whose script is not screened is
+        counted and skipped - never compared against another script's index,
+        which is what made ten Devanagari words drop a 300-word English row.
+        """
+        probes = probe_texts(text)
+        if not probes:
+            return None
+        by_script: dict[str, list[str]] = {}
+        for probe in probes:
+            by_script.setdefault(dominant_script(probe), []).append(probe)
+        hit = None
+        for script in sorted(by_script):
+            group = by_script[script]
+            index = self.indexes.get(script)
+            if index is None:
+                if script in self.screened:
+                    # Screenable, and this corpus simply holds no eval item in
+                    # it. Nothing to compare against is not a hole in the
+                    # screen, so it is not counted as one.
+                    continue
+                self.unscreened_probes[script] = (
+                    self.unscreened_probes.get(script, 0) + len(group)
+                )
+                self.unscreened_rows[script] = self.unscreened_rows.get(script, 0) + 1
+                continue
+            if hit is not None:
+                # Already flagged by an earlier script. The remaining queries
+                # cannot change the verdict and this layer's cost is per query.
+                continue
+            result = index.deduplicate(records=group, threshold=self.threshold)
+            kept = selected_records(result)
+            if len(kept) >= len(group):
+                continue
+            matched_text, score, probe = duplicate_provenance(result)
+            item = self.item_by_text.get(matched_text) if matched_text else None
+            detail = {"threshold": self.threshold, "script": script}
+            if score is not None:
+                detail["score"] = round(score, 4)
+            if probe is not None:
+                detail["probe_words"] = len(probe.split())
+            hit = Hit(
+                LEVEL_SEMANTIC,
+                item.set_key if item else "*",
+                item.item_id if item else "semhash",
+                detail,
+            )
+        return hit
 
     def matches(self, text: str) -> bool:
         """Is any window of this text a semantic duplicate of an eval item?"""
-        probes = probe_texts(text)
-        if not probes:
-            return False
-        result = self.index.deduplicate(records=probes, threshold=self.threshold)
-        return len(selected_records(result)) < len(probes)
+        return self.match(text) is not None
 
     def __call__(self, item: Item):
-        if self.matches(item.text):
-            return (Hit(LEVEL_SEMANTIC, "*", "semhash", {"threshold": self.threshold}),)
-        return ()
+        hit = self.match(item.text)
+        return (hit,) if hit is not None else ()
 
 
-def semantic_control(*, threshold: float = SEMANTIC_THRESHOLD) -> None:
-    """Raise unless the seam is OBSERVED working, in both directions.
+def semantic_controls(*, threshold: float = SEMANTIC_THRESHOLD) -> dict[str, str]:
+    """{script: "" if its control passed, else why it did not}.
 
     `semantic: "ran"` in the manifest has to mean "this layer can find a
     reworded eval question inside a row", not "the call did not raise". The
@@ -1712,27 +2130,59 @@ def semantic_control(*, threshold: float = SEMANTIC_THRESHOLD) -> None:
     including the one it shipped at, where the seam caught 0 of 2 paraphrases.
     A control that a power-less seam passes certifies nothing. This one fails
     for an exact-match seam, fails for a whole-row seam (measured: a verbatim
-    leak in a 288-word row is invisible to one), and fails at a threshold too
-    high to see a rewording.
+    leak in a 288-word row is invisible to one), fails when the probe geometry
+    stops covering the row (the paraphrase is placed at the worst alignment the
+    geometry admits, not at a stride boundary), and has a CEILING: measured
+    cache-only at the shipped geometry it passes at 0.7 through 0.85 and fails
+    at 0.9 and 0.95, where a rewording is no longer visible. The dedupe control
+    makes no ceiling claim and does not need to; this one is the reason the
+    threshold can be called measured rather than assumed.
 
-    It runs against its OWN one-item index rather than the eval corpus: the
-    eval texts are whatever was downloaded, and a control has to be a question
-    whose answer is known before the run.
+    IT IS PER SCRIPT, and that is what turns a model's blindness into a
+    recorded hole instead of four thousand silent false positives. Each half
+    runs against its OWN one-item index - the eval texts are whatever was
+    downloaded, and a control has to be a question whose answer is known before
+    the run - and a script whose half fails is simply not screened.
     """
-    seam = SemanticFilter([SEMANTIC_CONTROL_ITEM], threshold=threshold)
-    if not seam.matches(SEMANTIC_CONTROL_ROW):
-        raise SemanticSeamError(
-            f"the semantic layer did not find a REWORDED copy of its control item inside a "
-            f"row at threshold {threshold}. A layer that cannot recognise a rewording "
-            f"cannot recognise the paraphrase it exists for, and recording it as having "
-            f"run would put a screen in the manifest that never screened anything. "
-            f"(An exact-match seam, a whole-row seam and a too-high threshold all land "
-            f"here - the semantic_detail beside this says which was asked for.)"
+    out: dict[str, str] = {}
+    for control in SEMANTIC_CONTROLS:
+        seam = SemanticFilter(
+            [control.item], threshold=threshold, screened=[control.script],
         )
-    if seam.matches(SEMANTIC_CONTROL_NEGATIVE):
+        if not seam.matches(control.row):
+            out[control.script] = (
+                f"the semantic layer did not find a REWORDED copy of its {control.script} "
+                f"control item inside a row at threshold {threshold}. A layer that cannot "
+                f"recognise a rewording cannot recognise the paraphrase it exists for, and "
+                f"recording it as having run would put a screen in the manifest that never "
+                f"screened anything. (An exact-match seam, a whole-row seam, a probe geometry "
+                f"that no longer covers the row and a too-high threshold all land here - the "
+                f"semantic_detail beside this says which was asked for.)"
+            )
+        elif seam.matches(control.negative):
+            out[control.script] = (
+                f"the semantic layer flagged {control.script} text with nothing to do with "
+                f"Indian law, so in that script it flags everything - every row written in it "
+                f"would be dropped as contaminated."
+            )
+        else:
+            out[control.script] = ""
+    return out
+
+
+def semantic_control(*, threshold: float = SEMANTIC_THRESHOLD) -> None:
+    """Raise unless AT LEAST ONE script's control passes.
+
+    The ladder: a script whose half fails is not screened and is recorded as
+    such; a run where NO half passes has no working seam at all and is
+    `semhash-control-failed`, the same rung as a drifted API. dedupe.py's
+    control is single-script by construction (it compares this corpus against
+    itself, and rule 2 already scopes it) and keeps its own shape.
+    """
+    failures = semantic_controls(threshold=threshold)
+    if not any(detail == "" for detail in failures.values()):
         raise SemanticSeamError(
-            "the semantic layer flagged text with nothing to do with Indian law, so it "
-            "flags everything - every row would be dropped as contaminated."
+            " / ".join(detail for detail in failures.values() if detail)
         )
 
 
@@ -1831,10 +2281,34 @@ def output_record(path: Path, rows: int) -> dict:
     return {"path": str(path), "rows": rows, "sha256": sha256_file(path)}
 
 
+def semantic_script_record(layer, controls: dict[str, str] | None) -> dict:
+    """PER SCRIPT: which the semantic layer screened, which it could not, why.
+
+    An honest hole, carried like a waiver. `potion-base-8M` has no
+    discriminative power over Devanagari (see dominant_script), so on the first
+    real run this block is where the manifest says that Hindi - 7,318 of BBL's
+    24,365 questions - was screened by the exact stack alone. A dataset card
+    that claims a paraphrase screen has to be able to say which scripts it
+    covered, and `semantic: ran` alone cannot.
+    """
+    out: dict[str, dict] = {}
+    for script, why in sorted((controls or {}).items()):
+        out[script] = {"control": "passed" if not why else why,
+                       "screened": not why, "eval_items": 0,
+                       "unscreened_probes": 0, "unscreened_rows": 0}
+    for script, entry in (layer.script_report() if layer is not None else {}).items():
+        record = out.setdefault(
+            script, {"control": "no control half for this script", "screened": False}
+        )
+        record.update(entry)
+    return dict(sorted(out.items()))
+
+
 def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *,
                 inputs: Sequence[str], semantic: str, semantic_detail: str = "",
                 output: dict | None = None, generations: dict | None = None,
                 threshold: float = CONTAINMENT, ids_from_text: bool = True,
+                semantic_layer=None, semantic_controls: dict[str, str] | None = None,
                 top: int = 20) -> dict:
     """The record that has to outlive this run.
 
@@ -1929,6 +2403,11 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
         # semantic_control for the two silent directions it pins.
         "semantic": semantic,
         "semantic_detail": semantic_detail,
+        # WHICH SCRIPTS the semantic layer could actually screen. `ran` over a
+        # corpus 30% of which is in a script the model is blind to is not the
+        # same screen as `ran`, and this is where the difference is written
+        # down. See semantic_script_record.
+        "semantic_scripts": semantic_script_record(semantic_layer, semantic_controls),
         # ROW-MATCHES per identifier, so this sums to at least `dropped`: a row
         # that shares two identifiers with the eval side is blamed on both,
         # because --no-case-id-from-text removes a whole channel and the
@@ -2004,20 +2483,29 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
             return 2
 
         semantic_fn, semantic_status, semantic_detail = None, SEMANTIC_UNAVAILABLE, ""
-        texts = [i.text for c in corpora.values() for i in c.items]
+        semantic_controls_ran: dict[str, str] = {}
+        eval_items = [item for c in corpora.values() for item in c.items]
         if semhash_available():
-            if not texts:
+            if not eval_items:
                 # Every set waived: there is nothing for this layer to compare
                 # against, which is not the same fact as "it did not run" and
                 # must not be recorded as "ran".
                 semantic_status = SEMANTIC_NO_ITEMS
             else:
                 try:
-                    # The control FIRST, on a one-item index: it costs a second
-                    # and it proves the model, the API shape and the seam's
-                    # power before the 20,000-item index is built.
-                    semantic_control()
-                    seam = SemanticFilter(texts)
+                    # The controls FIRST, on one-item indexes: they cost a
+                    # second and they prove the model, the API shape and the
+                    # seam's power PER SCRIPT before the 20,000-item index is
+                    # built. A script whose control fails is not screened.
+                    semantic_controls_ran = semantic_controls()
+                    passed = sorted(
+                        script for script, why in semantic_controls_ran.items() if not why
+                    )
+                    if not passed:
+                        raise SemanticSeamError(
+                            " / ".join(why for why in semantic_controls_ran.values() if why)
+                        )
+                    seam = SemanticFilter(eval_items, screened=passed)
                 except SemanticModelError as exc:
                     # Its own rung. The remedy is network or a warm cache, and
                     # sending an operator to look for API drift instead is the
@@ -2151,6 +2639,7 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
             stats, corpora, index, inputs=input_names, semantic=semantic_status,
             semantic_detail=semantic_detail, ids_from_text=ids_from_text,
             output=output_record(out_path, written), generations=generations,
+            semantic_layer=semantic_fn, semantic_controls=semantic_controls_ran,
         )
         write_jsonl(out_path.parent / DROPS_FILENAME, drops)
         write_manifest(out_path.parent / MANIFEST_FILENAME, manifest)
@@ -2196,6 +2685,18 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
             print("  identifiers that cost the most rows (read this before trusting the yield):")
             for identifier, count in manifest["top_identifiers"][:5]:
                 print(f"    {identifier:<48} {count}")
+        for script, entry in manifest["semantic_scripts"].items():
+            if entry["screened"] or not (entry["eval_items"] or entry["unscreened_rows"]):
+                continue
+            # A hole with a name and a size. The alternative - and what shipped
+            # before this - was a run in which the Hindi third of BBL produced
+            # thousands of drops that read exactly like real leaks.
+            print(
+                f"    SEMANTIC SCREENING IS OFF FOR {script.upper()}:"
+                f" {entry['eval_items']} eval items and {entry['unscreened_rows']} candidate"
+                f" rows were compared by the exact stack ONLY."
+            )
+            print(f"      {entry['control']}")
         if semantic_status != SEMANTIC_RAN:
             print(
                 f"  semantic layer did NOT run ({semantic_status}) - paraphrased eval questions"
