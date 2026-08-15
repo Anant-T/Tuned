@@ -122,8 +122,19 @@ providers:
 # bucket is per WORKSPACE, not per model. providers.TokenBucket is per
 # (provider, model), so each model is given half - two per-model buckets of
 # 50k would issue at twice the real refill rate and 429-storm at full load.
-# Cerebras tpd may actually be account-wide shared rather than per-model;
-# treated per-model here until it is empirically tested. qwen/qwen3.6-27b is
+# Cerebras is header-verified 2026-08-15 on a funded account ($5 credit):
+# all three models answered 200, and the limit headers read rpm 5, tpm
+# 30,000, 1,000,000 tokens/day and 2,400 requests/day PER MODEL. So the
+# per-model treatment above was right, and the "may be account-wide,
+# untested" caveat is retired rather than merely re-worded. Costing:
+# pay-per-token at $0.35/$0.75 per 1M in/out on gpt-oss-120b, so the
+# provider's own 1M tokens/day ceiling bounds the burn at roughly
+# $0.55-0.75/day and the $5 credit covers the whole generation phase; the
+# daily budget report is the instrument to watch it with. NOTE that the
+# measured rpd 2,400 is NOT declared in the limits above, so store._cap
+# reads requests/day as unlimited here and the tpd ceiling is the only thing
+# ledgered - fine while tpd binds first, which at these rates it does.
+# qwen/qwen3.6-27b is
 # a Groq PREVIEW model and may vanish without notice - never make it the sole
 # judge; the routing lists below always give fallbacks. Model refs in routing
 # are "provider/model-id" strings - note that "groq/qwen/qwen3.6-27b" contains
