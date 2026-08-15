@@ -3327,6 +3327,36 @@ def test_a_run_with_no_eval_item_in_a_screenable_script_did_not_run(tmp_path, mo
     # ... and --require-semantic refuses it, which `ran` would not have.
     assert decon_main(["--config", cfg, "--no-generated", "--require-semantic"]) == 2
 
+    # THE SAME PULL, WITH THE ACTS NAMED IN ENGLISH - which is how Indian legal
+    # writing names them, so it is the realistic version of this run. Before
+    # the residue share test those citations built a Latin index of statute
+    # names, and the run recorded `ran` over a screen whose only eval items
+    # were the names of acts. It lands on the SAME rung now, and the manifest
+    # says why in its own counter rather than by silence.
+    (tmp_path / "cited").mkdir(parents=True, exist_ok=True)
+    cited = temp_config(tmp_path / "cited")
+    cited_paths = paths_for(tmp_path / "cited")
+    write_jsonl(cited_paths.streams_dir / "s.jsonl", [row(HINDI_UNRELATED), row(prose(898, 60))])
+    store = Store.open(cited_paths.state_db)
+    for key, spec in EVAL_SETS.items():
+        floor = math.ceil((spec.expect_rows or 0) * EVAL_MIN_SHARE)
+        eval_snapshot(store, tmp_path / "cited" / "hf", key, [
+            {"question": " ".join(hindi_words[i % 7:] + hindi_words[: i % 7])
+                         + " Indian Penal Code 1860 302"}
+            for i in range(max(1, floor))
+        ])
+    store.close()
+    assert decon_main(["--config", cited, "--no-generated"]) == 0
+    capsys.readouterr()
+    cited_manifest = json.loads(
+        (cited_paths.out_dir / "decontamination.json").read_text(encoding="utf-8")
+    )
+    assert cited_manifest["semantic"] == SEMANTIC_NO_SCREENABLE_ITEMS
+    latin = cited_manifest["semantic_scripts"][SCRIPT_LATIN]
+    assert latin["eval_items"] == 0, "a statute's name became an eval item again"
+    assert latin["residue_items"] > 0, "the skipped residues are not counted anywhere"
+    assert latin["screened"] is False
+
 
 def test_screened_means_the_control_passed_and_an_index_holds_items():
     """ONE definition, and it used to be two. The manifest wrote
