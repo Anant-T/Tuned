@@ -2636,8 +2636,14 @@ class SemanticFilter:
             detail["item_residue"] = bool(
                 matched_text is not None and matched_text in self.residue_texts
             )
+            # Word-level comparison, not string membership: the short-row split
+            # rebuilds probes[0] as " ".join(words), so a raw text with a
+            # newline differs from its own whole-row probe by whitespace alone
+            # and a membership test misreads every pipeline-built short row as
+            # a residue.
             detail["probe_residue"] = bool(
-                probe is not None and probe not in set(probe_texts(text))
+                probe is not None
+                and all(probe.split() != p.split() for p in probe_texts(text))
             )
             hit = Hit(
                 LEVEL_SEMANTIC,

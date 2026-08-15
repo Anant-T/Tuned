@@ -4455,6 +4455,18 @@ def test_the_residue_share_table_reproduces():
                if len(tokens(script_partition(f"{HINDI_QUESTION} {t}").get(SCRIPT_LATIN, "")))
                >= SCRIPT_PARTITION_FLOOR]
     assert cleared == ["Indian Penal Code 1860 302", "Code of Criminal Procedure 1973"]
+    # THE NEUTRAL-WORD EXCLUSION has cases where it alone decides. These
+    # digit-heavy citation tails sit BELOW the threshold only because the
+    # denominator counts script-bearing words: under any counting that lets
+    # the shared numerals in, each reads >= 0.21 and a statute's section list
+    # becomes an eval item. This is the clause the share test is safe by.
+    digit_heavy = [
+        "sections 302 304B 498A 34 IPC 1860",
+        "Act 1881 section 138 141 142 NI",
+        "CrPC 1973 125 127 128 read with 397",
+    ]
+    for tail in digit_heavy:
+        assert share_of(tail) < SCRIPT_RESIDUE_MIN_SHARE
 
 
 def test_the_share_test_decides_in_both_directions_at_its_own_edge(monkeypatch):
@@ -4641,6 +4653,16 @@ def test_a_residue_match_and_a_whole_item_match_are_told_apart_by_the_record(mon
     mixed = seam.match(f"भारतीय दंड संहिता के तहत {clause} was the charge")
     assert mixed is not None and mixed.detail["probe_residue"] is True
     assert whole.detail["probe_residue"] is False
+
+    # AND THE PIPELINE'S OWN ROW SHAPE, not a hand-spaced string: Item.text is
+    # prompt + "\n" + answer, while the short-row split rebuilds the probe as
+    # " ".join(words). The comparison must be word-level, because whitespace
+    # alone can never make a monolingual whole-row probe a "residue" - a
+    # membership test here misread every pipeline-built short row.
+    newline_row = clause.replace("criminal", "wrongful").replace(" by ", "\nby ")
+    piped = seam.match(newline_row)
+    assert piped is not None
+    assert piped.detail["probe_residue"] is False
 
 
 def test_the_semantic_attribution_is_the_same_on_every_run(monkeypatch):
