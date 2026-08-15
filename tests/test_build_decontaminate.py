@@ -4421,6 +4421,45 @@ def test_the_share_test_decides_in_both_directions_at_its_own_edge(monkeypatch):
     assert round(script_share(below.text, SCRIPT_DEVANAGARI), 3) == 0.806
 
 
+def test_an_item_whose_scripts_are_all_minorities_still_reaches_an_index(monkeypatch):
+    """The clause that makes the share test safe, with the case it needs. The
+    rule is about RESIDUES, so the item's own dominant script is indexed
+    whatever its share - and without that clause an item written in six scripts
+    at 0.162-0.189 apiece clears the bar in NONE of them and is screened by
+    nobody, silently. Applying the share test to the dominant script too
+    survived the whole suite until this fixture existed."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    text = " ".join([
+        "the appellant was convicted under the code",
+        "अभियुक्त को दोषी ठहराया गया था",
+        "আসামীকে দোষী সাব্যস্ত করা হয়েছিল আজ",
+        "குற்றவாளி என்று தீர்ப்பு வழங்கப்பட்டது இன்று மீண்டும்",
+        "నిందితుడు దోషిగా తీర్పు ఇవ్వబడింది ఈరోజు మళ్ళీ",
+        "ο κατηγορουμενος κριθηκε ενοχος σημερα ξανα",
+    ])
+    item = EvalItem("bbl", "bbl#six", text, frozenset())
+    parts = script_partition(text)
+    assert len(parts) == 6
+    # EVERY script is a minority of the others - the premise, asserted, so this
+    # cannot quietly stop being the case the test is about.
+    assert max(script_share(text, s) for s in parts) < SCRIPT_RESIDUE_MIN_SHARE
+    # ... and every partition clears the token floor, so the floor is not what
+    # is deciding here.
+    assert all(len(tokens(p)) >= SCRIPT_PARTITION_FLOOR for p in parts.values())
+
+    dominant = dominant_script(text)
+    assert dominant in parts
+    seam = SemanticFilter([item], screened=list(parts))
+    assert [i.item_id for _, i in seam.items_by_script[dominant]] == ["bbl#six"], (
+        "an item whose scripts are all minorities of each other fell out of every index"
+    )
+    # The other five ARE residues by this rule, and are counted as such rather
+    # than indexed - which is the half that says the clause is a carve-out for
+    # the dominant script and not a hole in the test.
+    assert set(seam.items_by_script) == {dominant}
+    assert seam.residue_items == {s: 1 for s in parts if s != dominant}
+
+
 def test_a_statute_citation_in_an_eval_item_does_not_condemn_every_row_citing_it(
     monkeypatch,
 ):
