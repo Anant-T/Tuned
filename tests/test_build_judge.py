@@ -10,6 +10,7 @@ from pipeline_fakes import (
     StealsTheLease,
     build_cfg,
     cfg_with_fourth_judge_family,
+    cfg_without_the_paid_judges,
     chat_response,
     judge_reply,
     open_store,
@@ -663,13 +664,22 @@ def test_a_keyless_judge_pool_re_queues_rather_than_parking(tmp_path, cfg, paths
     missing key is a fact about the FLEET, so the row goes back to the queue
     it came from rather than parking as if nothing could ever judge it."""
     with judged_store(tmp_path, paths, cfg) as store:
-        router = FakeRouter(cfg, missing_keys={"mistral", "groq", "cerebras"})
+        # Every provider, derived: one left keyed is one judge still routable,
+        # and the row then gets judged instead of re-queued.
+        router = FakeRouter(cfg, missing_keys={p.name for p in cfg.providers})
         totals = run_judge(store, cfg, router, paths)
         assert only_task(store)["state"] == JUDGE_STATE_FROM
         assert totals["unroutable"] == 0
         event = json.loads(store.events("judge_route_error")[0]["detail_json"])
         assert event["unroutable"] is False
-        assert event["skipped"] == ["missing-key"]
+        # "family-excluded" rides along because the judge pool now contains the
+        # generator's OWN family (the openai backstop is lumped into gpt-oss),
+        # and eligible_refs tests family before key. That makes this the harder
+        # case rather than a weaker one: the set CONTAINS a row-shaped reason
+        # and still must not read as row-shaped, because
+        # `skips <= ROW_SHAPED_SKIPS` is a subset test and a missing key is not
+        # in it. Read as row-shaped, this row would park instead of re-queue.
+        assert event["skipped"] == ["family-excluded", "missing-key"]
 
 
 def test_a_recorded_slot_is_never_bought_twice(tmp_path, cfg, paths):
@@ -734,13 +744,21 @@ def test_slot_b_can_be_unroutable_after_slot_a_has_been_paid_for(tmp_path, cfg, 
     """R2-C3, the realistic shape. A long row routes to magistral, family
     separation removes mistral, the 8k glm judge is out on length, slot A
     takes qwen - and slot B has nothing left. The row parks having already
-    paid for judge A, which is the money this costs."""
+    paid for judge A, which is the money this costs.
+
+    Run against the pool WITHOUT the paid backstop. The shipped pool no longer
+    has this hole - closing it is what the openai judges are for - but the
+    handling is what is under test here, not the config: a slot B that comes
+    back empty must bank judge A and park recoverably, and that has to keep
+    working for any pool that runs out. It is also the live behaviour for an
+    operator who has not funded OPENAI_API_KEY."""
+    holed = cfg_without_the_paid_judges(cfg)
     store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
-    plan_wave(store, cfg, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
+    plan_wave(store, holed, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
     with store:
         asyncio.run(
             run_workers(
-                store, cfg, FakeRouter(cfg), paths=paths, streams=["synthesis"],
+                store, holed, FakeRouter(holed), paths=paths, streams=["synthesis"],
                 n_workers=1, max_batches=1,
             )
         )
@@ -748,8 +766,8 @@ def test_slot_b_can_be_unroutable_after_slot_a_has_been_paid_for(tmp_path, cfg, 
         assert gen["model_family"] == "mistral"  # the long prompt diverted
         _lengthen(store, only_task(store)["task_id"], 2000)
 
-        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5, "a says fine")]})
-        totals = run_judge(store, cfg, router, paths)
+        router = FakeRouter(holed, {"judge": [judge_reply(5, 5, 5, "a says fine")]})
+        totals = run_judge(store, holed, router, paths)
         calls = router.calls_for("judge")
         assert len(calls) == 2
         assert calls[0]["ref"].model == "qwen/qwen3.6-27b"  # slot A paid for
@@ -764,25 +782,30 @@ def test_slot_b_can_be_unroutable_after_slot_a_has_been_paid_for(tmp_path, cfg, 
 
 def test_a_reopened_row_never_re_pays_the_judge_it_already_bought(tmp_path, cfg, paths):
     """The other half of R2-C3: parking is only survivable if something can
-    un-park it, and the re-opened row must cost one call, not two."""
+    un-park it, and the re-opened row must cost one call, not two.
+
+    On the backstop-less pool, for the same reason as the test above - the
+    shipped pool parks nothing here, and what is under test is the recovery,
+    which has to work for any pool that ran out."""
+    holed = cfg_without_the_paid_judges(cfg)
     store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
-    plan_wave(store, cfg, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
+    plan_wave(store, holed, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
     with store:
         asyncio.run(
             run_workers(
-                store, cfg, FakeRouter(cfg), paths=paths, streams=["synthesis"],
+                store, holed, FakeRouter(holed), paths=paths, streams=["synthesis"],
                 n_workers=1, max_batches=1,
             )
         )
         task_id = only_task(store)["task_id"]
         gen = _lengthen(store, task_id, 2000)
-        run_judge(store, cfg, FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5, "a")]}), paths)
+        run_judge(store, holed, FakeRouter(holed, {"judge": [judge_reply(5, 5, 5, "a")]}), paths)
         assert only_task(store)["state"] == "judge_unroutable"
 
-        # The operator adds the 32k+ fourth-family judge the config is missing
-        # and re-opens the parked rows. Family separation is untouched: slot B
-        # goes to the NEW family, never back to one already used.
-        widened = cfg_with_fourth_judge_family(cfg)
+        # The operator adds a 32k+ fourth-family judge and re-opens the parked
+        # rows. Family separation is untouched: slot B goes to the NEW family,
+        # never back to one already used.
+        widened = cfg_with_fourth_judge_family(holed)
         assert reopen_tasks(store, ["judge_unroutable"]) == {"judge_unroutable": 1}
         assert only_task(store)["state"] == JUDGE_STATE_FROM
 
@@ -1541,9 +1564,16 @@ def test_idle_judge_batches_are_announced_once(tmp_path, cfg, paths, capsys):
 
 def test_the_judge_cli_refuses_the_pool_hole_before_claiming(tmp_path, cfg, monkeypatch, capsys):
     """The judge worker is the one that discovers the hole by paying for
-    slot A, so it is the one that must not start into it."""
+    slot A, so it is the one that must not start into it.
+
+    The hole is produced by withholding OPENAI_API_KEY, which is both the
+    realistic case (the paid backstop is the last key an operator funds) and
+    the only way to get one from the shipped config now. It has to be
+    withheld EXPLICITLY: a machine that happens to export it would turn this
+    into a test of nothing, since the refusal it asserts would not happen."""
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr("tuned.data.providers.load_dotenv_keys", lambda path=None: 0)
     config_path = temp_config(tmp_path)
     with pytest.raises(SystemExit) as excinfo:

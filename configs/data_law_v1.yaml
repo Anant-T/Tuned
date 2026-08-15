@@ -73,6 +73,47 @@ providers:
         roles: [judge]
         limits: {rpm: 25, tpm: 25000, tpd: 33000000, max_context: 32000, max_output: 8192}
         params: {temperature: 0.2}
+  - name: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    quirks: [openai]
+    models:
+      # Both are declared family gpt-oss, which is NOT what the model card
+      # says: it is a deliberate, conservative lump so that OpenAI never
+      # grades its own lab's gpt-oss-120b rows. Family separation is what
+      # keeps a judge honest about a generator, and the cheap direction to
+      # be wrong in is "too separate".
+      #
+      # Neither block carries `temperature`: the gpt-5 family accepts the
+      # default and 400s on any other value (measured 2026-08-15). The
+      # `openai` quirk in providers.py drops it from the payload regardless,
+      # because judge.py sends its own per-call temperature and that would
+      # otherwise arrive here through build_payload.
+      #
+      # NO tpd on either block, and that is a decision rather than an
+      # omission: operator's call 2026-08-15, this provider runs UNCAPPED. An
+      # absent cap reads as unlimited (store._cap treats a missing key as
+      # infinity), the same way the cerebras blocks leave rpd absent. The
+      # rpm/tpm below are real RATE limits - OpenAI's actual tier limits - and
+      # not spend controls, so nothing in this file brakes spend. Any spend
+      # brake lives server-side in the OpenAI billing dashboard, where a
+      # config edit cannot remove it. Uncapped is not the same as preferred:
+      # both refs sit LAST in routing.judge and routing.tiebreak, so every
+      # free judge is tried first and these are reached only by rows nothing
+      # free can serve.
+      - id: gpt-5-mini
+        family: gpt-oss
+        roles: [judge, tiebreak]
+        limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384}
+        params: {}
+      - id: gpt-5-nano
+        family: gpt-oss
+        roles: [judge, tiebreak]
+        # The calibration candidate: ~5x cheaper than mini, and carried here
+        # so the P5 gate can compare the two on real judgments rather than on
+        # price alone.
+        limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384}
+        params: {}
 
 # Mistral rpm/tpm are console+header-verified 2026-08-14 and are no longer
 # placeholders. The workspace limit is 50 rpm / 50k tpm and BOTH models draw
@@ -82,24 +123,32 @@ providers:
 # (provider, model), so each model is given half - two per-model buckets of
 # 50k would issue at twice the real refill rate and 429-storm at full load.
 # Cerebras tpd may actually be account-wide shared rather than per-model;
-# treated per-model here until it is empirically tested. qwen/qwen3.6-27b is a Groq PREVIEW model and may vanish without
-# notice - never make it the sole judge; the routing lists below always give
-# fallbacks. Model refs in routing are "provider/model-id" strings - note
-# that "groq/qwen/qwen3.6-27b" contains TWO slashes, so refs are split on the
-# FIRST slash only (provider="groq", model="qwen/qwen3.6-27b").
+# treated per-model here until it is empirically tested. qwen/qwen3.6-27b is
+# a Groq PREVIEW model and may vanish without notice - never make it the sole
+# judge; the routing lists below always give fallbacks. Model refs in routing
+# are "provider/model-id" strings - note that "groq/qwen/qwen3.6-27b" contains
+# TWO slashes, so refs are split on the FIRST slash only (provider="groq",
+# model="qwen/qwen3.6-27b").
 #
-# TODO(operator) WANTED, and the fleet REFUSES TO START without it: ONE more
-# judge model, in a FOURTH family - not mistral, not qwen, not gpt-oss - with
-# max_context >= 29661, added to BOTH routing.judge and routing.tiebreak
-# below. Config only, no code. providers.pool_gaps() names the gap at
-# startup and generate/judge exit 2 unless --allow-pool-gaps is passed.
+# CLOSED 2026-08-15. This block used to be a TODO(operator) demanding ONE
+# more judge model in a fourth family, which the fleet refused to start
+# without. That model is the openai provider above, and the gap is read as
+# closed out of the real preflight - generate.print_preflight over
+# providers.pool_gaps, every key present - rather than argued from the config:
+# with OPENAI_API_KEY set there are NO fatal gaps left, only the survivable
+# tiebreak warnings described at the bottom of this block. It went into BOTH
+# routing.judge and routing.tiebreak, LAST in each, because it is the paid
+# backstop: every free judge is preferred to it, so the ~$1/day cap is only
+# ever spent on rows nothing free can serve.
 #
-# 29,661 is not a round number because it is not a preference: it is
-# required_context(worst-case judge call) and the preflight prints the same
-# number it enforces. In practice that means a 32k model. A 16k model is NOT
-# enough - and that is worth saying because most free-tier candidates are
-# 16k, and an under-sized judge does not fail loudly: the fleet starts, long
-# rows pass the length gate, judge A is paid for, and the row parks.
+# What made it qualify, and the bar any replacement must clear:
+# max_context >= 29661. That is not a round number because it is not a
+# preference - it is required_context(worst-case judge call), and the
+# preflight prints the same number it enforces. In practice that means a 32k
+# model. A 16k model is NOT enough - and that is worth saying because most
+# free-tier candidates are 16k, and an under-sized judge does not fail
+# loudly: the fleet starts, long rows pass the length gate, judge A is paid
+# for, and the row parks. gpt-5-mini and gpt-5-nano declare 400k.
 #
 # Where the number comes from. The length gate passes a row whose prompt +
 # trace + answer is at most 8192 chars/4 tokens, i.e. 32,768 characters, and
@@ -110,35 +159,48 @@ providers:
 # that into 29,661 of declared window. Devanagari is what makes it large,
 # and this corpus is largely Devanagari.
 #
-# Why the JUDGE pool needs it (the fatal half). A long prompt is routed past
-# the 8k cerebras generator to mistral/magistral (40k). Family separation
-# then removes mistral from the judge pool; the 8k zai-glm-4.7 is removed on
-# context length; slot A takes groq/qwen; and slot B has NOTHING LEFT. The
-# row parks in judge_unroutable having ALREADY PAID for judge A. The
-# arithmetic makes this the rule and not an edge case: the generator diverts
-# to magistral at 2,555 routing tokens of prompt, and slot B dies at 5,531
-# routing tokens of judge prompt - which grounding plus a trace near
-# think_max (3000) clears routinely.
+# What the fatal gap WAS, kept because any future edit to routing.judge can
+# re-open it. A long prompt is routed past the 8k cerebras generator to
+# mistral/magistral (40k). Family separation then removes mistral from the
+# judge pool; the 8k zai-glm-4.7 is removed on context length; slot A takes
+# groq/qwen; and slot B had NOTHING LEFT. The row parked in judge_unroutable
+# having ALREADY PAID for judge A. The arithmetic made this the rule and not
+# an edge case: the generator diverts to magistral at 2,555 routing tokens of
+# prompt, and slot B died at 5,531 routing tokens of judge prompt - which
+# grounding plus a trace near think_max (3000) clears routinely. Slot B is
+# now openai/gpt-5-mini.
 #
-# Recovery once the model lands: `python -m tuned.data.tasks --reopen
-# judge_unroutable` (every stream by default; --reopen-stream narrows it).
-# A re-opened row re-pays only the slot it never bought, and comes back with
-# its attempt budget restored.
+# Recovery for rows that parked before this landed: `python -m
+# tuned.data.tasks --reopen judge_unroutable` (every stream by default;
+# --reopen-stream narrows it). A re-opened row re-pays only the slot it never
+# bought, and comes back with its attempt budget restored.
 #
-# Why the TIEBREAK pool needs it (the survivable half). The tiebreak pool is
-# gpt-oss (131k) plus two 8k models, so a long candidate produced by the
-# gpt-oss generator has no eligible tiebreak: separation removes gpt-oss and
-# the context check removes gemma and glm. judge.py decides on the two judges
-# it has and rejects the unresolved disagreement (run_event
-# tiebreak_unroutable_two_judge_decision - the metric to watch), so this one
-# only warns.
+# What is LEFT, and only warns. The TIEBREAK pool cannot serve a long row
+# from EITHER generator family, and closing the judge gap made the second of
+# those visible rather than causing it: pool_gaps stops walking a generator
+# family at its first fatal judge gap, so the mistral case was never reached
+# before. For a gpt-oss generation, separation removes every gpt-oss tiebreak
+# - the groq 20b and both openai models, which are lumped into that family on
+# purpose - and the context check removes gemma and glm. For a mistral
+# generation, the two judge slots take qwen and gpt-oss, which leaves the
+# tiebreak with no family it has not already spent. In both cases judge.py
+# decides on the two judges it has and rejects the unresolved disagreement
+# (run_event tiebreak_unroutable_two_judge_decision - the metric to watch).
+#
+# Closing THAT would take one more tiebreak in a family that is none of
+# gpt-oss/mistral/qwen/gemma/glm, with max_context >= 29666. The five over
+# the judge threshold are real and not a typo: the tiebreak prompt is a
+# little longer than the judge prompt and the preflight sizes the two
+# separately, so 29,661 buys a judge and 29,666 buys a tiebreak.
 #
 # NOT an option: letting a judge share the generator's family when the pool
 # runs out. Family separation is a data-quality invariant, not a preference.
 routing:
   generator: [cerebras/gpt-oss-120b, mistral/magistral-small-latest]
-  judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b, cerebras/zai-glm-4.7]
-  tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b, cerebras/zai-glm-4.7]
+  judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b, cerebras/zai-glm-4.7,
+          openai/gpt-5-mini, openai/gpt-5-nano]
+  tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b, cerebras/zai-glm-4.7,
+             openai/gpt-5-mini, openai/gpt-5-nano]
   probe: [groq/llama-3.1-8b-instant]
   family_separation: true
   judge_mode: dual        # dual | audit

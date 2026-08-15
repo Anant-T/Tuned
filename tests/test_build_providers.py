@@ -16,7 +16,11 @@ import pytest
 
 httpx = pytest.importorskip("httpx")
 
-from pipeline_fakes import cfg_with_context, cfg_with_split_pools  # noqa: E402
+from pipeline_fakes import (  # noqa: E402
+    cfg_with_context,
+    cfg_with_split_pools,
+    cfg_without_the_paid_judges,
+)
 
 from tuned.data.config import (  # noqa: E402
     ModelCfg,
@@ -749,9 +753,17 @@ def cfg():
 
 
 @pytest.fixture
-def keys(monkeypatch):
-    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY"):
-        monkeypatch.setenv(env, "sk-test")
+def keys(cfg, monkeypatch):
+    """Every provider in the SHIPPED config, keyed.
+
+    Derived from the config rather than listed, because a provider added to
+    the config and missed here does not fail: `eligible_refs` skips its models
+    as "missing-key", so every preflight test in this module goes on quietly
+    measuring the OLD pool and passing. That is how a judge added to close a
+    gap can leave the test that asserts the gap green.
+    """
+    for provider in cfg.providers:
+        monkeypatch.setenv(provider.api_key_env, "sk-test")
 
 
 def _router(cfg, **kw) -> Router:
@@ -936,7 +948,7 @@ def test_complete_raises_when_every_ref_fails(cfg, keys):
         clock=clock,
         sleeper=sleeper,
         client_factory=_factory(
-            clock, sleeper, seen, {"mistral": 500, "groq": 503, "cerebras": 500}
+            clock, sleeper, seen, {"mistral": 500, "groq": 503, "cerebras": 500, "openai": 500}
         ),
     )
 
@@ -944,8 +956,11 @@ def test_complete_raises_when_every_ref_fails(cfg, keys):
         asyncio.run(router.complete("judge", [{"role": "user", "content": "grade this"}]))
 
     assert excinfo.value.retryable is True
-    assert "all 3 eligible model(s) failed" in str(excinfo.value)
+    # Five refs over four providers: the openai backstop contributes two, and
+    # BOTH have to be tried before the role is out of options.
+    assert "all 5 eligible model(s) failed" in str(excinfo.value)
     assert seen.count("mistral") == 2 and seen.count("groq") == 2 and seen.count("cerebras") == 2
+    assert seen.count("openai") == 4  # two refs, two in-provider attempts each
 
 
 def test_complete_does_not_fail_over_on_non_retryable(cfg, keys):
@@ -1032,7 +1047,9 @@ def test_no_eligible_model_is_retryable_only_when_the_reason_is_transient(cfg, k
     assert "cooling" in str(excinfo.value)
 
     # Structural: no keys at all - coming back in a minute changes nothing.
-    _unset(monkeypatch, "MISTRAL_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY")
+    # Every provider in the config, derived: one left keyed is one ref still
+    # eligible, and the call then succeeds instead of raising.
+    _unset(monkeypatch, *(p.api_key_env for p in cfg.providers))
     structural = _router(cfg)
     with pytest.raises(ProviderError) as excinfo:
         asyncio.run(structural.complete("judge", [{"role": "user", "content": "hi"}]))
@@ -1082,7 +1099,9 @@ def test_retries_charge_the_rpm_bucket_too(cfg, keys):
             router.complete(
                 "judge",
                 [{"role": "user", "content": "hi"}],
-                exclude_families=frozenset({"mistral", "glm"}),  # isolate the groq ref
+                # Isolate the groq ref: every OTHER family in the judge pool,
+                # which now includes the gpt-oss backstop.
+                exclude_families=frozenset({"mistral", "glm", "gpt-oss"}),
                 est_tokens=100,
             )
         )
@@ -1380,7 +1399,7 @@ def test_build_check_request_is_pure():
 def test_check_refs_covers_every_configured_model(cfg):
     refs = check_refs(cfg)
     expected = sum(len(p.models) for p in cfg.providers)
-    assert len(refs) == expected == 8
+    assert len(refs) == expected == 10
     assert ModelRef("groq", "qwen/qwen3.6-27b") in refs
     assert check_refs(cfg, "groq/qwen/qwen3.6-27b") == (ModelRef("groq", "qwen/qwen3.6-27b"),)
     with pytest.raises(KeyError):
@@ -1469,7 +1488,7 @@ def test_no_eligible_model_carries_the_reasons_it_skipped(cfg, keys, monkeypatch
     """A caller has to tell "no key anywhere" from "this row fits nowhere":
     one is a fleet-configuration fact a re-queue survives, the other is a fact
     about the row. The message string alone is not a contract."""
-    _unset(monkeypatch, "MISTRAL_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY")
+    _unset(monkeypatch, *(p.api_key_env for p in cfg.providers))
     with pytest.raises(ProviderError) as excinfo:
         asyncio.run(_router(cfg).complete("judge", [{"role": "user", "content": "hi"}]))
     assert excinfo.value.skipped == frozenset({"missing-key"})
@@ -1585,7 +1604,7 @@ def test_overflow_at_every_ref_is_reported_as_a_row_shaped_failure(cfg, keys):
         clock=clock,
         sleeper=sleeper,
         client_factory=_overflow_factory(
-            clock, sleeper, seen, {"mistral", "groq", "cerebras"}, OVERFLOW_BODY
+            clock, sleeper, seen, {"mistral", "groq", "cerebras", "openai"}, OVERFLOW_BODY
         ),
     )
 
@@ -1594,7 +1613,10 @@ def test_overflow_at_every_ref_is_reported_as_a_row_shaped_failure(cfg, keys):
 
     assert excinfo.value.context_exceeded is True
     assert excinfo.value.retryable is False
-    assert seen == ["mistral", "groq", "cerebras"]  # every ref was offered it
+    # Every ref was offered it, the two paid backstops included - a 400 that
+    # says "too long for this window" never charges the breaker, so the pass
+    # runs to the end of the list rather than stopping at the first refusal.
+    assert seen == ["mistral", "groq", "cerebras", "openai", "openai"]
 
 
 def test_undersized_families_keeps_an_explicit_safety_margin(cfg):
@@ -1645,25 +1667,104 @@ def test_unkeyed_roles_names_the_role_and_the_env_vars(cfg, monkeypatch):
     assert unkeyed_roles(cfg, ("probe",))["probe"] == ("GROQ_API_KEY",)
 
 
-def test_pool_gaps_finds_the_judge_hole_the_shipped_config_still_has(cfg, keys):
-    """R2-C3: long rows route to magistral, family separation then removes
-    mistral, the 8k glm judge is out on length, slot A takes qwen and slot B
-    has NOTHING. The row parks having already paid for judge A."""
+def test_the_shipped_config_has_no_fatal_judge_hole_left(cfg, keys):
+    """R2-C3 CLOSED. The hole was: long rows route to magistral, family
+    separation removes mistral, the 8k glm judge is out on length, slot A takes
+    qwen and slot B has NOTHING - so the row parks having already paid for
+    judge A. The openai backstop is the fourth family that fills slot B.
+
+    Pinned as "no fatal gap", not as "no gap": the tiebreak holes are still
+    there and still only warn, which is what makes this a closure rather than
+    a config that stopped being checked."""
     gaps = pool_gaps(cfg, needed_tokens=worst_case_judge_tokens(cfg))
-    judge_gaps = [g for g in gaps if g.role == "judge"]
+    assert [g for g in gaps if g.role == "judge"] == []
+    assert [g for g in gaps if g.fatal] == []
+
+    # ...and it is the openai refs doing it, at the size that used to empty the
+    # slot. Slot B on a mistral row lands on gpt-oss, and the walk that finds it
+    # is the Router's own.
+    router = Router(cfg)
+    needed = worst_case_judge_tokens(cfg)
+    too_small = undersized_families(cfg, "judge", needed)
+    slot_a = next(router.eligible_refs("judge", exclude_families=frozenset({"mistral"}) | too_small))
+    slot_b = next(
+        router.eligible_refs(
+            "judge", exclude_families=frozenset({"mistral", "qwen"}) | too_small
+        )
+    )
+    assert slot_a == GROQ_JUDGE
+    assert slot_b == ModelRef("openai", "gpt-5-mini")
+
+    # The tiebreak holes remain, for BOTH generator families, and remain
+    # survivable: judge.py decides on the two judges it has.
+    tiebreak_gaps = [g for g in gaps if g.role == "tiebreak"]
+    assert {g.generator_family for g in tiebreak_gaps} == {"gpt-oss", "mistral"}
+    assert all(not g.fatal for g in tiebreak_gaps)
+
+    # ...and the hole really is closed by the ADDITION, not by the check going
+    # quiet: take the backstop back out and the old gap is reported verbatim.
+    before = pool_gaps(
+        cfg_without_the_paid_judges(cfg), needed_tokens=worst_case_judge_tokens(cfg)
+    )
+    judge_gaps = [g for g in before if g.role == "judge"]
     assert [(g.generator_family, g.slot) for g in judge_gaps] == [("mistral", "b")]
     assert judge_gaps[0].fatal is True
-    # The two CONDITIONAL halves of the detail: whose row it is, and which
-    # family slot A already spent on it. (`"mistral" in detail` was the sixth
-    # vacuous assertion in this family - every judge family is listed
-    # unconditionally by the "the judge pool is [...]" segment of the same
-    # f-string, mistral among them, so it held for any gap in this config.)
     assert "a mistral generation of" in judge_gaps[0].detail
     assert "minus ['qwen'] already used" in judge_gaps[0].detail
-    # The tiebreak hole is the one round 1 documented and gave a defined,
-    # unpaid fallback for, so it is reported but not fatal.
-    tiebreak_gaps = [g for g in gaps if g.role == "tiebreak"]
-    assert tiebreak_gaps and all(not g.fatal for g in tiebreak_gaps)
+
+
+def test_the_shipped_openai_models_send_no_temperature_and_declare_no_daily_cap(cfg):
+    """Two decisions that are invisible until they are wrong.
+
+    No `temperature`: the gpt-5 family 400s on any value but the default, and a
+    400 with no context marker ABORTS the call rather than failing over. The
+    quirk strips it as well; this is the config's half, and the half that keeps
+    the payload clean when no per-call temperature is sent at all.
+
+    No `tpd`/`rpd`: the operator chose UNCAPPED on 2026-08-15, and an absent key
+    is how "unlimited" is spelt here. Pinned as a MEANING and not a spelling -
+    the ledger's own reader is asked - because an absent number reads like an
+    oversight, and the obvious repair for an oversight is to invent one. Any
+    spend brake for this provider lives server-side, not in this file."""
+    from tuned.data.store import _cap
+
+    provider, _ = cfg.model_for(ModelRef("openai", "gpt-5-mini"))
+    assert provider.quirks == ("openai",)
+    assert provider.api_key_env == "OPENAI_API_KEY"
+    models = {m.id: m for m in provider.models}
+    assert set(models) == {"gpt-5-mini", "gpt-5-nano"}
+
+    judge_bar = required_context(worst_case_judge_tokens(cfg))
+    for model in models.values():
+        assert "temperature" not in model.params, model.id
+        for cap in ("tpd", "rpd"):
+            assert cap not in model.limits, model.id
+            assert _cap(model.limits, cap) == float("inf"), model.id
+        # The rate limits that ARE declared are real per-minute limits, not
+        # brakes wearing a limit's name.
+        assert (model.limits["rpm"], model.limits["tpm"]) == (500, 200000), model.id
+        # ...and each clears the threshold the preflight enforces, which is
+        # what makes it a judge rather than another 16k candidate.
+        assert model.limits["max_context"] >= judge_bar, model.id
+        assert model.family == "gpt-oss", model.id
+
+
+def test_the_paid_backstop_is_last_in_both_routing_lists(cfg, keys):
+    """Position IS the preference: Router.pick walks the role's list in order
+    and takes the first eligible ref. Anywhere but last, a paid call gets made
+    for a row a free judge would have taken - which is the whole of "uncapped
+    does not mean preferred"."""
+    paid = ("openai/gpt-5-mini", "openai/gpt-5-nano")
+    router = Router(cfg)
+    for role in ("judge", "tiebreak"):
+        refs = getattr(cfg.routing, role)
+        assert refs[-2:] == paid, role
+        assert not any(r.startswith("openai/") for r in refs[:-2]), role
+        # ...and the Router's own walk agrees, which is the half that decides
+        # anything: the config list is only a preference if this is its order.
+        walked = [f"{r.provider}/{r.model}" for r in router.eligible_refs(role)]
+        assert tuple(walked[-2:]) == paid, role
+        assert router.pick(role).ref.provider != "openai", role
 
 
 def _with_fourth_judge(cfg, *, max_context: int, provider: str = "groq"):
@@ -1727,11 +1828,18 @@ def test_the_preflight_sizes_the_judge_prompt_in_the_routing_currency(cfg):
 
 
 def test_a_16k_fourth_family_judge_is_a_fatal_pool_gap(cfg, keys):
-    """The operator is choosing this model now, and many free-tier candidates
-    are 16k - which is ABOVE the >= 11520 the preflight used to print. It has
-    to be reported as the gap it is, before the fleet starts."""
+    """Many free-tier candidates are 16k - which is ABOVE the >= 11520 the
+    preflight used to print - and a 16k judge cannot hold the longest row this
+    build makes. It has to be reported as the gap it is, before the fleet
+    starts.
+
+    Run against the pool WITHOUT the paid backstop, because that is the pool in
+    which a fourth-family judge is the thing filling slot B. With the 400k
+    openai judges in the list the slot is filled whatever the 16k model does,
+    so the fixture would guarantee the null result and prove nothing about
+    size."""
     size = 16384
-    patched = _with_fourth_judge(cfg, max_context=size)
+    patched = _with_fourth_judge(cfg_without_the_paid_judges(cfg), max_context=size)
     needed = worst_case_judge_tokens(patched)
     assert "fourth" in undersized_families(patched, "judge", needed)
     fatal = [g for g in pool_gaps(patched, needed_tokens=needed) if g.fatal]
@@ -1761,9 +1869,11 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
     size, so there is no subset of rows the override lets through safely."""
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
-    _unset(monkeypatch, "GROQ_API_KEY")
+    _unset(monkeypatch, "GROQ_API_KEY", "OPENAI_API_KEY")
     # The fourth-family judge the operator is sourcing, behind the key that
-    # has not arrived - and qwen is behind the same one.
+    # has not arrived - and qwen is behind the same one. The paid backstop is
+    # unkeyed too: keyed, it fills every slot at every size and there is no
+    # unservable gap left to classify.
     widened = _with_fourth_judge(cfg, max_context=131072)
 
     for needed in (500, 2000, worst_case_judge_tokens(widened)):
@@ -1774,7 +1884,10 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
         gap = next(g for g in gaps if g.generator_family == "mistral")
         assert gap.unservable is True, f"servable at needed={needed}"
         assert gap.key_shaped is True
-        assert gap.key_envs == ("GROQ_API_KEY",)
+        # BOTH pending keys are named: either one would fill the slot, and a
+        # remedy that named only the first would send the operator after half
+        # of what they have.
+        assert gap.key_envs == ("GROQ_API_KEY", "OPENAI_API_KEY")
         assert "no row size is servable" in gap.detail
 
     # ...and the classification is per GAP, not per config: a gpt-oss row can
@@ -1794,8 +1907,12 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
 def test_a_context_shaped_judge_gap_has_row_sizes_the_pool_still_serves(cfg, keys):
     """The other side of R4-C1, and the reason the override exists at all: a
     16k fourth-family judge empties slot B only ABOVE a size, so short rows
-    really are servable and running them is a real choice."""
-    sixteen_k = _with_fourth_judge(cfg, max_context=16384)
+    really are servable and running them is a real choice.
+
+    Without the paid backstop, for the same reason as the 16k test above: a
+    400k judge in the list fills slot B at every size, so there would be no
+    context-shaped gap to have sizes on either side of."""
+    sixteen_k = _with_fourth_judge(cfg_without_the_paid_judges(cfg), max_context=16384)
     assert [g for g in pool_gaps(sixteen_k, needed_tokens=2000) if g.fatal] == []
     assert [g for g in pool_gaps(sixteen_k, needed_tokens=8000) if g.fatal] == []
     fatal = [g for g in pool_gaps(sixteen_k, needed_tokens=20000) if g.fatal]
@@ -1887,7 +2004,12 @@ def test_unservable_is_asked_at_the_smallest_call_this_build_can_make(cfg, keys)
     floor = min_judge_tokens(cfg)
     tiny = 3000
     assert tiny < required_context(floor), "the fixture has to be under the real floor"
-    patched = cfg_with_context(cfg, family="glm", role="judge", max_context=tiny)
+    # Without the paid backstop: an unbounded judge in the list serves the
+    # short rows too, so nothing would be unservable and the rule would have
+    # no case.
+    patched = cfg_with_context(
+        cfg_without_the_paid_judges(cfg), family="glm", role="judge", max_context=tiny
+    )
 
     def mistral_gap(config):
         gaps = pool_gaps(
@@ -1902,7 +2024,7 @@ def test_unservable_is_asked_at_the_smallest_call_this_build_can_make(cfg, keys)
     assert "no row size is servable" in gap.detail
     # The floor is what decides it: glm at 8,192 really can serve the short
     # rows, and that gap stays overridable.
-    assert mistral_gap(cfg).unservable is False
+    assert mistral_gap(cfg_without_the_paid_judges(cfg)).unservable is False
 
     # ...and the consequence, at the flag: an unservable gap is a refusal
     # whatever --allow-pool-gaps says, so the fleet cannot be started against
@@ -2013,8 +2135,15 @@ def test_pool_gaps_walks_the_generator_role_through_the_routers_own_filter(cfg, 
     walk. A generator family behind a key that has not arrived produces no rows
     at all, so a judge gap reported for it is a refusal about a combination
     that cannot occur - and a spurious refusal is not free, it is the operator
-    reaching for --allow-pool-gaps."""
-    patched = _with_extra_generator(cfg, family="qwen", api_key_env="FOURTHPARTY_API_KEY")
+    reaching for --allow-pool-gaps.
+
+    Run without the paid backstop, so that the gap the unkeyed family would
+    contribute is a FATAL one and the rule is tested where it costs: with the
+    400k judges in the list every judge slot fills for every family, and the
+    only thing an unkeyed generator could add is another tiebreak warning."""
+    patched = _with_extra_generator(
+        cfg_without_the_paid_judges(cfg), family="qwen", api_key_env="FOURTHPARTY_API_KEY"
+    )
     _unset(monkeypatch, "FOURTHPARTY_API_KEY")
     needed = worst_case_judge_tokens(patched)
 
@@ -2049,8 +2178,14 @@ def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg
             if g.fatal
         }
 
-    assert fatal() == {("gpt-oss", "b"), ("mistral", "a")}
-    assert fatal(needed_for_window=sizer) == {("mistral", "a")}
+    # Both generator families lose slot B at the flat size: qwen is now too
+    # small and glm always was, so the pool is mistral + the gpt-oss backstop
+    # and each family's own is one of them.
+    assert fatal() == {("gpt-oss", "b"), ("mistral", "b")}
+    # Sized at what its own 8k window permits, the gpt-oss family's judges fit
+    # again and its refusal disappears; the 40k mistral family really can make
+    # the long row, so its gap stays.
+    assert fatal(needed_for_window=sizer) == {("mistral", "b")}
 
 
 def test_the_family_window_bound_never_sizes_above_the_flat_worst_case(cfg, keys):
@@ -2093,7 +2228,14 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     sized = pool_gaps(
         patched, needed_tokens=judge_needed, tiebreak_needed_tokens=tiebreak_needed
     )
-    assert [(g.role, g.generator_family) for g in sized] == [("tiebreak", "gpt-oss")]
+    # Both generator families, because the paid backstop is spent on judge slot
+    # B for a mistral row and is therefore gone from its tiebreak too. What the
+    # test turns on is unchanged: every one of these flips on the four tokens
+    # between the judge prompt and the tiebreak prompt.
+    assert [(g.role, g.generator_family) for g in sized] == [
+        ("tiebreak", "gpt-oss"),
+        ("tiebreak", "mistral"),
+    ]
     # Sized by the JUDGE's number instead, that same model reads as big enough.
     assert pool_gaps(patched, needed_tokens=judge_needed) == []
     # ...and one token more really does close it.
@@ -2105,12 +2247,10 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     ) == []
 
 
-def test_blocking_key_envs_names_only_keys_that_would_change_something(cfg, monkeypatch):
+def test_blocking_key_envs_names_only_keys_that_would_change_something(cfg, keys, monkeypatch):
     """Its entire purpose: naming the env var of a model that is excluded on
     family or on context length would send the operator after a key that opens
     nothing, in the middle of a launch where keys are the scarce thing."""
-    for env in ("MISTRAL_API_KEY", "GROQ_API_KEY"):
-        monkeypatch.setenv(env, "sk-test")
     _unset(monkeypatch, "CEREBRAS_API_KEY")  # the glm judge lives there
 
     assert _blocking_key_envs(cfg, "judge", frozenset()) == ("CEREBRAS_API_KEY",)
@@ -2291,29 +2431,44 @@ def _divert_point(cfg, role: str, family: str, reply_tokens: int) -> int:
     return size
 
 
-def test_the_config_todo_quotes_the_numbers_the_code_enforces(cfg, keys):
-    """That block is the operator's spec for choosing the fourth-family judge,
-    and its arithmetic was pre-margin and ~40% high (it said ~4.2k where the
-    real divert point is 2555, and ~7.2k where slot B really dies at 5531)
-    while pool_gaps printed a third number. All three now come from here - and
-    the first one is read out of the preflight's own advice, not recomputed
-    beside it, because that string is what the operator shops against."""
+def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
+    """That block is the operator's spec for the judge pool, and its arithmetic
+    was pre-margin and ~40% high (it said ~4.2k where the real divert point is
+    2555, and ~7.2k where slot B really dies at 5531) while pool_gaps printed a
+    third number. All of them come from here now - and the advice is read out
+    of the preflight's own output, not recomputed beside it, because that
+    string is what the operator shops against.
+
+    Two numbers, not one, and the difference is easy to get wrong. What is
+    still ADVISED is the tiebreak's threshold, because the tiebreak is the only
+    gap the shipped pool still has and its prompt is a little longer than the
+    judge's. What the closed judge gap was measured against is the judge's, and
+    the block has to keep it: it is the bar any replacement judge must clear."""
     from tuned.data.generate import preflight_messages
 
     text = DATA_CONFIG.read_text(encoding="utf-8")
-    lines = sum(preflight_messages(cfg, ("generator",)), [])
-    advised = {int(line.split("max_context >= ")[1].split()[0]) for line in lines}
-    assert len(advised) == 1
+    refusals, warnings = preflight_messages(cfg, ("generator",))
+    assert refusals == [], "the judge gap is closed; nothing here should refuse"
+    advised = {int(line.split("max_context >= ")[1].split()[0]) for line in warnings}
+    assert len(advised) == 1, "one number: the operator buys one model"
     required = advised.pop()
-    assert required == required_context(worst_case_judge_tokens(cfg))
+    assert required == required_context(
+        worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
+    )
     assert f"max_context >= {required}" in text
     assert f"{required:,}" in text
-    # ...and the two thresholds the block explains the gap with.
+    # ...and the judge threshold the closed gap was measured against, which is
+    # the SMALLER of the two and is quoted in its own right.
+    judge_required = required_context(worst_case_judge_tokens(cfg))
+    assert judge_required < required
+    assert f"max_context >= {judge_required}" in text
+    assert f"{judge_required:,}" in text
+    # ...and the two thresholds the block explains the (now closed) gap with.
     from tuned.data.generate import max_output_tokens
 
     assert f"{_divert_point(cfg, 'generator', 'gpt-oss', max_output_tokens(cfg)):,}" in text
     assert f"{_divert_point(cfg, 'judge', 'glm', DEFAULT_JUDGE_REPLY_TOKENS):,}" in text
-    # The advice a 16k candidate would fail is stated, because most free-tier
+    # The size a 16k candidate would fail is stated, because most free-tier
     # candidates are 16k.
     assert "16k" in text
 

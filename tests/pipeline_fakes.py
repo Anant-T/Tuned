@@ -316,6 +316,41 @@ def paths_for(tmp_path):
     return build_paths(tmp_path / "build").ensure()
 
 
+def cfg_without_the_paid_judges(cfg: BuildConfig) -> BuildConfig:
+    """The shipped config minus the openai backstop - the pool before 2026-08-15.
+
+    A whole family of rules here is ABOUT a judge pool that runs out: slot B
+    parking a row that has already paid for slot A, an under-sized judge being
+    fatal rather than a warning, `--allow-pool-gaps` having short rows left to
+    run. The shipped pool no longer runs out - that is what closing the gap
+    means - so those rules need a pool that does, and this is the one they were
+    written against. It is not hypothetical either: it is exactly what an
+    operator who has not funded OPENAI_API_KEY is running.
+
+    Routing only, on purpose. What empties the slot is the ref not being in the
+    list; leaving the provider block reachable through `cfg.model_for` keeps
+    every walk the same shape it has in production.
+    """
+    from dataclasses import replace
+
+    def drop(refs):
+        return tuple(r for r in refs if not r.startswith("openai/"))
+
+    patched = replace(
+        cfg,
+        routing=replace(
+            cfg.routing, judge=drop(cfg.routing.judge), tiebreak=drop(cfg.routing.tiebreak)
+        ),
+    )
+    # The prefix trap the config comment warns about: "groq/openai/gpt-oss-20b"
+    # is a GROQ ref whose MODEL id starts with "openai/". Dropping it here would
+    # quietly empty the tiebreak pool and make every rule below pass for a
+    # reason nobody chose.
+    assert "groq/openai/gpt-oss-20b" in patched.routing.tiebreak
+    assert len(patched.routing.judge) == len(cfg.routing.judge) - 2
+    return patched
+
+
 def cfg_with_fourth_judge_family(cfg: BuildConfig, *, max_context: int = 131072) -> BuildConfig:
     """The shipped config plus the 32k+ fourth-family judge it is missing.
 
