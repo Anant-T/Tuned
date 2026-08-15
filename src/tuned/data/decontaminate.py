@@ -2000,11 +2000,20 @@ def script_partition(text: str, *, floor: int = SCRIPT_PARTITION_FLOOR) -> dict[
     `latin: screened, unscreened rows 0` over rows whose English leak it had
     just missed.
 
-    Splitting the probe collapses that: 19 of the 20 placements of those five
-    verbatim leaks score 1.000 against the Latin index once the Devanagari
-    words are not in the probe text (the twentieth scores 0.9487 and is caught
-    too), and the same five reworded leaks that a plain layer misses at three
-    interleaved Hindi words are all caught.
+    Splitting the probe collapses that, and the collapse DEPENDS ON PLACEMENT,
+    which neither the claim this replaces nor its correction said. Measured
+    over the five verbatim leaks at four placements each: at arbitrary offsets
+    all 20 score exactly 1.000 against the Latin index once the Devanagari
+    words are not in the probe text; at the WORST alignments the geometry
+    admits, 10 of the 20 are 1.000 and the rest run down to 0.9487, because a
+    question straddling a window boundary is only ever held in part. Every one
+    of the 40 is caught at 0.8 either way. (The ledger has now been wrong about
+    this cell twice - first "the same five score 1.000", then "19 of 20, the
+    twentieth 0.9487". Neither reproduces; re-run by
+    test_a_verbatim_leak_in_a_hindi_row_scores_by_where_it_sits.)
+
+    The same five reworded leaks that a plain layer misses at three interleaved
+    Hindi words are all caught.
 
     IT IS NOT CHEAPER, and the ledger used to say it was. The Latin query count
     per row is UNCHANGED, plus or minus one - measured on a 50/50 Hinglish row,

@@ -4141,6 +4141,51 @@ def test_the_dilution_cosine_table_reproduces(monkeypatch):
     assert whole == [0.979, 0.979, 0.979], whole
 
 
+def test_a_verbatim_leak_in_a_hindi_row_scores_by_where_it_sits(monkeypatch):
+    """The cell the ledger has now been wrong about twice - first "the same
+    five verbatim leaks score 1.000", then "19 of 20 placements, the twentieth
+    0.9487". Neither reproduces, because the score DEPENDS ON PLACEMENT and
+    both statements quote one number for two populations."""
+    seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
+    import tuned.data.decontaminate as decon
+
+    def best_residue(row_text):
+        return round(max(
+            duplicate_provenance(
+                seam.indexes[SCRIPT_LATIN].deduplicate(records=[part], threshold=0.05)
+            )[1]
+            for probe in probe_texts(row_text)[1:]
+            for script, part in script_partition(probe).items()
+            if script == SCRIPT_LATIN
+        ), 4)
+
+    pool = HINDI_UNRELATED.split() * 40
+
+    def buried(question, at):
+        words = question.split()
+        return " ".join(pool[:at] + words + pool[at:_TABLE_ROW_WORDS - len(words)])
+
+    anywhere, worst = [], []
+    for question in EVAL_QUESTIONS:
+        n = len(question.split())
+        bad = decon.worst_alignment_offset(n, _TABLE_ROW_WORDS)
+        for at in (0, 60, 140, 260):
+            anywhere.append(best_residue(buried(question, at)))
+        for at in (bad, bad + 1, bad - 1, _TABLE_ROW_WORDS - n):
+            worst.append(best_residue(buried(question, at)))
+
+    # AT AN ARBITRARY OFFSET the residue IS the question, so the match is exact.
+    assert anywhere == [1.0] * 20
+    # AT THE WORST ALIGNMENTS the question straddles a window boundary and only
+    # part of it is ever held: half are still exact, the rest run down to
+    # 0.9487, which is where the "one 0.9487" came from.
+    assert sum(1 for v in worst if v == 1.0) == 10
+    assert (min(worst), max(worst)) == (0.9487, 1.0)
+    # BOTH POPULATIONS ARE CAUGHT, which is the sentence that actually matters
+    # and the one neither version of the claim made.
+    assert all(v >= SEMANTIC_THRESHOLD for v in anywhere + worst)
+
+
 def test_splitting_the_probe_does_not_change_the_query_count():
     """The ledger claimed a Hinglish 300-word row goes "from 29 Latin queries
     to 4". It does not: the Latin count is UNCHANGED, plus or minus one. What
