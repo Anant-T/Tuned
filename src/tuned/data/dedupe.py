@@ -135,6 +135,7 @@ from tuned.data.decontaminate import (
     SemanticSeamError,
     gram_hashes,
     jaccard_from,
+    provenance_text,
     row_prov,
     selected_records,
     semhash_available,
@@ -527,9 +528,31 @@ def flagged_indexes(texts: Sequence[str], *, threshold: float = SEMANTIC_THRESHO
     separately, so "a\\nb" + "c" and "a" + "b\\nc" are different rows with the
     same joined text), and a set makes those two rows unflaggable no matter
     what semhash says about them.
+
+    AND THEY ARE READ THROUGH THE SHARED HELPER, not coerced with `str`.
+    semhash returns survivors in two shapes - plain strings, and single-key
+    mappings under the column name it gave the records - and `str({"text":
+    ...})` is `"{'text': ...}"`, which matches no row's text at all. Under the
+    dict shape every `budget[text]` read 0 and EVERY row flagged as a duplicate
+    of itself: the corpus-emptying direction, arrived at silently, in the
+    function whose docstring cites the fail-loud rule as its protection. A
+    survivor this helper cannot read is a shape neither seam knows, and it
+    raises rather than being counted as a row nothing matches.
     """
     result = semhash_index(texts).self_deduplicate(threshold=threshold)
-    budget = Counter(str(record) for record in selected_records(result))
+    kept = []
+    for record in selected_records(result):
+        text = provenance_text(record)
+        if text is None:
+            raise SemanticSeamError(
+                f"semhash returned a survivor this build cannot read as text "
+                f"({type(record).__name__}). Every survivor it does not recognise would "
+                f"count as a row nothing matches, i.e. as a DUPLICATE, so the corpus would "
+                f"empty itself quietly. Check the installed semhash version against "
+                f"selected_records and provenance_text."
+            )
+        kept.append(text)
+    budget = Counter(kept)
     flagged = []
     for ix, text in enumerate(texts):
         if budget[text] > 0:

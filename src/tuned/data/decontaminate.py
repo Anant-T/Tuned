@@ -1982,19 +1982,36 @@ def script_partition(text: str, *, floor: int = SCRIPT_PARTITION_FLOOR) -> dict[
 
     WHY THE PROBE IS SPLIT RATHER THAN ROUTED WHOLE. The embedding is over the
     whole probe text, so cross-script words inside a probe dilute it even when
-    the probe routes to the right index. Measured cache-only against the shipped
-    model, a reworded eval question sitting in a 30-word window scores 0.948
-    against its eval item and 0.893 with two Devanagari words beside it, 0.729
-    with three and 0.706 with four - and an ENGLISH eval question quoted
-    verbatim inside a Hindi-dominant row scored 0.40-0.59 and was KEPT, five
-    times out of five, while the row's Devanagari half was recorded as the only
-    unscreened thing about it. The screen said `latin: screened, unscreened
-    rows 0` over rows whose English leak it had just missed.
+    the probe routes to the right index. THE DILUTION TABLE, measured
+    cache-only against the shipped model on this repo's own five reworded
+    leaks, each at the worst alignment its geometry admits, with k Devanagari
+    words interleaved and the window routed WHOLE - best window score per k:
 
-    Splitting the probe collapses that: the same five verbatim leaks score
-    1.000 against the Latin index once the Devanagari words are not in the
-    probe text, and the same five reworded leaks that a plain layer misses at
-    three interleaved Hindi words are all caught.
+        k (Hindi words)     0      1      2      3      4
+        best window       0.915  0.899  0.860  0.731  0.713
+
+    Three interleaved words is where a leak stops clearing 0.8. (An earlier
+    version of this table read 0.948/0.893/0.729/0.706 from a fixture no longer
+    in the repo and did not reproduce; these numbers come from
+    test_the_dilution_cosine_table_reproduces, which re-runs them.) The same
+    dilution kept an ENGLISH eval question quoted verbatim inside a
+    Hindi-dominant row, five times out of five, while the row's Devanagari half
+    was recorded as the only unscreened thing about it - the screen said
+    `latin: screened, unscreened rows 0` over rows whose English leak it had
+    just missed.
+
+    Splitting the probe collapses that: 19 of the 20 placements of those five
+    verbatim leaks score 1.000 against the Latin index once the Devanagari
+    words are not in the probe text (the twentieth scores 0.9487 and is caught
+    too), and the same five reworded leaks that a plain layer misses at three
+    interleaved Hindi words are all caught.
+
+    IT IS NOT CHEAPER, and the ledger used to say it was. The Latin query count
+    per row is UNCHANGED, plus or minus one - measured on a 50/50 Hinglish row,
+    29 Latin queries at 300 words before the split and 29 after, 27 and 27 at
+    275, 9 and 9 at 100. What the split ADDS is one Devanagari partition per
+    window (28, 26, 8), counted as unscreened and never queried. Re-run by
+    test_splitting_the_probe_does_not_change_the_query_count.
 
     SCRIPT-NEUTRAL WORDS GO IN EVERY PARTITION. `302`, `1973`, `(2)` are not
     evidence of any script and they are most of what distinguishes one section
@@ -2275,10 +2292,10 @@ def duplicate_provenance(result) -> tuple[str | None, float | None, str | None]:
     except (AttributeError, TypeError):
         return None, None, None
     for record in filtered:
-        probe = _provenance_text(getattr(record, "record", None))
+        probe = provenance_text(getattr(record, "record", None))
         for pair in getattr(record, "duplicates", None) or ():
             try:
-                text, score = _provenance_text(pair[0]), float(pair[1])
+                text, score = provenance_text(pair[0]), float(pair[1])
             except (TypeError, ValueError, IndexError):
                 continue
             if text is None:
@@ -2288,8 +2305,14 @@ def duplicate_provenance(result) -> tuple[str | None, float | None, str | None]:
     return best_text, best_score, best_probe
 
 
-def _provenance_text(value) -> str | None:
+def provenance_text(value) -> str | None:
     """A semhash record as a string, whichever of its two shapes it arrived in.
+
+    PUBLIC because dedupe.py reads the same two shapes off the same library.
+    It used to coerce with `str(record)` instead, which stringifies a dict to
+    `"{'text': ...}"` - so under the dict shape every `budget[text]` read 0 and
+    every row in the corpus flagged as a duplicate of itself, in a function
+    whose docstring cites the fail-loud rule as its protection.
 
     A single-key mapping is unwrapped (the key is the column name semhash gave
     the strings it was handed, `text` today, and this does not depend on it
@@ -2423,6 +2446,14 @@ class SemanticFilter:
         # as a hole, because there is no eval question in them to miss; counted
         # rather than dropped on the floor, because "no letterless windows" and
         # "letterless windows, ignored" must not read the same in the manifest.
+        #
+        # THIS COUNTS WINDOWS, and until `route` gained its no-partition branch
+        # it could not: `SCRIPT_NONE` was reachable only from `probes[0]`, so a
+        # LETTERED row's letterless windows were counted nowhere and the
+        # counter was structurally 1 or 0 - a number whose own comment said the
+        # opposite of what it measured, and an assertion of `> 0` that could
+        # not separate 1 from 9. A 174-word Latin row with a run of section
+        # numbers through the middle of it has nine.
         self.letterless_probes = 0
         self.letterless_rows = 0
 
@@ -2807,6 +2838,15 @@ def semantic_script_record(layer, controls: dict[str, str] | None) -> dict:
     24,365 questions - was screened by the exact stack alone. A dataset card
     that claims a paraphrase screen has to be able to say which scripts it
     covered, and `semantic: ran` alone cannot.
+
+    `eval_items` IS PER SCRIPT AND DOES NOT SUM TO THE CORPUS. A code-switched
+    eval question is indexed in every script it carries a screenable share of,
+    so one item is counted under two of them - the question the field answers
+    is "how many eval items could THIS script's screen have found", and that is
+    two different ones. `residue_items` beside it is the partitions this layer
+    refused to index because they were a residue of their item rather than a
+    share of it (see SCRIPT_RESIDUE_MIN_SHARE); those are findable by nobody
+    and are counted so the decision is readable rather than silent.
 
     `screened` MEANS ONE THING HERE: the control passed AND an index was built
     AND it holds at least one eval item. Two definitions used to be in play and

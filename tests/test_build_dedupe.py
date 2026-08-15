@@ -22,6 +22,7 @@ from tuned.data.decontaminate import (
     EvalIndex,
     EvalItem,
     NGRAM as DECON_NGRAM,
+    SemanticSeamError,
     decontaminate_items,
     gram_hashes,
     item_of,
@@ -635,6 +636,44 @@ def test_two_candidates_carrying_the_same_text_are_both_reachable(monkeypatch):
     install_fake_semhash(monkeypatch)
     duplicate = prose(171, 60)
     assert flagged_indexes([duplicate, duplicate, prose(172, 60)]) == [1]
+
+
+def test_the_survivors_are_read_as_text_in_either_shape_semhash_returns(monkeypatch):
+    """semhash returns survivors as plain strings OR as single-key mappings
+    under the column name it gave the records, and this function used to coerce
+    with `str(record)`. `str({"text": "..."})` is `"{'text': ...}"`, which
+    matches no row's text at all - so under the dict shape `budget[text]` read 0
+    for EVERY row and every row flagged as a duplicate of itself. The corpus
+    empties, quietly, in the function whose docstring cites the fail-loud rule
+    as its protection."""
+    import tuned.data.dedupe as dedupe_module
+
+    texts = [prose(173, 60), prose(174, 60), prose(175, 60)]
+
+    class Wrapped:
+        """A stand-in index whose survivors arrive dict-shaped."""
+
+        def __init__(self, keep):
+            self.selected = [{"text": t} for t in keep]
+
+        def self_deduplicate(self, threshold=0.9):
+            return self
+
+    monkeypatch.setattr(dedupe_module, "semhash_index",
+                        lambda records: Wrapped(texts[:2]))
+    assert flagged_indexes(texts) == [2], "the dict shape read as 'everything is a duplicate'"
+
+    # ... and a survivor in NEITHER shape is a build this seam does not know,
+    # which must raise rather than count as a row nothing matches - the same
+    # direction selected_records refuses to default in.
+    class Unknown(Wrapped):
+        def __init__(self, keep):
+            self.selected = [object() for _ in keep]
+
+    monkeypatch.setattr(dedupe_module, "semhash_index",
+                        lambda records: Unknown(texts[:2]))
+    with pytest.raises(SemanticSeamError, match="cannot read as text"):
+        flagged_indexes(texts)
 
 
 def test_the_semantic_layer_runs_after_the_exact_stack_not_instead_of_it():

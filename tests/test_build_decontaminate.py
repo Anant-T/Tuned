@@ -3049,6 +3049,36 @@ def test_a_script_whose_control_fails_is_recorded_as_an_unscreened_hole(
     assert "(1 of those rows were compared by the exact stack ONLY" in out
 
 
+def test_a_lettered_rows_letterless_windows_are_counted(monkeypatch):
+    """`letterless_probes` was structurally 1 or 0. `route` could only produce
+    SCRIPT_NONE from `probes[0]`, so a LETTERED row's letterless windows - a run
+    of section numbers through the middle of an English judgment, ordinary here
+    - were counted nowhere, and the counter's own comment claimed the opposite.
+    An assertion of `> 0` cannot separate 1 from 9."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    seam = SemanticFilter(
+        [EvalItem("bbl", "bbl#en", prose(897, 40), frozenset())], screened=[SCRIPT_LATIN],
+    )
+    words = ("the appellant was convicted under the code and the trial court recorded reasons "
+             "which are borne out by the evidence on the record before this bench today").split()
+    numbers = " ".join(f"{n} ({n % 7}) [{n}]" for n in range(302, 342)).split()
+    row_text = " ".join([*words, *numbers, *words])
+    # The ROW is Latin - this is not the letterless-row case, which is the only
+    # one the old counter could see.
+    assert dominant_script(row_text) == SCRIPT_LATIN
+    letterless = [p for p in probe_texts(row_text)[1:] if dominant_script(p) == SCRIPT_NONE]
+    assert len(letterless) == 9, "the fixture must have MANY letterless windows, not one"
+
+    seam.match(row_text)
+    assert seam.letterless_probes == 9
+    assert seam.letterless_rows == 1
+    # Still not a hole, in either counter - there is no eval question in a
+    # section-number table to miss.
+    assert seam.unscreened_probes == {} and seam.unscreened_rows == {}
+    assert seam.script_report()[SCRIPT_NONE]["letterless_probes"] == 9
+    assert seam.script_report()[SCRIPT_NONE]["unscreened_probes"] == 0
+
+
 def test_the_banner_prints_two_different_row_counts_when_they_differ(
     tmp_path, monkeypatch, capsys
 ):
@@ -4005,6 +4035,119 @@ def test_a_code_switched_leak_survives_the_hindi_words_inside_it(monkeypatch):
     assert [missed(k, split=False) for k in (0, 1, 2, 3, 4)] == [0, 0, 1, 5, 5]
     assert [missed(k, split=True) for k in (0, 1, 2, 3, 4)] == [0, 0, 0, 1, 1]
     assert seam.threshold == 0.8
+
+
+def test_the_dilution_cosine_table_reproduces(monkeypatch):
+    """The dilution table, quoted in three docstrings and asserted nowhere -
+    and this module has been burned by a comment table twice. Frozen the way
+    test_the_control_cosines_are_what_this_module_says_they_are froze the
+    control's.
+
+    Two tables, and they are about different things. The FIRST is why a probe
+    is split at all: interleaving Devanagari into a Latin window takes the best
+    window score below the operating point. The SECOND is why the whole-row
+    probe of a long row is NOT split: a window's residue keeps its locality and
+    a whole row's does not, so the whole-row residue reads the same at every
+    separation."""
+    seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
+    import tuned.data.decontaminate as decon
+
+    def top(text):
+        _, score, _ = duplicate_provenance(
+            seam.indexes[SCRIPT_LATIN].deduplicate(records=[text], threshold=0.05)
+        )
+        return round(score, 3)
+
+    def switched(text, k):
+        hindi, out, used = HINDI_UNRELATED.split(), [], 0
+        for i, word in enumerate(text.split()):
+            out.append(word)
+            if used < k and i % 5 == 4:
+                out.append(hindi[used])
+                used += 1
+        return " ".join([*out, *hindi[used:k]])
+
+    diluted = []
+    for k in range(5):
+        diluted.append(max(
+            max(top(probe) for probe in probe_texts(leak_row(switched(q, k), worst=True))[1:])
+            for q in REWORDED_LEAKS
+        ))
+    assert diluted == [0.915, 0.899, 0.860, 0.731, 0.713], diluted
+    # THE OPERATING POINT IS THE POINT OF THE TABLE: two interleaved Hindi
+    # words still clear it, three do not.
+    assert diluted[2] > SEMANTIC_THRESHOLD > diluted[3]
+
+    # THE LOCALITY TABLE, which decides where the split STOPS.
+    terms = ["section", "indian penal code", "criminal breach of trust",
+             "public servant", "punishable", "imprisonment for life"]
+
+    def hindi_about(gap):
+        pool, at, out = list(HINDI_UNRELATED.split()) * 60, 0, []
+        for term in terms:
+            out.extend(pool[at:at + gap])
+            at += gap
+            out.extend(term.split())
+        while len(out) < 300:
+            out.extend(pool[at:at + gap])
+            at += gap
+        return " ".join(out[:300])
+
+    windowed, whole = [], []
+    for gap in (4, 12, 25):
+        row_text = hindi_about(gap)
+        windowed.append(max(
+            top(part)
+            for probe in probe_texts(row_text)[1:]
+            for script, part in script_partition(probe).items()
+            if script == SCRIPT_LATIN
+        ))
+        whole.append(top(decon.script_partition(row_text)[SCRIPT_LATIN]))
+    # A WINDOW's residue falls away with separation ...
+    assert windowed == [0.936, 0.790, 0.485], windowed
+    # ... and the WHOLE ROW's does not move at all, which is the whole-row
+    # seam's own defect arriving through a side door. That is why the whole-row
+    # probe of a row that has windows keeps its dominant-script routing.
+    assert whole == [0.979, 0.979, 0.979], whole
+
+
+def test_splitting_the_probe_does_not_change_the_query_count():
+    """The ledger claimed a Hinglish 300-word row goes "from 29 Latin queries
+    to 4". It does not: the Latin count is UNCHANGED, plus or minus one. What
+    the split adds is a Devanagari partition per window, counted as unscreened
+    and never queried - which is a hole made visible, not a saving.
+
+    Pure geometry, so no model and no seam."""
+    english = ("the appellant was convicted under section of the code and sentenced by the "
+               "trial court today").split()
+    hindi = ("अभियुक्त को धारा के अंतर्गत दोषी ठहराया गया और विचारण न्यायालय ने दंड निर्धारित "
+             "किया").split()
+
+    def hinglish(n):
+        out = []
+        while len(out) < n:
+            out += english[: len(english) // 2] + hindi[: len(hindi) // 2]
+        return " ".join(out[:n])
+
+    measured = {}
+    for words in (100, 275, 300):
+        text = hinglish(words)
+        probes = probe_texts(text)
+        latin_whole = sum(dominant_script(p) == SCRIPT_LATIN for p in probes)
+        after: dict[str, int] = {dominant_script(probes[0]): 1}
+        for probe in probes[1:]:
+            for script in script_partition(probe):
+                after[script] = after.get(script, 0) + 1
+        measured[words] = (latin_whole, after[SCRIPT_LATIN], after[SCRIPT_DEVANAGARI])
+
+    assert measured == {
+        # row words: (Latin queries routed whole, Latin queries split, Devanagari partitions)
+        100: (9, 9, 8),
+        275: (27, 27, 26),
+        300: (29, 29, 28),
+    }, measured
+    for before, after_latin, _ in measured.values():
+        assert abs(after_latin - before) <= 1, "the split changed the Latin query count"
 
 
 def test_the_price_of_splitting_the_probe_is_a_hindi_row_about_the_same_section(monkeypatch):
