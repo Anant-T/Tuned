@@ -66,18 +66,23 @@ providers:
       - id: magistral-small-latest
         family: mistral
         roles: [generator]
-        limits: {rpm: 60, tpm: 500000, tpd: 33000000, max_context: 40000, max_output: 8192}
+        limits: {rpm: 25, tpm: 25000, tpd: 33000000, max_context: 40000, max_output: 8192}
         params: {temperature: 0.7, top_p: 0.95}
       - id: mistral-small-latest
         family: mistral
         roles: [judge]
-        limits: {rpm: 60, tpm: 500000, tpd: 33000000, max_context: 32000, max_output: 8192}
+        limits: {rpm: 25, tpm: 25000, tpd: 33000000, max_context: 32000, max_output: 8192}
         params: {temperature: 0.2}
 
-# Mistral rpm/tpm are UNVERIFIED (console check pending) - placeholders, kept
-# conservative at rpm 60. Cerebras tpd may actually be account-wide shared
-# rather than per-model; treated per-model here until it is empirically
-# tested. qwen/qwen3.6-27b is a Groq PREVIEW model and may vanish without
+# Mistral rpm/tpm are console+header-verified 2026-08-14 and are no longer
+# placeholders. The workspace limit is 50 rpm / 50k tpm and BOTH models draw
+# on the ONE bucket: the remaining-tokens header decremented continuously
+# across calls made with different models (50000 -> 49983 -> 49966), so the
+# bucket is per WORKSPACE, not per model. providers.TokenBucket is per
+# (provider, model), so each model is given half - two per-model buckets of
+# 50k would issue at twice the real refill rate and 429-storm at full load.
+# Cerebras tpd may actually be account-wide shared rather than per-model;
+# treated per-model here until it is empirically tested. qwen/qwen3.6-27b is a Groq PREVIEW model and may vanish without
 # notice - never make it the sole judge; the routing lists below always give
 # fallbacks. Model refs in routing are "provider/model-id" strings - note
 # that "groq/qwen/qwen3.6-27b" contains TWO slashes, so refs are split on the

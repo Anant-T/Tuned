@@ -759,8 +759,16 @@ def test_pick_caches_routed_models(cfg, keys):
     router = _router(cfg)
     first = router.pick("judge")
     assert router.pick("judge") is first  # one client + one bucket per ref
-    assert first.bucket.rpm == 60
-    assert first.bucket.tpm == 500000
+    # The bucket is built from THAT model's own limits, which is what makes the
+    # mistral halving reach the wire: the two mistral models share ONE 50 rpm /
+    # 50k tpm workspace bucket (header-verified 2026-08-14 - the remaining-token
+    # counter decrements across calls made with different models), while
+    # TokenBucket is per (provider, model). Each is therefore configured with
+    # half, and BOTH halves have to be here: a bucket that kept the workspace
+    # figure would issue at twice the real refill rate.
+    assert (first.bucket.rpm, first.bucket.tpm) == (25, 25000)
+    generator = router.routed(ModelRef("mistral", "magistral-small-latest"))
+    assert (generator.bucket.rpm, generator.bucket.tpm) == (25, 25000)
 
 
 # --- 9. circuit breaker -----------------------------------------------------
