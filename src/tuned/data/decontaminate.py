@@ -1915,6 +1915,67 @@ def dominant_script(text: str) -> str:
 # nothing shorter to find.
 SCRIPT_PARTITION_FLOOR = SHORT_MIN_TOKENS
 
+# HOW MUCH OF AN EVAL ITEM A MINORITY-SCRIPT PARTITION HAS TO BE before that
+# partition is indexed as a findable eval item in its own right. A SHARE, not a
+# token floor, and the two are rules about different populations:
+# SHORT_MIN_TOKENS is a rule about ITEMS - the length under which a whole eval
+# item is not screenable, and every item it admits appears WHOLE on the exact
+# stack. A minority-script partition is a FRAGMENT of an item, matched at
+# cosine >= 0.8 with no exact-stack backstop under it at all, and a floor
+# cannot tell a five-token fragment that is the question from a five-token
+# fragment that is the statute's name.
+#
+# MEASURED, on the residue a Hindi eval item actually contributes. Every
+# minority-script Latin residue of a 25-word Hindi question, as a share of the
+# item's script-bearing words:
+#
+#   BARE CITATIONS (must not be indexed)          share
+#     Indian Penal Code 1860 302                  0.107
+#     Code of Criminal Procedure 1973             0.138
+#     Negotiable Instruments Act 1881             0.107
+#     Limitation Act 1963                         0.074
+#     Constitution of India                       0.107
+#     IPC 302                                     0.038
+#     section 138 NI Act                          0.107
+#   ENGLISH CLAUSES OF THE QUESTION (must be)     share
+#     criminal breach of trust by a public servant  0.242   <- round 4's P08
+#     ...under which section...is...punishable      0.359
+#     ...maximum term of imprisonment...cheque      0.324
+#     ...entitled to maintenance under the code     0.286
+#     ...compoundable between complainant/accused   0.286
+#
+# The two populations separate on [0.138, 0.242) and 0.2 sits inside it with
+# margin either way. Re-run by test_the_residue_share_table_reproduces.
+#
+# WHAT IT BUYS, measured end to end: without it, a Hindi item naming its
+# statute in English puts `Indian Penal Code 1860 302` in the LATIN index as an
+# eval item, and every Hindi row citing that act meets it at cosine 1.000 with
+# exact containment 0.000 - a drop record indistinguishable from a verbatim
+# leak, unbounded across BhashaBench's 7,318 Hindi questions.
+#
+# THE ITEM'S OWN DOMINANT SCRIPT IS ALWAYS INDEXED, whatever its share. The
+# rule is about residues, and an item whose scripts are all minorities of each
+# other (six scripts at 0.16 apiece) must not fall out of every index at once.
+SCRIPT_RESIDUE_MIN_SHARE = 0.2
+
+
+def script_share(text: str, script: str) -> float:
+    """What share of `text`'s SCRIPT-BEARING words are written in `script`.
+
+    Script-neutral words are excluded from both ends. They go into EVERY
+    partition by design (see script_partition), so counting them would let a
+    citation's `302 1860 (2)` inflate the weight of the very residue they are
+    shared by - `Indian Penal Code 1860 302` is three Latin words wearing five,
+    and it is the three that say how much of the item this is.
+
+    0.0 for a text with no script-bearing words at all, which is the answer
+    that keeps it out of every index rather than dividing by zero.
+    """
+    words = [w for w in (text or "").split() if dominant_script(w) != SCRIPT_NONE]
+    if not words:
+        return 0.0
+    return sum(dominant_script(w) == script for w in words) / len(words)
+
 
 def script_partition(text: str, *, floor: int = SCRIPT_PARTITION_FLOOR) -> dict[str, str]:
     """{script: the words of `text` written in it, in order, with the digits}.
@@ -2276,7 +2337,9 @@ class SemanticFilter:
     silence. That count now includes the Devanagari share of an
     English-dominant row, which the routing-whole version could not see at all.
 
-    THE WHOLE-ROW PROBE IS NOT SPLIT, and that boundary is measured. Its
+    THE WHOLE-ROW PROBE OF A ROW THAT HAS WINDOWS IS NOT SPLIT, and that
+    boundary is measured. (A row with NO windows is a different case: there the
+    whole-row probe IS the window and is split like one - see `route`.) Its
     residue would be every English word of a 300-word Hindi judgment strung
     together, and this embedding model is order-insensitive: a Hindi row merely
     MENTIONING the six English terms of art of an eval question scored 0.979
@@ -2301,6 +2364,16 @@ class SemanticFilter:
         # code-switched row in one script at a time, rather than each side
         # diluting the other. A monolingual item indexes as itself.
         self.items_by_script: dict[str, list[tuple[str, EvalItem]]] = {}
+        # Minority-script partitions that were a residue rather than a share of
+        # their item, per script. Counted, not silently dropped: this is the
+        # decision that keeps every row citing a statute out of the drop log,
+        # and a decision nothing can read is how this module has been wrong
+        # before.
+        self.residue_items: dict[str, int] = {}
+        # The indexed texts that are a FRAGMENT of their item rather than the
+        # whole of it. Read by `match` so a Hit can say so - see the residue
+        # provenance there.
+        self.residue_texts: set[str] = set()
         for entry in eval_items:
             item = (
                 entry if isinstance(entry, EvalItem)
@@ -2312,7 +2385,17 @@ class SemanticFilter:
                 # stack counts these as unmatchable; here they are simply not
                 # indexed, and an item too short to embed is not a hole.
                 continue
+            dominant = dominant_script(item.text)
             for script, part in parts.items():
+                if (script != dominant
+                        and script_share(item.text, script) < SCRIPT_RESIDUE_MIN_SHARE):
+                    # A RESIDUE, not a share of the item. Indexing it makes the
+                    # statute's own name an eval item - see
+                    # SCRIPT_RESIDUE_MIN_SHARE for the measurement.
+                    self.residue_items[script] = self.residue_items.get(script, 0) + 1
+                    continue
+                if part.split() != item.text.split():
+                    self.residue_texts.add(part)
                 self.items_by_script.setdefault(script, []).append((part, item))
         self.screened = (
             frozenset(self.items_by_script) if screened is None else frozenset(screened)
@@ -2358,10 +2441,11 @@ class SemanticFilter:
     def script_report(self) -> dict[str, dict]:
         """What this layer screened and what it did not, by script."""
         out: dict[str, dict] = {}
-        seen = set(self.items_by_script) | set(self.unscreened_probes)
+        seen = (set(self.items_by_script) | set(self.unscreened_probes)
+                | set(self.residue_items))
         if self.letterless_probes:
             out[SCRIPT_NONE] = {
-                "screened": False, "eval_items": 0,
+                "screened": False, "eval_items": 0, "residue_items": 0,
                 # NOT `unscreened`: the banner reads those as holes and this is
                 # not one. Its own pair of names, so the count is readable and
                 # the hole count stays honest.
@@ -2373,7 +2457,15 @@ class SemanticFilter:
         for script in sorted(seen):
             out[script] = {
                 "screened": script in self.indexes,
+                # A CODE-SWITCHED ITEM IS COUNTED ONCE PER SCRIPT IT IS INDEXED
+                # IN, so these do not sum to the corpus - the question "how many
+                # eval items could this script's screen have found" is per
+                # script, and one item is findable in two of them.
                 "eval_items": len(self.items_by_script.get(script, ())),
+                # ... and the partitions in this script that were a residue of
+                # their item rather than a share of it, and so are findable by
+                # nobody. See SCRIPT_RESIDUE_MIN_SHARE.
+                "residue_items": self.residue_items.get(script, 0),
                 "unscreened_probes": self.unscreened_probes.get(script, 0),
                 "unscreened_rows": self.unscreened_rows.get(script, 0),
                 "wholly_unscreened_rows": self.wholly_unscreened_rows.get(script, 0),
@@ -2383,16 +2475,62 @@ class SemanticFilter:
     def route(self, text: str) -> dict[str, list[str]]:
         """{script: the texts of `text` that go to that script's index}.
 
-        The whole row goes to its dominant script whole; every window is split
-        into its scripts. Separated from `match` so the routing can be asserted
-        without a model behind it.
+        Every WINDOW is split into its scripts. The whole-row probe is routed
+        whole, by dominant script - but ONLY when the row is long enough to
+        have windows of its own, which is the one place that exemption was ever
+        measured.
+
+        WHEN THE ROW IS NO LONGER THAN ONE WINDOW, THE WHOLE-ROW PROBE IS A
+        WINDOW, and it gets a window's treatment. `probe_texts` returns
+        `[text]` for a row of `SEMANTIC_PROBE_WORDS` words or fewer, and
+        splitting `probes[1:]` alone left every such row routed whole by
+        `dominant_script` - the exact path the split exists to remove, still
+        live below window length. Measured against the shipped model, a
+        reworded eval question with four Devanagari words in front of it, in
+        rows of 18 to 40 words:
+
+            row words   18 19 20 ... 29 30 | 31 32 ... 40
+            probes       1  1  1       1  1 |  3  3      3
+            caught      0/5      ...     0/5 | 5/5 ...  5/5
+
+        Nothing in that band is caught, and the same rows with the four
+        Devanagari words REMOVED are caught 5/5 from 20 words up - so it is the
+        dilution, not the length. The exact stack does not carry them either
+        (13-gram containment 0.000; 0.188 at the item's own window, against the
+        0.5 it requires), and the manifest recorded `latin: screened true,
+        unscreened 0` over every one of them. Re-run by
+        test_a_row_no_longer_than_one_window_is_split_like_the_window_it_is.
+
+        The whole-row exemption survives above that boundary because that is
+        where its own justifying measurement was taken: a 300-word row's Latin
+        residue loses the locality a window's residue keeps (see the class
+        docstring's 0.979 table).
+
+        A PROBE WITH NO PARTITION AT ALL is routed whole rather than dropped -
+        a letterless window (a run of section numbers) or a probe too short to
+        hold an eval item in any script. `script_partition` returns `{}` for
+        both, and returning nothing for them would put a window in no bucket at
+        all: `SCRIPT_NONE` is reachable from a WINDOW only through this branch,
+        because a post-split partition never carries a `none` key.
+
+        Separated from `match` so the routing can be asserted without a model
+        behind it.
         """
         probes = probe_texts(text)
         if not probes:
             return {}
-        by_script: dict[str, list[str]] = {dominant_script(probes[0]): [probes[0]]}
-        for probe in probes[1:]:
-            for script, part in script_partition(probe).items():
+        windows = probes[1:]
+        by_script: dict[str, list[str]] = {}
+        if windows:
+            by_script[dominant_script(probes[0])] = [probes[0]]
+        else:
+            windows = [probes[0]]
+        for probe in windows:
+            parts = script_partition(probe)
+            if not parts:
+                by_script.setdefault(dominant_script(probe), []).append(probe)
+                continue
+            for script, part in parts.items():
                 by_script.setdefault(script, []).append(part)
         return by_script
 
@@ -2448,6 +2586,19 @@ class SemanticFilter:
                 detail["score"] = round(score, 4)
             if probe is not None:
                 detail["probe_words"] = len(probe.split())
+            # WHICH SIDES OF THIS MATCH WERE FRAGMENTS. A terms-of-art false
+            # positive and a buried verbatim leak were byte-identical shapes in
+            # the drop log - same level, same score band, same fields - and
+            # "the per-Hit provenance makes the real rate readable on run one"
+            # was the whole argument for shipping the 0.8 operating point. Both
+            # are recorded whether true or false: a missing key reads as an
+            # older run, a `false` reads as a whole-text match.
+            detail["item_residue"] = bool(
+                matched_text is not None and matched_text in self.residue_texts
+            )
+            detail["probe_residue"] = bool(
+                probe is not None and probe not in set(probe_texts(text))
+            )
             hit = Hit(
                 LEVEL_SEMANTIC,
                 item.set_key if item else "*",
@@ -2675,6 +2826,7 @@ def semantic_script_record(layer, controls: dict[str, str] | None) -> dict:
             "screened": False,
             "index": False,
             "eval_items": 0,
+            "residue_items": 0,
             "unscreened_probes": 0,
             "unscreened_rows": 0,
             "wholly_unscreened_rows": 0,

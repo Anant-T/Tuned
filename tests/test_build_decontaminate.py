@@ -36,6 +36,7 @@ from tuned.data.decontaminate import (
     SCRIPT_LATIN,
     SCRIPT_NONE,
     SCRIPT_PARTITION_FLOOR,
+    SCRIPT_RESIDUE_MIN_SHARE,
     SCRIPT_UNLISTED,
     SEMANTIC_CONTROL_ROW_WORDS,
     SEMANTIC_CONTROLS,
@@ -74,6 +75,7 @@ from tuned.data.decontaminate import (
     probe_windows,
     script_of,
     script_partition,
+    script_share,
     refusals,
     row_form,
     selected_records,
@@ -2849,7 +2851,8 @@ def test_an_index_that_holds_hindi_cannot_drop_an_unrelated_hindi_row(monkeypatc
     assert seam.match(HINDI_QUESTION) is None, "not even a verbatim Hindi leak - honestly off"
     report = seam.script_report()
     assert report[SCRIPT_DEVANAGARI] == {
-        "screened": False, "eval_items": 1, "unscreened_probes": 2, "unscreened_rows": 2,
+        "screened": False, "eval_items": 1, "residue_items": 0,
+        "unscreened_probes": 2, "unscreened_rows": 2,
         # BOTH rows are entirely in this script, so both were carried by the
         # exact stack alone - which is a different fact from a row that merely
         # QUOTES some Devanagari, and the banner says which.
@@ -3100,7 +3103,7 @@ def test_screened_means_the_control_passed_and_an_index_holds_items():
     # A control that passed over nothing is not a screen.
     assert empty[SCRIPT_LATIN] == {
         "control": "passed", "control_passed": True, "screened": False, "index": False,
-        "eval_items": 0, "unscreened_probes": 0, "unscreened_rows": 0,
+        "eval_items": 0, "residue_items": 0, "unscreened_probes": 0, "unscreened_rows": 0,
         "wholly_unscreened_rows": 0,
     }
     # A failing control is never `screened`, and the three reasons the block
@@ -3889,6 +3892,291 @@ def test_the_whole_row_probe_is_not_split_and_the_measurement_says_why(monkeypat
     row = hindi_about(terms, 25)
     assert row not in seam.route(row).get(SCRIPT_LATIN, [])
     assert seam.route(row)[SCRIPT_DEVANAGARI][0] == row
+    # ... and the exemption is scoped to rows that HAVE windows, which is the
+    # only place the measurement above was taken. Below window length the same
+    # row is split - see the boundary test.
+    assert len(probe_texts(row)) > 1
+
+
+def test_a_row_no_longer_than_one_window_is_split_like_the_window_it_is(monkeypatch):
+    """CRITICAL 1, the measured boundary. `probe_texts` returns `[text]` for a
+    row of SEMANTIC_PROBE_WORDS words or fewer, so splitting `probes[1:]` alone
+    left every short row routed WHOLE by dominant_script - the exact path the
+    split exists to remove, still live below window length.
+
+    The sweep, against the shipped model: a reworded eval question with four
+    Devanagari words in front of it, in rows of 18 to 40 words. Before the fix,
+    0 of 5 were caught at every length from 18 to 30 and 5 of 5 from 31 up,
+    where windows begin. The eval question is 21-22 words, so at 18-23 the
+    fixture TRUNCATES it - and the same rows with no Devanagari in them at all
+    are not caught 5/5 there either, which is what says that band is the
+    fixture and 24-30 was the screen."""
+    real_semhash(monkeypatch)
+    import tuned.data.decontaminate as decon
+
+    hindi = "यह प्रश्न विधि से"
+    assert len(hindi.split()) == 4
+    filler = ("in this matter the court observed further that the record placed before it "
+              "and the submissions advanced were considered at length before any conclusion")
+
+    def row_of(target, n_words, *, devanagari):
+        words = (hindi.split() if devanagari else []) + target.split()
+        words = words[:n_words]
+        pool = filler.split()
+        while len(words) < n_words:
+            words.append(pool[(len(words)) % len(pool)])
+        return " ".join(words[:n_words])
+
+    seam = decon.SemanticFilter(
+        [EvalItem("bbl", f"bbl#{i}", t, frozenset()) for i, t in enumerate(EVAL_QUESTIONS)],
+        screened=[SCRIPT_LATIN],
+    )
+    caught, windowed = {}, {}
+    for n in range(24, 35):
+        caught[n] = sum(
+            seam.match(row_of(t, n, devanagari=True)) is not None for t in REWORDED_LEAKS
+        )
+        windowed[n] = len(probe_texts(row_of(REWORDED_LEAKS[0], n, devanagari=True))) > 1
+
+    # THE BAND THAT HAD NO WINDOWS IS THE BAND THAT WAS BLIND, and it is the
+    # half of the sweep the fix is about: 24-30 have exactly one probe.
+    assert [n for n in caught if not windowed[n]] == list(range(24, 31))
+    assert [n for n in caught if windowed[n]] == list(range(31, 35))
+    # ... and every length is caught now, on both sides of the boundary.
+    assert caught == {n: 5 for n in range(24, 35)}, (
+        f"the split does not reach rows of <= {SEMANTIC_PROBE_WORDS} words: {caught}"
+    )
+
+    # THE ROUTING ITSELF, asserted without the model behind it: a 26-word mixed
+    # row reaches the Latin index as its LATIN WORDS, not as the whole row with
+    # four Devanagari words diluting it.
+    short = row_of(REWORDED_LEAKS[0], 26, devanagari=True)
+    assert len(probe_texts(short)) == 1
+    routed = seam.route(short)
+    assert short not in routed[SCRIPT_LATIN], "the whole mixed row still reaches the index"
+    assert routed[SCRIPT_LATIN] == [script_partition(short)[SCRIPT_LATIN]]
+    # The four Devanagari words are UNDER the partition floor, so they are
+    # dropped rather than routed - and are not recorded as a hole either, for
+    # the same reason the exact stack does not count a 3-token eval item as an
+    # item. The point of the fix is that they are no longer inside the LATIN
+    # probe text, not that they acquire an index of their own.
+    assert len(tokens(hindi)) < SCRIPT_PARTITION_FLOOR
+    assert SCRIPT_DEVANAGARI not in routed
+    assert SCRIPT_DEVANAGARI not in script_partition(short)
+    # And the exact stack does NOT carry these rows, which is why the hole was
+    # a false negative rather than a redundancy: 0.188 against the 0.5 it needs.
+    window = window_for(len(tokens(EVAL_QUESTIONS[0])))
+    assert round(containment(
+        gram_hashes(tokens(EVAL_QUESTIONS[0]), n=window),
+        gram_hashes(tokens(short), n=window),
+    ), 3) == 0.188
+
+
+# --------------------------------------------------------------------------
+# CRITICAL 2: the item-side split used to index BARE CITATIONS as eval items.
+#
+# A Hindi eval question names its statute in English, as Indian legal writing
+# does throughout. Its Latin partition is then `Indian Penal Code 1860 302` -
+# five tokens, clearing SHORT_MIN_TOKENS - and indexed as an independent eval
+# record. Every row citing that act meets it at cosine 1.000 with exact
+# containment 0.000, and the drop record is byte-identical to a verbatim leak.
+# Unbounded across BhashaBench-Legal's 7,318 Hindi questions.
+# --------------------------------------------------------------------------
+
+HINDI_ITEM_CITING_ITS_STATUTE = (
+    f"{HINDI_QUESTION} Indian Penal Code 1860 302"
+)
+# Round 4's P08 item: an English CLAUSE that is a real share of a Hindi item.
+# This is the case the item-side split was built for and it must survive.
+HINDI_ITEM_WITH_AN_ENGLISH_CLAUSE = (
+    f"{HINDI_QUESTION} under which section of the indian penal code is criminal breach of "
+    f"trust by a public servant made punishable with imprisonment for life"
+)
+_HINDI_JUDGMENT = " ".join([
+    "अभियुक्त के विरुद्ध आरोप पत्र दाखिल किया गया और विचारण न्यायालय ने साक्ष्य का मूल्यांकन "
+    "करते हुए दोषसिद्धि अभिलिखित की तथा दंड निर्धारित किया"] * 3)
+
+
+def test_the_residue_share_table_reproduces():
+    """SCRIPT_RESIDUE_MIN_SHARE's table, re-run. The floor could not do this
+    job: `Indian Penal Code 1860 302` is five tokens and clears SHORT_MIN_TOKENS
+    exactly, and so does `Code of Criminal Procedure 1973`. What separates them
+    from a real clause is what SHARE of the item they are."""
+    citations = [
+        "Indian Penal Code 1860 302", "Code of Criminal Procedure 1973",
+        "Negotiable Instruments Act 1881", "Limitation Act 1963",
+        "Constitution of India", "IPC 302", "section 138 NI Act",
+    ]
+    clauses = [
+        "criminal breach of trust by a public servant",
+        "under which section of the indian penal code is criminal breach of trust punishable",
+        "what is the maximum term of imprisonment for dishonour of a cheque",
+        "whether the appellant is entitled to maintenance under the code",
+        "is the offence compoundable between the complainant and the accused",
+    ]
+    share_of = lambda tail: script_share(f"{HINDI_QUESTION} {tail}", SCRIPT_LATIN)
+    cit = [round(share_of(t), 3) for t in citations]
+    cla = [round(share_of(t), 3) for t in clauses]
+    assert cit == [0.107, 0.138, 0.107, 0.074, 0.107, 0.038, 0.107]
+    assert cla == [0.242, 0.359, 0.324, 0.286, 0.286]
+    # The two populations SEPARATE, and the shipped point sits inside the gap
+    # with margin on both sides. If they ever stop separating, the share test
+    # is the wrong instrument and this is where that shows.
+    assert max(cit) < SCRIPT_RESIDUE_MIN_SHARE < min(cla)
+    assert (max(cit), min(cla)) == (0.138, 0.242)
+    # ... and the floor alone does NOT separate them: two of the citations
+    # clear SHORT_MIN_TOKENS, which is why this is a share and not a floor.
+    cleared = [t for t in citations
+               if len(tokens(script_partition(f"{HINDI_QUESTION} {t}").get(SCRIPT_LATIN, "")))
+               >= SCRIPT_PARTITION_FLOOR]
+    assert cleared == ["Indian Penal Code 1860 302", "Code of Criminal Procedure 1973"]
+
+
+def test_the_share_test_decides_in_both_directions_at_its_own_edge(monkeypatch):
+    """THE STRADDLING PAIR, one English word apart, both clearing the token
+    floor. Six English words beside the 25-word Hindi question is 0.194 and is
+    a residue; seven is 0.219 and is an item. A boundary pinned at 1 and 30 -
+    or at a citation and a clause - is invariant to the move that matters."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    english = "criminal breach of trust by a public servant is punishable".split()
+
+    def item_with(k):
+        return EvalItem("bbl", f"bbl#{k}", f"{HINDI_QUESTION} {' '.join(english[:k])}",
+                        frozenset())
+
+    below, above = item_with(6), item_with(7)
+    assert round(script_share(below.text, SCRIPT_LATIN), 3) == 0.194
+    assert round(script_share(above.text, SCRIPT_LATIN), 3) == 0.219
+    # BOTH clear the token floor, so the pair isolates the SHARE from the floor.
+    for item in (below, above):
+        part = script_partition(item.text)[SCRIPT_LATIN]
+        assert len(tokens(part)) >= SCRIPT_PARTITION_FLOOR
+
+    under = SemanticFilter([below], screened=[SCRIPT_LATIN])
+    assert SCRIPT_LATIN not in under.items_by_script
+    assert under.script_report()[SCRIPT_LATIN]["residue_items"] == 1
+    assert under.script_report()[SCRIPT_LATIN]["eval_items"] == 0
+
+    over = SemanticFilter([above], screened=[SCRIPT_LATIN])
+    assert [part for part, _ in over.items_by_script[SCRIPT_LATIN]] == [
+        " ".join(english[:7])
+    ]
+    assert over.script_report()[SCRIPT_LATIN]["residue_items"] == 0
+    assert over.script_report()[SCRIPT_LATIN]["eval_items"] == 1
+    # The item's OWN DOMINANT script is indexed whatever its share - the rule is
+    # about residues, and an item whose scripts are all minorities of each other
+    # must not fall out of every index at once.
+    assert over.script_report()[SCRIPT_DEVANAGARI]["eval_items"] == 1
+    assert under.script_report()[SCRIPT_DEVANAGARI]["eval_items"] == 1
+    assert round(script_share(below.text, SCRIPT_DEVANAGARI), 3) == 0.806
+
+
+def test_a_statute_citation_in_an_eval_item_does_not_condemn_every_row_citing_it(
+    monkeypatch,
+):
+    """THE ACCEPTANCE TABLE, measured against the shipped model at the shipped
+    share threshold, in BOTH directions. The three same-statute rows are
+    ordinary Hindi judgments whose only English is the act's name; the leaks
+    are the same shape carrying the eval item's actual clause.
+
+        row                                        before   after
+        A cites the act, same section              1.0000   0.4664
+        B cites the act, words reordered           1.0000   0.4664
+        C cites the act, DIFFERENT section         0.7955   0.5142
+        D leaks the English clause verbatim        1.0000   1.0000
+        E leaks it reworded                        0.9481   0.9481
+        F clean, unrelated English residue         0.1217   0.1217
+
+    A and B dropped at cosine 1.000 with exact containment 0.000 - the residue
+    matched itself. This is the same-stem price measured the other way round.
+    """
+    real_semhash(monkeypatch)
+    import tuned.data.decontaminate as decon
+
+    items = [
+        EvalItem("bbl", "bbl#hi-cite", HINDI_ITEM_CITING_ITS_STATUTE, frozenset()),
+        EvalItem("bbl", "bbl#p08", HINDI_ITEM_WITH_AN_ENGLISH_CLAUSE, frozenset()),
+    ]
+    seam = decon.SemanticFilter(items, screened=[SCRIPT_LATIN])
+    # The bare citation is NOT an eval record; the real clause is.
+    assert [len(tokens(t)) for t in seam.item_by_text] == [23]
+    assert seam.script_report()[SCRIPT_LATIN]["residue_items"] == 1
+
+    rows = {
+        "A": f"{_HINDI_JUDGMENT} Indian Penal Code 1860 302",
+        "B": f"{_HINDI_JUDGMENT} Penal Code Indian 302 1860",
+        "C": f"{_HINDI_JUDGMENT} Indian Penal Code 1860 420",
+        "D": f"{_HINDI_JUDGMENT} under which section of the indian penal code is criminal "
+             f"breach of trust by a public servant made punishable with imprisonment for life",
+        "E": f"{_HINDI_JUDGMENT} under which provision of the indian penal code is criminal "
+             f"breach of trust committed by a public servant punishable with imprisonment "
+             f"for life",
+        "F": f"{_HINDI_JUDGMENT} the workman was appointed as a fitter and his services "
+             f"were terminated",
+    }
+    dropped = {key: seam.match(text) is not None for key, text in rows.items()}
+    assert dropped == {"A": False, "B": False, "C": False,
+                       "D": True, "E": True, "F": False}, dropped
+
+    # THE SCORES, not just the verdicts - a table checked only at its own
+    # operating point cannot say the point is the right one.
+    def residue_score(text):
+        parts = [part
+                 for probe in probe_texts(text)[1:]
+                 for script, part in script_partition(probe).items()
+                 if script == SCRIPT_LATIN]
+        _, score, _ = duplicate_provenance(
+            seam.indexes[SCRIPT_LATIN].deduplicate(records=parts, threshold=0.05)
+        )
+        return round(score, 4)
+
+    assert [residue_score(rows[k]) for k in "ABCDEF"] == [
+        0.4664, 0.4664, 0.5142, 1.0000, 0.9481, 0.1217
+    ]
+    # And nothing here was ever carried by the exact stack: the rows the layer
+    # used to drop score 0.000 containment against both eval items.
+    for key in "ABC":
+        for item in items:
+            window = window_for(len(tokens(item.text)))
+            assert containment(gram_hashes(tokens(item.text), n=window),
+                               gram_hashes(tokens(rows[key]), n=window)) == 0.0
+
+
+def test_a_residue_match_and_a_whole_item_match_are_told_apart_by_the_record(monkeypatch):
+    """PROVENANCE MUST NAME RESIDUES. A terms-of-art false positive and a real
+    buried leak were the same shape in the drop log - same level, same fields,
+    scores one band apart - and "the per-Hit provenance makes the real rate
+    readable on run one" was the argument for shipping 0.8 at all. One test,
+    both records, told apart by the record alone."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    clause = "criminal breach of trust by a public servant made punishable"
+    seam = SemanticFilter(
+        [EvalItem("bbl", "bbl#mixed", f"{HINDI_QUESTION} {clause}", frozenset()),
+         EvalItem("bbl", "bbl#en", clause.replace("criminal", "wrongful"), frozenset())],
+        screened=[SCRIPT_LATIN],
+    )
+    # A match on a code-switched item's Latin FRAGMENT.
+    residue_hit = seam.match(f"{clause} was the charge")
+    assert residue_hit is not None and residue_hit.item_id == "bbl#mixed"
+    assert residue_hit.detail["item_residue"] is True
+
+    # A match on an item indexed WHOLE, by a probe that is the whole probe.
+    whole = seam.match(clause.replace("criminal", "wrongful"))
+    assert whole is not None and whole.item_id == "bbl#en"
+    assert whole.detail["item_residue"] is False
+
+    # THE TWO RECORDS DIFFER, and on this field rather than by luck of score.
+    assert residue_hit.detail["item_residue"] != whole.detail["item_residue"]
+    # BOTH keys are always present, so a `false` is a statement and not an
+    # absence: a missing key would read as an older run.
+    for hit in (residue_hit, whole):
+        assert set(hit.detail) >= {"item_residue", "probe_residue", "script", "threshold"}
+
+    # THE PROBE SIDE has its own case: a mixed row's Latin words are a residue
+    # OF THE PROBE, a monolingual row's are the probe itself word for word.
+    mixed = seam.match(f"भारतीय दंड संहिता के तहत {clause} was the charge")
+    assert mixed is not None and mixed.detail["probe_residue"] is True
+    assert whole.detail["probe_residue"] is False
 
 
 def test_the_semantic_attribution_is_the_same_on_every_run(monkeypatch):
