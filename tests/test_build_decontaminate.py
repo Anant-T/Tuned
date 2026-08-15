@@ -1410,6 +1410,49 @@ def test_an_eval_set_that_was_never_acquired_is_a_refusal(store, tmp_path):
             assert EVAL_SETS[other].repo_id not in text
 
 
+def test_every_status_value_this_module_writes_is_pinned_as_a_literal():
+    """G07, and the whole family it belongs to. `corpus.status ==
+    EVAL_UNMATCHABLE` is satisfied by every value the constant could hold, so
+    the BRANCH was pinned and the STRING that reaches the manifest was not -
+    the same vacuity S22/S23/S24 were swept for, missed one constant at a time.
+
+    These are wire format: the manifest, the drop log and the refusal banner
+    carry them, an operator greps them and the first-run checklist reads them.
+    Swept in one place so the next one added is a visible decision."""
+    assert {
+        "ok": EVAL_OK,
+        "not_acquired": EVAL_NOT_ACQUIRED,
+        "no_files": EVAL_NO_FILES,
+        "no_text_column": EVAL_NO_TEXT_COLUMN,
+        "empty": EVAL_EMPTY,
+        "unreadable": EVAL_UNREADABLE,
+        "no_reader": EVAL_NO_READER,
+        "unmatchable": EVAL_UNMATCHABLE,
+        "too_few_rows": EVAL_TOO_FEW,
+        "no_screened_split": EVAL_NO_SPLIT,
+    } == {v: v for v in (
+        EVAL_OK, EVAL_NOT_ACQUIRED, EVAL_NO_FILES, EVAL_NO_TEXT_COLUMN, EVAL_EMPTY,
+        EVAL_UNREADABLE, EVAL_NO_READER, EVAL_UNMATCHABLE, EVAL_TOO_FEW, EVAL_NO_SPLIT,
+    )}, "an eval status value moved - the manifest's vocabulary is wire format"
+    # ... and every one of them is DISTINCT, which is the property the ladder
+    # rests on: two rungs sharing a value is one remedy wearing two names.
+    assert len({EVAL_OK, EVAL_NOT_ACQUIRED, EVAL_NO_FILES, EVAL_NO_TEXT_COLUMN,
+                EVAL_EMPTY, EVAL_UNREADABLE, EVAL_NO_READER, EVAL_UNMATCHABLE,
+                EVAL_TOO_FEW, EVAL_NO_SPLIT}) == 10
+
+    assert (SEMANTIC_UNAVAILABLE, SEMANTIC_UNUSABLE, SEMANTIC_NO_MODEL, SEMANTIC_NO_ITEMS,
+            SEMANTIC_NO_SCREENABLE_ITEMS, SEMANTIC_RAN) == (
+        "semhash-not-installed", "semhash-control-failed", "semhash-model-unavailable",
+        "no-eval-items-to-compare", "no-eval-items-in-a-screenable-script", "ran",
+    )
+    assert (LEVEL_CASE_ID, LEVEL_TEXT, LEVEL_NARROW, LEVEL_SHORT, LEVEL_SEMANTIC) == (
+        "case_id", "text", "narrow", "short", "semantic",
+    )
+    assert (SCRIPT_LATIN, SCRIPT_DEVANAGARI, SCRIPT_NONE, SCRIPT_UNLISTED) == (
+        "latin", "devanagari", "none", "unlisted",
+    )
+
+
 @pytest.mark.parametrize(
     "records,files,expected",
     [
@@ -1463,7 +1506,12 @@ def test_an_eval_set_that_loads_but_can_match_nothing_is_a_refusal(store, tmp_pa
     eval_snapshot(store, tmp_path, "bbl", [{"question": "define estoppel"},
                                            {"question": "what is res judicata"}])
     corpus = eval_corpus(store, spec)
-    assert corpus.status == EVAL_UNMATCHABLE
+    # G07: THE LITERAL, not the constant against itself. `corpus.status ==
+    # EVAL_UNMATCHABLE` is true for every value the constant could hold, and
+    # this string is what the manifest and the refusal banner carry to the
+    # operator - the same vacuity that S22/S23/S24 were swept for, one constant
+    # further down.
+    assert corpus.status == EVAL_UNMATCHABLE == "unmatchable"
     assert corpus.unmatchable == len(corpus.items) == 2
     blocked = refusals({"bbl": corpus})
     assert len(blocked) == 1
@@ -3001,6 +3049,48 @@ def test_a_script_whose_control_fails_is_recorded_as_an_unscreened_hole(
     assert "(1 of those rows were compared by the exact stack ONLY" in out
 
 
+def test_the_banner_prints_two_different_row_counts_when_they_differ(
+    tmp_path, monkeypatch, capsys
+):
+    """S34/S34b. The banner's `unscreened_rows` and `wholly_unscreened_rows`
+    were interchangeable IN BOTH DIRECTIONS, because the only run that read the
+    line had one row of each kind and both counts were 1. Two numbers that are
+    equal in every fixture are one number printed twice.
+
+    So: a run with TWO rows carrying Devanagari, only ONE of which is wholly
+    Devanagari. `unscreened_rows` is 2 and `wholly_unscreened_rows` is 1, and
+    swapping them changes the printed line."""
+    cfg = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    # Row 1: English, with a Devanagari quote inside it. Screened in Latin,
+    # with a recorded hole - NOT "compared by the exact stack ONLY".
+    quote = " ".join(HINDI_UNRELATED.split()[:10])
+    words = prose(896, 300).split()
+    partly = " ".join([*words[:100], quote, *words[100:]])
+    # Row 2: nothing but Devanagari. This one IS carried by the exact stack.
+    wholly = " ".join([HINDI_UNRELATED] * 4)
+    write_jsonl(paths.streams_dir / "s.jsonl", [row(partly), row(wholly)])
+    store = Store.open(paths.state_db)
+    all_eval_snapshots(store, tmp_path / "hf", {"bbl": [{"question": HINDI_QUESTION}]})
+    store.close()
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    assert decon_main(["--config", cfg, "--no-generated"]) == 0
+    out = capsys.readouterr().out
+    scripts = json.loads(
+        (paths.out_dir / "decontamination.json").read_text(encoding="utf-8")
+    )["semantic_scripts"]
+
+    # THE TWO COUNTS DIFFER, which is what makes the line readable at all.
+    assert scripts[SCRIPT_DEVANAGARI]["unscreened_rows"] == 2
+    assert scripts[SCRIPT_DEVANAGARI]["wholly_unscreened_rows"] == 1
+    # ... and BOTH numbers are in the printed line, each in its own clause.
+    assert "2 candidate rows carried text this layer could not read" in out
+    assert "(1 of those rows were compared by the exact stack ONLY" in out
+    # The negative: neither number is printed where the other belongs.
+    assert "1 candidate rows carried text this layer could not read" not in out
+    assert "(2 of those rows were compared by the exact stack ONLY" not in out
+
+
 def test_a_letterless_window_and_an_unlisted_script_are_different_holes(
     tmp_path, monkeypatch, capsys
 ):
@@ -3052,6 +3142,123 @@ def test_a_letterless_window_and_an_unlisted_script_are_different_holes(
     # silently joining the benign bucket.
     assert script_of("Ⴀ") == SCRIPT_UNLISTED
     assert dominant_script(numbers) == SCRIPT_NONE
+
+
+def test_the_partition_floor_decides_at_its_own_edge():
+    """P05. The floor was pinned at 1 and at 30 - both extremes, neither the
+    edge - so `>= floor` and `> floor` were interchangeable. A partition of
+    EXACTLY SCRIPT_PARTITION_FLOOR tokens is kept, one token fewer is dropped,
+    and the constant is the one it is DERIVED from rather than a second number
+    that happens to agree today."""
+    assert SCRIPT_PARTITION_FLOOR == SHORT_MIN_TOKENS == 5
+    hindi = "क ख ग घ ङ च छ ज झ ञ"
+    at_the_floor = "alpha beta gamma delta epsilon"
+    under_it = "alpha beta gamma delta"
+    assert len(tokens(at_the_floor)) == SCRIPT_PARTITION_FLOOR
+    assert len(tokens(under_it)) == SCRIPT_PARTITION_FLOOR - 1
+    assert SCRIPT_LATIN in script_partition(f"{hindi} {at_the_floor}")
+    assert SCRIPT_LATIN not in script_partition(f"{hindi} {under_it}")
+    # The Devanagari half is above the floor in both, so the pair moves one
+    # thing only - and a partition under the floor is DROPPED, never recorded
+    # as a hole, for the same reason a 3-token eval item is not an item.
+    assert SCRIPT_DEVANAGARI in script_partition(f"{hindi} {under_it}")
+    # ... and the floor is a parameter, so the same text decides the other way
+    # when it moves. This is what says the behaviour reads the constant.
+    assert SCRIPT_LATIN not in script_partition(f"{hindi} {at_the_floor}", floor=6)
+
+
+def test_script_neutral_words_go_in_every_partition_without_a_model():
+    """P06. The rule the whole "the threshold grid does not move" argument
+    rests on - a monolingual text's partition is the text itself, word for
+    word, so splitting a probe can only change a MIXED one - was killed by a
+    cache-gated test alone. On a fresh clone with no extras and no model, that
+    left the invariant untested. This is the fake-free sibling: `script_partition`
+    is pure Python and needs no seam at all."""
+    mono = "the appellant was convicted under section 302 of the code"
+    assert script_partition(mono)[SCRIPT_LATIN].split() == mono.split()
+    assert list(script_partition(mono)) == [SCRIPT_LATIN]
+
+    mixed = ("अभियुक्त को धारा 302 के अंतर्गत दोषी ठहराया गया "
+             "the appellant was convicted under 302 (2) today")
+    parts = script_partition(mixed)
+    assert set(parts) == {SCRIPT_DEVANAGARI, SCRIPT_LATIN}
+    # THE NEUTRAL WORDS ARE IN BOTH. `302` and `(2)` are not evidence of any
+    # script and they are most of what distinguishes one section from another;
+    # dropping them from a partition would throw away the numbers this module's
+    # tokeniser was fixed to keep.
+    for part in parts.values():
+        assert "302" in part.split()
+        assert "(2)" in part.split()
+    # ... and each partition holds ONLY its own script's words besides those.
+    for script, part in parts.items():
+        for word in part.split():
+            assert dominant_script(word) in (script, SCRIPT_NONE)
+    # The words keep the text's order in every partition, which is what makes a
+    # monolingual partition identical to its text rather than merely equal as a
+    # set.
+    assert parts[SCRIPT_LATIN].split() == [
+        w for w in mixed.split() if dominant_script(w) in (SCRIPT_LATIN, SCRIPT_NONE)
+    ]
+
+
+def test_a_screenable_script_with_no_eval_item_is_skipped_and_is_not_a_hole(monkeypatch):
+    """P18. `match`'s third branch - the index is missing BECAUSE this corpus
+    holds no eval item in a script whose control passed - had no case of its
+    own. Nothing to compare against is not a hole in the screen, and the union
+    rule says the branch that carries that sentence must carry a case."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    # Devanagari is SCREENED (its control is asserted passed here) and yet no
+    # eval item is in it, so no index exists for it.
+    seam = SemanticFilter(
+        [EvalItem("bbl", "bbl#en", prose(893, 40), frozenset())],
+        screened=[SCRIPT_LATIN, SCRIPT_DEVANAGARI],
+    )
+    assert SCRIPT_DEVANAGARI in seam.screened
+    assert SCRIPT_DEVANAGARI not in seam.indexes
+
+    row_text = " ".join([*prose(894, 300).split()[:150], HINDI_UNRELATED,
+                         *prose(894, 300).split()[150:]])
+    assert seam.match(row_text) is None
+    report = seam.script_report()
+    # NOT counted as unscreened, in either counter, and not a wholly-unscreened
+    # row either - the two branches beside this one.
+    assert seam.unscreened_probes.get(SCRIPT_DEVANAGARI, 0) == 0
+    assert seam.unscreened_rows.get(SCRIPT_DEVANAGARI, 0) == 0
+    assert seam.wholly_unscreened_rows.get(SCRIPT_DEVANAGARI, 0) == 0
+    assert SCRIPT_DEVANAGARI not in report, "a script with nothing to find is not a hole"
+    # The contrast, one line down: the SAME row against a seam where Devanagari
+    # is NOT screened is a hole and is counted as one.
+    unscreened = SemanticFilter(
+        [EvalItem("bbl", "bbl#en", prose(893, 40), frozenset())], screened=[SCRIPT_LATIN],
+    )
+    assert unscreened.match(row_text) is None
+    assert unscreened.script_report()[SCRIPT_DEVANAGARI]["unscreened_rows"] == 1
+
+
+def test_an_eval_item_under_the_floor_in_every_script_is_indexed_nowhere(monkeypatch):
+    """P21. `SemanticFilter.__init__`'s `if not parts: continue` - an item too
+    short to embed in ANY script - had no case either. It is not a hole: the
+    exact stack calls these unmatchable and refuses on them, and an item this
+    layer cannot embed is not a screen with a gap in it."""
+    install_fake_semhash(monkeypatch, answer="latin-only")
+    tiny = EvalItem("bbl", "bbl#tiny", "define estoppel", frozenset())
+    real = EvalItem("bbl", "bbl#real", prose(895, 40), frozenset())
+    assert len(tokens(tiny.text)) < SCRIPT_PARTITION_FLOOR
+    assert script_partition(tiny.text) == {}
+
+    seam = SemanticFilter([tiny, real], screened=[SCRIPT_LATIN])
+    assert [item.item_id for _, item in seam.items_by_script[SCRIPT_LATIN]] == ["bbl#real"]
+    report = seam.script_report()
+    assert report[SCRIPT_LATIN]["eval_items"] == 1
+    # NOT a residue either - that counter is for a partition this rule dropped,
+    # and this item had no partition at all in any script.
+    assert report[SCRIPT_LATIN]["residue_items"] == 0
+    # A letterless item lands in the same branch by the same route.
+    letterless = EvalItem("bbl", "bbl#nums", "302 (1) 1973 -- 34", frozenset())
+    assert script_partition(letterless.text) == {}
+    only = SemanticFilter([letterless], screened=[SCRIPT_LATIN])
+    assert only.items_by_script == {}
+    assert only.screening_scripts() == frozenset()
 
 
 def test_a_run_with_no_eval_item_in_a_screenable_script_did_not_run(tmp_path, monkeypatch, capsys):
