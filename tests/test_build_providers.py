@@ -264,6 +264,82 @@ def test_cerebras_quirk_clamps_max_tokens(monkeypatch):
     assert payloads[-1]["max_tokens"] == 100_000  # default quirk passes through
 
 
+def test_openai_quirk_renames_max_tokens_and_never_sends_temperature(monkeypatch):
+    """Both measured as 400s against the live gpt-5 API 2026-08-15, and a 400
+    with no context marker is in _ABORT_STATUSES - it aborts the call rather
+    than failing over, so either field left in place is a judge role that
+    fails every call it is handed instead of quietly degrading.
+
+    The temperature has to be dropped at the HOOK and not merely left out of
+    the config: judge.py sends `params={"temperature": ...}` per call, and
+    `build_payload` merges request params OVER the model's own, so the config
+    carrying none is only half the fix."""
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+    payloads = []
+
+    def handler(request):
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json=_body())
+
+    openai = _provider("openai", quirks=("openai",))
+    gpt5 = _model("gpt-5-mini", family="gpt-oss", roles=("judge",), params={})
+
+    # The per-CALL temperature - the one the config cannot prevent.
+    _complete(
+        _client(handler, provider=openai, model=gpt5),
+        _request(max_tokens=1024, params={"temperature": 0.2}),
+    )
+    assert payloads[-1]["max_completion_tokens"] == 1024
+    assert "max_tokens" not in payloads[-1]
+    assert "temperature" not in payloads[-1]
+    # ...and everything else the caller asked for still ships.
+    assert payloads[-1]["model"] == "gpt-5-mini"
+    assert payloads[-1]["messages"] == [{"role": "user", "content": "hi"}]
+
+    # A temperature carried by the MODEL's own params is dropped too.
+    warm = _model("gpt-5-nano", family="gpt-oss", roles=("judge",), params={"temperature": 0.7})
+    _complete(_client(handler, provider=openai, model=warm), _request(max_tokens=64))
+    assert "temperature" not in payloads[-1]
+    assert payloads[-1]["max_completion_tokens"] == 64
+
+    # A call with no reply allowance sends neither name - the hook renames a
+    # field, it does not invent one.
+    _complete(_client(handler, provider=openai, model=gpt5), _request(params={"top_p": 0.95}))
+    assert "max_tokens" not in payloads[-1] and "max_completion_tokens" not in payloads[-1]
+    assert payloads[-1]["top_p"] == 0.95
+
+    # ...and none of this leaks onto the providers that still take both fields.
+    _complete(
+        _client(handler, provider=_provider("groq")),
+        _request(max_tokens=512, params={"temperature": 0.2}),
+    )
+    assert payloads[-1]["max_tokens"] == 512 and payloads[-1]["temperature"] == 0.2
+    assert "max_completion_tokens" not in payloads[-1]
+
+
+def test_openai_quirk_refuses_two_reply_allowances(monkeypatch):
+    """Both names set means two different budgets are in play and the rename is
+    about to drop one of them; which one survives would come down to dict
+    ordering. The loser is a ceiling somebody set on purpose, so this fails
+    loudly here rather than on the wire."""
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+    openai = _provider("openai", quirks=("openai",))
+    gpt5 = _model("gpt-5-mini", family="gpt-oss", roles=("judge",), params={})
+    client = _client(lambda request: httpx.Response(200, json=_body()), provider=openai, model=gpt5)
+
+    with pytest.raises(ValueError) as excinfo:
+        client.build_payload(_request(max_tokens=1024, params={"max_completion_tokens": 256}))
+    message = str(excinfo.value)
+    assert "gpt-5-mini" in message
+    assert "1024" in message and "256" in message
+
+    # One of them alone is fine, whichever name it arrives under.
+    assert client.build_payload(_request(max_tokens=1024))["max_completion_tokens"] == 1024
+    only_new = client.build_payload(_request(params={"max_completion_tokens": 256}))
+    assert only_new["max_completion_tokens"] == 256 and "max_tokens" not in only_new
+    asyncio.run(client.aclose())
+
+
 def test_unknown_quirk_name_raises_at_construction():
     with pytest.raises(KeyError) as excinfo:
         ChatClient(_provider(quirks=("nosuchprovider",)), _model())

@@ -273,6 +273,52 @@ def _cerebras_request_hook(payload: dict, model: ModelCfg) -> dict:
     return clamped
 
 
+def _openai_request_hook(payload: dict, model: ModelCfg) -> dict:
+    """The gpt-5 family rejects two fields every other provider here accepts.
+
+    Both measured against the live API on 2026-08-15, and both came back 400 -
+    not a warning, not a silently ignored field, so neither can be left to the
+    default hook:
+
+    * ``max_tokens`` is retired on this family; the parameter is
+      ``max_completion_tokens``.  Renamed rather than dropped, because the
+      reply allowance is what stops a judge call from running to the model's
+      full 16k output.
+    * ``temperature`` accepts the default and NOTHING else.  So the only
+      temperature this model can be sent is no temperature at all, and the
+      hook removes it.  Deliberately dropped rather than rewritten to the
+      value the API would have used: a rewrite would put a number we invented
+      into the payload and leave the caller believing it chose it.  The gpt-5
+      blocks in the config carry no ``temperature`` for the same reason - but
+      the config is only half of it, because judge.py sends its own
+      ``params={"temperature": ...}`` per call and that survives the failover
+      onto this provider.  The hook is what makes such a call routable here.
+
+    ``_ABORT_STATUSES`` is why "aborts the whole call" is the cost of getting
+    this wrong rather than "fails over": a 400 with no context marker is read
+    as OUR payload being malformed, so the call raises instead of touring the
+    pool - which is right, and which makes this hook the only thing standing
+    between a paid backstop and a judge role that 400s on every call.
+    """
+    adjusted = dict(payload)
+    adjusted.pop("temperature", None)
+    if "max_tokens" not in adjusted:
+        return adjusted
+    if "max_completion_tokens" in adjusted:
+        # Both set means two different reply allowances are in play and the
+        # rename is about to silently discard one of them.  Which one survives
+        # would depend on dict ordering, and the loser is a budget somebody
+        # set on purpose - so say so here rather than let the wire decide.
+        raise ValueError(
+            f"openai quirk on {model.id}: payload carries BOTH max_tokens "
+            f"({adjusted['max_tokens']!r}) and max_completion_tokens "
+            f"({adjusted['max_completion_tokens']!r}); the rename would drop "
+            f"one of two different reply allowances. Send exactly one."
+        )
+    adjusted["max_completion_tokens"] = adjusted.pop("max_tokens")
+    return adjusted
+
+
 DEFAULT_QUIRK = Quirk(
     request_hook=_default_request_hook,
     response_hook=_default_response_hook,
@@ -291,6 +337,11 @@ QUIRKS: dict[str, Quirk] = {
     ),
     "groq": DEFAULT_QUIRK,
     "mistral": DEFAULT_QUIRK,
+    "openai": Quirk(
+        request_hook=_openai_request_hook,
+        response_hook=_default_response_hook,
+        retry_after=_default_retry_after,
+    ),
     "openrouter": DEFAULT_QUIRK,
 }
 
