@@ -1668,6 +1668,73 @@ def test_the_same_figure_at_the_foot_of_the_page_is_still_furniture():
         assert f"\n{600 + i}\n" not in f"\n{joined}\n"
 
 
+def _closing_line(i: int) -> str:
+    """A second body line per page, unique and past the digit-blind cap."""
+    line = f"{i + 1}. That figure was not disputed by either side in this appeal."
+    assert RUNNING_DIGIT_BLIND_CHARS < len(line) <= RUNNING_MAX_CHARS
+    return line
+
+
+def test_a_table_running_across_pages_cannot_vote_its_own_figures_into_furniture():
+    # THE COUNTING SIDE of the same rule, and the reason a key is registered
+    # only where it may be USED. A schedule of damages spanning six pages
+    # puts a bare figure on every page; if those figures could be counted
+    # where they can never be deleted, they would carry `#` over the
+    # threshold themselves - and then the one cell that happens to fall at a
+    # page edge is deleted as a printed page number, by a key its own table
+    # armed. Nothing here is furniture and nothing is removed.
+    figures = [str(125000 + i * 1000) for i in range(6)]
+    pages = []
+    for i in range(6):
+        cell = figures[i]
+        # The last page is the one that matters: its figure sits where a
+        # printed page number would.
+        rows = [_body_line(i), cell, _closing_line(i)] if i < 5 else [
+            _body_line(i), _closing_line(i), cell
+        ]
+        pages.append("\n".join(rows) + "\n")
+    cleaned, stats = clean_pages(pages)
+    joined = "\n".join(cleaned)
+
+    assert stats["running"] == 0
+    for figure in figures:
+        assert f"\n{figure}\n" in f"\n{joined}\n"
+    # THE PREMISE: the six figures really are ONE key - they differ only in
+    # digits, and the digit-blind key is what the printed page number needs -
+    # so counting them where they sit would have been six pages' worth, past
+    # the threshold for a six-page document.
+    from tuned.data.extract import _running_key
+
+    assert len({_running_key(f) for f in figures}) == 1
+    assert 6 >= max(2, int(6 * 0.4 + 0.999999))
+
+
+def test_a_page_number_in_brackets_does_not_take_the_citation_year_with_it():
+    # THE CLASS THIS RULE COVERS is "a line with numbers and no words", not
+    # "a line of bare digits". The letterless key keeps punctuation, so
+    # `(1974)` broken out of a citation is safe from a volume that prints
+    # `1095` at the foot - but not from one that prints `(1095)`, where both
+    # are `(#)` and the page number is on every page. Position is then the
+    # only thing left, and it is enough.
+    pages = [f"{_body_line(i)}\n" + ("(1974)\n" if i == 2 else "") + f"({1095 + i})\n"
+             for i in range(6)]
+    cleaned, stats = clean_pages(pages)
+    joined = "\n".join(cleaned)
+
+    assert "(1974)" in joined
+    # THE PREMISE and the control: the bracketed page numbers share that key
+    # exactly and they all go, so the citation year survived the pass rather
+    # than survived a pass that did nothing. (Four digits because a bracketed
+    # THREE-digit number is the bare-enumerator shape and is excluded from
+    # furniture before any of this - and S.C.R. page numbers do reach four.)
+    from tuned.data.extract import _running_key
+
+    assert _running_key("(1974)") == _running_key("(1095)") == "(#)"
+    assert stats["running"] == 6
+    for i in range(6):
+        assert f"\n({1095 + i})\n" not in f"\n{joined}\n"
+
+
 def test_the_scr_margin_letters_go_and_a_lettered_heading_stays():
     # P0 found "A B C D E F G H" running down the left margin of these
     # reprints - and lettered section headings in the same alphabet.
@@ -2675,10 +2742,13 @@ class StructuredReader(FakeReader):
 
 
 def test_a_scan_era_object_is_refused_without_being_read_at_all(tmp_path, store):
-    # STRUCTURE BEFORE TEXT, and the saving is the point: the structural read
-    # was measured at 0.03-0.33 s against 28.9 s for the same document's
-    # markdown conversion, so a scan-era object costs a hundredth of what
-    # reading it would.
+    # STRUCTURE BEFORE TEXT, and the saving is the point: measured over the
+    # 15 real objects the structural read costs 0.003-0.53 s against
+    # 0.8-21.4 s to convert the same document - 21x to 523x cheaper on every
+    # one of them - so a scan-era object is refused for a fraction of what
+    # reading it would cost. (The absolute figures are the machine's; the
+    # ratio is the claim, and an earlier run at half these times gives the
+    # same one.)
     key = _key()
     _, paths = _corpus(tmp_path, [key], store=store)
     reader = StructuredReader(

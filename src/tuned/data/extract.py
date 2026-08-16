@@ -1774,9 +1774,17 @@ def pdf_structure(path: str | Path) -> PdfStructure:
     Past the reader seam and therefore not verifiable offline, so it makes
     no judgements at all: it reports the fonts, the image filters and the
     count of pages that carry an image and no text, and `structural_refusal`
-    - which is pure - decides what that means. Measured at 0.03-0.33 s per
-    document against 28.9 s for the same document's markdown conversion, so
-    it is free relative to the read it accompanies.
+    - which is pure - decides what that means. Measured over the 15 real
+    objects: 0.003-0.53 s per document against 0.8-21.4 s to convert the
+    same document, which is 21x to 523x cheaper on every one of them - so
+    it is free relative to the read it accompanies, which is what the
+    STRUCTURE BEFORE TEXT ordering in extract_corpus turns on.
+
+    The ABSOLUTE numbers are a property of the machine and not of this
+    module: an earlier run of the same 15 recorded 0.001-0.75 s against
+    0.4-10.4 s, and neither the old "0.03-0.33 s" nor the old "28.9 s"
+    reproduces on either. The ratio does, by one to two orders of
+    magnitude, and the ratio is the claim.
     """
     try:
         import pymupdf
