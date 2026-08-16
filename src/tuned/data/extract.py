@@ -11,11 +11,25 @@ P0 CHECK 3 established that the objects under `data/pdf/year=YYYY/english/`
 are not the court's plain judgment release: they are the typeset SUPREME
 COURT REPORTS reprint, and every one of them opens with the publisher's
 editorial headnote - a legal-issue summary, enumerated `HELD:` points and a
-Case Law Reference table - before the court's own words begin. That front
-matter is the reporter's copyright under *Eastern Book Company v. D.B.
-Modak*, not the court's uncopyrightable judgment, and it is also a SUMMARY
-OF THE ANSWER: a headnote that survives into a training example both
-infringes and leaks.
+Case Law Reference table - before the court's own words begin. A smoke over
+15 real bucket objects spread across 2010-2025 found the headnote on 15 of
+15, so this is a property of the bucket and not of a sample.
+
+WHY THAT FRONT MATTER MAY NOT BE SHIPPED, stated as the operative rule
+rather than the famous case. The S.C.R. headnote is prepared by the
+Supreme Court's own Editorial Section - the 2023+ volumes print the
+editor's name under it ("Headnotes prepared by: ...") - which makes it a
+GOVERNMENT WORK under s.2(k) of the Copyright Act with copyright vesting in
+the Government under s.17(d). The s.52(1)(q)(iv) exemption that puts
+judgments in the public domain covers "any judgment or order of a court",
+and the reporter's summary of one is not the judgment. *Eastern Book
+Company v. D.B. Modak* is BACKGROUND and not the authority here: it is
+about a PRIVATE reporter's copyright in its own headnotes and it is cited
+for why editorial matter attracts copyright at all, not for who owns this
+particular headnote.
+
+And it is also a SUMMARY OF THE ANSWER: a headnote that survives into a
+training example both infringes and leaks.
 
 So the boundary between headnote and judgment is where this module is most
 likely to be wrong, and the design follows from that:

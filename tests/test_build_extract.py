@@ -55,7 +55,8 @@ from tuned.data.extract import (
 RUNNING_HEADER = "[2020] 7 S.C.R. 941"
 
 # Front matter + headnote: every line of this is the publisher's editorial
-# work under EBC v. Modak, and none of it may reach the corpus.
+# work - a Government work under s.2(k)/s.17(d) of the Copyright Act, outside
+# the s.52(1)(q)(iv) judgment exemption - and none of it may reach the corpus.
 HEADNOTE = """\
 KALYANI SHARMA
 v.
