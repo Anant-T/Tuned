@@ -2331,11 +2331,14 @@ def audit_report(
     byte, against the row the corpus holds.
     """
     fingerprint = reader_fingerprint(reader)
-    lane = fingerprint["lane"]
-    if fingerprint["pymupdf4llm"]:
-        lane += f" {fingerprint['pymupdf4llm']}"
-    if fingerprint["layout"]:
-        lane += f" layout={fingerprint['layout']}"
+    # All three reader inputs, and UNCONDITIONALLY: `n/a` is a fact about the
+    # run (an injected reader, whose bytes this module did not pin) and not
+    # an absence worth hiding, and a header that omits a field on some runs
+    # is a header an operator cannot compare across two of them.
+    lane = (
+        f"{fingerprint['lane']} {fingerprint['pymupdf4llm'] or 'n/a'}"
+        f" layout={fingerprint['layout'] or 'n/a'}"
+    )
     lines = [
         f"AUDIT of {store.document_count(source_id, status=STATUS_OK)} emitted and "
         f"{store.document_count(source_id, status=STATUS_QUARANTINED)} quarantined documents"

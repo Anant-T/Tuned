@@ -3069,6 +3069,11 @@ def test_the_audit_opens_with_the_check_that_settles_whether_the_guard_can_read_
     # see which one changed.
     assert f"extract_version {EXTRACT_VERSION}" in report
     assert reader_fingerprint(reader)["lane"] in report
+    # ...all three of the reader's inputs, and `n/a` where this module did
+    # not pin one: a header that drops a field on some runs cannot be read
+    # across two of them, and the layout state is the input that leaves no
+    # other mark.
+    assert "layout=n/a" in report
 
 
 def test_the_audit_says_when_the_rules_no_longer_reproduce_what_the_corpus_holds(
@@ -3501,6 +3506,10 @@ def test_cli_extracts_the_selection_into_the_build_corpus(tmp_path, capsys):
     # could not run - a corpus with no scan-era refusals because nothing
     # looked reads exactly like a corpus with no scans in it.
     assert "reader    " in out
+    # ...all three inputs to the bytes on that line, the layout state
+    # included: it is the one an operator has no other way to see, since a
+    # process-global switch leaves no mark on the file it changed.
+    assert "layout" in out
     assert "STRUCTURAL GATES DID NOT RUN" in out
 
 
