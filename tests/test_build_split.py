@@ -325,16 +325,41 @@ def test_the_same_input_assigns_the_same_way_twice():
     assert assignment(rows) == assignment(rows)
 
 
+def hash_filled_corpus():
+    """A corpus where the CONTENT-KEYED channel actually decides something.
+
+    corpus() alone cannot test it: its dated cases fill the eval target on
+    their own, so hash_assigned is 0 and the date-less ordering never runs. A
+    determinism test over that corpus passes with a positional row key - which
+    is precisely the nondeterminism it exists to forbid, and a mutant swapping
+    the content key for the input index survived it.
+    """
+    rows = [keyed(1, cnr=cnr("ESCR", 2020)), keyed(2, cnr=cnr("ESCR", 2020))]
+    rows += [keyed(500 + i) for i in range(38)]
+    return rows
+
+
 @pytest.mark.parametrize("seed", [1, 2, 3, 17, 99])
-def test_shuffling_the_input_does_not_move_one_row(seed):
+@pytest.mark.parametrize("build", [corpus, hash_filled_corpus], ids=["dated", "hash_filled"])
+def test_shuffling_the_input_does_not_move_one_row(seed, build):
     """Content-keyed end to end: atoms are grouped, ordered by date then by a
     hash of the atom key, and the target is filled by walking that order - so
     nothing in the decision can see which line a row arrived on."""
-    rows = corpus()
+    rows = build()
     base = assignment(rows)
     shuffled = list(rows)
     random.Random(seed).shuffle(shuffled)
     assert assignment(shuffled) == base
+
+
+def test_the_hash_channel_really_decides_the_second_corpus():
+    """Guards the guard: if the hash-filled corpus ever stopped using the
+    content-keyed channel, the shuffle test above would go quiet rather than
+    fail."""
+    _train, _evaluation, stats = split_items(items(*hash_filled_corpus()), fraction=0.10)
+    assert stats["hash_assigned_units"] > 0
+    _train, _evaluation, dated = split_items(items(*corpus()), fraction=0.10)
+    assert dated["hash_assigned_units"] == 0
 
 
 def test_the_output_files_are_byte_identical_across_two_cli_runs(tmp_path):
@@ -403,6 +428,22 @@ def test_an_assigner_that_loses_a_row_is_refused():
 
     with pytest.raises(RowsLost, match="partition"):
         split_items(fixture, fraction=0.10, assign=loses)
+
+
+def test_an_assigner_that_emits_more_rows_than_it_read_is_refused():
+    """The OTHER direction of the counting check, which had no case: an
+    assigner that loses rows is caught by `<`, and only one that invents them
+    needs the `!=`. The identity check below would catch this too, so the test
+    pins WHICH refusal fires - a mutant weakening `!=` to `<` survived a test
+    that only asked for the exception type."""
+    fixture = items(*[keyed(i) for i in range(10)])
+
+    def invents(rows, *, fraction):
+        return list(range(10)), [0, 1], {"rows": 10, "eval_target_rows": 1,
+                                         "eval_rows": 2, "train_rows": 10}
+
+    with pytest.raises(RowsLost, match="partition"):
+        split_items(fixture, fraction=0.10, assign=invents)
 
 
 def test_an_assigner_that_duplicates_a_row_is_refused_even_at_the_right_count():

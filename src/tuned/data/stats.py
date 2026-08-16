@@ -388,14 +388,23 @@ def gate_share(name: str, count: int, total: int, *, floor: float | None = None,
     if ceiling is not None:
         bounds.append(f"<= {ceiling:.1%}")
     body = f"{label} {share:.1%} of {total} ({' and '.join(bounds)})"
-    # Rounded before the comparison, for gate_mix's reason: a share that is one
-    # ulp under its bound is a corpus that met the bound, and both ends of a
-    # band are places a corpus is deliberately parked. The plan's floors are
-    # INCLUSIVE (">= 80%", "18-22%"), so a corpus sitting exactly on one passes.
-    rounded = round(share, 9)
-    if floor is not None and rounded < floor:
+    # NOT rounded before the comparison, unlike gate_mix, and the difference is
+    # measured rather than stylistic. Here the share is one DIVISION of two
+    # integers, and IEEE division is correctly rounded: when count/total equals
+    # the bound as a rational, `count / total` and `float("0.18")` are the same
+    # double, bit for bit. Searched exhaustively over every total from 2 to
+    # 4,000 for all four shipped bounds - no (count, total) produces a share
+    # that differs from its bound in floating point while equalling it in
+    # arithmetic, so a guard here could never change a verdict and would be a
+    # branch nothing can reach. gate_mix subtracts and then scales by 100,
+    # which is where the noise actually comes from (62/100 against 0.60 is
+    # 2.0000000000000018 percentage points), and that is where the guard is.
+    #
+    # The plan's bounds are INCLUSIVE (">= 80%", "18-22%"), so a corpus sitting
+    # exactly on one passes.
+    if floor is not None and share < floor:
         return Gate(name, RED, f"{body} - BELOW the floor", detail)
-    if ceiling is not None and rounded > ceiling:
+    if ceiling is not None and share > ceiling:
         return Gate(name, RED, f"{body} - ABOVE the ceiling", detail)
     return Gate(name, GREEN, body, detail)
 

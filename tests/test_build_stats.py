@@ -386,6 +386,27 @@ def test_the_empty_think_ceiling_and_the_trace_floor_cannot_both_be_satisfied_ab
                       floor=0.18, ceiling=0.22, label="e").status == GREEN
 
 
+def test_the_float_guard_is_where_the_float_noise_is():
+    """gate_mix rounds before comparing and gate_share does not, on purpose.
+
+    A share is ONE division of two integers and IEEE division is correctly
+    rounded, so when count/total equals its bound as a rational the two are the
+    same double bit for bit - searched here over every total up to 4,000 for
+    all four shipped bounds. gate_mix subtracts and then scales by 100, which
+    is where the noise is: 62/100 against a 0.60 target is 2.0000000000000018
+    percentage points, and an unguarded `> 2.0` reds a corpus sitting exactly
+    on the tolerance.
+    """
+    for bound in (0.80, 0.18, 0.22, 0.005):
+        for total in range(2, 4001):
+            exact = bound * total
+            count = round(exact)
+            if abs(count - exact) < 1e-9:
+                assert count / total == bound, (count, total, bound)
+    assert abs(0.62 - 0.60) * 100 != 2.0
+    assert round(abs(0.62 - 0.60) * 100, 9) == 2.0
+
+
 @pytest.mark.parametrize("count,status", [(0, GREEN), (5, GREEN), (6, RED)])
 def test_the_dup_ceiling_is_half_a_percent(count, status):
     gate = gate_share(GATE_DUP, count, 1000, ceiling=0.005, label="exact duplicates")

@@ -171,6 +171,25 @@ def test_a_close_tag_inside_the_trace_is_not_mistaken_for_the_opening_one():
     assert conforms(row("q", content), OPEN, CLOSE) is None
 
 
+def test_the_close_is_looked_for_PAST_the_open_tag_not_inside_it():
+    """The reason `tail` is a slice rather than the whole content.
+
+    Under the shipped tags the two are indistinguishable - `</think>` is not a
+    substring of `<think>`, so the first close is in the same place either way,
+    and a mutant replacing the slice with the whole string survived the suite.
+    They come apart the moment a config's open tag CONTAINS its close tag,
+    which the think tags are config (`data.think_open`/`data.think_close`) and
+    nothing forbids. Searching the whole content would then find the close
+    inside the opening tag and call an unclosed block closed.
+    """
+    nested_open, nested_close = "<a></a>", "</a>"
+    unclosed = row("q", f"{nested_open}a trace that never closes")
+    assert conforms(unclosed, nested_open, nested_close) == DROP_UNCLOSED_SCAFFOLD
+    # ...and a genuinely closed one under the same tags still passes.
+    closed = row("q", f"{nested_open}trace{nested_close}answer")
+    assert conforms(closed, nested_open, nested_close) is None
+
+
 # --------------------------------------------------------------------------
 # Building, and never rewriting.
 # --------------------------------------------------------------------------
