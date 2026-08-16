@@ -1536,6 +1536,104 @@ def test_a_footnote_block_of_several_notes_is_moved_whole():
     assert cleaned[0].rstrip().endswith("the deposition of")
 
 
+def test_a_number_on_an_earlier_page_cannot_make_this_page_a_footnote_block():
+    # THE MISREADING, and it shipped: "paragraph numbering ascends through a
+    # judgment, so the highest number seen ANYWHERE above is a safe mark to
+    # compare against". Three things that are not paragraphs inflate it - a
+    # wrapped sentence (`...the admonition of Article` / `335. The several`),
+    # a quoted statute, a quoted paragraph of the judgment under appeal - and
+    # from then on EVERY number below the inflated mark is footnote-eligible
+    # for the rest of the file. Measured: paragraph 48 of one real judgment
+    # was carried to the foot of the file under `[FOOTNOTES]`.
+    inflating = (
+        "39. The policy has to be read together with the requirement of\n"
+        "maintaining efficiency of administration - the admonition of Article\n"
+        "335. The concessions and relaxations it speaks of are for the members\n"
+        "of the reserved categories and for no one else.\n"
+    )
+    later = (
+        f"{_PAGE_FILLER}\n"
+        "48. Mere reference to the decision in Sharma v. State, (2000) 2 SCC 1,\n"
+        "does not re-validate the reasoning of the Division Bench in this case.\n"
+    )
+    cleaned, stats = clean_pages([inflating, later])
+
+    assert stats["footnote_pages"] == 0
+    assert "48. Mere reference" in cleaned[1]
+    # THE PREMISE, stated as a fact about the FIXTURE rather than as a second
+    # copy of the rule: the wrapped sentence really does read as a paragraph
+    # number, so the mark really would have been 335 had it been threaded,
+    # and the paragraph at the foot of the later page really is below it.
+    from tuned.data.extract import _PARA_LINE
+
+    assert _PARA_LINE.match("335. The several concessions, exemptions and relaxations are")
+    assert 48 < 335
+    # ... and the pass is not simply switched off: the SAME page numbers past
+    # a real note, and the note goes.
+    within = (
+        f"{_PAGE_FILLER}\n"
+        "48. Mere reference to the earlier decision does not re-validate the\n"
+        "reasoning of the Division Bench in this case, as we have explained.\n"
+        "1 Sharma v. State of Maharashtra, (2000) 2 SCC 1, at paragraph 34.\n"
+    )
+    kept, within_stats = clean_pages([inflating, within])
+    assert within_stats["footnote_pages"] == 1
+    assert "Sharma v. State of Maharashtra" not in kept[1]
+    assert "48. Mere reference" in kept[1]
+
+
+_SEVERED_HEAD = (
+    "72. Similarly, the Division Bench in Mehta v. Union of India, AIR 1955\n"
+    "Bom 113, took the view that the earlier ruling cannot serve as a useful\n"
+    "guide on this question. The observations relied upon read as follows:\n"
+    f"{_PAGE_FILLER}{_PAGE_FILLER}\n"
+)
+_SEVERED_BLOCK = (
+    "8. Where a decree is one for the payment of money, as Mehta v. Union,\n"
+    "(1889) 13 Bom 241, explains, and an appeal against it is lodged by the\n"
+    "party who has been directed to pay, the court below stays execution so\n"
+    "far as it directs payment, and on an application by that party it\n"
+)
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        # The measured one: the page ran out in the middle of a clause and
+        # the last word is an ordinary lower-case word.
+        "may do so on the judgment-debtor lodging the amount in court, unless\n",
+        # The other shape a wrapped legal sentence ends on, which the
+        # lower-case limb cannot see: a citation, and then the comma that
+        # says the sentence has not finished.
+        "may do so on the terms settled in Mehta v. Union, (2005) 4 SCC 1,\n",
+    ],
+)
+def test_a_quoted_paragraph_the_page_break_severed_is_not_taken_for_a_footnote(tail):
+    # The failure PER-PAGE NUMBERING CANNOT SEE, and the reason the two rules
+    # are not one: here the inflating number is a real paragraph (`72.`) on
+    # the SAME page, and the block under it is a quoted paragraph of an old
+    # report whose sentence runs on to the next page. Measured: seven lines
+    # of a judgment moved to the foot of the file, cut at "...lodging the
+    # amount in Court, unless".
+    severed = _SEVERED_BLOCK + tail
+    page = _SEVERED_HEAD + severed
+    cleaned, stats = clean_pages([page])
+
+    assert stats["footnote_pages"] == 0
+    assert "Where a decree is one for the payment of money"in cleaned[0]
+    # THE PREMISE, and the disjointness with every other condition: the block
+    # satisfies all of them - its number is below the paragraph above it ON
+    # THIS PAGE, it reads as a reference, and it is a small minority of the
+    # page - so the trailing-off guard is the only thing that can be holding
+    # it. The proof is the SAME block, finished, which goes.
+    assert 8 < 72
+    assert len(severed) < len(page) * FOOTNOTE_MAX_SHARE
+    finished = _SEVERED_BLOCK + "may do so on terms it thinks fit to impose.\n"
+    moved, moved_stats = clean_pages([_SEVERED_HEAD + finished])
+    assert moved_stats["footnote_pages"] == 1
+    assert "Where a decree is one for the payment of money"not in moved[0]
+
+
 def test_a_document_too_short_for_most_pages_to_mean_anything_keeps_its_repeated_lines():
     # RUNNING_MIN_PAGES, untested. "Furniture on MOST pages" says nothing
     # over two pages, and the deletion it licenses is silent: a two-page

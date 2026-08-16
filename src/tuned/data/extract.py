@@ -546,30 +546,60 @@ _FOOTNOTE_HINT = re.compile(
 FOOTNOTE_WINDOW = 8
 FOOTNOTE_MAX_SHARE = 0.25
 FOOTNOTE_HEADING = "[FOOTNOTES]"
+# A block that trails off in mid-sentence. The last line of a note ENDS
+# something - a citation's year or page number, a full stop - while the last
+# line of a paragraph the page break interrupted ends on a lower-case word or
+# a comma and continues overleaf. See split_footnotes.
+_UNFINISHED_TAIL = re.compile(r"[a-z,]$")
 
 
-def split_footnotes(page: str, para_high: int) -> tuple[str, list[str], int]:
+def split_footnotes(page: str) -> tuple[str, list[str]]:
     """Split a page's footnote tail off its body.
 
-    Returns (body, footnote lines, new paragraph high-water mark).
+    Returns (body, footnote lines).
 
     A footnote marker and a numbered judgment paragraph are the same
     PATTERN, so they are told apart by the NUMBER: a marker counts as a
     footnote only when it is below the highest paragraph number that appears
-    STRICTLY ABOVE it. Paragraph numbering ascends through a judgment, so a
-    real paragraph never satisfies that (it is the number above's successor)
-    while a footnote restarting at 1 always does - and a page that has
-    established no paragraph numbering above the line yields nothing at all.
+    STRICTLY ABOVE IT ON THIS PAGE. Paragraph numbering ascends through a
+    judgment, so a real paragraph never satisfies that (it is the number
+    above's successor) while a footnote restarting at 1 always does - and a
+    page that has established no paragraph numbering above the line yields
+    nothing at all.
 
-    Two further conditions, both there because the failure to avoid is
+    ON THIS PAGE is the correction, and it is the whole of the first of two
+    fixes. This mark used to be threaded across the document and never
+    decreased, which made "below the highest paragraph number" mean "below
+    the highest number ANYWHERE ABOVE, on any page" - so once one line
+    inflated it, every number under it became footnote-eligible for the rest
+    of the file. Measured on 15 real objects, three things inflated it and
+    none of them was a paragraph: a wrapped sentence whose next line opened
+    `335. The several...` (the number belongs to `Article 335` on the line
+    above), a quoted statute (`178. Place of inquiry or trial.-`) and a
+    quoted paragraph of the judgment under appeal (`122. The details...`).
+    Paragraph 48 of one judgment and half a sentence of another were carried
+    to the foot of the file under `[FOOTNOTES]` - the silent corruption this
+    function's own docstring names. Per page, the mark cannot travel: a
+    quoted `8.` is only a footnote if THIS page numbered past 8 above it.
+
+    Three further conditions, all there because the failure to avoid is
     taking a numbered PARAGRAPH out of the body: the block must read like a
-    reference (_FOOTNOTE_HINT), and it must not be most of the page. Both
-    cost recall on discursive footnotes, which is the right direction -
-    leaving a footnote interleaved is a nuisance, deleting a paragraph is
-    silent corruption of the one segmentation signal that works corpus-wide.
+    reference (_FOOTNOTE_HINT), it must not be most of the page, and it must
+    not TRAIL OFF - a block whose last line ends on a lower-case word or a
+    comma is a sentence the page break interrupted, not a note. That last
+    one is the second fix, and it is not redundant with the first: the case
+    it caught (a quoted paragraph `8.` under a real paragraph `72.` on the
+    SAME page, severed at "...lodging the amount in Court, unless") is one
+    per-page numbering cannot see. All three cost recall on discursive
+    footnotes, which is the right direction - leaving a footnote interleaved
+    is a nuisance, deleting a paragraph is silent corruption of the one
+    segmentation signal that works corpus-wide.
     """
     lines = page.split("\n")
-    # highs[i] = the largest paragraph number strictly above line i.
+    # highs[i] = the largest paragraph number strictly above line i, ON THIS
+    # PAGE. It starts at zero for every page, which is what stops one bad
+    # line poisoning the rest of the document.
+    para_high = 0
     highs: list[int] = []
     for line in lines:
         highs.append(para_high)
@@ -581,7 +611,7 @@ def split_footnotes(page: str, para_high: int) -> tuple[str, list[str], int]:
     while last >= 0 and not lines[last].strip():
         last -= 1
     if last < 0:
-        return page, [], para_high
+        return page, []
 
     start = None
     for i in range(max(0, last - FOOTNOTE_WINDOW + 1), last + 1):
@@ -590,23 +620,27 @@ def split_footnotes(page: str, para_high: int) -> tuple[str, list[str], int]:
             start = i
             break
     if start is None:
-        return page, [], para_high
+        return page, []
     for i in range(start, last + 1):
         # Nothing between the block's first marker and the foot of the page
         # may be the NEXT paragraph - that would make this a paragraph break,
         # not a footnote block.
         match = _PARA_LINE.match(lines[i])
         if match and int(match.group(1)) >= highs[i]:
-            return page, [], para_high
+            return page, []
 
     block = [line for line in lines[start:] if line.strip()]
     text = "\n".join(block)
     if not block or not _FOOTNOTE_HINT.search(text):
-        return page, [], para_high
+        return page, []
     if len(text) > max(1, len(page)) * FOOTNOTE_MAX_SHARE:
         # A "footnote block" that is most of the page is something else.
-        return page, [], para_high
-    return "\n".join(lines[:start]), block, para_high
+        return page, []
+    if _UNFINISHED_TAIL.search(block[-1].strip()):
+        # The sentence runs on to the next page: this is the body, cut by
+        # the page break.
+        return page, []
+    return "\n".join(lines[:start]), block
 
 
 def clean_pages(pages: Sequence[str]) -> tuple[list[str], dict]:
@@ -641,9 +675,8 @@ def clean_pages(pages: Sequence[str]) -> tuple[list[str], dict]:
 
     out: list[str] = []
     footnotes: list[tuple[int, str]] = []
-    para_high = 0
     for index, page in enumerate(staged):
-        body, moved, para_high = split_footnotes(page, para_high)
+        body, moved = split_footnotes(page)
         if moved:
             stats["footnote_pages"] += 1
             footnotes.extend((index, line) for line in moved)
