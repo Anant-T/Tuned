@@ -921,16 +921,114 @@ def test_the_report_names_the_tokenizer_that_measured_the_lengths(tmp_path):
     assert report["stats_version"] == STATS_VERSION == 1
 
 
+BANNED_THRESHOLDS = ("0.80", "0.18", "0.20", "0.005", "8192", "2.0", "60", "16", "24")
+
+
+def banned_literals(source: str, banned=BANNED_THRESHOLDS) -> list[tuple[int, str]]:
+    """(line, text) for every shipped threshold written as a literal IN CODE.
+
+    An AST walk and not a regex over the text, for two reasons the old regex
+    got wrong in both directions.
+
+    It under-caught: it demanded the literal be followed by `)`, `>`, `=` or
+    `,`, so `if share < 0.80:`, `floor = 0.80` and `return share >= 0.80` all
+    sailed through - i.e. every form in which a threshold is actually hardcoded
+    except the argument one. Only literals reached by the code are considered
+    here, in any position.
+
+    It would over-catch if simply widened: this module EXPLAINS its bounds in
+    prose ("62/100 against a 0.60 target is 2.0000000000000018 percentage
+    points", `float("0.18")`), and a comment about a number is not a number.
+    Comments and strings are not in the AST at all, so they are legal by
+    construction rather than by an exception.
+
+    Two rules, because a threshold can be spelled two ways:
+
+      * the literal is SPELLED like a bound - `0.80`, or `0.8` for the same
+        value written shorter - anywhere in the code;
+      * or the literal is an operand of a COMPARISON and equals a bound
+        numerically. That is what catches a bare `share < 2` for the 2.0 mix
+        tolerance while leaving `round(share, 2)` alone, which is the only
+        legitimate use of that value in this module.
+
+    The residual is stated rather than hidden: a bound whose value is a small
+    integer (2.0) hardcoded OUTSIDE a comparison - `tolerance = 2` - is not
+    caught, because it is indistinguishable from a rounding precision. Every
+    place a threshold is USED is a comparison.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    values = {float(b) for b in banned}
+    compared = {
+        id(operand)
+        for node in ast.walk(tree) if isinstance(node, ast.Compare)
+        for operand in (node.left, *node.comparators)
+    }
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or isinstance(node.value, bool):
+            continue
+        if not isinstance(node.value, (int, float)):
+            continue
+        text = ast.get_source_segment(source, node) or repr(node.value)
+        spelled = text in banned or ("." in text and float(node.value) in values)
+        if spelled or (id(node) in compared and float(node.value) in values):
+            hits.append((node.lineno, text))
+    return hits
+
+
 def test_no_threshold_is_written_into_this_module():
     """Every number the gates compare against comes from config. A builder
     gate whose thresholds live in its own source is a gate that gets edited to
     pass."""
-    import re
-
     source = STATS_SRC.read_text(encoding="utf-8")
-    body = source.split('"""', 2)[2]  # past the module docstring
-    for banned in ("0.80", "0.18", "0.20", "0.005", "8192", "2.0", "60", "16", "24"):
-        assert not re.search(rf"(?<![\w.]){re.escape(banned)}(?![\w.])\s*[)>=,]", body), banned
+    assert banned_literals(source) == []
+
+
+def test_the_banned_literal_guard_catches_the_forms_a_threshold_is_hardcoded_in():
+    """Guards the guard, against the exact forms that used to escape it.
+
+    The old regex caught one of these five and missed four, which made a test
+    named "no threshold is written into this module" a test about where the
+    punctuation fell.
+    """
+    escaped_before = [
+        "if share < 0.80:\n    pass\n",                  # comparison, colon after
+        "floor = 0.80\n",                                # assignment at end of line
+        "def f(share):\n    return share >= 0.80\n",     # returned comparison
+        "if report['max'] > 8192:\n    pass\n",          # hardcoded bucket
+    ]
+    caught_before = ["x = max(share, 0.80)\n"]           # the argument form
+    for form in escaped_before + caught_before:
+        assert banned_literals(form), form
+    # Same value, shorter spelling, and the integer form of the tolerance in
+    # the position a threshold is used in.
+    assert banned_literals("cut = 0.8\n")
+    assert banned_literals("if share < 2:\n    pass\n")
+    # ...and the module's own arithmetic, prose and rounding stay legal, or the
+    # guard would be traded for a different kind of noise.
+    for legal in (
+        "y = round(share, 2)\n",
+        "z = round(v, 4)\nw = things[:5]\n",
+        "rank = ceil(p / 100 * n)\n",
+        "# 62/100 against a 0.60 target is 2.0000000000000018 percentage points\nq = 1\n",
+        'd = "count/total and float(\\"0.18\\") are the same double"\n',
+    ):
+        assert banned_literals(legal) == [], legal
+
+
+def test_the_guard_would_catch_the_mutant_it_exists_for():
+    """The review's `R-STATS-HARDCODE-FLOOR` mutant died on a band test rather
+    than here, which is what made this guard decorative. Planted in the REAL
+    source, it now trips the guard that is named for it."""
+    source = STATS_SRC.read_text(encoding="utf-8")
+    mutant = source.replace(
+        "if floor is not None and share < floor:",
+        "if floor is not None and share < 0.80:",
+    )
+    assert mutant != source, "the line the mutant replaces has moved"
+    assert [text for _line, text in banned_literals(mutant)] == ["0.80"]
 
 
 def test_cli_hard_exits_after_success():
