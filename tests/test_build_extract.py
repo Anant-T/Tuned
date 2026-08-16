@@ -1135,6 +1135,24 @@ def test_a_legacy_devanagari_font_is_refused_though_its_text_reads_as_latin(font
     )
 
 
+def test_every_font_family_is_written_in_the_form_the_gate_can_match():
+    # A ROW OF THE TABLE NOTHING COULD REACH. The font name is folded before
+    # the test and the family is not, so a family written with a hyphen can
+    # never match anything: `"shree-dev"` sat in this tuple looking like
+    # coverage of `Shree-Dev7-0714` while `"shreedev"` two entries earlier
+    # was what actually matched it. The parametrised test above passed either
+    # way - which is the shape of a fixture that guarantees a null - so the
+    # form of the table is asserted here instead.
+    from tuned.data.extract import DEVANAGARI_FONT_FAMILIES, IDENTITY_ENCODINGS, _folded
+
+    for family in DEVANAGARI_FONT_FAMILIES:
+        assert _folded(family) == family, family
+    assert len(set(DEVANAGARI_FONT_FAMILIES)) == len(DEVANAGARI_FONT_FAMILIES)
+    # The encodings are compared folded on BOTH sides, so those may carry the
+    # hyphen they are really written with - and do.
+    assert [_folded(name) for name in IDENTITY_ENCODINGS] != list(IDENTITY_ENCODINGS)
+
+
 def test_a_devanagari_font_with_a_unicode_encoding_is_not_mojibake():
     # The other direction, and it is what keeps the rule from refusing every
     # bilingual judgment: an Identity-H Devanagari font extracts as real
@@ -1821,16 +1839,17 @@ def test_a_number_on_an_earlier_page_cannot_make_this_page_a_footnote_block():
     # THE MISREADING, and it shipped: "paragraph numbering ascends through a
     # judgment, so the highest number seen ANYWHERE above is a safe mark to
     # compare against". Three things that are not paragraphs inflate it - a
-    # wrapped sentence (`...the admonition of Article` / `335. The several`),
-    # a quoted statute, a quoted paragraph of the judgment under appeal - and
+    # wrapped sentence whose next line opens on the number of the ARTICLE it
+    # was naming (`...of Article` / `335. ...`), a quoted statute, a quoted
+    # paragraph of the judgment under appeal - and
     # from then on EVERY number below the inflated mark is footnote-eligible
     # for the rest of the file. Measured: paragraph 48 of one real judgment
     # was carried to the foot of the file under `[FOOTNOTES]`.
     inflating = (
-        "39. The policy has to be read together with the requirement of\n"
-        "maintaining efficiency of administration - the admonition of Article\n"
-        "335. The concessions and relaxations it speaks of are for the members\n"
-        "of the reserved categories and for no one else.\n"
+        "39. The scheme is to be read alongside the duty of preserving the\n"
+        "standard of the service, which is the caution sounded by Article\n"
+        "335. The relaxations that it permits are meant for candidates of the\n"
+        "categories it names and for nobody besides them.\n"
     )
     later = (
         f"{_PAGE_FILLER}\n"
@@ -1847,7 +1866,7 @@ def test_a_number_on_an_earlier_page_cannot_make_this_page_a_footnote_block():
     # and the paragraph at the foot of the later page really is below it.
     from tuned.data.extract import _PARA_LINE
 
-    assert _PARA_LINE.match("335. The several concessions, exemptions and relaxations are")
+    assert _PARA_LINE.match("335. The relaxations that it permits are meant for candidates")
     assert 48 < 335
     # ... and the pass is not simply switched off: the SAME page numbers past
     # a real note, and the note goes.
@@ -1882,7 +1901,7 @@ _SEVERED_BLOCK = (
     [
         # The measured one: the page ran out in the middle of a clause and
         # the last word is an ordinary lower-case word.
-        "may do so on the judgment-debtor lodging the amount in court, unless\n",
+        "may do so once the party liable brings the sum into the registry, unless\n",
         # The other shape a wrapped legal sentence ends on, which the
         # lower-case limb cannot see: a citation, and then the comma that
         # says the sentence has not finished.
@@ -1894,8 +1913,9 @@ def test_a_quoted_paragraph_the_page_break_severed_is_not_taken_for_a_footnote(t
     # are not one: here the inflating number is a real paragraph (`72.`) on
     # the SAME page, and the block under it is a quoted paragraph of an old
     # report whose sentence runs on to the next page. Measured: seven lines
-    # of a judgment moved to the foot of the file, cut at "...lodging the
-    # amount in Court, unless".
+    # of a judgment moved to the foot of the file, cut mid-clause on a
+    # lower-case word (the fixture's wording is invented, the shape is the
+    # one that was measured).
     severed = _SEVERED_BLOCK + tail
     page = _SEVERED_HEAD + severed
     cleaned, stats = clean_pages([page])
@@ -2057,8 +2077,10 @@ def test_a_table_row_is_demoted_in_both_shapes_the_reader_can_emit(row, alternat
 @pytest.mark.parametrize(
     "line",
     [
-        # The four this corpus actually produced, in the counts the smoke
-        # measured: 886 `<u>`, 222 `<br>`, 164 `<sup>`, 10 `<mark>`.
+        # The four this corpus actually produced, in the counts measured on
+        # the shipped read: 878 `<u>`, 164 `<br>`, 164 `<sup>`, 10 `<mark>`.
+        # (The smoke's 886/222 was the same corpus read with the layout
+        # engine on - see READER_LAYOUT.)
         "<u>Case Law Reference</u>",
         "<mark>Case Law Reference</mark>",
         "<sup>Case Law Reference</sup>",
@@ -2089,7 +2111,7 @@ def test_the_line_break_tag_becomes_a_space_and_does_not_glue_two_words():
     # emitted text. A newline instead would tear the `|cell|cell|` row in
     # half before the table rule can read it, which is why it is a space.
     assert demote_markdown("Sub<br>Inspectors") == "Sub Inspectors"
-    row = "|2.<br>|General for the post of Sub<br>Inspectors|168|"
+    row = "|2.<br>|Selection of candidates as Sub<br>Inspectors|168|"
     demoted = demote_markdown(row)
     assert "SubInspectors" not in demoted
     assert "Sub Inspectors" in demoted
@@ -2617,17 +2639,27 @@ def test_every_document_row_records_which_reader_made_it(tmp_path, store):
         row = store.document(SC_SOURCE_ID, key)
         assert row["status"] == status
         assert json.loads(row["meta_json"])["reader"]["lane"].endswith("FakeReader")
+        # ...and the layout-engine state with it. This module sets that
+        # switch for its own reader only, so an injected one records that
+        # nothing was pinned rather than claiming a state it did not set.
+        assert json.loads(row["meta_json"])["reader"]["layout"] is None
     # ...and an injected reader is NAMED rather than allowed to claim the
     # pinned lane, which is the misreading that would make the field a lie
     # in every test-shaped run.
-    from tuned.data.extract import READER_LANE
+    from tuned.data.extract import READER_LANE, READER_LAYOUT
 
     assert reader_fingerprint(reader)["lane"] != READER_LANE
     assert reader_fingerprint(read_pdf_pages) == {
         "lane": READER_LANE,
         "pymupdf4llm": reader_fingerprint(read_pdf_pages)["pymupdf4llm"],
+        "layout": READER_LAYOUT,
     }
     assert reader_fingerprint(read_pdf_pages)["lane"] == "pymupdf4llm.helpers.pymupdf_rag"
+    # THREE INPUTS TO THE BYTES, not two. The layout switch is process-global
+    # and moves what the pinned lane extracts - measured, emitted text
+    # differs on 2 of the 15 real objects with it toggled - so a row that
+    # names only the lane and the version cannot re-derive its own text.
+    assert reader_fingerprint(read_pdf_pages)["layout"] == "off"
 
 
 class StructuredReader(FakeReader):
@@ -2835,6 +2867,12 @@ def test_the_manifest_joins_the_selection_row_to_the_extraction_facts(tmp_path, 
     # the smoke measured the two lanes disagreeing about whole documents.
     assert row["reader_lane"].endswith("FakeReader")
     assert "reader_version" in row
+    # ALL THREE inputs to the bytes, not two: the layout-engine state is
+    # process-global and moves what the pinned lane extracts (emitted text
+    # differs on 2 of the 15 real objects with it toggled), so the column
+    # that lets a manifest be re-derived has to carry it too. None here
+    # because this module pins that switch for its own reader only.
+    assert "reader_layout" in row and row["reader_layout"] is None
 
 
 def test_two_selection_rows_landing_on_one_pdf_are_written_to_the_manifest_once(
@@ -3154,9 +3192,41 @@ def test_the_reader_is_the_pinned_lane_and_never_the_package_level_dispatch_shim
     # answered - so the import path is the only thing that chose.
     assert package.to_markdown("a.pdf") == [{"text": "the wrong lane"}]
     assert called == ["lane", "shim"]
-    # ...and the process-wide switch is thrown too, so that anything else
-    # holding the package-level name gets the lane this module chose.
+    # ...and the layout switch is thrown on the way, which is not a tidiness
+    # measure: it is a process-global mutation of pymupdf that decides what
+    # the PINNED LANE extracts. See the test below.
     assert package.layout_calls == [False]
+
+
+def test_the_layout_state_the_row_records_is_the_one_the_reader_throws(monkeypatch):
+    # THE FIELD AND THE SWITCH ARE ONE FACT. `use_layout` was documented here
+    # as belt and braces - "so that anything else in the process gets the
+    # lane this module chose" - and that is not what it does. It mutates
+    # `pymupdf` process-wide and changes what the pinned legacy lane itself
+    # extracts: measured over the 15 real objects, raw pages differ on 6 and
+    # the difference survives into the EMITTED text on 2 (2022_large
+    # 129,282 -> 129,143 chars, 2025_large 128,900 -> 128,921), because the
+    # table detector sees a different page. A row that recorded `layout: off`
+    # while the reader threw `True` would name a state that did not make its
+    # bytes, so the recorded value and the thrown switch read the same
+    # constant - and this fails if either one is hard-coded past it.
+    from tuned.data import extract
+
+    def lane(path, *, page_chunks=False, margins=0, table_strategy="lines_strict"):
+        return ["only page"]
+
+    package = _install_reader(monkeypatch, lane)
+
+    assert read_pdf_pages("a.pdf") == ["only page"]
+    assert package.layout_calls == [False]
+    assert reader_fingerprint(read_pdf_pages)["layout"] == extract.READER_LAYOUT == "off"
+
+    monkeypatch.setattr(extract, "READER_LAYOUT", "on")
+    package.layout_calls.clear()
+
+    assert read_pdf_pages("a.pdf") == ["only page"]
+    assert package.layout_calls == [True]
+    assert reader_fingerprint(read_pdf_pages)["layout"] == "on"
 
 
 def test_a_library_without_the_pinned_lane_is_refused_rather_than_dispatched(monkeypatch):

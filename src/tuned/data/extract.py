@@ -187,6 +187,13 @@ from tuned.data.select import SELECTION_FILENAME
 #      their verdicts: over the 15 sampled objects 42 of 678 removals are
 #      given up, all of them printed page numbers or OCR-mangled margin
 #      letters, and all 15 are emitted at both versions.
+#      The row also gains a field: the reader fingerprint now records the
+#      LAYOUT-ENGINE state beside the lane and the version, because that
+#      switch is a third input to the bytes (measured: emitted text differs
+#      on 2 of the 15 with it toggled) and a version-4 row records only two
+#      of the three. A manifest that grows a column is a re-extraction for
+#      the same reason a rule change is - the old rows cannot answer the
+#      question the new column asks.
 EXTRACT_VERSION = 5
 
 TEXT_DIRNAME = "text"
@@ -300,9 +307,14 @@ _MD_TABLE_ROW = re.compile(r"^(?:[ \t]{0,3}\|.*|.*\|.*\|.*)$", re.M)
 _MD_QUOTE = re.compile(r"^[ \t]{0,3}(?:>[ \t]?)+", re.M)
 _MD_BULLET = re.compile(r"^[ \t]{0,3}[-*+][ \t]+", re.M)
 
-# THE READER DOES NOT EMIT ONLY MARKDOWN. Measured over 15 real objects:
-# 886 `<u>`, 222 `<br>`, 164 `<sup>` and 10 `<mark>`, and the damage was not
-# cosmetic. `<u>Case Law Reference</u>` defeats a `^`-anchored signature in
+# THE READER DOES NOT EMIT ONLY MARKDOWN. Measured over 15 real objects on
+# the SHIPPED read: 878 `<u>`, 164 `<br>`, 164 `<sup>` and 10 `<mark>`, and
+# the damage was not cosmetic. (886/222/164/10 is the same count taken with
+# the layout engine ON - 58 of those `<br>`s are inside table cells the
+# other engine finds and this one does not, which is READER_LAYOUT being a
+# reader input rather than a presentation switch. The tag CLASSES are the
+# same either way, and they are what this pass turns on.)
+# `<u>Case Law Reference</u>` defeats a `^`-anchored signature in
 # five documents; `<u>Judgment</u>` squashes to `<u>judgment</u>`, which is
 # not in _HEADING_WORDS, and quarantined ALL THREE 2025 documents as
 # `no_judgment_start` on a heading that is plainly there. So an inline tag
@@ -1151,7 +1163,8 @@ def stopword_rate(text: str) -> float:
 #                 them - but citation-level accuracy is exactly where
 #                 twenty-year-old OCR fails, and the evidence is already
 #                 visible in the running heads: `[201 O]` for `[2010]`,
-#                 `S.Q.R.` for `S.C.R.`, `1f` for `11`. Whether OCR-era text
+#                 `S.Q.R.` for `S.C.R.` (once, on page 9 of the 2014 large
+#                 object), `1f` for `11`. Whether OCR-era text
 #                 belongs in v1 is a decision, and a decision that is taken
 #                 by accident is the thing this quarantine exists to
 #                 prevent. Measured: fires on 6 of 15, silent on the other
@@ -1173,8 +1186,16 @@ SCAN_IMAGE_ONLY_SHARE = 0.5
 # number and a running head come to more than this, so it is not a page the
 # OCR merely did badly on, it is a page with no text layer.
 MIN_IMAGE_PAGE_TEXT = 50
+# EVERY ENTRY IN ITS FOLDED FORM, because that is the only form that can
+# match: the font name is put through `_folded` (lower-case, alphanumerics
+# only) before the test, and the family is not. `"shree-dev"` was in this
+# tuple and could never fire - the hyphen is exactly what `_folded` strips
+# out of `Shree-Dev7-0714` - so it was a row of the table nothing could
+# reach, guaranteeing a null the way a mis-shaped fixture does. Deleted; the
+# `"shreedev"` beside it is what was doing the work. A test asserts the form
+# of every entry, so the next hyphen is caught rather than discovered.
 DEVANAGARI_FONT_FAMILIES = (
-    "krutidev", "kruti", "devlys", "shreedev", "shree-dev", "chanakya", "shusha",
+    "krutidev", "kruti", "devlys", "shreedev", "chanakya", "shusha",
     "agra", "mangal", "kokila", "aparajita", "utsaah", "sanskrit", "devanagari",
 )
 IDENTITY_ENCODINGS = ("identity-h", "identity-v")
@@ -1588,15 +1609,30 @@ READER_OCR_OFF = {"use_ocr": False, "force_ocr": False}
 # required options, has no OCR, and is what every measurement in this file
 # was taken against.
 READER_LANE = "pymupdf4llm.helpers.pymupdf_rag"
+# ...AND THE LAYOUT ENGINE, which is a third input to the bytes and not a
+# tidiness measure. `pymupdf4llm.__init__` calls `use_layout(True)` at
+# import, which activates `pymupdf.layout`; `use_layout(False)` sets
+# `pymupdf._get_layout` back to None. Both are process-global mutations of
+# `pymupdf`, and they change what the PINNED LEGACY LANE ITSELF extracts
+# from the same file with the same options - so this is not a matter of
+# which lane the rest of the process gets.
+#
+# MEASURED over the 15 real objects, same lane, same options, one process,
+# the engine toggled between the two reads: see the reader-fingerprint
+# section for what differs and where. The value here is recorded on every
+# row for the same reason the lane and the version are: a row that cannot
+# say which reader state made it cannot be re-derived, and anything else in
+# the process that calls `use_layout(True)` after this module's last read
+# would move the corpus with no trace on the row.
+READER_LAYOUT = "off"
+_LAYOUT_STATES = {"off": False, "on": True}
 
 
 def _pinned_to_markdown():
     """The pinned `to_markdown`, or an actionable refusal.
 
-    `use_layout(False)` is belt and braces: it puts the package-level shim
-    on the same path this function returns, so anything else in the process
-    that calls `pymupdf4llm.to_markdown` gets the lane this module chose
-    rather than the one the library prefers.
+    Also pins the layout engine to READER_LAYOUT, which decides extracted
+    bytes rather than presentation - see READER_LAYOUT above.
     """
     try:
         import pymupdf4llm
@@ -1618,7 +1654,7 @@ def _pinned_to_markdown():
         ) from exc
     use_layout = getattr(pymupdf4llm, "use_layout", None)
     if callable(use_layout):
-        use_layout(False)
+        use_layout(_LAYOUT_STATES[READER_LAYOUT])
     return to_markdown
 
 
@@ -1632,6 +1668,32 @@ def reader_fingerprint(reader) -> dict:
     that does not say which reader made it cannot be re-derived, and the
     audit's byte-for-byte re-check would blame the rules for a library
     upgrade.
+
+    THREE INPUTS, not two. The layout engine is the third and it was the
+    unrecorded one: `use_layout` is a process-global switch on `pymupdf`,
+    and toggling it moves what the PINNED LANE ITSELF extracts. Measured on
+    the 15 real objects - same lane, same options, one process, the engine
+    toggled between two reads of each file, both states repeatable:
+
+      * RAW PAGES DIFFER ON 6 OF 15, and every one of the six is the table
+        detector seeing a different page. Four lose their `|pipes|` rows
+        entirely with the engine off (2014_large 145 bars -> 0, 2022_small
+        15 -> 0, 2022_medium 65 -> 0, 2022_large 286 -> 0 - the Case Law
+        Reference grid arriving as bold lines instead), 2018_large loses
+        some (78 -> 48) and 2025_large GAINS rows (80 -> 96), so it is not
+        "the engine finds more tables".
+      * THE DIFFERENCE SURVIVES EVERY CLEANUP PASS INTO THE EMITTED TEXT ON
+        2 OF 15: 2022_large (129,282 chars with the engine on against
+        129,143 with it off) and 2025_large (128,900 against 128,921).
+      * No verdict changes on these 15: all fifteen are emitted either way.
+
+    So nothing is corrupted - the shipped path always sets the same state,
+    and repeat reads are byte-identical - but a row that records only the
+    lane and the version records two thirds of what decided its bytes.
+
+    `layout` is None for an injected reader, because this module has not set
+    the switch for one: only `read_pdf_pages` goes through
+    _pinned_to_markdown.
     """
     if reader is read_pdf_pages:
         version = None
@@ -1641,12 +1703,12 @@ def reader_fingerprint(reader) -> dict:
             version = _version("pymupdf4llm")
         except Exception:  # pragma: no cover - absent library, reported as None
             version = None
-        return {"lane": READER_LANE, "pymupdf4llm": version}
+        return {"lane": READER_LANE, "pymupdf4llm": version, "layout": READER_LAYOUT}
     # An injected reader (a test's, or the MIT fallback the plan names) is
     # named for what it is. The point is that the row says which one ran.
     name = getattr(reader, "__qualname__", type(reader).__qualname__)
     module = getattr(reader, "__module__", type(reader).__module__)
-    return {"lane": f"{module}.{name}", "pymupdf4llm": None}
+    return {"lane": f"{module}.{name}", "pymupdf4llm": None, "layout": None}
 
 
 def _reader_options(to_markdown) -> dict:
@@ -2089,8 +2151,11 @@ MANIFEST_FIELDS = (
     "page_start", "page_end", "marker", "reportable", "source_id",
     # WHICH READER MADE THIS TEXT. Downstream reads the manifest and not the
     # document table, so a corpus assembled across a library upgrade would
-    # otherwise be indistinguishable from one that was not.
-    "reader_lane", "reader_version",
+    # otherwise be indistinguishable from one that was not. All THREE inputs
+    # to the bytes: the lane, the library version and the layout-engine state
+    # (see reader_fingerprint - the last one moves emitted text on 2 of the
+    # 15 sampled objects).
+    "reader_lane", "reader_version", "reader_layout",
 )
 
 
@@ -2143,6 +2208,7 @@ def manifest_rows(
             "reportable": meta.get("reportable"),
             "reader_lane": (meta.get("reader") or {}).get("lane"),
             "reader_version": (meta.get("reader") or {}).get("pymupdf4llm"),
+            "reader_layout": (meta.get("reader") or {}).get("layout"),
             "source_id": source_id,
         }
         yield merged
@@ -2260,6 +2326,8 @@ def audit_report(
     lane = fingerprint["lane"]
     if fingerprint["pymupdf4llm"]:
         lane += f" {fingerprint['pymupdf4llm']}"
+    if fingerprint["layout"]:
+        lane += f" layout={fingerprint['layout']}"
     lines = [
         f"AUDIT of {store.document_count(source_id, status=STATUS_OK)} emitted and "
         f"{store.document_count(source_id, status=STATUS_QUARANTINED)} quarantined documents"
@@ -2452,7 +2520,8 @@ def main(argv: Sequence[str] | None = None, *, reader=None) -> int:
         reader_meta = stats["reader"]
         print(
             f"  reader    {reader_meta['lane']}"
-            f"  (pymupdf4llm {reader_meta['pymupdf4llm'] or 'n/a'})"
+            f"  (pymupdf4llm {reader_meta['pymupdf4llm'] or 'n/a'},"
+            f" layout {reader_meta['layout'] or 'n/a'})"
         )
         if not stats["structure_probed"]:
             print(
