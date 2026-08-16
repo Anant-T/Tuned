@@ -429,11 +429,19 @@ def clean_page(text: str) -> tuple[str, dict]:
 # Corpus-level cleanup: running headers, footers, watermarks.
 # --------------------------------------------------------------------------
 
-# A line has to be furniture on MOST pages before it is treated as furniture
-# anywhere, and a document has to be long enough for "most pages" to mean
-# something.
+# A line has to be furniture on ENOUGH pages before it is treated as
+# furniture anywhere, and a document has to be long enough for "enough pages"
+# to mean something.
+#
+# 0.4, AND THE OLD 0.6 WAS STRUCTURALLY UNREACHABLE. A law report is printed
+# recto/verso: the left-hand page carries `NNN SUPREME COURT REPORTS [YYYY] V
+# S.C.R.` and the right-hand page carries the case name, so NEITHER head can
+# appear on more than about half the pages and a threshold above 0.5 refuses
+# both by construction. Measured before the change: running heads survived in
+# ALL TEN emitted bodies, up to 31 in one, and `dropped: N running` read 0 on
+# nine of fifteen documents - a pass that never fired, reporting success.
 RUNNING_MIN_PAGES = 4
-RUNNING_FRACTION = 0.6
+RUNNING_FRACTION = 0.4
 RUNNING_MAX_CHARS = 100
 
 _DIGITS = re.compile(r"\d+")
@@ -445,13 +453,54 @@ _DIGITS = re.compile(r"\d+")
 # have its body deleted as furniture. So it is allowed only on lines short
 # enough to BE a head or a foot.
 RUNNING_DIGIT_BLIND_CHARS = 60
+# The rest of the key, and it exists because the fraction alone did not fix
+# the pass. The 2010-2017 volumes are scans with an OCR text layer, and the
+# ONE line that repeats on every left-hand page arrives under several
+# spellings of the same thing: `[2010]`, `[2010)`, `[201 O]`, `(201 O]`,
+# `[201 OJ]` - the year's `0` read as the letter `O`, the bracket read as
+# `J`, the space the OCR put inside the year. Digit-blinding alone leaves
+# those as five different keys, none of which reaches any threshold. So the
+# key drops everything that is not a letter or the digit placeholder, folds
+# `O` onto the placeholder, and collapses a run of placeholders to one - at
+# which point `[2010]` and `[201 O]` are the same key and the head is
+# furniture again. (Case is folded by upper-casing here rather than
+# case-folding: the key is compared only against other keys.)
+_RUNNING_NOISE = re.compile(r"[^A-Z#]+")
+_RUNNING_PLACEHOLDER_RUN = re.compile(r"#+")
+# ...with ONE line that is never furniture however often it repeats. A bare
+# paragraph enumerator (`48.`) is the Tier-1 segmentation signal P0 found,
+# and the hard key above cannot tell it from a printed page number (`923`)
+# once the punctuation is gone - both are `#`. Deleting a page number is
+# free; deleting the paragraph anchor is the corruption this module exists
+# to avoid, so the shape is excluded from furniture rather than ranked
+# against a threshold.
+_BARE_ENUMERATOR = re.compile(r"^\(?\d{1,3}[.)]$")
+# ...and the hard key is for a line with WORDS in it. A line with no letters
+# has no spelling for a scanner to disagree about, and folding its
+# punctuation away would put `1974)` - the tail of a citation the reader
+# broke onto its own line, measured - under the same key as every printed
+# page number in the volume, which is enough of them to cross any threshold.
+# So a numbers-only line keeps the plain digit skeleton it always had.
+_HAS_LETTER = re.compile(r"[A-Za-z]")
 
 
 def _running_key(line: str) -> str:
-    """Match key for a repeated line: case folded, digits collapsed if short."""
-    flat = _flat(line).casefold()
+    """Match key for a repeated line, or "" for a line that is never furniture.
+
+    Case folded, and on a line short enough to BE a head or a foot also
+    digit-blind - plus, where the line has words in it, letter-`O`-blind and
+    stripped of the punctuation the scanners disagree about.
+    """
+    flat = _flat(line)
+    if _BARE_ENUMERATOR.match(flat):
+        return ""
     skeleton = _DIGITS.sub("#", flat)
-    return skeleton if len(skeleton) <= RUNNING_DIGIT_BLIND_CHARS else flat
+    if len(skeleton) > RUNNING_DIGIT_BLIND_CHARS:
+        return flat.casefold()
+    if not _HAS_LETTER.search(skeleton):
+        return skeleton
+    hard = _RUNNING_NOISE.sub("", skeleton.upper().replace("O", "#"))
+    return _RUNNING_PLACEHOLDER_RUN.sub("#", hard)
 
 
 def running_lines(

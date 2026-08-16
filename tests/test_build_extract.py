@@ -1292,6 +1292,119 @@ def test_running_headers_page_numbers_and_watermarks_go_but_body_lines_stay():
     assert stats["running"] >= 6
 
 
+def _body_line(i: int) -> str:
+    """A body line that differs from its neighbours only in a digit.
+
+    LONG on purpose: digit-blinding is what folds a printed page number onto
+    one key, and applied to prose it folds a whole judgment's paragraphs onto
+    one key too - so the module allows it only on lines short enough to BE a
+    head or a foot, and a fixture whose "body" is short is testing the length
+    cap rather than the rule it means to.
+    """
+    line = f"{i + 1}. The submission advanced for the appellant on this page alone."
+    assert RUNNING_DIGIT_BLIND_CHARS < len(line) <= RUNNING_MAX_CHARS
+    return line
+
+
+def test_a_head_on_alternate_pages_is_furniture_though_it_is_on_only_half_of_them():
+    # RUNNING_FRACTION, and the old 0.6 was STRUCTURALLY UNREACHABLE. A law
+    # report is printed recto/verso: the left-hand page carries the volume
+    # head and the right-hand page carries the case name, so neither can
+    # appear on more than about half the pages. A threshold above 0.5
+    # therefore refuses BOTH by construction - and the pass reported success
+    # by removing nothing. Measured: running heads survived in all ten
+    # emitted bodies, up to 31 in one document.
+    verso = "1096 SUPREME COURT REPORTS [2010] 10 S.C.R."
+    recto = "KALYANI SHARMA v. STATE OF MAHARASHTRA AND ORS. 1097"
+    pages = []
+    for i in range(6):
+        head = verso if i % 2 == 0 else recto
+        pages.append(f"{head}\n{_body_line(i)}\n")
+    cleaned, stats = clean_pages(pages)
+    joined = "\n".join(cleaned)
+
+    assert "SUPREME COURT REPORTS" not in joined
+    assert "KALYANI SHARMA" not in joined
+    assert stats["running"] == 6
+    # THE PREMISE: each head really is on HALF the pages and no more, so a
+    # threshold set for "most pages" could never have reached either.
+    assert sum(1 for page in pages if verso in page) == 3
+    assert sum(1 for page in pages if recto in page) == 3
+    assert 3 / len(pages) == 0.5
+    # ... and the body lines, which differ only in a digit, are still there.
+    for i in range(6):
+        assert _body_line(i) in joined
+
+
+def test_a_running_head_the_scanner_spelled_three_ways_is_still_one_line():
+    # WHAT THE FRACTION ALONE COULD NOT FIX. The 2010-2017 volumes are scans
+    # with an OCR text layer, and the one line that repeats on every left-hand
+    # page arrives under several spellings of the same thing: the year's `0`
+    # read as the letter `O`, the closing bracket read as `)`, a space the
+    # scanner put inside the year. Digit-blinding alone leaves those as three
+    # different keys, none of which reaches any threshold - so the head
+    # survives on a document where it is on every other page.
+    spellings = [
+        "326 SUPREME COURT REPORTS [201 O] 1 S.C.R.",
+        "328 SUPREME COURT REPORTS [2010] 1 S.C.R.",
+        "330 SUPREME COURT REPORTS (2010) 1 S.C.R.",
+    ]
+    pages = [f"{spellings[i % 3]}\n{_body_line(i)}\n" for i in range(6)]
+    cleaned, stats = clean_pages(pages)
+    joined = "\n".join(cleaned)
+
+    assert "SUPREME COURT REPORTS" not in joined
+    assert stats["running"] == 6
+    # THE PREMISE: no two of the three spellings are the same string, and
+    # each is on only a third of the pages - so nothing but folding them onto
+    # one key can have carried any of them over a threshold.
+    assert len(set(spellings)) == 3
+    for spelling in spellings:
+        assert sum(1 for page in pages if spelling in page) == 2
+    for i in range(6):
+        assert _body_line(i) in joined
+
+
+def test_a_bare_paragraph_number_is_never_furniture_however_many_pages_carry_one():
+    # THE PRICE OF THE HARD KEY, guarded rather than paid. Once the key drops
+    # punctuation, `48.` and the printed page number `923` are both `#` - and
+    # printed page numbers are on every page, so the merged key clears any
+    # threshold and takes the paragraph anchor with it. That anchor is the one
+    # corpus-wide Tier-1 segmentation signal there is, and its deletion would
+    # be silent.
+    pages = [f"{12 + i}.\n{_body_line(i)}\n{941 + i}\n" for i in range(6)]
+    cleaned, stats = clean_pages(pages)
+    joined = "\n".join(cleaned)
+
+    for i in range(6):
+        assert f"\n{12 + i}.\n" in f"\n{joined}\n"
+    # THE PREMISE and the control in one: the printed page numbers, which
+    # differ from the enumerators only in the punctuation the key drops, DO
+    # go - so the pass really did fire on this document and the enumerators
+    # survived it rather than surviving a pass that did nothing.
+    assert stats["running"] == 6
+    for i in range(6):
+        assert f"\n{941 + i}\n" not in f"\n{joined}\n"
+
+
+def test_a_numbers_only_line_is_not_folded_onto_the_printed_page_number():
+    # The other half of the same guard, and a measured one: the reader broke
+    # `(1974)` out of a citation onto its own line, and a key that folded its
+    # bracket away would have put it under `#` with every page number in the
+    # volume - which is enough of them to cross any threshold. A line with no
+    # letters in it has no spelling for a scanner to disagree about, so it
+    # keeps the punctuation that tells it from a page number.
+    pages = [f"{_body_line(i)}\n" + ("1974)\n" if i == 2 else "") + f"{941 + i}\n"
+             for i in range(6)]
+    cleaned, stats = clean_pages(pages)
+    joined = "\n".join(cleaned)
+
+    assert "1974)" in joined
+    assert stats["running"] == 6
+    for i in range(6):
+        assert f"\n{941 + i}\n" not in f"\n{joined}\n"
+
+
 def test_the_scr_margin_letters_go_and_a_lettered_heading_stays():
     # P0 found "A B C D E F G H" running down the left margin of these
     # reprints - and lettered section headings in the same alphabet.
