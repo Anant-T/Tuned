@@ -123,6 +123,14 @@ DATE_FROM_CITATION = "citation"
 DATE_FROM_CNR = "cnr"
 DATE_FROM_NONE = "none"
 DATE_CHANNELS = (DATE_FROM_PROV, DATE_FROM_CITATION, DATE_FROM_CNR, DATE_FROM_NONE)
+# STRONGEST FIRST, and load-bearing rather than decorative: it is the order
+# `item_date` prefers in, and it is what breaks a tie when two rows of one case
+# reach the SAME date through different channels. Without a tie-break the row
+# that happened to arrive first labelled the case, which made the manifest's
+# `by_date_channel` census - the instrument that says when the `_prov` channel
+# starts carrying anything - move under a shuffle of an input the assignment
+# is otherwise entirely indifferent to.
+_CHANNEL_RANK = {channel: rank for rank, channel in enumerate(DATE_CHANNELS)}
 
 # A four-digit run that could be a year of an Indian law report. The floor is
 # not decoration: `(2005) 7 SCC 510` normalises with a 3-digit page and
@@ -273,6 +281,14 @@ def units_of(items: Sequence[Item]) -> list[Unit]:
     A case's date is the NEWEST any of its rows names. A case is as recent as
     the most recent thing known about it; taking the oldest would let one
     under-annotated row drag a whole case out of the newest-first band.
+
+    On a TIE the stronger channel wins, and that is not cosmetic. Two rows of
+    one case can reach the same date key by different routes - a `_prov.year`
+    on one and the CNR's year on the other - and the date and the assignment
+    are the same either way, so nothing in the split moves. The manifest's
+    channel census does: with no tie-break it recorded whichever row arrived
+    first, which is the one number in the manifest that could disagree with
+    itself across a shuffle of the input.
     """
     order: list[str] = []
     grouped: dict[str, list[int]] = {}
@@ -286,8 +302,13 @@ def units_of(items: Sequence[Item]) -> list[Unit]:
             grouped[key] = []
             facts[key] = (case_id, date, channel)
         else:
-            known_case, known_date, _ = facts[key]
-            if date is not None and (known_date is None or date > known_date):
+            known_case, known_date, known_channel = facts[key]
+            if date is not None and (
+                known_date is None
+                or date > known_date
+                or (date == known_date
+                    and _CHANNEL_RANK[channel] < _CHANNEL_RANK[known_channel])
+            ):
                 facts[key] = (known_case, date, channel)
         grouped[key].append(index)
     return [

@@ -36,6 +36,7 @@ from tuned.data.split import (
     custody_of,
     date_key,
     eval_target,
+    item_date,
     manifest_digests,
     ordered_units,
     prov_date,
@@ -316,8 +317,22 @@ def test_the_channel_census_counts_every_atom_not_just_the_eval_ones():
 
 def assignment(rows, *, fraction=0.10):
     """key -> side, which is what has to be stable."""
-    train, evaluation, _ = split_items(items(*rows), fraction=fraction)
-    return {**{i.key: "train" for i in train}, **{i.key: "eval" for i in evaluation}}
+    return split_record(rows, fraction=fraction)[0]
+
+
+def split_record(rows, *, fraction=0.10):
+    """(key -> side, the stats block the manifest is written from).
+
+    BOTH halves, because "no row moved" and "the manifest is the same
+    manifest" are two claims and only the first was ever checked. The channel
+    census is a measurement about the corpus that goes into split.json and out
+    of it into an operator's reading of when the `_prov` channel woke up; a
+    number that moves under a shuffle is a number nobody can act on, even when
+    every row landed where it landed before.
+    """
+    train, evaluation, stats = split_items(items(*rows), fraction=fraction)
+    sides = {**{i.key: "train" for i in train}, **{i.key: "eval" for i in evaluation}}
+    return sides, stats
 
 
 def test_the_same_input_assigns_the_same_way_twice():
@@ -339,17 +354,43 @@ def hash_filled_corpus():
     return rows
 
 
+def channel_tie_corpus():
+    """A corpus where two rows of ONE case reach the SAME date by different
+    channels: one carries a `_prov.year`, the other is dated off the CNR.
+
+    Neither of the other two corpora can see the tie - no row in them carries
+    a `_prov` date at all - and the tie is invisible in the ASSIGNMENT by
+    construction, because the date and therefore the side are identical
+    whichever channel wins. It is the census that moves, which is why the
+    shuffle test has to compare the manifest and not only the sides.
+    """
+    key = cnr("ESCR", 2020)
+    rows = [keyed(1, cnr=key, year=2020), keyed(2, cnr=key)]
+    rows += [keyed(700 + i) for i in range(18)]
+    return rows
+
+
 @pytest.mark.parametrize("seed", [1, 2, 3, 17, 99])
-@pytest.mark.parametrize("build", [corpus, hash_filled_corpus], ids=["dated", "hash_filled"])
-def test_shuffling_the_input_does_not_move_one_row(seed, build):
+@pytest.mark.parametrize(
+    "build", [corpus, hash_filled_corpus, channel_tie_corpus],
+    ids=["dated", "hash_filled", "channel_tie"],
+)
+def test_shuffling_the_input_does_not_move_one_row_or_one_manifest_number(seed, build):
     """Content-keyed end to end: atoms are grouped, ordered by date then by a
     hash of the atom key, and the target is filled by walking that order - so
-    nothing in the decision can see which line a row arrived on."""
+    nothing in the decision can see which line a row arrived on.
+
+    The manifest stats are compared too, not just the sides. They were the half
+    that could still move: `units_of` took a later row's date only on a strict
+    `>`, so when two rows of one case named the same date through different
+    channels the FIRST one to arrive labelled the case, and `by_date_channel`
+    came out `{'prov': 1}` or `{'cnr': 1}` depending on the shuffle.
+    """
     rows = build()
-    base = assignment(rows)
+    base = split_record(rows)
     shuffled = list(rows)
     random.Random(seed).shuffle(shuffled)
-    assert assignment(shuffled) == base
+    assert split_record(shuffled) == base
 
 
 def test_the_hash_channel_really_decides_the_second_corpus():
@@ -360,6 +401,34 @@ def test_the_hash_channel_really_decides_the_second_corpus():
     assert stats["hash_assigned_units"] > 0
     _train, _evaluation, dated = split_items(items(*corpus()), fraction=0.10)
     assert dated["hash_assigned_units"] == 0
+
+
+def test_the_tie_corpus_really_puts_two_channels_on_one_case():
+    """Guards the guard, again: a corpus whose two rows stopped disagreeing
+    about the channel would make the census stable for a reason that has
+    nothing to do with the tie-break."""
+    key = f"cnr:{cnr('ESCR', 2020)}"
+    rows = channel_tie_corpus()
+    channels = {item_date(i, key)[1] for i in items(*rows[:2])}
+    assert channels == {DATE_FROM_PROV, DATE_FROM_CNR}
+    assert {item_date(i, key)[0] for i in items(*rows[:2])} == {"2020-00-00"}
+
+
+def test_two_channels_on_one_date_break_toward_the_stronger_one():
+    """The tie-break itself, in both arrival orders. `_prov` beats the case
+    identifier for the same reason `item_date` consults it first: it is the
+    channel a seed builder fills deliberately, and the census exists to say
+    when it starts firing."""
+    key = cnr("ESCR", 2020)
+    by_prov, by_cnr = keyed(1, cnr=key, year=2020), keyed(2, cnr=key)
+    for order in ([by_prov, by_cnr], [by_cnr, by_prov]):
+        unit = [u for u in units_of(items(*order)) if u.case_id][0]
+        assert (unit.date, unit.channel) == ("2020-00-00", DATE_FROM_PROV)
+    # A NEWER date still wins outright - the tie-break only breaks ties, and a
+    # stronger channel naming an older date must not drag the case back.
+    older_prov = keyed(3, cnr=key, year=2015)
+    unit = [u for u in units_of(items(older_prov, by_cnr)) if u.case_id][0]
+    assert (unit.date, unit.channel) == ("2020-00-00", DATE_FROM_CNR)
 
 
 def test_the_output_files_are_byte_identical_across_two_cli_runs(tmp_path):
