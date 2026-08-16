@@ -2080,6 +2080,7 @@ from tuned.data.extract import (
     main,
     pdf_index,
     read_pdf_pages,
+    reader_fingerprint,
     resolve_pdf,
     audit_sample,
     spread,
@@ -2513,6 +2514,164 @@ def test_the_recorded_document_carries_the_span_and_the_selection_identity(tmp_p
     assert json.loads(row["meta_json"])["signals"] == ["held", "case_law_reference"]
 
 
+def test_every_document_row_records_which_reader_made_it(tmp_path, store):
+    # EXTRACT_VERSION ALONE UNDER-GUARDS THE CORPUS, and the smoke proved it:
+    # the same rules over the same PDFs gave DIFFERENT verdicts on the two
+    # lanes the installed library can dispatch to - two 2025 objects flipped
+    # between `ok` and quarantined. So the text on disk is a function of the
+    # reader as well as of this file, and a row that does not name its reader
+    # cannot be re-derived: the audit's byte-for-byte re-check would blame
+    # the rules for a library upgrade.
+    good, bad = _key(start=1), _key(start=101, end=140)
+    _, paths = _corpus(tmp_path, [good, bad], store=store)
+    reader = FakeReader({paths[good]: scr_pages(), paths[bad]: ["too short"]})
+
+    extract_corpus(
+        store,
+        [_selection(good), _selection(bad, scr_prefix="2015_1_101_")],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+    )
+
+    # ON EVERY ROW, refused as well as emitted: a quarantine is a verdict the
+    # reader produced too, and re-opening it after an upgrade is exactly the
+    # case this exists for.
+    for key, status in ((good, STATUS_OK), (bad, STATUS_QUARANTINED)):
+        row = store.document(SC_SOURCE_ID, key)
+        assert row["status"] == status
+        assert json.loads(row["meta_json"])["reader"]["lane"].endswith("FakeReader")
+    # ...and an injected reader is NAMED rather than allowed to claim the
+    # pinned lane, which is the misreading that would make the field a lie
+    # in every test-shaped run.
+    from tuned.data.extract import READER_LANE
+
+    assert reader_fingerprint(reader)["lane"] != READER_LANE
+    assert reader_fingerprint(read_pdf_pages) == {
+        "lane": READER_LANE,
+        "pymupdf4llm": reader_fingerprint(read_pdf_pages)["pymupdf4llm"],
+    }
+    assert reader_fingerprint(read_pdf_pages)["lane"] == "pymupdf4llm.helpers.pymupdf_rag"
+
+
+class StructuredReader(FakeReader):
+    """A reader that can also report what the PDF is made of."""
+
+    def __init__(self, docs, structures, **over):
+        super().__init__(docs, **over)
+        self._structures = {str(k): v for k, v in structures.items()}
+        self.structure = self._structure
+
+    def _structure(self, path):
+        return self._structures[str(path)]
+
+
+def test_a_scan_era_object_is_refused_without_being_read_at_all(tmp_path, store):
+    # STRUCTURE BEFORE TEXT, and the saving is the point: the structural read
+    # was measured at 0.03-0.33 s against 28.9 s for the same document's
+    # markdown conversion, so a scan-era object costs a hundredth of what
+    # reading it would.
+    key = _key()
+    _, paths = _corpus(tmp_path, [key], store=store)
+    reader = StructuredReader(
+        {paths[key]: scr_pages()},
+        {paths[key]: PdfStructure(fonts=(("HiddenHorzOCR", "WinAnsiEncoding"),), pages=6)},
+    )
+
+    stats = extract_corpus(
+        store,
+        [_selection(key)],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+    )
+
+    assert stats["quarantined"] == 1
+    assert stats["reasons"] == {Q_SCANNED_ERA: 1}
+    assert stats["structure_probed"] == 1
+    # NEVER READ. The premise of the ordering, and a fixture in which the
+    # document was unreadable could not tell the two apart - this one reads
+    # perfectly well and is refused anyway.
+    assert reader.read == []
+    assert extract_text(scr_pages()).ok
+    row = store.document(SC_SOURCE_ID, key)
+    assert row["status"] == STATUS_QUARANTINED
+    assert row["text_path"] is None
+    # ...and the structure is on the row either way, so the operator can see
+    # WHAT was refused rather than only that something was.
+    assert json.loads(row["meta_json"])["structure"]["fonts"] == ["HiddenHorzOCR"]
+
+
+def test_the_scan_era_gate_can_be_opened_deliberately(tmp_path, store):
+    # "Which years are in v1" is an operator's decision. The gate makes the
+    # decision explicit; it does not take it. Without this the quarantine
+    # would be a wall rather than a question.
+    key = _key()
+    _, paths = _corpus(tmp_path, [key], store=store)
+    reader = StructuredReader(
+        {paths[key]: scr_pages()},
+        {paths[key]: PdfStructure(image_filters=("/JBIG2Decode",), pages=6)},
+    )
+
+    stats = extract_corpus(
+        store,
+        [_selection(key)],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+        allow_scanned_era=True,
+    )
+
+    assert stats["extracted"] == 1
+    assert reader.read == [paths[key]]
+    # ...and the knob is for the ERA only. A text layer this module cannot
+    # decode is not a matter of preference, so the same flag does not admit
+    # it.
+    mojibake = _key(start=201, end=240)
+    _corpus(tmp_path, [mojibake], store=store)
+    local = str(tmp_path / "corpus" / "sc" / mojibake)
+    second = StructuredReader(
+        {local: scr_pages()},
+        {local: PdfStructure(fonts=(("KrutiDev010", "WinAnsiEncoding"),), pages=6)},
+    )
+    again = extract_corpus(
+        store,
+        [_selection(mojibake, scr_prefix="2015_1_201_")],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=second,
+        allow_scanned_era=True,
+    )
+    assert again["reasons"] == {Q_MOJIBAKE_FONT: 1}
+
+
+def test_a_reader_that_cannot_report_structure_leaves_the_gates_unarmed_and_says_so(
+    tmp_path, store, capsys
+):
+    # THE SILENCE THIS BREAKS. A run with no scan-era refusals because it
+    # never looked reads exactly like a corpus with no scans in it, and the
+    # difference matters more than most of what the run prints.
+    key = _key()
+    _, paths = _corpus(tmp_path, [key], store=store)
+    reader = FakeReader({paths[key]: scr_pages()})
+
+    stats = extract_corpus(
+        store,
+        [_selection(key)],
+        index=pdf_index(store),
+        text_root=tmp_path / "text",
+        reader=reader,
+    )
+
+    assert stats["structure_probed"] == 0
+    assert stats["extracted"] == 1
+    assert Q_SCANNED_ERA not in stats["reasons"]
+    # THE PREMISE: this reader really has no probe, and one that has is
+    # counted - so the zero is about the reader and not about the corpus.
+    assert getattr(reader, "structure", None) is None
+    assert json.loads(store.document(SC_SOURCE_ID, key)["meta_json"])["structure"] is None
+
+
 def test_a_second_selection_row_on_one_pdf_does_not_re_record_the_document(tmp_path, store):
     # Two rows, two case ids, one PDF. The manifest keeps the FIRST row, so
     # the index has to as well: re-recording from the later row would leave
@@ -2594,6 +2753,12 @@ def test_the_manifest_joins_the_selection_row_to_the_extraction_facts(tmp_path, 
     assert row["chars"] > 0
     assert Path(row["text_path"]).read_text(encoding="utf-8").startswith("The Judgment")
     assert row["doc_id"] == "2015_1_1_20_EN"
+    # ...and WHICH READER MADE IT. Downstream reads this file and not the
+    # document table, so a corpus assembled across a library upgrade would
+    # otherwise be indistinguishable from one built in a single pass - and
+    # the smoke measured the two lanes disagreeing about whole documents.
+    assert row["reader_lane"].endswith("FakeReader")
+    assert "reader_version" in row
 
 
 def test_two_selection_rows_landing_on_one_pdf_are_written_to_the_manifest_once(
@@ -2696,6 +2861,12 @@ def test_the_audit_opens_with_the_check_that_settles_whether_the_guard_can_read_
     # string the report does not print would be worse than no tell: the
     # operator would scan for it, not find it, and conclude nothing is wrong.
     assert report.count("headnote signals: none") == 2
+    # ...and the header names the reader beside the rules, for the reason
+    # every row now carries it: this report's verdicts are a function of both,
+    # and an operator reading a re-run against a different library needs to
+    # see which one changed.
+    assert f"extract_version {EXTRACT_VERSION}" in report
+    assert reader_fingerprint(reader)["lane"] in report
 
 
 def test_the_audit_says_when_the_rules_no_longer_reproduce_what_the_corpus_holds(
@@ -2822,6 +2993,31 @@ def test_a_healthy_corpus_still_spends_half_the_audit_on_the_refusals(tmp_path, 
 
 # --------------------------------------------------------------- the reader
 
+def _install_reader(monkeypatch, lane_to_markdown, *, shim=None, with_lane=True):
+    """A fake pymupdf4llm whose PINNED LANE carries `lane_to_markdown`.
+
+    The package-level `to_markdown` is deliberately a DIFFERENT function -
+    the dispatch shim the installed 1.28.2 really has - so that "which of the
+    two ran" is observable. A test that put the same callable in both places
+    would pass whichever one the module called, which is the whole question.
+    """
+    package = types.ModuleType("pymupdf4llm")
+    package.to_markdown = shim or (lambda *a, **k: pytest.fail("the shim was called"))
+    package.layout_calls = []
+    package.use_layout = package.layout_calls.append
+    helpers = types.ModuleType("pymupdf4llm.helpers")
+    monkeypatch.setitem(sys.modules, "pymupdf4llm", package)
+    monkeypatch.setitem(sys.modules, "pymupdf4llm.helpers", helpers)
+    if with_lane:
+        lane = types.ModuleType("pymupdf4llm.helpers.pymupdf_rag")
+        lane.to_markdown = lane_to_markdown
+        helpers.pymupdf_rag = lane
+        monkeypatch.setitem(sys.modules, "pymupdf4llm.helpers.pymupdf_rag", lane)
+    else:
+        monkeypatch.setitem(sys.modules, "pymupdf4llm.helpers.pymupdf_rag", None)
+    return package
+
+
 def test_the_reader_pins_the_options_that_decide_what_the_text_contains(monkeypatch):
     # THE READER'S DEFAULTS ARE NOT THIS REPO'S DECISIONS. pymupdf4llm crops
     # 50 points off the top and bottom of every page unless told otherwise,
@@ -2831,18 +3027,16 @@ def test_the_reader_pins_the_options_that_decide_what_the_text_contains(monkeypa
     # that as a clean document.
     seen = {}
 
-    class Library:
-        @staticmethod
-        def to_markdown(path, *, page_chunks=False, margins=(0, 50, 0, 50),
-                        table_strategy="lines_strict", write_images=False,
-                        embed_images=False, force_text=True, show_progress=True):
-            seen.update(
-                path=path, page_chunks=page_chunks, margins=margins,
-                table_strategy=table_strategy, show_progress=show_progress,
-            )
-            return [{"text": "page one"}, {"text": "page two"}]
+    def to_markdown(path, *, page_chunks=False, margins=(0, 50, 0, 50),
+                    table_strategy="lines_strict", write_images=False,
+                    embed_images=False, force_text=True, show_progress=True):
+        seen.update(
+            path=path, page_chunks=page_chunks, margins=margins,
+            table_strategy=table_strategy, show_progress=show_progress,
+        )
+        return [{"text": "page one"}, {"text": "page two"}]
 
-    monkeypatch.setitem(sys.modules, "pymupdf4llm", Library)
+    _install_reader(monkeypatch, to_markdown)
 
     assert read_pdf_pages("a.pdf") == ["page one", "page two"]
     assert seen["margins"] == 0
@@ -2853,18 +3047,89 @@ def test_the_reader_pins_the_options_that_decide_what_the_text_contains(monkeypa
     # library's own default is a CROP, so passing nothing is a decision too.
     import inspect
 
-    assert inspect.signature(Library.to_markdown).parameters["margins"].default == (0, 50, 0, 50)
+    assert inspect.signature(to_markdown).parameters["margins"].default == (0, 50, 0, 50)
+
+
+def test_the_reader_is_the_pinned_lane_and_never_the_package_level_dispatch_shim(
+    monkeypatch,
+):
+    # WHAT `pymupdf4llm.to_markdown` IS in 1.28.2: not the reader, but a
+    # `(*args, **kwargs)` shim that forwards to one of two implementations,
+    # defaulting to the one that drops `margins` and `table_strategy`, turns
+    # OCR on, and was measured reporting NO HEADNOTE on a document that has
+    # one. Calling the package-level name is therefore not "calling the
+    # library", it is letting the library choose the corpus.
+    called = []
+
+    def shim(*args, **kwargs):
+        called.append("shim")
+        return [{"text": "the wrong lane"}]
+
+    def lane(path, *, page_chunks=False, margins=(0, 50, 0, 50),
+             table_strategy="lines_strict", show_progress=True):
+        called.append("lane")
+        return [{"text": "the pinned lane"}]
+
+    package = _install_reader(monkeypatch, lane, shim=shim)
+
+    assert read_pdf_pages("a.pdf") == ["the pinned lane"]
+    assert called == ["lane"]
+    # THE PREMISE: the shim really is reachable and really would have
+    # answered - so the import path is the only thing that chose.
+    assert package.to_markdown("a.pdf") == [{"text": "the wrong lane"}]
+    assert called == ["lane", "shim"]
+    # ...and the process-wide switch is thrown too, so that anything else
+    # holding the package-level name gets the lane this module chose.
+    assert package.layout_calls == [False]
+
+
+def test_a_library_without_the_pinned_lane_is_refused_rather_than_dispatched(monkeypatch):
+    # The refusal that must NOT become a fallback. If the lane is gone, the
+    # only thing left is the path this module rejected on measured evidence,
+    # so "use whatever is there" would silently rebuild the corpus under the
+    # reader that reports no headnote on a document that has one.
+    def lane(path, *, page_chunks=False, margins=0, table_strategy="lines_strict"):
+        return []  # pragma: no cover - never reached, the lane is not installed
+
+    _install_reader(monkeypatch, lane, with_lane=False)
+    with pytest.raises(ExtractionError, match="pymupdf4llm.helpers.pymupdf_rag"):
+        read_pdf_pages("a.pdf")
+
+
+def test_an_ocr_switch_is_turned_off_where_the_reader_declares_one(monkeypatch):
+    # v1 ships no OCR: `no_text` is a quarantine and not an invitation. The
+    # pinned lane has no OCR knob today, but the lane the shim prefers
+    # defaults `use_ocr=True`, and a version of the pinned one could grow the
+    # same default without saying so.
+    seen = {}
+
+    def lane(path, *, page_chunks=False, margins=0, table_strategy="lines_strict",
+             use_ocr=True, **kwargs):
+        seen.update(use_ocr=use_ocr, **kwargs)
+        return ["only page"]
+
+    _install_reader(monkeypatch, lane)
+    assert read_pdf_pages("a.pdf") == ["only page"]
+    assert seen["use_ocr"] is False
+    # THE PREMISE: the reader's own default is ON, so passing nothing would
+    # have OCR'd the corpus.
+    import inspect
+
+    assert inspect.signature(lane).parameters["use_ocr"].default is True
+    # ...and `force_ocr`, which this reader does NOT declare, is not smuggled
+    # in on the catch-all: a switch that is only accepted is not a switch
+    # that is honoured, and a row saying "OCR off" would then be a claim
+    # nothing checked.
+    assert "force_ocr" not in seen
 
 
 def test_a_reader_that_cannot_take_the_pinned_options_is_refused_not_silently_defaulted(
     monkeypatch,
 ):
-    class Old:
-        @staticmethod
-        def to_markdown(path, *, page_chunks=False, table_strategy="lines_strict"):
-            return []
+    def lane(path, *, page_chunks=False, table_strategy="lines_strict"):
+        return []
 
-    monkeypatch.setitem(sys.modules, "pymupdf4llm", Old)
+    _install_reader(monkeypatch, lane)
     with pytest.raises(ExtractionError, match="margins"):
         read_pdf_pages("a.pdf")
 
@@ -2873,13 +3138,11 @@ def test_a_reader_missing_only_a_cosmetic_option_still_runs(monkeypatch):
     # The line between the two: an option that changes the CORPUS is refused,
     # an option that changes the LOG is dropped. Stopping a run over a
     # progress bar would be its own kind of wrong.
-    class Terse:
-        @staticmethod
-        def to_markdown(path, *, page_chunks=False, margins=(0, 50, 0, 50),
-                        table_strategy="lines_strict"):
-            return ["only page"]
+    def lane(path, *, page_chunks=False, margins=(0, 50, 0, 50),
+             table_strategy="lines_strict"):
+        return ["only page"]
 
-    monkeypatch.setitem(sys.modules, "pymupdf4llm", Terse)
+    _install_reader(monkeypatch, lane)
     assert read_pdf_pages("a.pdf") == ["only page"]
 
 
@@ -2894,32 +3157,30 @@ def test_a_reader_that_only_swallows_kwargs_is_refused_like_one_that_cannot_take
     # by a different door. Accepting a name is not honouring it.
     seen = {}
 
-    class Loose:
-        @staticmethod
-        def to_markdown(path, *, page_chunks=False, **kwargs):
-            seen.update(kwargs)
-            # What the library actually does with what it swallowed: nothing.
-            # The crop default is still what produced this page.
-            return ["page one"]
+    def loose(path, *, page_chunks=False, **kwargs):
+        seen.update(kwargs)
+        # What the library actually does with what it swallowed: nothing.
+        # The crop default is still what produced this page.
+        return ["page one"]
 
-    monkeypatch.setitem(sys.modules, "pymupdf4llm", Loose)
+    _install_reader(monkeypatch, loose)
     with pytest.raises(ExtractionError, match="margins"):
         read_pdf_pages("a.pdf")
     # THE PREMISES. The reader really would have run and really would have
     # taken the options without complaint - so nothing but this check stands
     # between a renamed option and a silently cropped corpus.
     assert seen == {}
-    assert Loose.to_markdown("a.pdf", margins=0, table_strategy="x") == ["page one"]
+    assert loose("a.pdf", margins=0, table_strategy="x") == ["page one"]
     assert seen == {"margins": 0, "table_strategy": "x"}
     # ... and the error names the option whose default decides the corpus.
-    assert "**kwargs" in _error_text(Loose)
+    assert "**kwargs" in _error_text(loose)
 
 
-def _error_text(module) -> str:
+def _error_text(to_markdown) -> str:
     from tuned.data.extract import _reader_options
 
     try:
-        _reader_options(module.to_markdown)
+        _reader_options(to_markdown)
     except ExtractionError as exc:
         return str(exc)
     return ""
@@ -2934,14 +3195,12 @@ def test_a_reader_with_kwargs_beside_the_required_options_may_use_them_for_the_r
     # ones may ride in on the catch-all.
     seen = {}
 
-    class Modern:
-        @staticmethod
-        def to_markdown(path, *, page_chunks=False, margins=(0, 50, 0, 50),
-                        table_strategy="lines_strict", **kwargs):
-            seen.update(page_chunks=page_chunks, margins=margins, **kwargs)
-            return ["only page"]
+    def modern(path, *, page_chunks=False, margins=(0, 50, 0, 50),
+               table_strategy="lines_strict", **kwargs):
+        seen.update(page_chunks=page_chunks, margins=margins, **kwargs)
+        return ["only page"]
 
-    monkeypatch.setitem(sys.modules, "pymupdf4llm", Modern)
+    _install_reader(monkeypatch, modern)
     assert read_pdf_pages("a.pdf") == ["only page"]
     assert seen["margins"] == 0
     assert seen["show_progress"] is False
@@ -2988,6 +3247,29 @@ def test_cli_extracts_the_selection_into_the_build_corpus(tmp_path, capsys):
     assert "HELD:" not in body
     manifest = (paths.corpus_dir / "extraction.jsonl").read_text(encoding="utf-8")
     assert json.loads(manifest.splitlines()[0])["object_key"] == key
+    # The run names its reader, and says out loud when the structural gates
+    # could not run - a corpus with no scan-era refusals because nothing
+    # looked reads exactly like a corpus with no scans in it.
+    assert "reader    " in out
+    assert "STRUCTURAL GATES DID NOT RUN" in out
+
+
+def test_the_cli_is_quiet_about_the_gates_when_the_reader_can_arm_them(tmp_path, capsys):
+    # The other side of the line above: the warning has to be about THIS
+    # reader, or it is noise that trains the operator to skip it.
+    config = temp_config(tmp_path)
+    paths = _build_paths(config)
+    key = _key()
+    store, local = _corpus(tmp_path, [key], store=Store.open(paths.state_db))
+    store.close()
+    _write_selection(paths, [_selection(key)])
+    reader = StructuredReader({local[key]: scr_pages()}, {local[key]: PdfStructure(pages=6)})
+
+    assert main(["--config", config], reader=reader) == 0
+
+    out = capsys.readouterr().out
+    assert "STRUCTURAL GATES DID NOT RUN" not in out
+    assert "documents indexed -> 1" in out
 
 
 def test_cli_says_so_when_it_refused_more_than_a_quarter_of_what_it_read(tmp_path, capsys):

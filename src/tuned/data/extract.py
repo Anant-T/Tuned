@@ -1435,10 +1435,8 @@ def extract_text(pages: Sequence[str]) -> Extraction:
 #   show_progress      a progress bar per document, over tens of thousands of
 #                      documents, is noise in a log nobody can then read.
 #
-# UNVERIFIED against a real pymupdf4llm (it is in the [build] extra and is
-# not installed here), which is the reason for the signature check rather
-# than a reason to leave the defaults in place: an option this module cannot
-# pass is a behaviour this module cannot state.
+# VERIFIED against pymupdf4llm 1.28.2 - see READER_LANE below for what that
+# verification found and why the lane is now pinned by name.
 READER_OPTIONS = {
     "page_chunks": True,
     "margins": 0,
@@ -1452,6 +1450,99 @@ READER_OPTIONS = {
 # take these is refused; the rest degrade to their defaults, because losing a
 # progress bar is not worth stopping a run over.
 READER_REQUIRED = ("page_chunks", "margins", "table_strategy")
+# OCR IS OFF, and v1 ships no OCR by design (`no_text` is a quarantine, not
+# an invitation). The pinned lane below has no OCR knob at all, so there is
+# nothing to turn off there - but the OTHER lane defaults `use_ocr=True`,
+# and a future version of the pinned one could grow the same default. These
+# are therefore passed only where they are EXPLICIT parameters, on the same
+# principle as READER_REQUIRED: a value that rides in on `**kwargs` is
+# accepted, not honoured, and would report a pinning that had not happened.
+READER_OCR_OFF = {"use_ocr": False, "force_ocr": False}
+
+# THE LANE, pinned by import path rather than taken from the package.
+#
+# `pymupdf4llm.to_markdown` in 1.28.2 is not a function, it is a
+# `(*args, **kwargs)` dispatch shim that forwards to one of two completely
+# different implementations. _reader_options refuses it - correctly, and
+# that refusal is why every document raised until this was pinned - but
+# "refuse the shim" is only half an answer, because the shim's DEFAULT
+# destination is the layout path, and that path:
+#
+#   * silently drops `margins` and `table_strategy` (the two options above
+#     whose absence changes the corpus);
+#   * defaults `use_ocr=True`, which makes `no_text` unmeasurable and
+#     contradicts the no-OCR-in-v1 decision;
+#   * deletes text it classifies as a formula, on legal documents, upstream
+#     and unfixed;
+#   * ran ~2.3x slower on the same objects (measured), with an open
+#     Windows-only crash in its ONNX dependency;
+#   * and - measured - emitted `ok` with `signals: none` on a document whose
+#     text plainly reads `C Held:`, i.e. it fired this module's own
+#     first-run alarm and read as healthy.
+#
+# So the legacy implementation is named explicitly. It honours all three
+# required options, has no OCR, and is what every measurement in this file
+# was taken against.
+READER_LANE = "pymupdf4llm.helpers.pymupdf_rag"
+
+
+def _pinned_to_markdown():
+    """The pinned `to_markdown`, or an actionable refusal.
+
+    `use_layout(False)` is belt and braces: it puts the package-level shim
+    on the same path this function returns, so anything else in the process
+    that calls `pymupdf4llm.to_markdown` gets the lane this module chose
+    rather than the one the library prefers.
+    """
+    try:
+        import pymupdf4llm
+    except ImportError as exc:
+        raise ExtractionError(
+            "pymupdf4llm is needed to read the judgment PDFs and is not installed - "
+            "run: pip install -e .[build]"
+        ) from exc
+    try:
+        from pymupdf4llm.helpers.pymupdf_rag import to_markdown
+    except ImportError as exc:
+        raise ExtractionError(
+            f"the installed pymupdf4llm no longer provides {READER_LANE}.to_markdown, "
+            f"and this module pins that lane by name rather than accepting whatever "
+            f"`pymupdf4llm.to_markdown` dispatches to: the alternative path drops "
+            f"`margins` and `table_strategy`, turns OCR ON by default, and was measured "
+            f"reporting no headnote on a document that has one. Re-pin READER_LANE "
+            f"against the installed version deliberately - do not fall back."
+        ) from exc
+    use_layout = getattr(pymupdf4llm, "use_layout", None)
+    if callable(use_layout):
+        use_layout(False)
+    return to_markdown
+
+
+def reader_fingerprint(reader) -> dict:
+    """Which reader produced a document's text - recorded on every row.
+
+    EXTRACT_VERSION alone under-guards the corpus and the smoke proved it:
+    the same rules over the same PDFs gave DIFFERENT verdicts on the two
+    lanes (two 2025 objects flipped between `ok` and quarantined), so the
+    text on disk is a function of the library as well as of this file. A row
+    that does not say which reader made it cannot be re-derived, and the
+    audit's byte-for-byte re-check would blame the rules for a library
+    upgrade.
+    """
+    if reader is read_pdf_pages:
+        version = None
+        try:
+            from importlib.metadata import version as _version
+
+            version = _version("pymupdf4llm")
+        except Exception:  # pragma: no cover - absent library, reported as None
+            version = None
+        return {"lane": READER_LANE, "pymupdf4llm": version}
+    # An injected reader (a test's, or the MIT fallback the plan names) is
+    # named for what it is. The point is that the row says which one ran.
+    name = getattr(reader, "__qualname__", type(reader).__qualname__)
+    module = getattr(reader, "__module__", type(reader).__module__)
+    return {"lane": f"{module}.{name}", "pymupdf4llm": None}
 
 
 def _reader_options(to_markdown) -> dict:
@@ -1488,28 +1579,83 @@ def _reader_options(to_markdown) -> dict:
     # The non-required ones may ride in on **kwargs: losing a progress bar to
     # a renamed option is not worth stopping a run over, which is the same
     # reason they are not in READER_REQUIRED.
-    return {
+    options = {
         name: value
         for name, value in READER_OPTIONS.items()
         if name in params or var_keyword
     }
+    # ...and the OCR switches never do. See READER_OCR_OFF.
+    options.update(
+        {name: value for name, value in READER_OCR_OFF.items() if name in params}
+    )
+    return options
 
 
 def read_pdf_pages(path: str | Path) -> list[str]:
-    """One string per page, via pymupdf4llm.
+    """One string per page, via the pinned pymupdf4llm lane.
 
     The MIT fallback the plan names (pypdf + pdfplumber) is a replacement
     for THIS FUNCTION and nothing else - everything above it is text.
     """
-    try:
-        import pymupdf4llm
-    except ImportError as exc:
-        raise ExtractionError(
-            "pymupdf4llm is needed to read the judgment PDFs and is not installed - "
-            "run: pip install -e .[build]"
-        ) from exc
-    chunks = pymupdf4llm.to_markdown(str(path), **_reader_options(pymupdf4llm.to_markdown))
+    to_markdown = _pinned_to_markdown()
+    chunks = to_markdown(str(path), **_reader_options(to_markdown))
     return [chunk["text"] if isinstance(chunk, dict) else str(chunk) for chunk in chunks]
+
+
+def pdf_structure(path: str | Path) -> PdfStructure:
+    """What the PDF is made of, for the two structural quarantines.
+
+    Past the reader seam and therefore not verifiable offline, so it makes
+    no judgements at all: it reports the fonts, the image filters and the
+    count of pages that carry an image and no text, and `structural_refusal`
+    - which is pure - decides what that means. Measured at 0.03-0.33 s per
+    document against 28.9 s for the same document's markdown conversion, so
+    it is free relative to the read it accompanies.
+    """
+    try:
+        import pymupdf
+    except ImportError as exc:  # pragma: no cover - ships with pymupdf4llm
+        raise ExtractionError(
+            "pymupdf is needed to read the judgment PDFs' structure and is not "
+            "installed - run: pip install -e .[build]"
+        ) from exc
+    fonts: dict[tuple[str, str], None] = {}
+    filters: dict[str, None] = {}
+    image_only = 0
+    with pymupdf.open(str(path)) as doc:
+        for page in doc:
+            for entry in page.get_fonts(full=True):
+                # (xref, ext, type, basefont, refname, encoding, referencer)
+                fonts.setdefault((str(entry[3]), str(entry[5])), None)
+            images = page.get_images(full=True)
+            for image in images:
+                try:
+                    filters.setdefault(str(doc.xref_get_key(image[0], "Filter")[1]), None)
+                except Exception:  # pragma: no cover - a filter we cannot read
+                    continue
+            if images and len(page.get_text().strip()) < MIN_IMAGE_PAGE_TEXT:
+                image_only += 1
+        return PdfStructure(
+            fonts=tuple(fonts),
+            image_filters=tuple(filters),
+            image_only_pages=image_only,
+            pages=doc.page_count,
+        )
+
+
+# The reader seam carries the structural probe with it, because the facts
+# are a property of the object the reader opens: a reader that can report
+# them hangs `pdf_structure` off itself, and one that cannot (a test's, the
+# MIT fallback before it grows one) leaves the structural gates unarmed -
+# which extract_corpus counts and the CLI prints, so that "unarmed" is a
+# line in the log rather than a silence.
+read_pdf_pages.structure = pdf_structure
+
+
+def structure_of(reader, path: str | Path) -> PdfStructure | None:
+    """This reader's structural facts for `path`, or None if it has none."""
+    probe = getattr(reader, "structure", None)
+    return None if probe is None else probe(path)
 
 
 # --------------------------------------------------------------------------
@@ -1666,6 +1812,7 @@ def extract_corpus(
     limit: int | None = None,
     force: bool = False,
     max_failures: int = DEFAULT_MAX_FAILURES,
+    allow_scanned_era: bool = False,
 ) -> dict:
     """Extract the selection, in the order it is given, resumably.
 
@@ -1681,8 +1828,15 @@ def extract_corpus(
     A per-document failure is counted and the run continues; `max_failures`
     stops a run whose fault is not in the documents. A failure to write the
     INDEX is deliberately not caught - that is the database, not a PDF.
+
+    `allow_scanned_era` re-admits the OCR-era volumes. It is the one knob on
+    a structural quarantine and it exists because "which years are in v1" is
+    an operator's decision: the gate makes the decision explicit, it does
+    not make it here. The mojibake gate has no such knob - a text layer this
+    module cannot decode is not a matter of preference.
     """
     text_root = Path(text_root)
+    fingerprint = reader_fingerprint(reader)
     stats: dict = {
         "considered": 0,
         "extracted": 0,
@@ -1695,6 +1849,12 @@ def extract_corpus(
         "routes": dict.fromkeys(JOIN_ROUTES, 0),
         "reasons": {},
         "failures": [],
+        "reader": fingerprint,
+        # Whether the structural gates could run at all. A reader with no
+        # structural probe leaves scanned_era and mojibake_font unarmed, and
+        # that has to be visible: a run reporting zero scan-era refusals
+        # because it never looked reads exactly like a clean corpus.
+        "structure_probed": 0,
     }
     indexed = store.document_index(source_id)
     seen: set[str] = set()
@@ -1726,7 +1886,21 @@ def extract_corpus(
             if extract_decision(indexed.get(key), dest, force=force) == "skip":
                 stats["skipped"] += 1
                 continue
-            result = extract_text(reader(index.by_key[key]))
+            local = index.by_key[key]
+            # STRUCTURE BEFORE TEXT, and it is the cheaper read by two
+            # orders of magnitude: a scan-era object is refused without
+            # spending 29 seconds converting it to markdown first.
+            structure = structure_of(reader, local)
+            refusal = None
+            if structure is not None:
+                stats["structure_probed"] += 1
+                refusal = structural_refusal(structure)
+                if refusal == Q_SCANNED_ERA and allow_scanned_era:
+                    refusal = None
+            if refusal is not None:
+                result = Extraction(False, refusal, pages=structure.pages)
+            else:
+                result = extract_text(reader(local))
         except Exception as exc:
             stats["failed"] += 1
             detail = {"key": key, "error": f"{type(exc).__name__}: {exc}"}
@@ -1761,7 +1935,14 @@ def extract_corpus(
             "page_end": span.end if span else None,
             "marker": result.marker,
             "extract_version": EXTRACT_VERSION,
-            "meta": result.meta(),
+            # The reader goes on EVERY row, emitted or refused: the verdict
+            # is a function of the lane as much as of these rules, and a row
+            # that does not name its reader cannot be re-derived.
+            "meta": {
+                **result.meta(),
+                "reader": fingerprint,
+                "structure": None if structure is None else structure.digest(),
+            },
         }
         if result.ok:
             chars, digest = write_text(dest, result.text)
@@ -1802,6 +1983,10 @@ MANIFEST_FIELDS = (
     "doc_id", "case_id", "title", "citation", "year", "court", "coram",
     "case_type", "priority", "object_key", "text_path", "chars", "pages",
     "page_start", "page_end", "marker", "reportable", "source_id",
+    # WHICH READER MADE THIS TEXT. Downstream reads the manifest and not the
+    # document table, so a corpus assembled across a library upgrade would
+    # otherwise be indistinguishable from one that was not.
+    "reader_lane", "reader_version",
 )
 
 
@@ -1852,6 +2037,8 @@ def manifest_rows(
             "page_end": document["page_end"],
             "marker": document["marker"],
             "reportable": meta.get("reportable"),
+            "reader_lane": (meta.get("reader") or {}).get("lane"),
+            "reader_version": (meta.get("reader") or {}).get("pymupdf4llm"),
             "source_id": source_id,
         }
         yield merged
@@ -1965,10 +2152,14 @@ def audit_report(
     document is re-extracted under today's rules and compared, byte for
     byte, against the row the corpus holds.
     """
+    fingerprint = reader_fingerprint(reader)
+    lane = fingerprint["lane"]
+    if fingerprint["pymupdf4llm"]:
+        lane += f" {fingerprint['pymupdf4llm']}"
     lines = [
         f"AUDIT of {store.document_count(source_id, status=STATUS_OK)} emitted and "
         f"{store.document_count(source_id, status=STATUS_QUARANTINED)} quarantined documents"
-        f"  (extract_version {EXTRACT_VERSION})",
+        f"  (extract_version {EXTRACT_VERSION}, reader {lane})",
         AUDIT_TELL,
     ]
     for row in audit_sample(store, n, source_id=source_id):
@@ -2091,6 +2282,13 @@ def main(argv: Sequence[str] | None = None, *, reader=None) -> int:
     )
     parser.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
     parser.add_argument(
+        "--allow-scanned-era",
+        action="store_true",
+        help="admit the OCR-era volumes (JBIG2 scans with an ABBYY text layer, "
+        "2010-2017) instead of quarantining them as scanned_era. The structure is "
+        "recorded on the row either way; this decides whether it refuses",
+    )
+    parser.add_argument(
         "--audit",
         type=int,
         default=0,
@@ -2133,6 +2331,7 @@ def main(argv: Sequence[str] | None = None, *, reader=None) -> int:
             limit=args.limit,
             force=args.force,
             max_failures=args.max_failures,
+            allow_scanned_era=args.allow_scanned_era,
         )
         joined = stats["routes"][ROUTE_PDF_KEY] + stats["routes"][ROUTE_SCR_PREFIX]
         print(
@@ -2146,6 +2345,18 @@ def main(argv: Sequence[str] | None = None, *, reader=None) -> int:
         )
         for reason, count in sorted(stats["reasons"].items()):
             print(f"    quarantine[{reason}]: {count}")
+        reader_meta = stats["reader"]
+        print(
+            f"  reader    {reader_meta['lane']}"
+            f"  (pymupdf4llm {reader_meta['pymupdf4llm'] or 'n/a'})"
+        )
+        if not stats["structure_probed"]:
+            print(
+                "    STRUCTURAL GATES DID NOT RUN: this reader reports no PDF "
+                "structure, so nothing was checked for scan-era (JBIG2/OCR-layer) "
+                "or undecodable-font objects. A run with no scanned_era refusals "
+                "reads the same either way - this line is the difference."
+            )
         if stats["duplicate_rows"]:
             print(
                 f"    {stats['duplicate_rows']} selection rows named a PDF another row had "
