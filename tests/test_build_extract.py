@@ -2908,7 +2908,16 @@ def test_the_run_counts_the_documents_carrying_a_reportable_flag(tmp_path, store
 def test_the_manifest_joins_the_selection_row_to_the_extraction_facts(tmp_path, store):
     ok_key, bad_key = _key(start=1, end=20), _key(start=101, end=140)
     _, paths = _corpus(tmp_path, [ok_key, bad_key], store=store)
-    rows = [_selection(ok_key), _selection(bad_key, case_id="C.A. 99/2019")]
+    # THE DECOYS. Every manifest column is seeded from the selection row and
+    # only then overwritten with what the extraction found, so a column the
+    # join forgot to fill reads as `None` - and `None` is also the right
+    # answer for the reader fields under an injected reader. A selection row
+    # carrying wrong values in those columns is what tells the two apart: if
+    # the manifest is copying the fingerprint, these never appear.
+    decoys = {"reader_lane": "selection.Row", "reader_version": "0.0.0",
+              "reader_layout": "on", "chars": -1, "marker": "from_the_selection"}
+    rows = [_selection(ok_key, **decoys),
+            _selection(bad_key, case_id="C.A. 99/2019", **decoys)]
     reader = FakeReader(
         {paths[ok_key]: scr_pages(), paths[bad_key]: scr_pages(body=BODY.split("\n", 1)[1])}
     )
@@ -2936,13 +2945,22 @@ def test_the_manifest_joins_the_selection_row_to_the_extraction_facts(tmp_path, 
     # otherwise be indistinguishable from one built in a single pass - and
     # the smoke measured the two lanes disagreeing about whole documents.
     assert row["reader_lane"].endswith("FakeReader")
-    assert "reader_version" in row
+    assert row["reader_version"] is None
     # ALL THREE inputs to the bytes, not two: the layout-engine state is
     # process-global and moves what the pinned lane extracts (emitted text
     # differs on 2 of the 15 real objects with it toggled), so the column
     # that lets a manifest be re-derived has to carry it too. None here
-    # because this module pins that switch for its own reader only.
-    assert "reader_layout" in row and row["reader_layout"] is None
+    # because this module pins that switch for its own reader only - and the
+    # decoy above is what makes that a fact about the join rather than about
+    # a column nobody filled.
+    assert row["reader_layout"] is None
+    assert row["chars"] > 0 and row["marker"] == "judgment_delivered_by"
+    # ...and the manifest's COLUMNS are exactly what MANIFEST_FIELDS declares.
+    # Every explicit key above has to be a declared one, or downstream reads a
+    # file whose shape is a side effect of this function's body.
+    from tuned.data.extract import MANIFEST_FIELDS
+
+    assert set(row) == set(MANIFEST_FIELDS)
 
 
 def test_two_selection_rows_landing_on_one_pdf_are_written_to_the_manifest_once(
