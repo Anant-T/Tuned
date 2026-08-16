@@ -1709,6 +1709,32 @@ def test_a_table_running_across_pages_cannot_vote_its_own_figures_into_furniture
     assert 6 >= max(2, int(6 * 0.4 + 0.999999))
 
 
+def test_a_letterless_scanner_artifact_mid_page_is_still_furniture():
+    # THE DIGIT IS THE CLASS BOUNDARY of the mid-page shelter above. The
+    # shelter exists for numbers-only lines - table figures - and
+    # _NUMBERS_ONLY demands a digit before a line can claim it. A scan-era
+    # artifact line (U+FFFD runs where glyphs did not survive) is letterless
+    # AND digitless: it gets no shelter anywhere on its page, and a document
+    # that repeats one mid-page is rid of every copy. Widen the class to all
+    # letterless lines and this noise survives in every emitted body - a
+    # failure that leaves junk rather than deleting content, which is why
+    # nothing else had it pinned.
+    artifact = "� � �"
+    pages = [
+        "\n".join([_body_line(i), artifact, _closing_line(i)]) + "\n"
+        for i in range(6)
+    ]
+    cleaned, stats = clean_pages(pages)
+    joined = "\n".join(cleaned)
+
+    assert artifact not in joined
+    assert stats["running"] == 6
+    # THE PREMISE: the artifact sat mid-page on every page - the edge rule
+    # sheltered nothing - and the body lines around it all stay.
+    for i in range(6):
+        assert _body_line(i) in joined and _closing_line(i) in joined
+
+
 def test_a_page_number_in_brackets_does_not_take_the_citation_year_with_it():
     # THE CLASS THIS RULE COVERS is "a line with numbers and no words", not
     # "a line of bare digits". The letterless key keeps punctuation, so
