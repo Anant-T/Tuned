@@ -1132,10 +1132,21 @@ def test_a_judgment_with_no_headnote_at_all_is_kept_whole():
         ("NAVIN SINHA, J. delivered the following judgment", "judgment_delivered_by"),
         ("The Court delivered the following order", "judgment_delivered_by"),
         ("R.F. NARIMAN, J. delivered the following Judgment", "judgment_delivered_by"),
+        # THE TWO THE 2014 VOLUMES USE AND THIS LIST DID NOT HAVE, each of
+        # which quarantined a real judgment as `no_judgment_start`. The first
+        # carries no "judgment" token at all; the second is plural AND takes
+        # "were", so a pattern that widened only the noun still misses it.
+        ("The order of the Court was delivered by", "judgment_delivered_by"),
+        ("The Judgments of the Court were delivered by", "judgment_delivered_by"),
+        ("The Orders of the Bench were delivered by", "judgment_delivered_by"),
         ("J U D G M E N T", "judgment_heading"),
         ("JUDGMENT", "judgment_heading"),
         ("## JUDGMENT", "judgment_heading"),
         ("O R D E R", "judgment_heading"),
+        # The heading behind an inline tag and behind a margin letter - see
+        # the two dedicated tests for what each of those cost.
+        ("**<u>Judgment</u>**", "judgment_heading"),
+        ("C JUDGMENT", "judgment_heading"),
     ],
 )
 def test_the_markers_the_reprints_actually_use(line, marker):
@@ -1155,6 +1166,11 @@ def test_the_markers_the_reprints_actually_use(line, marker):
         "Order XLI Rule 27 of the Code of Civil Procedure",
         "the judgment of the court below was delivered without reasons, we are told",
         "Case Arising From Judgment/Order dated 03.05.2019",
+        # The widened noun and verb must not have widened the SENTENCE: what
+        # holds `_DELIVERED_BY` together is that the line ENDS on "delivered
+        # by", and prose about an order of the court does not.
+        "The order of the Court was delivered by post to the parties on 3 May",
+        "The orders of the Court were pronounced in open court that morning",
     ],
 )
 def test_prose_that_merely_mentions_a_judgment_is_not_a_boundary(line):
@@ -1415,6 +1431,42 @@ def test_the_scr_margin_letters_go_and_a_lettered_heading_stays():
     assert "1. The appellant filed a writ petition." in cleaned[0]
     assert [line for line in cleaned[0].split("\n") if line.strip() in {"A", "B.", "H"}] == []
     assert stats["margin_letter"] == 3
+
+
+@pytest.mark.parametrize(
+    "line,signal",
+    [
+        ("C Held:", "held"),
+        ("A Case Law Reference:", "case_law_reference"),
+        ("D Cases referred to:", "cases_referred_to"),
+    ],
+)
+def test_an_inlined_margin_letter_does_not_hide_a_signature(line, signal):
+    # THE FAILURE THIS ANSWERS, and it was measured rather than imagined: on a
+    # reader that lays the page out in columns the print-alignment letter
+    # arrives INSIDE the line instead of on one of its own, and every
+    # `^`-anchored signature then reads `C Held:` as prose. One real document
+    # printed `headnote signals: none` over exactly that text - i.e. this
+    # module's own first-run alarm, firing, and reading like a clean
+    # judgment. A reader upgrade is how that arrives silently.
+    assert signal in headnote_signals(line)
+    # THE PREMISE: without the letter the guard already saw it, so the letter
+    # is the whole of what was hiding it.
+    assert signal in headnote_signals(line[2:])
+
+
+def test_the_margin_letter_is_taken_off_the_matching_form_and_never_off_the_text():
+    # `A` is an English word. Stripping a leading capital from the emitted
+    # text would eat it out of every sentence that begins "A person who..." -
+    # so the letter comes off the forms the guard MATCHES against and off
+    # nothing else. The cost of being wrong is then nil: a matching form that
+    # reads "person who..." simply fails to match, as it did before.
+    page = "A person who commits an offence under this section shall be liable.\n"
+    cleaned, stats = clean_pages([page])
+
+    assert "A person who commits an offence" in cleaned[0]
+    assert stats["margin_letter"] == 0
+    assert headnote_signals(page) == ()
 
 
 _PAGE_FILLER = (

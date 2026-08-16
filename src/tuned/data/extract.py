@@ -385,15 +385,31 @@ _SIGNATURE_HEADER = re.compile(r"^digitally\s+signed\s+by\s*:?$", re.I)
 # reprints. A lettered SECTION heading ("A. FACTUAL MATRIX") carries text
 # and is not this.
 #
-# UNMODELLED, and it belongs to the reader rather than to this rule: this
-# assumes the reader emits each `A`-`H` as a LINE OF ITS OWN. A layout-aware
-# reader that inlines the margin letter into the adjacent text instead would
-# both zero `dropped: N margin` (which reads as "these reprints have no
-# margin letters" and is not what it means) and put a stray capital in front
-# of the paragraph number - breaking the `^\d+\.` anchor that P0 identified
-# as the only corpus-wide Tier-1 signal. `dropped: N margin` reading 0 on the
-# first run is therefore a thing to CHECK against the page, not a pass.
+# MEASURED, on the pinned reader, over 15 objects spread across 2010-2025:
+# 8 to 562 own-line margin letters per document on the twelve pre-2023
+# objects and ZERO on the three 2023+ ones, which set their headnote in a
+# labelled layout with no print-alignment column. So the own-line model is
+# right for this reader, and `dropped: 0 margin` on a 2023+ document is the
+# document and not the rule.
 _MARGIN_LETTER = re.compile(r"^[A-H]\.?$")
+# The same letter INLINED into the line beside it, which is how it arrives
+# on a reader that lays the page out in columns rather than emitting the
+# margin as its own block. Measured on the layout reader this module now
+# refuses: one document's `headnote signals` printed EMPTY over text that
+# plainly reads `C Held:` - the audit's own first-run alarm, firing for real
+# and reading like a healthy document. A reader upgrade is exactly how that
+# would arrive silently, so the guard reads past the letter.
+#
+# It is taken off the MATCHING forms and never off the emitted text. `A` is
+# an English word: dropping the letter from a line that really begins "A
+# person who..." would eat it, while a matching form that reads "person
+# who..." simply fails to match, as it did before.
+_INLINE_MARGIN_LETTER = re.compile(r"^[A-H][ \t]+(?=\S)", re.M)
+
+
+def _unmargin(text: str) -> str:
+    """Every line with an inlined print-alignment letter off its front."""
+    return _INLINE_MARGIN_LETTER.sub("", text)
 
 
 def _is_signature(line: str) -> bool:
@@ -692,9 +708,21 @@ def clean_pages(pages: Sequence[str]) -> tuple[list[str], dict]:
 # "The Judgment of the Court was delivered by", and the variants the
 # reporters use. Matched on the SQUASHED line, so spacing and punctuation
 # cannot break it.
+#
+# TWO OF THOSE VARIANTS WERE MISSING, both found in the 2014 volumes and
+# both quarantined honestly as `no_judgment_start` until now:
+#
+#   "The order of the Court was delivered by"       - no "judgment" token
+#   "The Judgments of the Court were delivered by"  - plural, and "were"
+#
+# The second is how a reprint announces separate opinions, so the token that
+# has to move is the VERB as well as the noun. What holds the pattern
+# together is the rest of it - `of the Court/Bench ... delivered by` at the
+# end of the line - which is why widening the noun costs nothing: prose
+# about an order of the court does not end on "delivered by".
 _DELIVERED_BY = re.compile(
-    r"(?:following)?judgment(?:andorder|andopinion|&order)?ofthe(?:court|bench)"
-    r"was(?:being)?delivered(?:by|by:)$|"
+    r"(?:following)?(?:judgments?|orders?)(?:andorder|andopinion|&order)?"
+    r"ofthe(?:court|bench)(?:was|were)(?:being)?delivered(?:by|by:)$|"
     r"delivered(?:the)?following(?:judgment|order)$"
 )
 # A heading, alone on its line. `J U D G M E N T` squashes to `judgment`.
@@ -741,7 +769,11 @@ def find_judgment_start(text: str) -> Boundary | None:
         if squashed:
             if _DELIVERED_BY.search(squashed):
                 return Boundary(offset, MARKER_DELIVERED_BY, flat)
-            if squashed in _HEADING_WORDS:
+            # The heading is an EXACT match against a small set, so a margin
+            # letter inlined in front of it (`C JUDGMENT`) is not a near
+            # miss - it is a miss. _DELIVERED_BY needs no such help: it is
+            # searched, not matched, and anchored at the line's END.
+            if squashed in _HEADING_WORDS or _squash(_unmargin(flat)) in _HEADING_WORDS:
                 return Boundary(offset, MARKER_HEADING, flat)
         offset += len(line) + 1
     return None
@@ -900,16 +932,19 @@ def headnote_signals(text: str) -> tuple[str, ...]:
     decoration, and a guard that reads one rendering of the furniture refuses
     one rendering of the headnote and publishes the other eight.
 
-    Each signature is then read against up to FOUR forms of the same text,
+    Each signature is then read against up to SIX forms of the same text,
     one per way the typesetting can break a heading the eye reads whole: as
     demoted; with soft-hyphen line breaks closed up (`Case Law Refer-/ence`);
-    with spacing removed line by line (the letter-spaced heading); and with
-    spacing removed across one wrap (the letter-spaced heading the printed
-    column was too narrow to hold).
+    with an inlined print-alignment letter off the front of the line (`C
+    Held:`); and each of those with spacing removed line by line (the
+    letter-spaced heading) and across one wrap (the letter-spaced heading the
+    printed column was too narrow to hold).
     """
     plain = demote_markdown(text)
-    dehyphenated = _dehyphen(plain)
-    plains = (plain,) if dehyphenated == plain else (plain, dehyphenated)
+    plains = (plain,)
+    for variant in (_dehyphen(plain), _unmargin(plain)):
+        if variant not in plains:
+            plains += (variant,)
     spaced_forms = tuple(
         form for source in plains for form in (_despace(source), _despace_pairs(source))
     )
