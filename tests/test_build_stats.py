@@ -275,6 +275,57 @@ def test_a_present_but_unverified_link_is_red_too():
     assert gate.status == RED and "decontamination" in gate.detail["unverified"]
 
 
+@pytest.mark.parametrize(
+    "strip_at,check_key",
+    [("assemble", "split_check"), ("split", "dedupe_check"),
+     ("dedupe", "decontamination_check")],
+)
+def test_a_link_whose_verification_was_never_recorded_is_red_and_names_the_key(
+    strip_at, check_key
+):
+    """The third state, and the cheapest forgery of the three.
+
+    Corrupting a status is work; DELETING one is a keystroke, and every link is
+    still `present` afterwards. Tolerating an absent check for anything but the
+    head made a manifest with all three `*_check` keys stripped read "custody
+    complete" - a chain nobody walked, vouched for by the gate that exists to
+    say so.
+    """
+    manifest = full_chain()
+    holder = {"assemble": manifest, "split": manifest["split"],
+              "dedupe": manifest["split"]["dedupe"]}[strip_at]
+    del holder[check_key]
+    gate = gate_chain(chain_links(manifest), required=True)
+    assert gate.status == RED
+    assert gate.detail["missing"] == [] and gate.detail["unverified"] == []
+    assert check_key in gate.summary
+    assert "NEVER RECORDED" in gate.summary
+
+
+def test_a_manifest_with_every_check_key_stripped_cannot_read_custody_complete():
+    """The whole forgery at once, which is how it would actually arrive."""
+    manifest = full_chain()
+    del manifest["split_check"]
+    del manifest["split"]["dedupe_check"]
+    del manifest["split"]["dedupe"]["decontamination_check"]
+    links = chain_links(manifest)
+    assert all(link["present"] for link in links)  # ...every link still THERE
+    gate = gate_chain(links, required=True)
+    assert gate.status == RED
+    assert gate.detail["unrecorded"] == ["split", "dedupe", "decontamination"]
+    assert "custody complete" not in gate.summary
+
+
+def test_the_head_link_is_the_only_one_allowed_to_carry_no_check():
+    """assemble is where the walk starts, so nothing upstream verified it - and
+    that exemption must not widen to the links that DO have a verifier."""
+    links = chain_links(full_chain())
+    assert links[0] == {"stage": "assemble", "present": True, "check": None,
+                        "check_key": None}
+    assert [link["check"] for link in links[1:]] == ["verified"] * 3
+    assert gate_chain(links, required=True).status == GREEN
+
+
 def test_the_chain_gate_can_be_turned_down_to_a_note():
     gate = gate_chain(chain_links({"stage": "assemble"}), required=False)
     assert gate.status == REPORT and gate.detail["missing"]

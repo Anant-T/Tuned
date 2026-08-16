@@ -29,11 +29,15 @@ THE CHAIN IS A GATE, NOT A NOTE
 This module is the last thing that looks at the corpus before push.py writes a
 card about it, so "were these rows decontaminated" has to be answerable HERE,
 from the manifest chain alone. Each stage carries its predecessor's manifest
-whole, so the walk is assemble -> split -> dedupe -> decontamination and each
-link either names its verification status or is absent. An absent link is red
-under `gates.require_chain`, because a card that claims a decontaminated
-dataset over rows nothing screened is the single most expensive thing this
-build could ship.
+whole, so the walk is assemble -> split -> dedupe -> decontamination and every
+link past the head must RECORD `"verified"`. Three states are red under
+`gates.require_chain`, not one: the link is absent, the link is present with a
+failed status, or the link is present and its `*_check` key was never written
+at all. The third is the cheapest forgery of the three - stripping a key is
+easier than corrupting a status - and tolerating it would let a card claim a
+decontaminated dataset over rows nothing screened, which is the single most
+expensive thing this build could ship. Only the head (`assemble`) may carry no
+check: nothing upstream of it performed one.
 
 WHAT EACH GATE IS FOR
 ----------------------
@@ -274,13 +278,18 @@ def chain_links(manifest) -> list[dict]:
     Every stage carries its predecessor's manifest WHOLE precisely so this walk
     exists: a summary would answer "how many rows" and not "was this the file
     that was screened".
+
+    `check_key` travels with the link because the gate has to be able to NAME
+    the record that is missing. `None` marks the head, the one link no stage
+    upstream could have verified.
     """
     links = []
     node = manifest if isinstance(manifest, dict) else None
     for name, key, check_key in CHAIN:
         if key is None:
             present = isinstance(node, dict) and bool(node)
-            links.append({"stage": name, "present": present, "check": None})
+            links.append({"stage": name, "present": present, "check": None,
+                          "check_key": None})
             continue
         parent = node
         node = (parent or {}).get(key) if isinstance(parent, dict) else None
@@ -289,6 +298,7 @@ def chain_links(manifest) -> list[dict]:
             "present": isinstance(node, dict) and bool(node),
             "check": ((parent or {}).get(check_key) or {}).get("status")
             if isinstance(parent, dict) else None,
+            "check_key": check_key,
         })
     return links
 
@@ -298,18 +308,31 @@ def chain_links(manifest) -> list[dict]:
 # --------------------------------------------------------------------------
 
 def gate_chain(links: Sequence[dict], *, required: bool) -> Gate:
+    """Present, verified, and SAID SO - all three, for every link past the head.
+
+    An unrecorded check is its own fault and not a tolerated `None`: a manifest
+    carried forward with its `*_check` keys stripped is a chain nobody walked,
+    and it is the easiest damage to inflict on the record. The head link is the
+    only one exempt, because assemble is where the walk starts.
+    """
     missing = [link["stage"] for link in links if not link["present"]]
-    unverified = [
-        link["stage"] for link in links
-        if link["present"] and link["check"] not in (None, "verified")
-    ]
-    detail = {"links": list(links), "missing": missing, "unverified": unverified}
-    if not missing and not unverified:
+    graded = [link for link in links if link["present"] and link["check_key"]]
+    unrecorded = [link for link in graded if link["check"] is None]
+    unverified = [link["stage"] for link in graded if link["check"] not in (None, "verified")]
+    detail = {
+        "links": list(links), "missing": missing, "unverified": unverified,
+        "unrecorded": [link["stage"] for link in unrecorded],
+    }
+    if not missing and not unrecorded and not unverified:
         return Gate(GATE_CHAIN, GREEN,
                     "custody complete: assembled, split, deduped, decontaminated", detail)
     faults = []
     if missing:
         faults.append(f"absent: {', '.join(missing)}")
+    if unrecorded:
+        faults.append("verification NEVER RECORDED for " + ", ".join(
+            f"{link['stage']} (no {link['check_key']})" for link in unrecorded
+        ))
     if unverified:
         faults.append(f"unverified: {', '.join(unverified)}")
     return Gate(
