@@ -94,9 +94,14 @@ assembly:
     trace_floor: 0.80
     # The byte-exact empty-think band. Both ends are gates: too few and the
     # model never learns to emit the empty scaffold, too many and it learns to
-    # skip reasoning.
+    # skip reasoning. The ceiling is the trace floor's complement, not an
+    # independent number: a kept row is either traced or empty-scaffolded
+    # (assemble.py drops the third shape), so the shares sum to 1 and a
+    # ceiling above 0.20 would admit a corpus the hard floor then rejects.
+    # The plan's 0.22 was ruled down to 0.20 for exactly that (2026-08-16);
+    # the interaction is pinned in test_build_stats.py.
     empty_think_min: 0.18
-    empty_think_max: 0.22
+    empty_think_max: 0.20
     # A tripwire on the chain, not a re-dedupe: dedupe.py already ran.
     dup_ceiling: 0.005
     # Zero tolerance - special-token markup in message content survives the

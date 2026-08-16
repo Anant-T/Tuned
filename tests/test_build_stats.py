@@ -343,10 +343,10 @@ def test_the_trace_floor_is_inclusive(count, status):
 
 @pytest.mark.parametrize(
     "count,status",
-    [(17, RED), (18, GREEN), (20, GREEN), (22, GREEN), (23, RED)],
+    [(17, RED), (18, GREEN), (20, GREEN), (21, RED)],
 )
 def test_the_empty_think_band_is_closed_at_both_ends(count, status):
-    gate = gate_share(GATE_EMPTY_THINK, count, 100, floor=0.18, ceiling=0.22,
+    gate = gate_share(GATE_EMPTY_THINK, count, 100, floor=0.18, ceiling=0.20,
                       label="byte-exact empty think")
     assert gate.status == status
 
@@ -363,8 +363,10 @@ def test_the_empty_think_ceiling_and_the_trace_floor_cannot_both_be_satisfied_ab
         trace_share + empty_think_share == 1
 
     exactly, and the >= 80% floor caps the empty-think share at 20%. The
-    configured band's upper half (20% to 22%) is therefore UNREACHABLE without
-    failing the trace gate, and the effective band is 18-20%.
+    plan's 0.22 ceiling therefore had an UNREACHABLE upper half (any corpus
+    inside 20%-22% fails the trace gate), and the shipped ceiling is RULED
+    down to the floor's complement, 0.20: the two gates now agree at every
+    share instead of disagreeing across a dead band.
 
     Recorded as a test rather than as a comment because it is a fact about the
     thresholds an operator may want to change, and because a future builder
@@ -374,16 +376,20 @@ def test_the_empty_think_ceiling_and_the_trace_floor_cannot_both_be_satisfied_ab
     traces = trace_count(corpus)
     empties = empty_think_count(corpus, OPEN, CLOSE)
     assert traces + empties == len(corpus) == 100
-    # 22% empty-think is inside the configured band...
+    # Under the REJECTED 0.22 ceiling, 22% empty-think passed the band...
     assert gate_share(GATE_EMPTY_THINK, empties, 100, floor=0.18, ceiling=0.22,
                       label="e").status == GREEN
-    # ...and the same corpus fails the trace floor, which is the crossing point.
+    # ...while the same corpus failed the trace floor - the incoherence that
+    # forced the ruling.
     assert gate_share(GATE_TRACE, traces, 100, floor=0.80, label="t").status == RED
-    # 20% is the last share that satisfies both.
+    # Under the SHIPPED 0.20 ceiling the two gates agree: 22% fails both.
+    assert gate_share(GATE_EMPTY_THINK, empties, 100, floor=0.18, ceiling=0.20,
+                      label="e").status == RED
+    # 20% is the last share that satisfies both, and both say so.
     at_20 = [traced(i * 10) for i in range(80)] + [scaffolded(1000 + i) for i in range(20)]
     assert gate_share(GATE_TRACE, trace_count(at_20), 100, floor=0.80, label="t").status == GREEN
     assert gate_share(GATE_EMPTY_THINK, empty_think_count(at_20, OPEN, CLOSE), 100,
-                      floor=0.18, ceiling=0.22, label="e").status == GREEN
+                      floor=0.18, ceiling=0.20, label="e").status == GREEN
 
 
 def test_the_float_guard_is_where_the_float_noise_is():
@@ -397,7 +403,7 @@ def test_the_float_guard_is_where_the_float_noise_is():
     percentage points, and an unguarded `> 2.0` reds a corpus sitting exactly
     on the tolerance.
     """
-    for bound in (0.80, 0.18, 0.22, 0.005):
+    for bound in (0.80, 0.18, 0.20, 0.005):
         for total in range(2, 4001):
             exact = bound * total
             count = round(exact)
@@ -789,7 +795,7 @@ def test_no_threshold_is_written_into_this_module():
 
     source = STATS_SRC.read_text(encoding="utf-8")
     body = source.split('"""', 2)[2]  # past the module docstring
-    for banned in ("0.80", "0.18", "0.22", "0.005", "8192", "2.0", "60", "16", "24"):
+    for banned in ("0.80", "0.18", "0.20", "0.005", "8192", "2.0", "60", "16", "24"):
         assert not re.search(rf"(?<![\w.]){re.escape(banned)}(?![\w.])\s*[)>=,]", body), banned
 
 
