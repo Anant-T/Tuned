@@ -17,6 +17,105 @@ build:
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
 
+# --------------------------------------------------------------------------
+# The assembly tail: split.py -> assemble.py -> stats.py.
+# --------------------------------------------------------------------------
+# Thresholds live here so those modules read them instead of carrying magic
+# numbers. What is ALREADY STATED - by `build:` above or by the training
+# config this file references - is deliberately NOT repeated:
+#
+#   the eval fraction         = build.held_out_frac (0.10)
+#   the v1.1-full mix targets = build.mix (60 / 16 / 24)
+#   the length bucket         = the train config's train.main.max_seq_length
+#
+# A second copy of any of those is a fence that can silently disagree with the
+# fencing, so split.py and stats.py read the originals through
+# cfg.build.held_out_frac, cfg.assembly.targets() and cfg.max_seq_length.
+assembly:
+  # Which mix targets stats.py grades against when --profile is not passed.
+  default_profile: v1.1-full
+
+  # Extra mix profiles. v1.1-full is build.mix and MUST NOT be restated here -
+  # config.py refuses a redefinition rather than letting two 60/16/24s drift.
+  #
+  # The MVP cut is synthesis-light BY CONSTRUCTION, not by preference: it ships
+  # every row that needs no teacher plus whatever synthesis exists at the cut,
+  # so its targets are DERIVED and not chosen -
+  #
+  #     replay    = target_total * build.mix.replay   = 4,320
+  #                 (and 4,320 is exactly sum(replay.DEFAULT_COUNTS))
+  #     curated   = target_total * build.mix.curated  = 2,880
+  #                 (curated.py's C1 1,700 + the curated_c2 rewrite slice)
+  #     synthesis = mvp_total - the two above         = 3,100
+  #                 (the transition stream's ~1,100 + the 2,000-row core)
+  #     ---------------------------------------------------------------
+  #                                                     10,300 = mvp_total
+  #
+  # The shares below are those counts over build.mvp_total to four places, and
+  # test_build_config recomputes them from build.mix/target_total/mvp_total so
+  # a hand-edit here fails rather than quietly regrading the corpus.
+  profiles:
+    v1.0-MVP: {grounded_synthesis: 0.3010, curated: 0.2796, replay: 0.4194}
+
+  # _prov.source -> the mix bucket the row counts toward. EXPLICIT, because
+  # substring-guessing a bucket is how a stream silently changes size: an
+  # unmapped source is a RED gate naming the source, never a default.
+  #
+  # A source is `dataset` or `dataset:subset` - replay.py builds
+  # "HuggingFaceTB/smoltalk2:{sub}" from the upstream row's own `source`
+  # column, so the subset half is open-ended and cannot be enumerated. The
+  # lookup takes the whole string first and the part before the first ":"
+  # second, so a subset CAN be mapped away from its dataset's bucket by naming
+  # it in full here.
+  #
+  # The three bare names are generated streams (tasks.STREAM_MIX): _prov.source
+  # for a generated row is the stream it was planned under. curated_c2 counts
+  # as CURATED and not as synthesis - the 16% bucket is "curated legal", which
+  # is what a teacher REWRITE of a real judgment is, and the plan sizes the
+  # bucket at 2,880 against curated.py's 1,700 for exactly that reason.
+  source_streams:
+    synthesis: grounded_synthesis
+    transition: grounded_synthesis
+    curated_c2: curated
+    L-NLProc/PredEx_Instruction-Tuning_Pred-Exp: curated
+    opennyaiorg/aalap_instruction_dataset: curated
+    169Pi/indian_law: curated
+    open-thoughts/OpenThoughts-114k: replay
+    nvidia/Nemotron-Post-Training-Dataset-v2: replay
+    HuggingFaceTB/smoltalk2: replay
+    GSMS-B/Indian-Legal-QA-BNS-BNSS-BSA: replay
+    allenai/WildChat-4.8M: replay
+
+  gates:
+    # Mix tolerance in PERCENTAGE POINTS, not a ratio: "60% +/- 2pp" is
+    # 58-62%, which is not what 2% of 60% would be.
+    mix_tolerance_pp: 2.0
+    # Reasoning-trace share, a hard floor from the plan.
+    trace_floor: 0.80
+    # The byte-exact empty-think band. Both ends are gates: too few and the
+    # model never learns to emit the empty scaffold, too many and it learns to
+    # skip reasoning.
+    empty_think_min: 0.18
+    empty_think_max: 0.22
+    # A tripwire on the chain, not a re-dedupe: dedupe.py already ran.
+    dup_ceiling: 0.005
+    # Zero tolerance - special-token markup in message content survives the
+    # chat template and teaches the model to emit control tokens.
+    markup: true
+    # Every row must carry a non-empty _prov.license; push.py's card counts them.
+    require_license: true
+    # Rows in a new-code shape whose provenance is an old-code corpus. REPORT
+    # ONLY by default: the shape is a regex over prose and the false-positive
+    # direction costs real rows, so the number is published and the operator
+    # decides. Flip to true once the count has been read once.
+    cross_code_red: false
+    # Which provenances count as pre-transition for the gate above, beside any
+    # row carrying _prov.code_era == "ipc" outright.
+    old_code_sources: [169Pi/indian_law]
+    # The custody chain reaching all the way back to decontamination. stats.py
+    # is the terminal instrument, so a missing link is red rather than a note.
+    require_chain: true
+
 providers:
   - name: cerebras
     base_url: https://api.cerebras.ai/v1

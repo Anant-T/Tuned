@@ -41,6 +41,78 @@ class BuildCfg:
 
 
 @dataclass(frozen=True)
+class GateCfg:
+    """stats.py's thresholds. Every one of them is a gate, not a report knob.
+
+    `cross_code_red` and `require_chain` are the two toggles: the first because
+    the measurement is a regex over prose and its false-positive direction
+    costs real rows, the second because a build that never ran decontamination
+    is a different kind of problem from a threshold miss and an operator may
+    want to see the rest of the report before it refuses.
+    """
+
+    mix_tolerance_pp: float
+    trace_floor: float
+    empty_think_min: float
+    empty_think_max: float
+    dup_ceiling: float
+    markup: bool
+    require_license: bool
+    cross_code_red: bool
+    old_code_sources: tuple[str, ...]
+    require_chain: bool
+
+
+# The profile whose targets are build.mix. Named rather than spelled twice:
+# `assembly.profiles` may not redefine it (see _validate), so this constant is
+# the one place that says WHICH profile the top-level mix is.
+FULL_PROFILE = "v1.1-full"
+
+
+@dataclass(frozen=True)
+class AssemblyCfg:
+    """split/assemble/stats configuration - thresholds and the mix mapping.
+
+    Deliberately does NOT carry an eval fraction or a length bucket: those are
+    build.held_out_frac and the train config's train.main.max_seq_length, both
+    already in force, and a second copy is a fence that can disagree with the
+    fencing.
+    """
+
+    default_profile: str
+    profiles: dict[str, dict[str, float]]
+    source_streams: dict[str, str]
+    gates: GateCfg
+
+    def targets(self, profile: str | None = None) -> dict[str, float]:
+        name = profile or self.default_profile
+        if name not in self.profiles:
+            raise KeyError(
+                f"no mix profile {name!r}; known profiles are {sorted(self.profiles)}"
+            )
+        return dict(self.profiles[name])
+
+    def stream_of(self, source) -> str | None:
+        """Which mix bucket a `_prov.source` counts toward, or None.
+
+        None is a RED GATE upstream, never a default bucket - a source nobody
+        mapped is a stream nobody sized.
+
+        Two lookups, in this order: the whole source string, then the part
+        before the first ":". replay.py builds "HuggingFaceTB/smoltalk2:{sub}"
+        out of the upstream row's own column, so the subset half cannot be
+        enumerated in config - but a subset that needs its OWN bucket can still
+        say so, because the full string is tried first.
+        """
+        key = str(source or "")
+        if not key:
+            return None
+        if key in self.source_streams:
+            return self.source_streams[key]
+        return self.source_streams.get(key.split(":", 1)[0])
+
+
+@dataclass(frozen=True)
 class ModelCfg:
     id: str
     family: str
@@ -85,6 +157,7 @@ class BuildConfig:
     build: BuildCfg
     providers: tuple[ProviderCfg, ...]
     routing: RoutingCfg
+    assembly: AssemblyCfg
     # Resolved from the referenced train config at load time - never
     # duplicated in configs/data_law_v1.yaml itself.
     think_open: str
@@ -94,6 +167,11 @@ class BuildConfig:
     instruction_part: str
     response_part: str
     main_dataset_path: str
+    # The length bucket assemble.py drops rows against. It is the TRAINER's
+    # number (train.main.max_seq_length) resolved here for the same reason the
+    # think tags are: a builder that carried its own 8192 could pass a corpus
+    # the trainer then truncates or refuses.
+    max_seq_length: int
 
     def model_for(self, ref: ModelRef) -> tuple[ProviderCfg, ModelCfg]:
         for provider in self.providers:
@@ -158,6 +236,108 @@ def _validate(cfg: BuildConfig) -> None:
     if cfg.build.overgeneration < 1.0:
         raise ValueError(f"build.overgeneration must be >= 1.0, got {cfg.build.overgeneration}")
 
+    # 5: the assembly block. Every rule here is one stats.py would otherwise
+    # discover at the end of a multi-day build, on the corpus.
+    assembly = cfg.assembly
+    if assembly.default_profile not in assembly.profiles:
+        raise ValueError(
+            f"assembly.default_profile {assembly.default_profile!r} is not a profile; "
+            f"known profiles are {sorted(assembly.profiles)}"
+        )
+    buckets = set(assembly.profiles[FULL_PROFILE])
+    for name, targets in sorted(assembly.profiles.items()):
+        total = sum(targets.values())
+        if abs(total - 1.0) > 0.001:
+            raise ValueError(
+                f"assembly.profiles.{name} shares must sum to 1.0, got {total}"
+            )
+        if set(targets) != buckets:
+            # Two profiles over different buckets are two different gates
+            # wearing one name: --profile would silently change WHAT is
+            # measured rather than what it is measured against.
+            raise ValueError(
+                f"assembly.profiles.{name} names streams {sorted(targets)}, but "
+                f"{FULL_PROFILE} names {sorted(buckets)} - every profile must grade the "
+                f"same buckets"
+            )
+        for stream, share in sorted(targets.items()):
+            if not (0.0 <= share <= 1.0):
+                raise ValueError(
+                    f"assembly.profiles.{name}.{stream} must be in [0, 1], got {share}"
+                )
+    unknown = sorted(
+        f"{source} -> {stream}"
+        for source, stream in assembly.source_streams.items()
+        if stream not in buckets
+    )
+    if unknown:
+        raise ValueError(
+            f"assembly.source_streams maps sources to streams no profile grades "
+            f"({'; '.join(unknown)}); the streams are {sorted(buckets)}"
+        )
+    gates = assembly.gates
+    if gates.mix_tolerance_pp < 0:
+        raise ValueError(
+            f"assembly.gates.mix_tolerance_pp must be >= 0, got {gates.mix_tolerance_pp}"
+        )
+    if not (0.0 <= gates.trace_floor <= 1.0):
+        raise ValueError(
+            f"assembly.gates.trace_floor must be in [0, 1], got {gates.trace_floor}"
+        )
+    if not (0.0 <= gates.empty_think_min <= gates.empty_think_max <= 1.0):
+        raise ValueError(
+            f"assembly.gates.empty_think_min/max must satisfy 0 <= min <= max <= 1, got "
+            f"{gates.empty_think_min}/{gates.empty_think_max}"
+        )
+    if not (0.0 <= gates.dup_ceiling <= 1.0):
+        raise ValueError(
+            f"assembly.gates.dup_ceiling must be in [0, 1], got {gates.dup_ceiling}"
+        )
+
+
+def _assembly_of(raw: dict, build: BuildCfg) -> AssemblyCfg:
+    """The `assembly:` block, with build.mix folded in as the full profile.
+
+    build.mix IS the v1.1-full mix target - it is already there, already
+    validated to sum to 1.0, and stats.py grades against it. So the profile
+    table is assembled here rather than written twice, and a YAML that tries to
+    restate v1.1-full is refused: two copies of 60/16/24 can drift, and the one
+    that drifts is the one nothing else reads.
+    """
+    block = raw.get("assembly")
+    if block is None:
+        raise ValueError(
+            "this build config has no `assembly:` block, so split.py/assemble.py/stats.py "
+            "have no mix targets, no source->stream mapping and no gate thresholds. The "
+            "builder cannot grade a corpus it has no targets for."
+        )
+    profiles = {name: dict(targets) for name, targets in (block.get("profiles") or {}).items()}
+    if FULL_PROFILE in profiles:
+        raise ValueError(
+            f"assembly.profiles.{FULL_PROFILE} restates build.mix. build.mix is the ONE "
+            f"definition of that profile's targets; delete the copy here."
+        )
+    profiles[FULL_PROFILE] = dict(build.mix)
+    gates_raw = dict(block["gates"])
+    gates = GateCfg(
+        mix_tolerance_pp=float(gates_raw["mix_tolerance_pp"]),
+        trace_floor=float(gates_raw["trace_floor"]),
+        empty_think_min=float(gates_raw["empty_think_min"]),
+        empty_think_max=float(gates_raw["empty_think_max"]),
+        dup_ceiling=float(gates_raw["dup_ceiling"]),
+        markup=bool(gates_raw["markup"]),
+        require_license=bool(gates_raw["require_license"]),
+        cross_code_red=bool(gates_raw["cross_code_red"]),
+        old_code_sources=tuple(gates_raw.get("old_code_sources") or ()),
+        require_chain=bool(gates_raw["require_chain"]),
+    )
+    return AssemblyCfg(
+        default_profile=block["default_profile"],
+        profiles=profiles,
+        source_streams=dict(block["source_streams"]),
+        gates=gates,
+    )
+
 
 def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> BuildConfig:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
@@ -186,6 +366,8 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
         for p in raw["providers"]
     )
 
+    assembly = _assembly_of(raw, build)
+
     r = raw["routing"]
     routing = RoutingCfg(
         generator=tuple(r["generator"]),
@@ -207,6 +389,7 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
         build=build,
         providers=providers,
         routing=routing,
+        assembly=assembly,
         think_open=train_cfg.data.think_open,
         think_close=train_cfg.data.think_close,
         model_repo=train_cfg.model.repo,
@@ -214,6 +397,7 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
         instruction_part=train_cfg.model.instruction_part,
         response_part=train_cfg.model.response_part,
         main_dataset_path=train_cfg.train.main.dataset,
+        max_seq_length=train_cfg.train.main.max_seq_length,
     )
     _validate(cfg)
     return cfg

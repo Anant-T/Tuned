@@ -102,6 +102,23 @@ def _base_doc() -> dict:
             "family_separation": True,
             "judge_mode": "dual",
         },
+        "assembly": {
+            "default_profile": "v1.1-full",
+            "profiles": {"lean": {"a": 0.7, "b": 0.3}},
+            "source_streams": {"src/one": "a", "src/two": "b"},
+            "gates": {
+                "mix_tolerance_pp": 2.0,
+                "trace_floor": 0.8,
+                "empty_think_min": 0.18,
+                "empty_think_max": 0.22,
+                "dup_ceiling": 0.005,
+                "markup": True,
+                "require_license": True,
+                "cross_code_red": False,
+                "old_code_sources": ["old/corpus"],
+                "require_chain": True,
+            },
+        },
     }
 
 
@@ -160,6 +177,177 @@ def test_rule4_scalar_sanity_checks_rejected(tmp_path, mutate, match):
     path = _write(tmp_path, doc)
     with pytest.raises(ValueError, match=match):
         load_build_config(path, allow_unpinned=True)
+
+
+# --- the assembly block -----------------------------------------------------
+
+
+def test_the_full_profile_is_build_mix_and_is_not_written_twice():
+    """One definition of 60/16/24, in build.mix, reachable as a profile.
+
+    A second copy in assembly.profiles would be a fence that can disagree with
+    the fencing - and the copy nothing else reads is the one that drifts.
+    """
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    assert cfg.assembly.targets("v1.1-full") == cfg.build.mix
+    assert cfg.assembly.targets() == cfg.build.mix  # default_profile is v1.1-full
+    raw = yaml.safe_load(DATA_CONFIG.read_text(encoding="utf-8"))
+    assert "v1.1-full" not in (raw["assembly"]["profiles"] or {})
+
+
+def test_restating_the_full_profile_is_refused(tmp_path):
+    doc = _base_doc()
+    doc["assembly"]["profiles"]["v1.1-full"] = {"a": 0.5, "b": 0.5}
+    with pytest.raises(ValueError, match="restates build.mix"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+def test_a_build_config_without_an_assembly_block_is_refused(tmp_path):
+    doc = _base_doc()
+    del doc["assembly"]
+    with pytest.raises(ValueError, match="assembly"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+def test_the_mvp_profile_is_the_arithmetic_of_the_cut_not_a_preference():
+    """v1.0-MVP's targets are DERIVED, and this recomputes the derivation.
+
+    The MVP cut ships every zero-API row plus whatever synthesis exists, so its
+    shares are the component counts over mvp_total. Recomputed here from
+    build.mix/target_total/mvp_total and cross-checked against the stream
+    builders' own totals, because a hand-edited share would otherwise regrade
+    the corpus with nothing disagreeing.
+    """
+    from tuned.data.curated import DEFAULT_COUNTS as CURATED_COUNTS
+    from tuned.data.replay import DEFAULT_COUNTS as REPLAY_COUNTS
+
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    total, mvp = cfg.build.target_total, cfg.build.mvp_total
+    replay = round(total * cfg.build.mix["replay"])
+    curated = round(total * cfg.build.mix["curated"])
+    # The full-run replay target IS what replay.py builds, which is what makes
+    # this a cross-check rather than a restatement.
+    assert replay == sum(REPLAY_COUNTS) == 4320
+    # The curated BUCKET is bigger than curated.py's zero-API stream: the
+    # remainder is the curated_c2 teacher-rewrite slice.
+    assert curated == 2880 > sum(CURATED_COUNTS) == 1700
+    synthesis = mvp - replay - curated
+    assert synthesis == 3100  # transition ~1,100 + the 2,000-row synthesis core
+
+    mvp_targets = cfg.assembly.targets("v1.0-MVP")
+    assert mvp_targets == {
+        "grounded_synthesis": round(synthesis / mvp, 4),
+        "curated": round(curated / mvp, 4),
+        "replay": round(replay / mvp, 4),
+    }
+    # And the MVP cut really is synthesis-light, which is the whole reason it
+    # needs its own profile: 30% where the full run wants 60%.
+    assert mvp_targets["grounded_synthesis"] < cfg.build.mix["grounded_synthesis"] - 0.25
+
+
+def test_every_shipped_source_maps_to_a_stream():
+    """Every source string the stream builders can emit resolves to a bucket.
+
+    stats.py reds on an unmapped source, so this is the check that keeps that
+    gate from firing at the END of a multi-day build over a source that was
+    known all along.
+    """
+    from tuned.data.tasks import PLANNABLE_STREAMS
+
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    shipped = [
+        "open-thoughts/OpenThoughts-114k",
+        "nvidia/Nemotron-Post-Training-Dataset-v2",
+        "HuggingFaceTB/smoltalk2:smoltalk_smollm3_smol_magpie_ultra_no_think",
+        "HuggingFaceTB/smoltalk2:OpenHermes_2.5",
+        "GSMS-B/Indian-Legal-QA-BNS-BNSS-BSA",
+        "allenai/WildChat-4.8M",
+        "L-NLProc/PredEx_Instruction-Tuning_Pred-Exp",
+        "opennyaiorg/aalap_instruction_dataset",
+        "169Pi/indian_law",
+        *PLANNABLE_STREAMS,
+    ]
+    unmapped = [s for s in shipped if cfg.assembly.stream_of(s) is None]
+    assert unmapped == []
+    # The subset half of a replay source is open-ended, so the DATASET half is
+    # what carries the mapping - both smoltalk subsets land in replay.
+    assert cfg.assembly.stream_of("HuggingFaceTB/smoltalk2:anything-at-all") == "replay"
+    # curated_c2 reaches a teacher but counts as CURATED, not as synthesis.
+    assert cfg.assembly.stream_of("curated_c2") == "curated"
+    assert cfg.assembly.stream_of("synthesis") == "grounded_synthesis"
+
+
+def test_an_unmapped_source_is_none_and_not_a_default_bucket():
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    assert cfg.assembly.stream_of("nobody/mapped-this") is None
+    assert cfg.assembly.stream_of("") is None
+    assert cfg.assembly.stream_of(None) is None
+
+
+def test_the_whole_source_string_beats_the_dataset_half(tmp_path):
+    """A subset CAN be pulled out of its dataset's bucket, and that is what the
+    two-step lookup is for - a prefix-only rule would silently ignore the more
+    specific line, and a full-string-only rule could not map smoltalk at all."""
+    doc = _base_doc()
+    doc["assembly"]["source_streams"] = {"ds/one": "a", "ds/one:special": "b"}
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.assembly.stream_of("ds/one:special") == "b"
+    assert cfg.assembly.stream_of("ds/one:ordinary") == "a"
+    assert cfg.assembly.stream_of("ds/one") == "a"
+
+
+def test_the_eval_fraction_and_the_length_bucket_are_not_duplicated_here():
+    """The two numbers the assembly tail needs that already existed.
+
+    build.held_out_frac had NO reader in src/ before split.py; the length
+    bucket is the trainer's max_seq_length. Adding `assembly.eval_fraction` or
+    `assembly.max_tokens` would have made two of each, and this fails if
+    either one comes back.
+    """
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    train_cfg = load_config(TRAIN_CONFIG, allow_unpinned=True)
+    assert cfg.build.held_out_frac == 0.10
+    assert cfg.max_seq_length == train_cfg.train.main.max_seq_length == 8192
+    raw = yaml.safe_load(DATA_CONFIG.read_text(encoding="utf-8"))
+    assert not {"eval_fraction", "max_tokens", "length"} & set(raw["assembly"])
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (lambda d: d["assembly"].__setitem__("default_profile", "ghost"), "default_profile"),
+        (lambda d: d["assembly"]["profiles"].__setitem__("lean", {"a": 0.7, "b": 0.5}),
+         "sum to 1.0"),
+        (lambda d: d["assembly"]["profiles"].__setitem__("lean", {"a": 0.7, "c": 0.3}),
+         "same buckets"),
+        (lambda d: d["assembly"]["profiles"].__setitem__("lean", {"a": 1.7, "b": -0.7}),
+         r"must be in \[0, 1\]"),
+        (lambda d: d["assembly"]["source_streams"].__setitem__("src/three", "z"),
+         "no profile grades"),
+        (lambda d: d["assembly"]["gates"].__setitem__("mix_tolerance_pp", -1.0),
+         "mix_tolerance_pp"),
+        (lambda d: d["assembly"]["gates"].__setitem__("trace_floor", 1.5), "trace_floor"),
+        (lambda d: d["assembly"]["gates"].__setitem__("empty_think_min", 0.5),
+         "empty_think_min/max"),
+        (lambda d: d["assembly"]["gates"].__setitem__("empty_think_max", 1.5),
+         "empty_think_min/max"),
+        (lambda d: d["assembly"]["gates"].__setitem__("dup_ceiling", 2.0), "dup_ceiling"),
+    ],
+)
+def test_rule5_assembly_checks_rejected(tmp_path, mutate, match):
+    doc = _base_doc()
+    mutate(doc)
+    with pytest.raises(ValueError, match=match):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+def test_targets_for_an_unknown_profile_raises_rather_than_defaulting():
+    """--profile is a CLI flag, so a typo must not silently grade against the
+    default targets and record the profile name it did not use."""
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    with pytest.raises(KeyError, match="v1.0-mvp"):
+        cfg.assembly.targets("v1.0-mvp")  # real profile, wrong case
+    assert cfg.assembly.targets("v1.0-MVP")["replay"] == 0.4194
 
 
 # --- HubCfg dataset_* fields ----------------------------------------------
