@@ -310,6 +310,33 @@ def test_a_row_over_the_bucket_is_dropped_and_a_row_at_it_is_kept():
     assert kept == [short, long_]
 
 
+def test_the_boundary_is_tested_AT_the_boundary_and_one_token_past_it():
+    """The two fixtures above are 50 tokens apart, so `> limit` and
+    `> limit + 1` agree on both of them and the off-by-one is invisible.
+
+    A row exactly ONE token over is the whole point of drop-never-truncate: it
+    ships under the mutant, and the trainer then truncates it - the outcome
+    assemble.py exists to prevent. So the pair is built from ONE row measured
+    against two limits, its own length and one below it.
+    """
+    tok = FakeTokenizer()
+    fitted = reasoning_row(11, words=30)
+    exact = token_length(tok, fitted["messages"])
+
+    at_the_limit, drops, stats = assemble_rows(
+        [fitted], tokenizer=tok, think_open=OPEN, think_close=CLOSE, max_tokens=exact
+    )
+    assert at_the_limit == [fitted] and drops == [] and stats["max_tokens_kept"] == exact
+
+    one_over, drops, stats = assemble_rows(
+        [fitted], tokenizer=tok, think_open=OPEN, think_close=CLOSE, max_tokens=exact - 1
+    )
+    assert one_over == [] and stats["kept"] == 0
+    assert stats["by_reason"] == {DROP_TOO_LONG: 1}
+    assert (drops[0]["tokens"], drops[0]["limit"]) == (exact, exact - 1)
+    assert drops[0]["tokens"] == drops[0]["limit"] + 1  # ...exactly one over
+
+
 def test_an_over_length_row_is_dropped_whole_and_never_trimmed():
     tok = FakeTokenizer()
     fat = reasoning_row(3)
