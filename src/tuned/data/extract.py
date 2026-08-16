@@ -177,7 +177,17 @@ from tuned.data.select import SELECTION_FILENAME
 #      heading are recognised; and two structural quarantines are new. The
 #      row also now records WHICH READER made it, because the verdict is a
 #      function of that too.
-EXTRACT_VERSION = 4
+#   5  the running-head pass no longer deletes a line on the strength of its
+#      digits alone. Every bare integer has the same key - `1250000`, `42`
+#      and the printed page number are all `#` - so once the page number put
+#      `#` over the threshold, every numbers-only line in the document was
+#      furniture, and an award table would have lost its figures and kept
+#      their labels. A numbers-only line is now furniture only where it sits
+#      at a page edge. Version-4 rows are stale in their BYTES and not in
+#      their verdicts: over the 15 sampled objects 42 of 678 removals are
+#      given up, all of them printed page numbers or OCR-mangled margin
+#      letters, and all 15 are emitted at both versions.
+EXTRACT_VERSION = 5
 
 TEXT_DIRNAME = "text"
 EXTRACTION_FILENAME = "extraction.jsonl"
@@ -519,19 +529,47 @@ _RUNNING_NOISE = re.compile(r"[^A-Z#]+")
 _RUNNING_PLACEHOLDER_RUN = re.compile(r"#+")
 # ...with ONE line that is never furniture however often it repeats. A bare
 # paragraph enumerator (`48.`) is the Tier-1 segmentation signal P0 found,
-# and the hard key above cannot tell it from a printed page number (`923`)
-# once the punctuation is gone - both are `#`. Deleting a page number is
-# free; deleting the paragraph anchor is the corruption this module exists
-# to avoid, so the shape is excluded from furniture rather than ranked
-# against a threshold.
+# and what threatens it is not the printed page number but the OTHER
+# enumerators: `12.`, `48.` and `73.` are one key (`#.`) between them, so a
+# document that opens a page with a numbered paragraph carries that key on
+# every page and it clears any threshold - taking every paragraph anchor in
+# the document with it, at once and silently. Deleting a page number is
+# free; deleting the anchors is the corruption this module exists to avoid,
+# so the shape is excluded from furniture rather than ranked against a
+# threshold.
+#
+# (`48.` does NOT collide with the page number `923` as things stand - the
+# letterless branch below keeps its full stop, so the two keys are `#.` and
+# `#`. The two guards are the same defence at two depths, and removing the
+# letterless branch alone folds them together.)
 _BARE_ENUMERATOR = re.compile(r"^\(?\d{1,3}[.)]$")
 # ...and the hard key is for a line with WORDS in it. A line with no letters
 # has no spelling for a scanner to disagree about, and folding its
 # punctuation away would put `1974)` - the tail of a citation the reader
 # broke onto its own line, measured - under the same key as every printed
 # page number in the volume, which is enough of them to cross any threshold.
-# So a numbers-only line keeps the plain digit skeleton it always had.
+# So a numbers-only line keeps the plain digit skeleton instead of the hard
+# key.
+#
+# THAT SKELETON STILL DOES NOT TELL TWO NUMBERS APART, and the punctuation is
+# the only thing it can separate on: `\d+` matches a whole run, so `1250000`,
+# `42` and `1095` are ALL the single key `#`. The printed page number alone
+# puts `#` over the threshold on any document long enough for this pass to
+# run - measured on 8 of the 15 real objects - and from there every bare
+# integer in the document is furniture by key, including one that is data.
+# The shipped reader puts table cells on their own lines (a bare `864` was
+# observed landing alone out of a Case Law Reference grid), and tables of
+# figures - compensation, tax, sentence lengths - are ordinary in this
+# corpus, so the key on its own would delete the figures out of an award
+# table and leave their labels behind.
+#
+# What separates them is not spelling but PLACE: a printed page number is the
+# first or the last line on its page, and a figure inside a table is not. So
+# a numbers-only line is furniture only where it sits at a page edge - see
+# _page_running_keys, which is why that function exists and why both the
+# counting and the deleting go through it.
 _HAS_LETTER = re.compile(r"[A-Za-z]")
+_NUMBERS_ONLY = re.compile(r"^[^A-Za-z]*\d[^A-Za-z]*$")
 
 
 def _running_key(line: str) -> str:
@@ -540,6 +578,11 @@ def _running_key(line: str) -> str:
     Case folded, and on a line short enough to BE a head or a foot also
     digit-blind - plus, where the line has words in it, letter-`O`-blind and
     stripped of the punctuation the scanners disagree about.
+
+    A numbers-only line gets a key like any other, and that key carries no
+    information at all (every bare integer is `#`). Where such a line may be
+    USED is decided by _page_running_keys, which knows where on the page it
+    sat.
     """
     flat = _flat(line)
     if _BARE_ENUMERATOR.match(flat):
@@ -551,6 +594,55 @@ def _running_key(line: str) -> str:
         return skeleton
     hard = _RUNNING_NOISE.sub("", skeleton.upper().replace("O", "#"))
     return _RUNNING_PLACEHOLDER_RUN.sub("#", hard)
+
+
+def _page_running_keys(page: str) -> list[str]:
+    """One key per line of `page`, "" where the line can never be furniture.
+
+    The place the page-edge rule lives, and the reason it is a per-PAGE
+    function: a numbers-only line has no key that distinguishes it from the
+    printed page number (see _NUMBERS_ONLY above), so the only evidence left
+    is where it sat. First or last non-blank line of its page: furniture like
+    anything else. Anywhere else: never furniture, neither counted towards a
+    key's threshold nor deleted by one.
+
+    Counting and deleting both read this list, and that is deliberate - a key
+    that is registered on a line the pass may not delete would let a table of
+    figures vote itself into the furniture set.
+
+    ONE line in, not two, and that is measured rather than assumed: widening
+    the edge to the first or last TWO non-blank lines buys back 3 removals of
+    the 42 below and loses the award table's last figure, because a table
+    that runs to the foot of its page then has its final cell inside the
+    tolerance.
+
+    Measured over the 15 real objects: 678 removals become 636, and nothing
+    new is removed anywhere (the new set is a subset of the old, so "no body
+    line dropped" carries over). Of the 42:
+
+      * 4 are a printed page number the reader emitted TWICE at the foot of
+        a page - the second copy is the edge and still goes, the first stays;
+      * 38 are in the two scan-era documents, where this also costs the `#`
+        key its threshold: OCR-era pages put the printed number mid-page
+        often enough that it sits at an edge on only 22 of 60 pages against
+        a threshold of 24 (31 pages carried it somewhere before), so `#`
+        stops being furniture there and 15 mangled margin letters (`0` for
+        `O`/`D`, `8` for `B`) and 23 printed page numbers survive. Those
+        documents are refused as `scanned_era` unless the operator asks for
+        them.
+
+    Nothing that reads as prose is affected either way.
+    """
+    lines = page.split("\n")
+    filled = [index for index, line in enumerate(lines) if line.strip()]
+    edges = (filled[0], filled[-1]) if filled else ()
+    keys = []
+    for index, line in enumerate(lines):
+        key = _running_key(line)
+        if key and index not in edges and _NUMBERS_ONLY.match(_flat(line)):
+            key = ""
+        keys.append(key)
+    return keys
 
 
 def running_lines(
@@ -566,9 +658,9 @@ def running_lines(
     seen: dict[str, int] = {}
     for page in pages:
         keys = {
-            _running_key(line)
-            for line in page.split("\n")
-            if line.strip() and len(_flat(line)) <= max_chars
+            key
+            for key, line in zip(_page_running_keys(page), page.split("\n"))
+            if key and len(_flat(line)) <= max_chars
         }
         for key in keys:
             seen[key] = seen.get(key, 0) + 1
@@ -715,8 +807,8 @@ def clean_pages(pages: Sequence[str]) -> tuple[list[str], dict]:
         deduped = []
         for page in staged:
             kept = []
-            for line in page.split("\n"):
-                if line.strip() and _running_key(line) in furniture:
+            for key, line in zip(_page_running_keys(page), page.split("\n")):
+                if key and key in furniture:
                     stats["running"] += 1
                     continue
                 kept.append(line)

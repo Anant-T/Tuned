@@ -1574,6 +1574,82 @@ def test_a_numbers_only_line_is_not_folded_onto_the_printed_page_number():
         assert f"\n{941 + i}\n" not in f"\n{joined}\n"
 
 
+_AWARD_TABLE = (
+    "The sums worked out under each head were as follows:",
+    "Loss of dependency",
+    "1250000",
+    "Funeral expenses",
+    "25000",
+    "Loss of consortium",
+    "40000",
+)
+
+
+def _award_pages(*, table_at_foot: bool) -> list[str]:
+    """Six pages, a printed page number at the head and foot of each.
+
+    One page also carries an award table whose figures the reader put on
+    their own lines - which is what it does with a grid. `table_at_foot`
+    puts that table where the page's foot number would have been, so the
+    last of its figures sits at the page edge instead of inside the page.
+    """
+    pages = []
+    for i in range(6):
+        lines = [f"{600 + i}", _body_line(i)]
+        if i != 3:
+            lines.append(f"{600 + i}")
+        elif table_at_foot:
+            lines.extend(_AWARD_TABLE)
+        else:
+            lines.extend([*_AWARD_TABLE, f"{600 + i}"])
+        pages.append("\n".join(lines) + "\n")
+    return pages
+
+
+def test_a_figure_in_a_table_is_not_furniture_though_it_shares_the_page_numbers_key():
+    # WHAT THE DIGIT SKELETON CANNOT SEE. `\d+` matches a whole run, so every
+    # bare integer in the document has the same key: `1250000`, `25000` and
+    # `1095` are all `#`. The printed page number alone puts `#` over the
+    # threshold on any document long enough for this pass to run at all - so
+    # from there EVERY numbers-only line in the document is furniture by key,
+    # and an award table loses its figures while their labels stay behind.
+    # That is the silent corruption of emitted text this pass exists to
+    # prevent, arriving through the pass itself.
+    cleaned, stats = clean_pages(_award_pages(table_at_foot=False))
+    joined = "\n".join(cleaned)
+
+    for figure in ("1250000", "25000", "40000"):
+        assert f"\n{figure}\n" in f"\n{joined}\n"
+    for label in ("Loss of dependency", "Funeral expenses", "Loss of consortium"):
+        assert label in joined
+    # THE PREMISE, and the reason this is not a test of a pass that did
+    # nothing: the printed page numbers - head and foot, twelve of them, the
+    # same shape and the same key as the three figures - all go.
+    assert stats["running"] == 12
+    for i in range(6):
+        assert f"\n{600 + i}\n" not in f"\n{joined}\n"
+
+
+def test_the_same_figure_at_the_foot_of_the_page_is_still_furniture():
+    # THE OTHER SIDE of the rule above, without which it would be "a number
+    # is never furniture" and the printed page numbers would survive in every
+    # body. Position is the whole of the evidence: the identical line, one
+    # place further down the same page, is a page number as far as anything
+    # here can tell - so it goes, while the two figures above it stay.
+    cleaned, stats = clean_pages(_award_pages(table_at_foot=True))
+    joined = "\n".join(cleaned)
+
+    assert "\n40000\n" not in f"\n{joined}\n"
+    assert "\n1250000\n" in f"\n{joined}\n" and "\n25000\n" in f"\n{joined}\n"
+    # THE PREMISE: the two documents differ in nothing but where the table
+    # sits, `40000` is the same string in both, and the eleven printed page
+    # numbers still go - so the twelfth removal here is the figure.
+    assert _AWARD_TABLE[-1] == "40000"
+    assert stats["running"] == 12
+    for i in range(6):
+        assert f"\n{600 + i}\n" not in f"\n{joined}\n"
+
+
 def test_the_scr_margin_letters_go_and_a_lettered_heading_stays():
     # P0 found "A B C D E F G H" running down the left margin of these
     # reprints - and lettered section headings in the same alphabet.
