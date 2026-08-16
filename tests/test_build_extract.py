@@ -22,6 +22,10 @@ from tuned.data.extract import (
     MIN_BODY_CHARS,
     MIN_DOC_CHARS,
     MIN_LATIN_RATIO,
+    MIN_STOPWORD_RATE,
+    PdfStructure,
+    Q_MOJIBAKE_FONT,
+    Q_SCANNED_ERA,
     Q_BODY_TOO_SHORT,
     Q_HEADNOTE_RESIDUE,
     Q_LOW_TEXT_QUALITY,
@@ -46,6 +50,8 @@ from tuned.data.extract import (
     page_span_from_key,
     reportable_flag,
     seam_continues_an_enumeration,
+    stopword_rate,
+    structural_refusal,
 )
 
 # --------------------------------------------------------------------------
@@ -1011,6 +1017,152 @@ def test_a_regional_text_layer_is_quarantined():
     # ratio is the only check that can refuse this document.
     assert "(cid:" not in page
     assert latin_ratio(page) < MIN_LATIN_RATIO
+
+
+# Hindi typed in a legacy 8-bit Devanagari font (Kruti Dev and its
+# relatives, which is what Indian courts typed Hindi in for twenty years).
+# The glyph codes ARE Latin codepoints, so this is what the text layer of
+# such a page extracts as - not Devanagari, not `(cid:NN)` soup, but fluent-
+# looking ASCII with no English in it.
+MANGLED_HINDI = (
+    "vfHkfyf[kr fu.kZ; esa mYysf[kr rF; ,oa lk{; ds vk/kkj ij ;g fu"
+    ""
+    " fpr fd;k tkrk gS fd vihykFkhZ dks jkgr iznku dh tk;sA "
+) * 40
+
+
+def test_hindi_mangled_into_latin_letters_is_refused_though_every_letter_is_latin():
+    # THE GAP THE OTHER TWO LIMBS CANNOT SEE, and the reason for a third.
+    # The characters are Latin, so latin_ratio is happy; there is no broken
+    # font map, so the (cid:NN) count is zero; and script detection has
+    # nothing to detect because there is no Devanagari in the text layer at
+    # all. What it has none of is ENGLISH.
+    page = "The Judgment of the Court was delivered by\n" + MANGLED_HINDI
+    result = extract_text([page])
+
+    assert not result.ok
+    assert result.reason == Q_LOW_TEXT_QUALITY
+    # THE PREMISES, and they are the whole point: BOTH of the older limbs
+    # pass this document. Without these two lines this test would pass on a
+    # module that had never grown the third limb.
+    assert "(cid:" not in page
+    assert latin_ratio(page) > MIN_LATIN_RATIO
+    assert stopword_rate(page) < MIN_STOPWORD_RATE
+
+
+def test_real_judgment_prose_is_far_above_the_english_floor():
+    # The other direction, without which the floor could be set anywhere. The
+    # measured range over 15 real objects was 0.372-0.457 on the whole
+    # document and on the emitted body alike, so the floor has better than
+    # two-fold headroom under the worst real document.
+    assert stopword_rate(HEADNOTE + BODY) > MIN_STOPWORD_RATE * 2
+    assert extract_text(scr_pages()).ok
+
+
+# ------------------------------------------- what the OBJECT is made of
+
+def _structure(**over) -> PdfStructure:
+    facts = {
+        "fonts": (("ABCDEF+Helvetica", "WinAnsiEncoding"),),
+        "image_filters": (),
+        "image_only_pages": 0,
+        "pages": 12,
+    }
+    facts.update(over)
+    return PdfStructure(**facts)
+
+
+@pytest.mark.parametrize(
+    "structure",
+    [
+        # The ABBYY OCR layer's own font, which is the fingerprint of the
+        # 2010-2017 volumes: the text is INVISIBLE glyphs laid under a
+        # bitonal scan of the printed page.
+        _structure(fonts=(("HiddenHorzOCR", "WinAnsiEncoding"),)),
+        # ...the same thing seen from the image side, on a file whose fonts
+        # the library reports differently.
+        _structure(image_filters=("/JBIG2Decode",)),
+        # ...and a file that says neither, but is half pages with a picture
+        # on them and no text.
+        _structure(image_only_pages=6, pages=12),
+    ],
+)
+def test_a_scan_era_object_is_refused_on_its_structure(structure):
+    # THE DECISION THIS STOPS BEING TAKEN BY ACCIDENT. These files READ
+    # plausibly - 1,840-2,100 chars a page on the sampled objects, and the
+    # module emitted all six of them - so nothing downstream would notice.
+    # But citation-level accuracy is exactly where twenty-year-old OCR fails,
+    # and the evidence is already in their running heads: `[201 O]` for
+    # `[2010]`, `S.Q.R.` for `S.C.R.`. Whether OCR-era text is in v1 is an
+    # operator's call; making it silently is not.
+    assert structural_refusal(structure) == Q_SCANNED_ERA
+
+
+def test_a_born_digital_object_with_a_photograph_in_it_is_not_a_scan():
+    # MEASURED, and it is why the test is the scan STRUCTURE and not "has
+    # images": one real 2018 object carries a DCTDecode photograph across 70
+    # otherwise born-digital pages with subsetted embedded fonts. A gate that
+    # read "an image" would have refused it.
+    assert structural_refusal(
+        _structure(
+            fonts=(("IQIVMP+00bqoyjfrmmezrq,Bold", "WinAnsiEncoding"),),
+            image_filters=("/DCTDecode",),
+            image_only_pages=0,
+            pages=70,
+        )
+    ) is None
+    # ...and one image-only page in seventy is a scanned exhibit, not a
+    # scanned judgment.
+    assert structural_refusal(_structure(image_only_pages=1, pages=70)) is None
+
+
+@pytest.mark.parametrize(
+    "font",
+    [
+        "KrutiDev010",
+        "ABCDEF+Kruti Dev 010",          # subsetted, as the reader reports it
+        "DevLys 010",
+        "Shree-Dev7-0714",
+    ],
+)
+def test_a_legacy_devanagari_font_is_refused_though_its_text_reads_as_latin(font):
+    # The structural half of the mangled-Hindi failure. A Devanagari-family
+    # font declared with anything but an Identity encoding is an 8-bit glyph
+    # mapping, and its text layer is nonsense however clean it looks - so the
+    # refusal is available before a single page is converted.
+    assert structural_refusal(_structure(fonts=((font, "WinAnsiEncoding"),))) == (
+        Q_MOJIBAKE_FONT
+    )
+
+
+def test_a_devanagari_font_with_a_unicode_encoding_is_not_mojibake():
+    # The other direction, and it is what keeps the rule from refusing every
+    # bilingual judgment: an Identity-H Devanagari font extracts as real
+    # Devanagari, which the letter-ratio check handles on its own terms.
+    assert structural_refusal(_structure(fonts=(("Mangal", "Identity-H"),))) is None
+    assert structural_refusal(_structure(fonts=(("Nirmala UI", "Identity-V"),))) is None
+
+
+def test_an_undecodable_font_is_reported_before_the_era_it_shares_a_file_with():
+    # ORDER, on a document that is both. Re-OCR fixes a scan; nothing fixes a
+    # font this module cannot decode - so the reason the operator reads is
+    # the one that says what to do.
+    both = _structure(
+        fonts=(("HiddenHorzOCR", "WinAnsiEncoding"), ("KrutiDev010", "WinAnsiEncoding")),
+        image_filters=("/JBIG2Decode",),
+    )
+    assert structural_refusal(both) == Q_MOJIBAKE_FONT
+    # BOTH really do fire on this object - which is what makes this a test of
+    # the order rather than of either rule.
+    assert structural_refusal(_structure(fonts=(("HiddenHorzOCR", "x"),))) == Q_SCANNED_ERA
+    assert structural_refusal(_structure(fonts=(("KrutiDev010", "x"),))) == Q_MOJIBAKE_FONT
+
+
+def test_an_ordinary_born_digital_object_is_admitted():
+    # Without this the gate could refuse everything and every test above
+    # would still pass.
+    assert structural_refusal(_structure()) is None
+    assert structural_refusal(PdfStructure()) is None
 
 
 def test_a_page_break_in_the_middle_of_a_sentence_does_not_become_a_paragraph_break():

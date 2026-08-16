@@ -184,6 +184,12 @@ Q_NO_JUDGMENT_START = "no_judgment_start"
 Q_HEADNOTE_RESIDUE = "headnote_residue"
 Q_STRIP_TOO_LARGE = "strip_too_large"
 Q_BODY_TOO_SHORT = "body_too_short"
+# The two that read the OBJECT rather than its text - see PdfStructure.
+# scanned_era wants the OCR-era decision taken deliberately; mojibake_font
+# wants a document whose text layer is undecodable kept out of the corpus
+# even though it reads as clean Latin.
+Q_SCANNED_ERA = "scanned_era"
+Q_MOJIBAKE_FONT = "mojibake_font"
 QUARANTINE_REASONS = (
     Q_NO_TEXT,
     Q_LOW_TEXT_QUALITY,
@@ -191,6 +197,8 @@ QUARANTINE_REASONS = (
     Q_HEADNOTE_RESIDUE,
     Q_STRIP_TOO_LARGE,
     Q_BODY_TOO_SHORT,
+    Q_SCANNED_ERA,
+    Q_MOJIBAKE_FONT,
 )
 
 MARKER_DELIVERED_BY = "judgment_delivered_by"
@@ -991,6 +999,135 @@ def latin_ratio(text: str) -> float:
     return letters / total if total else 0.0
 
 
+# THE GAP latin_ratio CANNOT SEE. A Devanagari page set in a legacy
+# non-Unicode font (Kruti Dev, Shree-Dev, DevLys - the ones Indian courts
+# typed Hindi in for twenty years) does not extract as Devanagari at all: the
+# glyph codes are Latin codepoints, so the text layer comes out as fluent-
+# looking ASCII nonsense - `vfHkfyf[kr fu.kZ; esa mYysf[kr` - whose
+# latin_ratio is 0.80, comfortably ABOVE the floor. Script detection cannot
+# catch it because there is no script to detect.
+#
+# What it has none of is ENGLISH. Measured over the same 15 objects, real
+# judgment text runs 0.372-0.457 stopwords per word (whole document and
+# emitted body alike) and the mangled sample above runs 0.000, so the floor
+# sits at 0.15: under half the worst real document and far above anything
+# that is not English prose. The list is closed-class words only - no legal
+# vocabulary - so it says "this is English", not "this is a judgment".
+MIN_STOPWORD_RATE = 0.15
+_WORD = re.compile(r"[A-Za-z]+")
+_STOPWORDS = frozenset(
+    """a an the and or but if of to in on at by for with from as is are was were be
+    been being it its this that these those he she his her they them their which who
+    whom not no nor so than then there here when where while shall may can will would
+    should could has have had do does did any all such other same more most""".split()
+)
+
+
+def stopword_rate(text: str) -> float:
+    """English closed-class words as a share of words (0.0 for nothing)."""
+    words = _WORD.findall(text)
+    if not words:
+        return 0.0
+    return sum(1 for word in words if word.lower() in _STOPWORDS) / len(words)
+
+
+# --------------------------------------------------------------------------
+# What the OBJECT is, as opposed to what its text says.
+# --------------------------------------------------------------------------
+#
+# Two refusals that no amount of reading the text can reach, because the
+# evidence for both is in the PDF's structure and both produce text that
+# READS fine.
+#
+#   SCANNED ERA   The 2010-2017 volumes are not born-digital. They are JBIG2
+#                 bitonal scans carrying an ABBYY OCR text layer, which the
+#                 `HiddenHorzOCR` font is the fingerprint of. The text comes
+#                 out plausible - 1,840-2,100 chars/page on the sampled
+#                 2010 and 2014 objects, and this module emitted all six of
+#                 them - but citation-level accuracy is exactly where
+#                 twenty-year-old OCR fails, and the evidence is already
+#                 visible in the running heads: `[201 O]` for `[2010]`,
+#                 `S.Q.R.` for `S.C.R.`, `1f` for `11`. Whether OCR-era text
+#                 belongs in v1 is a decision, and a decision that is taken
+#                 by accident is the thing this quarantine exists to
+#                 prevent. Measured: fires on 6 of 15, silent on the other
+#                 9 - including a 2018 object that carries a DCTDecode
+#                 photograph and is otherwise born-digital, which is why the
+#                 test is the JBIG2/OCR-font structure and not "has images".
+#   MOJIBAKE      see MIN_STOPWORD_RATE above for the failure; this is the
+#                 structural half of it. A Devanagari-family font declared
+#                 with anything other than an Identity encoding is a legacy
+#                 8-bit glyph mapping, and its text layer is nonsense however
+#                 clean it looks.
+SCAN_OCR_FONTS = ("hiddenhorzocr",)
+SCAN_IMAGE_FILTERS = ("jbig2decode",)
+# Half the pages carrying an image and no text is a scan whatever its fonts
+# and filters say. A born-digital judgment with one photographed exhibit is
+# not, which is why this is a share and not a count.
+SCAN_IMAGE_ONLY_SHARE = 0.5
+# Below this a page with an image on it has no text worth the name - a page
+# number and a running head come to more than this, so it is not a page the
+# OCR merely did badly on, it is a page with no text layer.
+MIN_IMAGE_PAGE_TEXT = 50
+DEVANAGARI_FONT_FAMILIES = (
+    "krutidev", "kruti", "devlys", "shreedev", "shree-dev", "chanakya", "shusha",
+    "agra", "mangal", "kokila", "aparajita", "utsaah", "sanskrit", "devanagari",
+)
+IDENTITY_ENCODINGS = ("identity-h", "identity-v")
+
+
+@dataclass(frozen=True)
+class PdfStructure:
+    """What the PDF is made of. Raw facts; the reading of them is below.
+
+    Deliberately dumb: `pdf_structure` (past the reader seam, and therefore
+    unverifiable offline) only reports what the library says, and every
+    judgement about what those facts MEAN is made by `structural_refusal`,
+    which is pure text and fully tested.
+    """
+
+    fonts: tuple[tuple[str, str], ...] = ()      # (base font name, encoding)
+    image_filters: tuple[str, ...] = ()
+    image_only_pages: int = 0
+    pages: int = 0
+
+    def digest(self) -> dict:
+        """The compact form that goes on the document row."""
+        return {
+            "fonts": sorted({name for name, _enc in self.fonts})[:12],
+            "image_filters": sorted(set(self.image_filters)),
+            "image_only_pages": self.image_only_pages,
+            "pages": self.pages,
+        }
+
+
+def _folded(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").casefold())
+
+
+def structural_refusal(structure: PdfStructure) -> str | None:
+    """The quarantine this object's STRUCTURE calls for, or None.
+
+    Mojibake first: a document can be both a scan and mangled, and the
+    unreadable text layer is the more actionable of the two - re-OCR fixes a
+    scan, nothing fixes a font this module cannot decode.
+    """
+    identities = tuple(_folded(name) for name in IDENTITY_ENCODINGS)
+    fonts = tuple(_folded(name) for name, _encoding in structure.fonts)
+    for (name, encoding), folded in zip(structure.fonts, fonts):
+        if any(family in folded for family in DEVANAGARI_FONT_FAMILIES):
+            if _folded(encoding) not in identities:
+                return Q_MOJIBAKE_FONT
+    if any(marker in font for font in fonts for marker in SCAN_OCR_FONTS):
+        return Q_SCANNED_ERA
+    if any(marker in _folded(name) for name in structure.image_filters
+           for marker in SCAN_IMAGE_FILTERS):
+        return Q_SCANNED_ERA
+    if structure.pages and structure.image_only_pages >= structure.pages * SCAN_IMAGE_ONLY_SHARE:
+        return Q_SCANNED_ERA
+    return None
+
+
 # --------------------------------------------------------------------------
 # The page span, off the object key.
 # --------------------------------------------------------------------------
@@ -1153,7 +1290,15 @@ def extract_text(pages: Sequence[str]) -> Extraction:
 
     if len(joined.strip()) < MIN_DOC_CHARS:
         return no(Q_NO_TEXT)
-    if len(_CID.findall(joined)) > CID_LIMIT or latin_ratio(joined) < MIN_LATIN_RATIO:
+    if (
+        len(_CID.findall(joined)) > CID_LIMIT
+        or latin_ratio(joined) < MIN_LATIN_RATIO
+        # The third limb reads a different failure from the other two: they
+        # ask whether the characters are Latin, and this asks whether the
+        # LATIN IS ENGLISH. A legacy Devanagari font extracts as fluent-
+        # looking ASCII and sails past both of the others.
+        or stopword_rate(joined) < MIN_STOPWORD_RATE
+    ):
         return no(Q_LOW_TEXT_QUALITY)
 
     boundary = find_judgment_start(joined)
