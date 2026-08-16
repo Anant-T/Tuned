@@ -402,45 +402,83 @@ def test_the_empty_think_band_is_closed_at_both_ends(count, status):
     assert gate.status == status
 
 
-def test_the_empty_think_ceiling_and_the_trace_floor_cannot_both_be_satisfied_above_20pc():
-    """A MEASURED interaction between two gates the brief specifies separately.
+def test_the_dead_band_the_rejected_ceiling_left_open_and_the_shipped_one_closes():
+    """Why `empty_think_max` was ruled from 0.22 down to 0.20.
 
-    On every shipped row builder a kept row is exactly one of two things: a
-    reasoning row with a real trace (_prov.reasoning true) or a non-reasoning
-    row carrying the byte-exact empty scaffold (_prov.reasoning false). Rows
-    with neither - a bare answer from a teacher that returned no trace - are
-    dropped by assemble.py as no_think_scaffold. So over the assembled corpus
+    Given the identity assemble.py now ENFORCES - every kept row counted by
+    exactly one of the two shares, pinned over the real pipeline below - a 22%
+    empty-think corpus is a 78% traced one. Under the plan's 0.22 ceiling that
+    corpus passed the empty-think band and failed the trace floor: two gates
+    disagreeing about one corpus across a 20-22% dead band. Under the shipped
+    0.20 they agree at every share.
 
-        trace_share + empty_think_share == 1
-
-    exactly, and the >= 80% floor caps the empty-think share at 20%. The
-    plan's 0.22 ceiling therefore had an UNREACHABLE upper half (any corpus
-    inside 20%-22% fails the trace gate), and the shipped ceiling is RULED
-    down to the floor's complement, 0.20: the two gates now agree at every
-    share instead of disagreeing across a dead band.
-
-    Recorded as a test rather than as a comment because it is a fact about the
-    thresholds an operator may want to change, and because a future builder
-    that emits a third row shape would break the identity rather than the band.
+    Stated over explicit (count, total) pairs rather than over a corpus built
+    from helpers, because the arithmetic is the claim - a fixture would only
+    restate how it was assembled.
     """
-    corpus = [traced(i * 10) for i in range(78)] + [scaffolded(1000 + i) for i in range(22)]
-    traces = trace_count(corpus)
-    empties = empty_think_count(corpus, OPEN, CLOSE)
-    assert traces + empties == len(corpus) == 100
-    # Under the REJECTED 0.22 ceiling, 22% empty-think passed the band...
-    assert gate_share(GATE_EMPTY_THINK, empties, 100, floor=0.18, ceiling=0.22,
-                      label="e").status == GREEN
-    # ...while the same corpus failed the trace floor - the incoherence that
-    # forced the ruling.
-    assert gate_share(GATE_TRACE, traces, 100, floor=0.80, label="t").status == RED
-    # Under the SHIPPED 0.20 ceiling the two gates agree: 22% fails both.
-    assert gate_share(GATE_EMPTY_THINK, empties, 100, floor=0.18, ceiling=0.20,
-                      label="e").status == RED
+    for empties, traces in ((22, 78), (21, 79)):
+        # The rejected ceiling: green on the band, red on the floor.
+        assert gate_share(GATE_EMPTY_THINK, empties, 100, floor=0.18, ceiling=0.22,
+                          label="e").status == GREEN
+        assert gate_share(GATE_TRACE, traces, 100, floor=0.80, label="t").status == RED
+        # The shipped ceiling: both say the same thing about the same corpus.
+        assert gate_share(GATE_EMPTY_THINK, empties, 100, floor=0.18, ceiling=0.20,
+                          label="e").status == RED
     # 20% is the last share that satisfies both, and both say so.
-    at_20 = [traced(i * 10) for i in range(80)] + [scaffolded(1000 + i) for i in range(20)]
-    assert gate_share(GATE_TRACE, trace_count(at_20), 100, floor=0.80, label="t").status == GREEN
-    assert gate_share(GATE_EMPTY_THINK, empty_think_count(at_20, OPEN, CLOSE), 100,
-                      floor=0.18, ceiling=0.20, label="e").status == GREEN
+    assert gate_share(GATE_TRACE, 80, 100, floor=0.80, label="t").status == GREEN
+    assert gate_share(GATE_EMPTY_THINK, 20, 100, floor=0.18, ceiling=0.20,
+                      label="e").status == GREEN
+
+
+def test_the_identity_the_ceiling_rests_on_is_enforced_and_not_assumed(tmp_path):
+    """`trace + empty_think == emitted`, measured on the far side of the REAL
+    assemble.main rather than over a corpus built to satisfy it.
+
+    Three third shapes go in beside a conforming corpus - a real trace flagged
+    `reasoning: False`, the empty scaffold on a row claiming a trace, and a
+    one-newline block that is neither - and each is dropped by name. What is
+    emitted then satisfies the identity, which is what makes the empty-think
+    ceiling the trace floor's complement rather than an independent number.
+    """
+    from tuned.data.assemble import DROP_PROV_MISMATCH
+
+    third_shapes = [traced(50_000), scaffolded(51_000), traced(52_000)]
+    third_shapes[0]["_prov"]["reasoning"] = False               # trace, no claim
+    third_shapes[1]["_prov"]["reasoning"] = True                # claim, no trace
+    third_shapes[2]["messages"][1]["content"] = f"{OPEN}\n{CLOSE}an answer"  # neither
+    third_shapes[2]["_prov"]["reasoning"] = False
+
+    _codes, report, paths = run_pipeline(tmp_path, e2e_corpus() + third_shapes)
+    drops = list(read_jsonl(paths.out_dir / "assemble_drops.jsonl"))
+    assert sorted(d["reason"] for d in drops) == [
+        "over_length_bucket", DROP_PROV_MISMATCH, DROP_PROV_MISMATCH, DROP_PROV_MISMATCH,
+    ]
+    emitted = list(read_jsonl(paths.out_dir / "law_v1_train.jsonl")) + list(
+        read_jsonl(paths.out_dir / "law_v1_eval.jsonl")
+    )
+    assert len(emitted) == 100                                  # 104 in, four dropped
+    assert trace_count(emitted) + empty_think_count(emitted, OPEN, CLOSE) == len(emitted)
+    # ...and the report grades that same identity, off the same two gates.
+    assert (report["gates"][GATE_TRACE]["detail"]["count"]
+            + report["gates"][GATE_EMPTY_THINK]["detail"]["count"]
+            == report["measurements"]["rows"] == 100)
+
+
+def test_the_passing_corpus_loses_no_row_to_the_identity_rule(tmp_path):
+    """The premise of every number in the end-to-end fixture, asserted rather
+    than assumed: every shipped row builder keeps `_prov.reasoning` in step
+    with its content, so the rule that drops the third shape drops NOTHING
+    from a real corpus. The day that stops being true, this says so - instead
+    of a mix share moving for a reason nobody can see.
+    """
+    from tuned.data.assemble import DROP_NO_SCAFFOLD, DROP_PROV_MISMATCH
+
+    _codes, _report, paths = run_pipeline(tmp_path, e2e_corpus())
+    drops = list(read_jsonl(paths.out_dir / "assemble_drops.jsonl"))
+    by_reason = Counter(d["reason"] for d in drops)
+    assert by_reason[DROP_PROV_MISMATCH] == 0
+    assert by_reason[DROP_NO_SCAFFOLD] == 0
+    assert by_reason == Counter({"over_length_bucket": 1})
 
 
 def test_the_float_guard_is_where_the_float_noise_is():
@@ -643,21 +681,50 @@ def red_mix(rows):
     return _relabel(rows, REPLAY, 20)
 
 
+def _rescaffold(row_):
+    """A traced row turned into a non-reasoning one - CONTENT AND FLAG
+    TOGETHER. Moving one without the other is the third shape assemble.py now
+    drops, so a fixture that did it would measure the drop rule rather than the
+    gate it is aimed at."""
+    row_["messages"][1]["content"] = empty_think(OPEN, CLOSE) + row_["messages"][1][
+        "content"
+    ][len(OPEN):].split(CLOSE, 1)[1]
+    row_["_prov"]["reasoning"] = False
+
+
+def _retrace(row_, seed):
+    """The other direction: a scaffolded row given a real trace and the claim
+    to go with it."""
+    row_["messages"][1]["content"] = (
+        f"{OPEN}{prose(seed, 40)}{CLOSE}"
+        + row_["messages"][1]["content"][len(empty_think(OPEN, CLOSE)):]
+    )
+    row_["_prov"]["reasoning"] = True
+
+
 def red_trace(rows):
-    out = [dict(r, _prov=dict(r["_prov"])) for r in rows]
-    for r in out[:30]:
-        r["_prov"]["reasoning"] = False
+    """Two traced rows converted to scaffolded ones: 79 traces, 21 empties.
+
+    Under the enforced identity the trace floor cannot be missed alone - a
+    corpus below 80% traces is above 20% empty-think by arithmetic - so this
+    variant trips BOTH share gates, and that agreement is the ruling's point.
+    """
+    out = [json.loads(json.dumps(r)) for r in rows]
+    for r in [r for r in out if r["_prov"]["reasoning"]][:2]:
+        _rescaffold(r)
     return out
 
 
 def red_empty_think(rows):
-    """Ten more rows carrying the byte-exact scaffold, provenance untouched -
-    so the empty-think share moves and the trace share does not."""
+    """Two scaffolded rows converted to traced ones: 17 empties, 83 traces.
+
+    BELOW the floor rather than above the ceiling, which is the only half of
+    the band that moves on its own: 17% empty-think is 83% traced, and the
+    trace floor is happy at 83%.
+    """
     out = [json.loads(json.dumps(r)) for r in rows]
-    for r in out[20:30]:
-        r["messages"][1]["content"] = empty_think(OPEN, CLOSE) + r["messages"][1]["content"][
-            len(OPEN):
-        ].split(CLOSE, 1)[1]
+    for seed, r in enumerate([r for r in out if not r["_prov"]["reasoning"]][:2]):
+        _retrace(r, 70_000 + seed)
     return out
 
 
@@ -674,20 +741,36 @@ def red_license(rows):
 
 
 @pytest.mark.parametrize(
-    "mutate,gate",
+    "mutate,red",
     [
-        (red_mix, GATE_MIX),
-        (red_trace, GATE_TRACE),
-        (red_empty_think, GATE_EMPTY_THINK),
-        (red_markup, GATE_MARKUP),
-        (red_license, GATE_LICENSE),
+        (red_mix, [GATE_MIX]),
+        (red_trace, [GATE_TRACE, GATE_EMPTY_THINK]),
+        (red_empty_think, [GATE_EMPTY_THINK]),
+        (red_markup, [GATE_MARKUP]),
+        (red_license, [GATE_LICENSE]),
     ],
 )
-def test_each_red_variant_exits_non_zero_naming_exactly_its_own_gate(tmp_path, mutate, gate):
+def test_each_red_variant_exits_non_zero_naming_exactly_the_gates_it_trips(
+    tmp_path, mutate, red
+):
+    """EXACT list equality, so a variant that tripped a gate it was not aimed
+    at fails here rather than passing as a cascade.
+
+    `red_trace` names two, and that is arithmetic rather than a cascade: the
+    two share gates measure complementary halves of the same corpus, so a
+    corpus under the 80% trace floor is over the 20% empty-think ceiling by
+    the same rows. Which is exactly the coherence the ceiling was ruled down
+    to the floor's complement to get - under the rejected 0.22 ceiling this
+    corpus would have reported one red and left the other half green.
+    """
     codes, report, _paths = run_pipeline(tmp_path, mutate(e2e_corpus()))
     assert codes["stats"] == 1
     assert report["verdict"] == "red"
-    assert report["red"] == [gate], report["gates"][gate]["summary"]
+    assert report["red"] == red, {g: report["gates"][g]["summary"] for g in report["red"]}
+    # Nothing was dropped on the way in: each variant reds a GATE, and a
+    # fixture that tripped assemble's identity rule instead would grade a
+    # corpus smaller than the one it built.
+    assert report["measurements"]["rows"] == 100
 
 
 def append_to_the_artifact(paths, extra):

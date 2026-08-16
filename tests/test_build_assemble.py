@@ -18,6 +18,7 @@ from tuned.data.assemble import (
     DROP_EMPTY_USER,
     DROP_NO_CONTENT,
     DROP_NO_SCAFFOLD,
+    DROP_PROV_MISMATCH,
     DROP_TOO_LONG,
     DROP_TURNS,
     DROP_UNCLOSED_SCAFFOLD,
@@ -25,6 +26,7 @@ from tuned.data.assemble import (
     assemble_rows,
     built_row,
     conforms,
+    identity_fault,
     raw_fields,
     rendered,
     token_length,
@@ -221,7 +223,8 @@ def test_raw_fields_render_through_format_example_and_keep_their_provenance():
     from tuned.data.smoke import format_example
 
     source = {"problem": "q", "reasoning": "trace", "solution": "answer",
-              "_prov": {"source": "somewhere", "license": "Apache-2.0"}}
+              "_prov": {"source": "somewhere", "license": "Apache-2.0",
+                        "reasoning": True}}
     built, reason = built_row(source, think_open=OPEN, think_close=CLOSE)
     assert reason is None
     assert built["messages"] == format_example("q", "trace", "answer", OPEN, CLOSE)["messages"]
@@ -231,9 +234,21 @@ def test_raw_fields_render_through_format_example_and_keep_their_provenance():
 
 
 def test_raw_fields_without_provenance_do_not_grow_an_empty_one():
-    built, _ = built_row({"problem": "q", "reasoning": "t", "solution": "a"},
-                         think_open=OPEN, think_close=CLOSE)
-    assert "_prov" not in built
+    """No `_prov` in, no `_prov` out - this pass does not invent provenance.
+
+    The row has to be one whose CONTENT matches an absent reasoning flag, and
+    that is the empty-scaffold shape: with no `_prov` there is nothing claiming
+    a trace, so a rendered trace beside no claim is the third shape the
+    identity rule drops - asserted here too, so the fixture's shape is a
+    consequence of a stated rule rather than a convenience.
+    """
+    built, reason = built_row({"problem": "q", "reasoning": "\n\n", "solution": "a"},
+                              think_open=OPEN, think_close=CLOSE)
+    assert reason is None and "_prov" not in built
+    assert built["messages"][1]["content"] == empty_think(OPEN, CLOSE) + "a"
+    built, reason = built_row({"problem": "q", "reasoning": "a real trace", "solution": "a"},
+                              think_open=OPEN, think_close=CLOSE)
+    assert built is None and reason == DROP_PROV_MISMATCH
 
 
 def test_raw_fields_are_all_three_or_none():
@@ -269,6 +284,133 @@ def test_the_accepted_generation_export_already_emits_messages():
     source = inspect.getsource(decontaminate.generated_rows)
     assert '"messages"' in source and '"_prov"' in source
     assert not any(f'"{field}"' in source for field in ("problem", "solution"))
+
+
+# --------------------------------------------------------------------------
+# The identity: traced-and-flagged, or scaffolded-and-not, and nothing else.
+# --------------------------------------------------------------------------
+
+REAL_TRACE = f"{OPEN}a trace with words in it{CLOSE}an answer"
+SCAFFOLD = empty_think(OPEN, CLOSE) + "an answer"
+# One newline instead of two: structurally a fine row, and counted by NEITHER
+# of the two shares - which is what makes it a third shape rather than a near
+# miss.
+NEAR_SCAFFOLD = f"{OPEN}\n{CLOSE}an answer"
+BLANK_TRACE = f"{OPEN}   {CLOSE}an answer"
+
+
+def flagged(content: str, reasoning) -> dict:
+    """One assistant content and one `_prov.reasoning` claim. `None` removes
+    the key, which is how a row that never says arrives."""
+    r = row("q", content, reasoning=reasoning)
+    if reasoning is None:
+        del r["_prov"]["reasoning"]
+    return r
+
+
+@pytest.mark.parametrize(
+    "content,reasoning,reason",
+    [
+        # The two shapes that ARE the corpus.
+        (REAL_TRACE, True, None),
+        (SCAFFOLD, False, None),
+        (SCAFFOLD, None, None),                      # no claim reads as no trace
+        # A real trace nothing claims: the trace share misses it and the
+        # empty-think share misses it, so it lands in the denominator only.
+        (REAL_TRACE, False, DROP_PROV_MISMATCH),
+        (REAL_TRACE, None, DROP_PROV_MISMATCH),
+        # A claim of reasoning over a block with nothing in it: the trace floor
+        # counts a row the model cannot learn from, and the empty-think share
+        # counts it too.
+        (SCAFFOLD, True, DROP_PROV_MISMATCH),
+        # Neither measure sees these at all, whichever way the flag is set.
+        (NEAR_SCAFFOLD, False, DROP_PROV_MISMATCH),
+        (NEAR_SCAFFOLD, True, DROP_PROV_MISMATCH),
+        (BLANK_TRACE, True, DROP_PROV_MISMATCH),
+        (BLANK_TRACE, False, DROP_PROV_MISMATCH),
+    ],
+)
+def test_the_third_shape_is_dropped_by_name_whichever_way_it_disagrees(
+    content, reasoning, reason
+):
+    """`empty_think_max` is set as the trace floor's COMPLEMENT, which is only
+    coherent if every kept row is counted by exactly one of the two shares.
+    This is the rule that makes it so, in both directions and at the two
+    whitespace shapes that belong to neither."""
+    candidate = flagged(content, reasoning)
+    assert conforms(candidate, OPEN, CLOSE) is None, "all ten are structurally fine"
+    assert identity_fault(candidate, OPEN, CLOSE) == reason
+    built, dropped = built_row(candidate, think_open=OPEN, think_close=CLOSE)
+    assert dropped == reason
+    assert built is candidate if reason is None else built is None
+
+
+def test_the_two_kept_shapes_are_measured_the_way_stats_measures_them():
+    """A rule of its own here would be a second definition of the scaffold, and
+    the one that drifts is the one nothing else reads. So: the same
+    `replay.empty_think` bytes, and the same `_prov.reasoning` flag."""
+    from tuned.data.stats import empty_think_count, trace_count
+
+    kept = [flagged(REAL_TRACE, True), flagged(SCAFFOLD, False), flagged(SCAFFOLD, None)]
+    assert all(built_row(r, think_open=OPEN, think_close=CLOSE)[1] is None for r in kept)
+    assert trace_count(kept) == 1
+    assert empty_think_count(kept, OPEN, CLOSE) == 2
+    assert trace_count(kept) + empty_think_count(kept, OPEN, CLOSE) == len(kept)
+    # And the near-miss scaffold really is invisible to both, which is why it
+    # cannot be kept.
+    near = [flagged(NEAR_SCAFFOLD, False)]
+    assert trace_count(near) == 0 and empty_think_count(near, OPEN, CLOSE) == 0
+
+
+def test_no_shipped_row_builder_emits_a_row_this_rule_would_drop():
+    """The rule costs today's pipeline nothing, MEASURED rather than asserted.
+
+    The two zero-API builders are called for real and their output run through
+    the real check. `generated_rows` is read instead of run because its claim
+    and its content are two expressions over ONE `think` variable, and that -
+    not any particular generation - is the property that keeps it conforming.
+    """
+    import inspect
+
+    from tuned.data.curated import predex_prediction_row
+    from tuned.data.decontaminate import generated_rows
+    from tuned.data.replay import legal_qa_row
+
+    built, _ = legal_qa_row(
+        {"question": "What does the section require?", "answer": "A" * 400}, OPEN, CLOSE
+    )
+    assert built["_prov"]["reasoning"] is False
+    assert built_row(built, think_open=OPEN, think_close=CLOSE) == (built, None)
+
+    built, _ = predex_prediction_row(
+        {"Case Name": "X v Y", "Input": "F" * 600, "Output": "R" * 600}, OPEN, CLOSE
+    )
+    assert built["_prov"]["reasoning"] is False
+    assert built_row(built, think_open=OPEN, think_close=CLOSE) == (built, None)
+
+    source = inspect.getsource(generated_rows)
+    assert '"reasoning": bool(think),' in source
+    assert "if think else answer" in source
+
+
+def test_the_mismatch_drop_is_counted_by_reason_and_reported(tmp_path, capsys):
+    cfg, paths = split_output(
+        tmp_path, corpus(6) + [flagged(REAL_TRACE, False)], corpus(2)
+    )
+    assert assemble_main(["--config", cfg], tokenizer=FakeTokenizer()) == 0
+    out = capsys.readouterr().out
+    assert f"drop[{DROP_PROV_MISMATCH}]: 1" in out
+    assert "DISAGREEING with their own content" in out
+    drops = list(read_jsonl(paths.out_dir / "assemble_drops.jsonl"))
+    assert [(d["side"], d["reason"]) for d in drops] == [("train", DROP_PROV_MISMATCH)]
+    # Not relabelled and not rescaffolded: the row is simply not in the output.
+    assert len(list(read_jsonl(paths.out_dir / "law_v1_train.jsonl"))) == 6
+
+
+def test_a_clean_run_does_not_print_the_mismatch_warning(tmp_path, capsys):
+    cfg, _paths = split_output(tmp_path, corpus(6), corpus(2))
+    assert assemble_main(["--config", cfg], tokenizer=FakeTokenizer()) == 0
+    assert "DISAGREEING" not in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------
@@ -437,7 +579,7 @@ def test_the_manifest_carries_the_chain_and_names_its_instrument(tmp_path):
     cfg, paths = split_output(tmp_path, corpus(8), corpus(3))
     assert assemble_main(["--config", cfg], tokenizer=FakeTokenizer()) == 0
     manifest = json.loads((paths.out_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
-    assert manifest["assemble_version"] == ASSEMBLE_VERSION == 1
+    assert manifest["assemble_version"] == ASSEMBLE_VERSION == 2
     assert manifest["split_check"]["status"] == "verified"
     # The whole chain, three links deep.
     assert manifest["split"]["dedupe"]["decontamination"]["decon_version"] == 4

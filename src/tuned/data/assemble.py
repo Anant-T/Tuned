@@ -60,6 +60,38 @@ mutating `messages`, which this pass does not do, so such a row is dropped as
 `no_think_scaffold` and counted. The count is printed, because it is the
 number that says how much of the generated stream arrived without a trace.
 
+TWO SHAPES, AND A KEPT ROW HAS TO BE ONE OF THEM
+-------------------------------------------------
+stats.py measures two shares over this pass's output, and they are not
+independent numbers: `trace` counts rows whose `_prov.reasoning` is true, and
+`empty_think` counts rows whose assistant content STARTS WITH the byte-exact
+`replay.empty_think(open, close)`. The shipped empty-think ceiling is set as
+the trace floor's COMPLEMENT, which is only coherent if every kept row is
+counted by exactly one of the two - that is,
+
+    trace_count + empty_think_count == rows emitted
+
+Until this version that identity was an accident of the row builders: it held
+because every shipped builder keeps `_prov.reasoning` in step with what it put
+in the content, and nothing here looked. A future builder emitting a third
+shape - a real trace flagged `reasoning: False`, or the empty scaffold on a row
+claiming one - would have moved a threshold in stats.py from a module that
+never mentions it. So the rule is enforced HERE, where what reaches the gates
+is decided. A kept row is exactly one of:
+
+  * `_prov.reasoning` TRUE, and the content opens a think block with something
+    in it. A claim of reasoning over an empty block is a row the trace floor
+    counts and the model cannot learn from.
+  * `_prov.reasoning` FALSE or absent, and the content opens with the
+    byte-exact empty scaffold - the same bytes `empty_think_count` looks for.
+
+Anything else is dropped as `reasoning_flag_mismatch` and counted by reason
+like every other drop. NOT repaired: a row whose flag and content disagree is
+a row one of the two is wrong about and this pass cannot know which - moving
+the flag would forge provenance, moving the content would rewrite the corpus.
+Every shipped builder conforms today, so the rule drops nothing from the
+current pipeline. It is what keeps that true.
+
 DROP, NEVER TRUNCATE, ABOVE THE LENGTH BUCKET
 ----------------------------------------------
 The bucket is the TRAINER's `train.main.max_seq_length`, resolved through
@@ -76,6 +108,7 @@ Build:  python -m tuned.data.assemble --config configs/data_law_v1.yaml
 from collections.abc import Sequence
 from pathlib import Path
 
+from tuned.data.replay import empty_think
 from tuned.data.smoke import format_example
 from tuned.data.split import MANIFEST_FILENAME as SPLIT_MANIFEST_FILENAME
 from tuned.data.split import (
@@ -94,7 +127,13 @@ MANIFEST_FILENAME = "assemble.json"
 #    problem/reasoning/solution fields render through smoke.format_example,
 #    the structural shape is verified rather than assumed, and a row over the
 #    trainer's max_seq_length is dropped and counted rather than truncated.
-ASSEMBLE_VERSION = 1
+# 2  a kept row must now be one of the two shapes stats.py's share gates
+#    measure: `_prov.reasoning` true with a non-empty think block, or
+#    `_prov.reasoning` false with the byte-exact empty scaffold. The third
+#    shape is dropped as `reasoning_flag_mismatch` instead of emitted, which
+#    makes `trace_count + empty_think_count == rows emitted` a property of
+#    this pass rather than a coincidence of the row builders.
+ASSEMBLE_VERSION = 2
 
 DROP_NO_CONTENT = "no_messages_or_fields"
 DROP_TURNS = "not_one_user_one_assistant"
@@ -102,6 +141,7 @@ DROP_EMPTY_USER = "empty_user"
 DROP_NO_SCAFFOLD = "no_think_scaffold"
 DROP_UNCLOSED_SCAFFOLD = "unclosed_think_scaffold"
 DROP_EMPTY_ANSWER = "empty_answer"
+DROP_PROV_MISMATCH = "reasoning_flag_mismatch"
 DROP_TOO_LONG = "over_length_bucket"
 DROP_REASONS = (
     DROP_NO_CONTENT,
@@ -110,6 +150,7 @@ DROP_REASONS = (
     DROP_NO_SCAFFOLD,
     DROP_UNCLOSED_SCAFFOLD,
     DROP_EMPTY_ANSWER,
+    DROP_PROV_MISMATCH,
     DROP_TOO_LONG,
 )
 
@@ -153,6 +194,32 @@ def conforms(row, think_open: str, think_close: str) -> str | None:
     return None
 
 
+def identity_fault(row, think_open: str, think_close: str) -> str | None:
+    """DROP_PROV_MISMATCH when the flag and the content disagree, else None.
+
+    Runs AFTER `conforms`, so the content is already known to open a think
+    block and close it with an answer behind it. The two facts are read the
+    way stats.py reads them and not a way of their own: the claim off
+    `_prov.reasoning`, the scaffold as a BYTE-EXACT prefix. A measure here that
+    tolerated `<think>\\n</think>` while the gate downstream did not would put
+    a row in the corpus that neither share counts, which is the whole fault.
+
+    `traced` and `scaffolded` are mutually exclusive by construction - the
+    empty scaffold's block strips to nothing - and they are not complements: a
+    whitespace block that is not the byte-exact scaffold is NEITHER, and a row
+    carrying one is a third shape whichever way its flag is set.
+    """
+    content = row["messages"][1]["content"]
+    claims_trace = bool((row.get("_prov") or {}).get("reasoning"))
+    scaffolded = content.startswith(empty_think(think_open, think_close))
+    traced = bool(content[len(think_open):].split(think_close, 1)[0].strip())
+    if claims_trace and traced:
+        return None
+    if not claims_trace and scaffolded:
+        return None
+    return DROP_PROV_MISMATCH
+
+
 def raw_fields(row) -> tuple[str, str, str] | None:
     """(problem, reasoning, solution) if the row arrived unbuilt, else None."""
     if not all(isinstance(row.get(f), str) for f in RAW_FIELDS):
@@ -168,9 +235,16 @@ def built_row(row, *, think_open: str, think_close: str) -> tuple[dict | None, s
     format_example and keeps whatever `_prov` it arrived with, because stats.py
     and push.py both read provenance and a row that loses it at the last stage
     is a row nobody can license.
+
+    Two checks, in this order: the SHAPE the trainer needs, then the identity
+    the gates rest on. Shape first because a row with no assistant turn has no
+    content for the second check to read, and because "not one user one
+    assistant" is the more useful thing to be told about such a row.
     """
     if isinstance(row.get("messages"), list):
-        reason = conforms(row, think_open, think_close)
+        reason = conforms(row, think_open, think_close) or identity_fault(
+            row, think_open, think_close
+        )
         return (None, reason) if reason else (row, None)
     fields = raw_fields(row)
     if fields is None:
@@ -179,7 +253,9 @@ def built_row(row, *, think_open: str, think_close: str) -> tuple[dict | None, s
     built = format_example(problem, reasoning, solution, think_open, think_close)
     if "_prov" in row:
         built["_prov"] = row["_prov"]
-    reason = conforms(built, think_open, think_close)
+    reason = conforms(built, think_open, think_close) or identity_fault(
+        built, think_open, think_close
+    )
     return (None, reason) if reason else (built, None)
 
 
@@ -378,6 +454,16 @@ def main(argv: Sequence[str] | None = None, *, tokenizer=None) -> int:
             f"  {scaffold_drops} row(s) carried NO reasoning scaffold at all and were "
             f"dropped rather than repaired - a generation whose teacher returned no trace "
             f"arrives as a bare answer, and adding the empty block here would be a rewrite"
+        )
+    mismatch_drops = sum(
+        s["by_reason"].get(DROP_PROV_MISMATCH, 0) for s in sides.values()
+    )
+    if mismatch_drops:
+        print(
+            f"  {mismatch_drops} row(s) had _prov.reasoning DISAGREEING with their own "
+            f"content and were dropped rather than relabelled - a row the trace share and "
+            f"the empty-think share would either both miss or both count, which is what "
+            f"the empty-think ceiling being the trace floor's complement rests on"
         )
     print(f"wrote {written['train']} rows -> {out_train}")
     print(f"      {written['eval']} rows -> {out_eval}")
