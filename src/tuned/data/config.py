@@ -68,6 +68,14 @@ class GateCfg:
 # the one place that says WHICH profile the top-level mix is.
 FULL_PROFILE = "v1.1-full"
 
+# Slack for the ONE comparison in _validate that subtracts two share bounds.
+# `1 - 0.80` is 0.19999999999999996 in binary floating point, so a bare
+# `empty_think_max > 1 - trace_floor` refuses the shipped 0.80/0.20 pair - the
+# exact coherence the check exists to require. Nine places is far below any
+# threshold anyone would write and far above the noise; the same reasoning,
+# and the same number, as stats.gate_mix's rounding.
+_SHARE_EPS = 1e-9
+
 
 @dataclass(frozen=True)
 class AssemblyCfg:
@@ -289,10 +297,118 @@ def _validate(cfg: BuildConfig) -> None:
             f"assembly.gates.empty_think_min/max must satisfy 0 <= min <= max <= 1, got "
             f"{gates.empty_think_min}/{gates.empty_think_max}"
         )
+    # THE THREE SHARE BOUNDS ARE ONE SYSTEM, not three independent numbers.
+    # assemble.py drops every row that is neither traced nor empty-scaffolded
+    # (ASSEMBLE_VERSION 2), so over the corpus stats.py grades
+    # trace_share + empty_think_share == 1 exactly. Two combinations are then
+    # unsatisfiable as ARITHMETIC rather than as a corpus, and a build that
+    # meets them at the end of a multi-day run meets them on the corpus.
+    complement = 1.0 - gates.trace_floor
+    if gates.trace_floor + gates.empty_think_min > 1.0 + _SHARE_EPS:
+        raise ValueError(
+            f"assembly.gates.trace_floor {gates.trace_floor} and empty_think_min "
+            f"{gates.empty_think_min} cannot both be satisfied: a corpus with at least "
+            f"{gates.trace_floor:.1%} reasoning traces carries at most {complement:.1%} "
+            f"empty-scaffold rows, which is below that floor. EVERY corpus reds."
+        )
+    if gates.empty_think_max > complement + _SHARE_EPS:
+        raise ValueError(
+            f"assembly.gates.empty_think_max {gates.empty_think_max} is above "
+            f"1 - trace_floor ({complement:.4g}), which leaves a DEAD BAND: a corpus "
+            f"between {complement:.1%} and {gates.empty_think_max:.1%} empty-scaffold "
+            f"rows passes the empty-think band and fails the trace floor, so the two "
+            f"gates disagree about the same corpus. The ceiling is the trace floor's "
+            f"complement, not an independent number."
+        )
     if not (0.0 <= gates.dup_ceiling <= 1.0):
         raise ValueError(
             f"assembly.gates.dup_ceiling must be in [0, 1], got {gates.dup_ceiling}"
         )
+
+
+# What each required `assembly:` key is FOR. A partial block used to die with
+# a bare `KeyError: 'gates'` from whichever line reached for it first, which
+# names the key and nothing else - so these are rule 5's own refusals, written
+# where the raw dict still exists.
+_ASSEMBLY_KEYS = {
+    "default_profile": "the mix profile stats.py grades against when --profile is not passed",
+    "source_streams": "the _prov.source -> mix bucket mapping, without which every source "
+                      "is unmapped and every corpus reds",
+    "gates": "every threshold stats.py compares against",
+}
+_GATE_NUMBERS = {
+    "mix_tolerance_pp": "the mix tolerance in percentage points",
+    "trace_floor": "the reasoning-trace floor",
+    "empty_think_min": "the empty-think floor",
+    "empty_think_max": "the empty-think ceiling",
+    "dup_ceiling": "the duplicate-share ceiling",
+}
+# Toggles, and the reason they are parsed strictly rather than with bool():
+# `bool("false")` is True, so a QUOTED YAML boolean inverts every one of them.
+_GATE_TOGGLES = {
+    "markup": "whether control-token markup reds the build",
+    "require_license": "whether an unlicensed row reds the build",
+    "cross_code_red": "whether the cross-code measurement gates or only reports",
+    "require_chain": "whether a broken custody chain reds the build",
+}
+
+
+def _required(block, key: str, *, where: str, purpose: str):
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"`{where}:` must be a block of keys, got {type(block).__name__}"
+        )
+    if key not in block:
+        raise ValueError(
+            f"{where}.{key} is missing, and it is {purpose}. A PARTIAL `{where}:` block "
+            f"is a builder grading a corpus against thresholds nobody wrote."
+        )
+    return block[key]
+
+
+def _gate_number(raw: dict, key: str) -> float:
+    value = _required(raw, key, where="assembly.gates", purpose=_GATE_NUMBERS[key])
+    # bool is a subclass of int, so `float(True)` is 1.0 and a stray `true`
+    # would load as a threshold rather than as the mistake it is.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"assembly.gates.{key} must be a number, got {value!r}")
+    return float(value)
+
+
+def _gate_toggle(raw: dict, key: str) -> bool:
+    value = _required(raw, key, where="assembly.gates", purpose=_GATE_TOGGLES[key])
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"assembly.gates.{key} must be a YAML boolean (true/false), got {value!r}. "
+            f"It is not coerced: bool() of any non-empty string is True, so a quoted "
+            f'"false" would ARM this gate and a quoted "no" would read as yes.'
+        )
+    return value
+
+
+def _old_code_sources(raw: dict) -> tuple[str, ...]:
+    """The cross-code gate's pre-transition corpora - a LIST, always.
+
+    A bare string is the failure worth spelling out: `tuple("169Pi/indian_law")`
+    is sixteen single characters, no source string ever equals one of them, and
+    the gate goes silently dead while the config still reads as if it is armed.
+    """
+    value = raw.get("old_code_sources")
+    if value is None:
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"assembly.gates.old_code_sources must be a LIST of source strings, got "
+            f"{value!r}. A bare string iterates as its own characters, which empties "
+            f"the cross-code gate silently: no source matches a single letter."
+        )
+    wrong = [item for item in value if not isinstance(item, str)]
+    if wrong:
+        raise ValueError(
+            f"assembly.gates.old_code_sources must contain only source strings, got "
+            f"{wrong!r}"
+        )
+    return tuple(value)
 
 
 def _assembly_of(raw: dict, build: BuildCfg) -> AssemblyCfg:
@@ -311,6 +427,8 @@ def _assembly_of(raw: dict, build: BuildCfg) -> AssemblyCfg:
             "have no mix targets, no source->stream mapping and no gate thresholds. The "
             "builder cannot grade a corpus it has no targets for."
         )
+    for key, purpose in _ASSEMBLY_KEYS.items():
+        _required(block, key, where="assembly", purpose=purpose)
     profiles = {name: dict(targets) for name, targets in (block.get("profiles") or {}).items()}
     if FULL_PROFILE in profiles:
         raise ValueError(
@@ -318,23 +436,24 @@ def _assembly_of(raw: dict, build: BuildCfg) -> AssemblyCfg:
             f"definition of that profile's targets; delete the copy here."
         )
     profiles[FULL_PROFILE] = dict(build.mix)
-    gates_raw = dict(block["gates"])
+    gates_raw = block["gates"]
+    if not isinstance(gates_raw, dict):
+        raise ValueError(f"`assembly.gates:` must be a block of keys, got {gates_raw!r}")
     gates = GateCfg(
-        mix_tolerance_pp=float(gates_raw["mix_tolerance_pp"]),
-        trace_floor=float(gates_raw["trace_floor"]),
-        empty_think_min=float(gates_raw["empty_think_min"]),
-        empty_think_max=float(gates_raw["empty_think_max"]),
-        dup_ceiling=float(gates_raw["dup_ceiling"]),
-        markup=bool(gates_raw["markup"]),
-        require_license=bool(gates_raw["require_license"]),
-        cross_code_red=bool(gates_raw["cross_code_red"]),
-        old_code_sources=tuple(gates_raw.get("old_code_sources") or ()),
-        require_chain=bool(gates_raw["require_chain"]),
+        **{key: _gate_number(gates_raw, key) for key in _GATE_NUMBERS},
+        **{key: _gate_toggle(gates_raw, key) for key in _GATE_TOGGLES},
+        old_code_sources=_old_code_sources(gates_raw),
     )
+    streams = block["source_streams"]
+    if not isinstance(streams, dict):
+        raise ValueError(
+            f"assembly.source_streams must be a mapping of source -> stream, got "
+            f"{streams!r}"
+        )
     return AssemblyCfg(
         default_profile=block["default_profile"],
         profiles=profiles,
-        source_streams=dict(block["source_streams"]),
+        source_streams=dict(streams),
         gates=gates,
     )
 

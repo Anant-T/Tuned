@@ -110,7 +110,9 @@ def _base_doc() -> dict:
                 "mix_tolerance_pp": 2.0,
                 "trace_floor": 0.8,
                 "empty_think_min": 0.18,
-                "empty_think_max": 0.22,
+                # The floor's complement, which rule 5 now requires - 0.22
+                # against a 0.8 floor is the dead band the ruling closed.
+                "empty_think_max": 0.20,
                 "dup_ceiling": 0.005,
                 "markup": True,
                 "require_license": True,
@@ -332,6 +334,35 @@ def test_the_eval_fraction_and_the_length_bucket_are_not_duplicated_here():
         (lambda d: d["assembly"]["gates"].__setitem__("empty_think_max", 1.5),
          "empty_think_min/max"),
         (lambda d: d["assembly"]["gates"].__setitem__("dup_ceiling", 2.0), "dup_ceiling"),
+        # The three share bounds are ONE system under the identity assemble.py
+        # enforces, and two combinations of them are unsatisfiable as
+        # arithmetic rather than as a corpus.
+        (lambda d: d["assembly"]["gates"].__setitem__("trace_floor", 0.9),
+         "cannot both be satisfied"),
+        (lambda d: d["assembly"]["gates"].__setitem__("empty_think_max", 0.22),
+         "DEAD BAND"),
+        # A bare string iterates as 16 single characters and the cross-code
+        # gate goes silently dead.
+        (lambda d: d["assembly"]["gates"].__setitem__("old_code_sources", "169Pi/indian_law"),
+         "must be a LIST"),
+        (lambda d: d["assembly"]["gates"].__setitem__("old_code_sources", ["ok", 7]),
+         "only source strings"),
+        (lambda d: d["assembly"]["gates"].__setitem__("old_code_sources", 7),
+         "must be a LIST"),
+        # bool("false") is True, so a quoted YAML boolean inverts a gate.
+        (lambda d: d["assembly"]["gates"].__setitem__("cross_code_red", "false"),
+         "cross_code_red must be a YAML boolean"),
+        (lambda d: d["assembly"]["gates"].__setitem__("markup", "no"),
+         "markup must be a YAML boolean"),
+        (lambda d: d["assembly"]["gates"].__setitem__("require_chain", 1),
+         "require_chain must be a YAML boolean"),
+        (lambda d: d["assembly"]["gates"].__setitem__("require_license", "yes"),
+         "require_license must be a YAML boolean"),
+        # ...and the same strictness the other way: a toggle is not a threshold.
+        (lambda d: d["assembly"]["gates"].__setitem__("trace_floor", True),
+         "trace_floor must be a number"),
+        (lambda d: d["assembly"]["gates"].__setitem__("dup_ceiling", "half a percent"),
+         "dup_ceiling must be a number"),
     ],
 )
 def test_rule5_assembly_checks_rejected(tmp_path, mutate, match):
@@ -339,6 +370,62 @@ def test_rule5_assembly_checks_rejected(tmp_path, mutate, match):
     mutate(doc)
     with pytest.raises(ValueError, match=match):
         load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+@pytest.mark.parametrize(
+    "key", ["default_profile", "source_streams", "gates"]
+)
+def test_a_partial_assembly_block_names_the_key_it_is_missing(tmp_path, key):
+    """The whole-block-absent path had a good message; the PARTIAL path died
+    with a bare `KeyError: 'gates'` from whichever line reached for it first -
+    which names the key and nothing about what it is for or why the build
+    cannot run without it."""
+    doc = _base_doc()
+    del doc["assembly"][key]
+    with pytest.raises(ValueError, match=f"assembly.{key} is missing"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["mix_tolerance_pp", "trace_floor", "empty_think_min", "empty_think_max",
+     "dup_ceiling", "markup", "require_license", "cross_code_red", "require_chain"],
+)
+def test_every_missing_gate_key_is_a_named_refusal(tmp_path, key):
+    doc = _base_doc()
+    del doc["assembly"]["gates"][key]
+    with pytest.raises(ValueError, match=f"assembly.gates.{key} is missing"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+def test_old_code_sources_may_be_absent_or_empty_but_never_a_string(tmp_path):
+    """Absent is a legitimate configuration - the gate then fires only on
+    `_prov.code_era == "ipc"` - and that is why the type has to be checked
+    rather than the truthiness."""
+    doc = _base_doc()
+    del doc["assembly"]["gates"]["old_code_sources"]
+    assert load_build_config(_write(tmp_path, doc),
+                             allow_unpinned=True).assembly.gates.old_code_sources == ()
+    doc["assembly"]["gates"]["old_code_sources"] = []
+    assert load_build_config(_write(tmp_path, doc),
+                             allow_unpinned=True).assembly.gates.old_code_sources == ()
+
+
+def test_the_shipped_gate_bounds_are_a_coherent_system(tmp_path):
+    """The two couplings, against the config that actually ships.
+
+    0.80 + 0.18 = 0.98 <= 1, and 0.20 IS 1 - 0.80 - which is where the check
+    needs its epsilon, because `1 - 0.80` is 0.19999999999999996 in binary
+    floating point and a bare `>` refuses the very pair the rule exists to
+    require. Measured here rather than trusted.
+    """
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    gates = cfg.assembly.gates
+    assert gates.trace_floor + gates.empty_think_min <= 1.0
+    assert gates.empty_think_max == 0.20 and gates.trace_floor == 0.80
+    assert 1.0 - gates.trace_floor == 0.19999999999999996  # ...the reason for the slack
+    assert gates.empty_think_max > 1.0 - gates.trace_floor  # a bare `>` WOULD refuse it
+    assert gates.empty_think_max - (1.0 - gates.trace_floor) < 1e-9
 
 
 def test_targets_for_an_unknown_profile_raises_rather_than_defaulting():
