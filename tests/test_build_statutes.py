@@ -543,12 +543,18 @@ def test_mapping_loads_the_starter_rows():
     assert kinds == {"one_to_one", "changed", "new_offence", "deleted"}
 
 
-def test_every_starter_row_is_unverified():
-    """The operator audit assigns verified_by; until then the whole file is
-    inert and require_verified refuses every row."""
+def test_the_audited_map_is_mostly_verified_and_the_remainder_is_named():
+    """The 2026-08-16 source audit stamped every row where two independent
+    sources - at least one official, current-edition bare acts preferred -
+    agree on every cell. The 17 unverified rows are exactly the operator
+    decision sheet (kind-only questions; every BNS number two-source
+    agreed). These pins MOVE when the operator rules on a sheet row:
+    update them with the ruling, never loosen them to inequalities."""
     mapping = Mapping.load()
-    assert mapping.verified_rows() == []
-    assert len(mapping.unverified_rows()) == len(mapping)
+    assert len(mapping) == 171
+    assert len(mapping.verified_rows()) == 154
+    assert len(mapping.unverified_rows()) == 17
+    assert len(mapping.verified_rows()) + len(mapping.unverified_rows()) == len(mapping)
 
 
 @pytest.mark.parametrize(
@@ -569,7 +575,9 @@ def test_every_starter_row_is_unverified():
         (("IPC", "500"), ("BNS", "356")),
         (("IPC", "34"), ("BNS", "3(5)")),
         (("IPC", "120B"), ("BNS", "61")),
-        (("IPC", "124A"), ("BNS", "152")),
+        # 124A -> 152 was DELETED here by the source audit: all four sources
+        # treat sedition as repealed with no counterpart and BNS 152 as a new
+        # offence - the old case encoded the starter map's one structural error.
     ],
 )
 def test_counterpart_one_to_one_and_changed(old, new):
@@ -607,20 +615,27 @@ def test_counterpart_unmapped():
     assert mapping.row(SectionRef("IPC", "999")) is None
 
 
-def test_require_verified_raises_on_every_starter_row():
+def test_require_verified_passes_audited_rows_and_refuses_the_sheet():
+    """IPC 302 carries a two-source stamp and flows. IPC 375 ships a kind
+    at low confidence and sits on the operator decision sheet, so it must
+    refuse until a human rules - rape is exactly the section where a token
+    comparison is not an instrument and the audit said so out loud."""
     mapping = Mapping.load()
+    assert mapping.require_verified(SectionRef("IPC", "302"))["new_section"] == "103"
     with pytest.raises(ValueError, match="unverified"):
-        mapping.require_verified(SectionRef("IPC", "302"))
+        mapping.require_verified(SectionRef("IPC", "375"))
     with pytest.raises(ValueError, match="no mapping row"):
         mapping.require_verified(SectionRef("IPC", "999"))
 
 
 def test_require_verified_error_names_the_row():
+    # 375 rather than 420: the audit verified 420, and the row this error
+    # names must be one that actually refuses.
     mapping = Mapping.load()
     with pytest.raises(ValueError) as exc:
-        mapping.require_verified(SectionRef("IPC", "420"))
+        mapping.require_verified(SectionRef("IPC", "375"))
     message = str(exc.value)
-    assert "IPC 420" in message and "BNS 318" in message
+    assert "IPC 375" in message and "BNS 63" in message
 
 
 def test_require_verified_accepts_an_audited_row(tmp_path):
