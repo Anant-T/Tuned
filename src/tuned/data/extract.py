@@ -256,14 +256,42 @@ _MD_TABLE_ROW = re.compile(r"^(?:[ \t]{0,3}\|.*|.*\|.*\|.*)$", re.M)
 _MD_QUOTE = re.compile(r"^[ \t]{0,3}(?:>[ \t]?)+", re.M)
 _MD_BULLET = re.compile(r"^[ \t]{0,3}[-*+][ \t]+", re.M)
 
+# THE READER DOES NOT EMIT ONLY MARKDOWN. Measured over 15 real objects:
+# 886 `<u>`, 222 `<br>`, 164 `<sup>` and 10 `<mark>`, and the damage was not
+# cosmetic. `<u>Case Law Reference</u>` defeats a `^`-anchored signature in
+# five documents; `<u>Judgment</u>` squashes to `<u>judgment</u>`, which is
+# not in _HEADING_WORDS, and quarantined ALL THREE 2025 documents as
+# `no_judgment_start` on a heading that is plainly there. So an inline tag
+# sits in front of the first word of a line exactly the way a table bar
+# does, and it is stripped for the same reason and in the same place.
+#
+# The list is the tags an inline typesetting run can arrive as - the four
+# above are the ones this corpus produced, the rest are the same class of
+# thing and cost nothing to name. BLOCK tags are deliberately absent: this
+# is a decoration stripper, not an HTML parser, and a reader that started
+# emitting `<div>`/`<table>` would be a reader change to look at rather than
+# to absorb silently.
+_HTML_INLINE_TAG = re.compile(
+    r"</?(?:u|b|i|em|strong|sup|sub|mark|small|span|font)\b[^>]*>", re.I
+)
+# `<br>` is the one that carries meaning: it is a LINE BREAK inside a cell,
+# so deleting it glues two words together (`Sub<br>Inspectors` ->
+# `SubInspectors`, measured) while turning it into a newline would tear a
+# `|cell|cell|` row in half before _MD_TABLE_ROW can read it. A space is the
+# rendering that loses neither.
+_HTML_BREAK = re.compile(r"<br\b[^>]*>", re.I)
+
 
 def demote_markdown(text: str) -> str:
-    """Markdown decoration out, characters in.
+    """Markdown AND inline-HTML decoration out, characters in.
 
-    Order matters twice: a quoted rule (`> ---`) is only a rule once the
-    quote marker is gone, and a rule (`- - -`) is only distinguishable from a
-    bullet before the bullet is stripped.
+    Order matters three times: the tags come off first because a `|` row and
+    a `^` anchor are both read past them; a quoted rule (`> ---`) is only a
+    rule once the quote marker is gone; and a rule (`- - -`) is only
+    distinguishable from a bullet before the bullet is stripped.
     """
+    text = _HTML_BREAK.sub(" ", text)
+    text = _HTML_INLINE_TAG.sub("", text)
     text = _MD_TABLE_RULE.sub("", text)
     text = _MD_TABLE_ROW.sub(lambda m: m.group(0).replace("|", " "), text)
     text = _MD_QUOTE.sub("", text)
@@ -673,6 +701,13 @@ def author_line_offset(text: str) -> int | None:
 # heading.
 _ENUM_HEADING = r"[ \t]*(?:\(?\d{1,3}[.)][ \t]*)?"
 _ENUM_HEADING_SQUASHED = r"(?:\(?\d{1,3}[.)])?"
+# What a `$`-anchored heading is allowed to have AFTER it. The 2023+ volumes
+# print `Headnotes †` - the dagger footnoting the editor's name at the foot
+# of the page - and a bare `$` reads that line as prose, which cost the
+# `headnotes` signature on every 2023+ document measured. Only NON-WORD
+# characters are tolerated: a heading followed by a word is a sentence, and
+# that is the whole reason these two are anchored at the end at all.
+_HEADING_TAIL = r"[^\w\n]*$"
 _SIGNATURES = (
     # `HELD` is the reporter's label in three shapes the reprints actually
     # use: `HELD:` anywhere on a line (the column wrap), a bare all-caps
@@ -698,8 +733,8 @@ _SIGNATURES = (
      re.compile(rf"^{_ENUM_HEADING}case\s+law\s+(?:reference|referred|cited)", re.I | re.M),
      re.compile(rf"^{_ENUM_HEADING_SQUASHED}caselaw(?:reference|referred|cited)", re.I | re.M)),
     ("cases_referred_to",
-     re.compile(rf"^{_ENUM_HEADING}cases?\s+referred\s+to\s*:?\s*$", re.I | re.M),
-     re.compile(rf"^{_ENUM_HEADING_SQUASHED}cases?referredto:?$", re.I | re.M)),
+     re.compile(rf"^{_ENUM_HEADING}cases?\s+referred\s+to\s*:?{_HEADING_TAIL}", re.I | re.M),
+     re.compile(rf"^{_ENUM_HEADING_SQUASHED}cases?referredto:?{_HEADING_TAIL}", re.I | re.M)),
     ("list_of_acts",
      re.compile(rf"^{_ENUM_HEADING}list\s+of\s+acts", re.I | re.M),
      re.compile(rf"^{_ENUM_HEADING_SQUASHED}listofacts", re.I | re.M)),
@@ -710,8 +745,8 @@ _SIGNATURES = (
      re.compile(rf"^{_ENUM_HEADING}issues?\s+for\s+consideration", re.I | re.M),
      re.compile(rf"^{_ENUM_HEADING_SQUASHED}issues?forconsideration", re.I | re.M)),
     ("headnotes",
-     re.compile(rf"^{_ENUM_HEADING}headnotes?\s*:?\s*$", re.I | re.M),
-     re.compile(rf"^{_ENUM_HEADING_SQUASHED}headnotes?:?$", re.I | re.M)),
+     re.compile(rf"^{_ENUM_HEADING}headnotes?\s*:?{_HEADING_TAIL}", re.I | re.M),
+     re.compile(rf"^{_ENUM_HEADING_SQUASHED}headnotes?:?{_HEADING_TAIL}", re.I | re.M)),
     ("case_arising_from",
      re.compile(rf"^{_ENUM_HEADING}case\s+arising\s+from", re.I | re.M),
      re.compile(rf"^{_ENUM_HEADING_SQUASHED}casearisingfrom", re.I | re.M)),

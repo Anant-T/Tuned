@@ -1560,6 +1560,80 @@ def test_a_table_row_is_demoted_in_both_shapes_the_reader_can_emit(row, alternat
     assert headnote_signals(demote_markdown(row)) == ("case_law_reference",)
 
 
+# ------------------------------------------------ the reader's inline HTML
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The four this corpus actually produced, in the counts the smoke
+        # measured: 886 `<u>`, 222 `<br>`, 164 `<sup>`, 10 `<mark>`.
+        "<u>Case Law Reference</u>",
+        "<mark>Case Law Reference</mark>",
+        "<sup>Case Law Reference</sup>",
+        # ...and the same class of thing under other names, with attributes,
+        # in the other case, and behind the markdown that wraps it.
+        '<span class="hdr">Case Law Reference</span>',
+        "<B>Case Law Reference</B>",
+        "**<u>Case Law Reference</u>**",
+    ],
+)
+def test_an_inline_tag_does_not_hide_the_editorial_furniture(line):
+    # THE MISREADING: "the reader emits markdown, so demoting markdown is
+    # enough". It emits HTML too, and a tag sits in front of the first word
+    # of a line exactly the way a table bar does - so a `^`-anchored
+    # signature reads `<u>Case Law Reference</u>` as prose. Measured: the
+    # guard was blind to `case_law_reference` in five of fifteen real
+    # documents for this reason alone.
+    assert headnote_signals(line) == ("case_law_reference",)
+    # THE PREMISE: the tag really is in column 0, so nothing but the strip
+    # can be what let the anchor through.
+    assert line.startswith("<") or line.startswith("**<")
+
+
+def test_the_line_break_tag_becomes_a_space_and_does_not_glue_two_words():
+    # `<br>` is the one tag that carries meaning: it is the line break
+    # INSIDE a table cell, so deleting it outright welds the words on either
+    # side of it together - `Sub<br>Inspectors` -> `SubInspectors`, in real
+    # emitted text. A newline instead would tear the `|cell|cell|` row in
+    # half before the table rule can read it, which is why it is a space.
+    assert demote_markdown("Sub<br>Inspectors") == "Sub Inspectors"
+    row = "|2.<br>|General for the post of Sub<br>Inspectors|168|"
+    demoted = demote_markdown(row)
+    assert "SubInspectors" not in demoted
+    assert "Sub Inspectors" in demoted
+    assert "|" not in demoted
+
+
+def test_the_tags_do_not_survive_into_the_emitted_judgment():
+    # They leaked into six of ten emitted training texts, 326 `<u>` in one.
+    pages = scr_pages(
+        body="<u>" + BODY.replace("NAVIN SINHA, J.", "<u>NAVIN SINHA, J.</u>") + "</u>"
+    )
+    result = extract_text(pages)
+
+    assert result.ok, result.reason
+    assert "<u>" not in result.text and "</u>" not in result.text
+    assert "NAVIN SINHA, J." in result.text
+
+
+def test_a_heading_with_a_footnote_dagger_after_it_is_still_a_heading():
+    # THE MISREADING the `$` anchor made: the 2023+ volumes print
+    # `Headnotes †`, the dagger footnoting the editor's name, and a heading
+    # anchored at the end of the line reads that as prose. It cost the
+    # `headnotes` signature on every 2023+ document measured.
+    assert "headnotes" in headnote_signals("**Headnotes** <sup>**†**</sup>")
+    assert "headnotes" in headnote_signals("Headnotes †")
+    assert "cases_referred_to" in headnote_signals("Cases Referred To: †")
+    # ...and the anchor still does its job: only NON-WORD characters are
+    # tolerated, so a heading followed by a WORD is the sentence the anchor
+    # was put there to exclude. `Headnotes prepared by: <editor>` is a real
+    # line of these volumes - at the FOOT of the document, where reading it
+    # as furniture would put a signature past the cut that the removed head
+    # cannot account for, and quarantine the judgment.
+    assert "headnotes" not in headnote_signals("†Headnotes prepared by: A. Editor")
+    assert "cases_referred_to" not in headnote_signals("Cases referred to in argument were")
+
+
 # --------------------------------------------------------------------------
 # The join, the resume decision, and the run.
 # --------------------------------------------------------------------------
@@ -1567,6 +1641,7 @@ def test_a_table_row_is_demoted_in_both_shapes_the_reader_can_emit(row, alternat
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 from pipeline_fakes import temp_config
