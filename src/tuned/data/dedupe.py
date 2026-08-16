@@ -135,6 +135,7 @@ from tuned.data.decontaminate import (
     SemanticSeamError,
     gram_hashes,
     jaccard_from,
+    output_record,
     provenance_text,
     row_prov,
     selected_records,
@@ -155,7 +156,15 @@ MANIFEST_FILENAME = "dedupe.json"
 #    collapsed four tasks built on one seed into one at every threshold), its
 #    threshold is recorded, and its drops name the form. The emitted set moves
 #    wherever that layer runs.
-DEDUPE_VERSION = 3
+# 4: the manifest gained `outputs` - a digest of the rows THIS pass wrote,
+#    the same record decontaminate.py has carried since decon_version 2. Every
+#    version-3 manifest asserted a chain of custody it could not itself be
+#    checked against: split.py verifies its input against the digest dedupe
+#    recorded, and there was none, so the chain ended here. Version-3
+#    manifests are not stale in their COUNTS, only in what a downstream pass
+#    can prove about them - split.py refuses one by name rather than
+#    inheriting it.
+DEDUPE_VERSION = 4
 
 # Shorter window than decontamination's 13: this is a similarity question
 # between two rows of comparable length, not a "did this text appear inside
@@ -805,7 +814,7 @@ def ids_from_text_for(upstream: dict | None, *, override: bool = False) -> bool:
 
 def manifest_of(stats: dict, *, inputs: Sequence[str], upstream: dict | None,
                 semantic: str, thresholds: dict, semantic_detail: str = "",
-                custody: dict | None = None) -> dict:
+                custody: dict | None = None, outputs: Sequence[dict] = ()) -> dict:
     from tuned.data.store import utcnow
 
     upstream_summary = None
@@ -829,6 +838,14 @@ def manifest_of(stats: dict, *, inputs: Sequence[str], upstream: dict | None,
         "dedupe_version": DEDUPE_VERSION,
         "at": utcnow(),
         "inputs": list(inputs),
+        # What this pass WROTE, by content. decontaminate.py has recorded this
+        # since decon_version 2 and it is what custody_of above verifies its
+        # own input against; dedupe's manifest carried none, so the chain of
+        # custody it asserts upstream could not be extended downstream at all.
+        # A LIST rather than a single record because split.py writes two files
+        # and stats.py reads two, and one shape for the whole tail is one
+        # reader (`manifest_digests`) rather than three.
+        "outputs": list(outputs),
         "thresholds": thresholds,
         "counts": {
             key: stats[key]
@@ -929,9 +946,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     kept, drops, stats = dedupe_items(
         items, cap=None if args.no_cap else CNR_CAP, semantic=semantic
     )
+    # THE ROWS BEFORE THE MANIFEST: the manifest records a digest of what was
+    # written, so it cannot be built before the bytes exist. A manifest written
+    # first would have to name a file it had not seen.
+    written = write_jsonl(out_path, [item.row for item in kept])
+    write_jsonl(out_path.parent / DROPS_FILENAME, drops)
     manifest = manifest_of(
         stats,
         inputs=[str(p) for p in inputs],
+        outputs=[output_record(out_path, written)],
         upstream=upstream,
         semantic=semantic_status,
         semantic_detail=semantic_detail,
@@ -946,8 +969,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
     )
 
-    written = write_jsonl(out_path, [item.row for item in kept])
-    write_jsonl(out_path.parent / DROPS_FILENAME, drops)
     write_manifest(out_path.parent / MANIFEST_FILENAME, manifest)
     store = Store.open(paths.state_db)
     try:

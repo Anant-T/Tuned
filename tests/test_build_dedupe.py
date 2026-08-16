@@ -945,8 +945,18 @@ def test_the_cli_writes_rows_drops_and_a_manifest(tmp_path, capsys):
     assert (NGRAM, PROMPT_JACCARD, ROW_JACCARD, CNR_CAP, SEMANTIC_THRESHOLD) == (
         5, 0.85, 0.90, 3, 0.9
     )
-    assert manifest["dedupe_version"] == DEDUPE_VERSION == 3
+    assert manifest["dedupe_version"] == DEDUPE_VERSION == 4
     assert manifest["counts"]["total"] == 3
+    # The chain of custody DOWNSTREAM: split.py verifies its input against the
+    # digest recorded here, exactly as this pass verifies its own input against
+    # decontamination's. Version 3 recorded none, so the chain it asserts
+    # upstream stopped dead at this file.
+    from tuned.data.acquire import sha256_file
+
+    out_file = paths.out_dir / "deduped.jsonl"
+    assert manifest["outputs"] == [
+        {"path": str(out_file), "rows": 2, "sha256": sha256_file(out_file)}
+    ]
     assert "drop[exact]: 1" in out
     event = json.loads(Store.open(paths.state_db).events("dedupe")[0]["detail_json"])
     assert event["counts"]["kept"] == 2
