@@ -423,8 +423,9 @@ def gate_share(name: str, count: int, total: int, *, floor: float | None = None,
     # which is where the noise actually comes from (62/100 against 0.60 is
     # 2.0000000000000018 percentage points), and that is where the guard is.
     #
-    # The plan's bounds are INCLUSIVE (">= 80%", "18-22%"), so a corpus sitting
-    # exactly on one passes.
+    # The bounds are INCLUSIVE (">= 80%", "18-20%" as shipped - the plan's 22%
+    # ceiling was ruled down to the trace floor's complement), so a corpus
+    # sitting exactly on one passes.
     if floor is not None and share < floor:
         return Gate(name, RED, f"{body} - BELOW the floor", detail)
     if ceiling is not None and share > ceiling:

@@ -567,14 +567,20 @@ SCALE = 20
 
 
 def e2e_corpus() -> list[dict]:
-    """~100 rows across three streams, plus one that cannot fit the bucket.
+    """101 rows across three streams, one of which cannot fit the bucket.
 
-    Composed to sit inside every band at once, which is not automatic:
-    60/16/24 exactly on the mix, 19 byte-exact empty-think rows (19%, inside
-    both the configured 18-22% band and the 18-20% the trace floor really
-    allows), 81 reasoning rows, no duplicates, no markup, a license on every
-    row. Six two-row cases carry CNRs so the split has siblings to keep
-    together and dates to prefer; everything else is case-less.
+    Composed to sit inside every band at once, which is not automatic: of the
+    100 that survive assemble, 60/16/24 exactly on the mix, 19 byte-exact
+    empty-think rows (19%, inside the shipped 18-20% band) and 81 reasoning
+    rows (81%, over the 80% floor) - which is the identity, 19 + 81 = 100 - no
+    duplicates, no markup, a license on every row. Six two-row cases carry
+    CNRs so the split has siblings to keep together and dates to prefer;
+    everything else is case-less.
+
+    Nothing is dropped here except the over-length row: dedupe drops ZERO on
+    this corpus (the `drop[exact]: 1` belongs to the dup fixture below, which
+    feeds it a repeated row on purpose) and assemble's identity rule drops
+    zero, both pinned as their own tests.
     """
     rows: list[dict] = []
     for case in range(6):
@@ -659,7 +665,10 @@ def test_the_over_length_row_is_dropped_by_assemble_and_named(tmp_path):
     _codes, _report, paths = run_pipeline(tmp_path, e2e_corpus())
     drops = list(read_jsonl(paths.out_dir / "assemble_drops.jsonl"))
     assert [(d["side"], d["reason"]) for d in drops] == [("train", "over_length_bucket")]
-    assert drops[0]["tokens"] > 8192
+    # The VALUE, not just `> 8192`. A number nothing pins is a number a report
+    # can misquote and a fixture can drift out from under - which is what
+    # happened: the round-1 report said 11,180.
+    assert (drops[0]["tokens"], drops[0]["limit"]) == (11_120, 8192)
     # Dropped, not trimmed: the row is simply absent from the artifact.
     assert len(list(read_jsonl(paths.out_dir / "law_v1_train.jsonl"))) == 90
 
