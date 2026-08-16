@@ -3212,6 +3212,22 @@ def test_cli_hard_exits_after_success():
     assert "os._exit(" in EXTRACT_SRC.read_text(encoding="utf-8")
 
 
+def test_the_version_ledger_describes_the_version_the_module_ships():
+    # `extract_version` is the third resume input: rows written under older
+    # rules are re-extracted, rows at this version are left alone. So a rule
+    # change without a bump leaves a corpus the rules no longer produce - and
+    # a bump without a ledger entry leaves nobody able to say what the stale
+    # rows are stale FOR, which is the question `--force` or a targeted
+    # re-run turns on. Cross-checked against the comment rather than pinned
+    # to a literal: two independent statements of the same fact, and this
+    # fails when they drift apart in either direction.
+    source = EXTRACT_SRC.read_text(encoding="utf-8")
+    entries = [int(n) for n in re.findall(r"^#   (\d+)  ", source, re.M)]
+    assert entries == sorted(entries)
+    assert entries[-1] == EXTRACT_VERSION
+    assert entries[0] == 2  # version 1 predates the ledger and is not described
+
+
 def _write_selection(paths_obj, rows):
     from tuned.data.jsonl import write_jsonl
     from tuned.data.select import SELECTION_FILENAME

@@ -165,7 +165,19 @@ from tuned.data.select import SELECTION_FILENAME
 #      the emitted SET; neither moves the text of a document that is still
 #      emitted, so a version-2 row is stale in its verdict and not in its
 #      bytes. Re-extraction is still the only way to find that out.
-EXTRACT_VERSION = 3
+#   4  FIRST CONTACT WITH THE REAL OBJECTS, and every version-3 row is stale
+#      in its verdict AND in its bytes. The reader is pinned to one lane
+#      (versions 1-3 could not read a PDF at all, and the lane the library
+#      would have chosen gives different verdicts); the demoter strips the
+#      inline HTML the reader really emits, which is what was hiding
+#      `Case Law Reference` and the `Judgment` heading; footnote splitting
+#      no longer carries a paragraph high-water mark across pages, which is
+#      what was moving real paragraphs to the foot of the file; the running-
+#      head pass fires at all; two marker phrasings and one `$`-anchored
+#      heading are recognised; and two structural quarantines are new. The
+#      row also now records WHICH READER made it, because the verdict is a
+#      function of that too.
+EXTRACT_VERSION = 4
 
 TEXT_DIRNAME = "text"
 EXTRACTION_FILENAME = "extraction.jsonl"
