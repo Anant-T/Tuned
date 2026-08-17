@@ -597,26 +597,48 @@ def test_the_whole_flow_runs_on_synthetic_gold(store, cfg, tmp_path):
     assert event["disqualified"] == [JUDGE_BAD]
 
 
-def test_a_second_calibration_supersedes_the_first_without_losing_it(store, cfg):
+def test_a_later_calibration_supersedes_the_earlier_one_without_losing_it(store, cfg):
+    """The superseded fit survives with active = 0.
+
+    The stamp is passed EXPLICITLY rather than taken from the clock. Written
+    the obvious way - two run_calibration calls back to back - this test raced
+    the Windows clock granularity (~15.6ms), which is coarser than two
+    60-row calibrations: the two stamps came out identical, the ids collided
+    and INSERT OR REPLACE folded them into one row. That made the test flaky
+    rather than wrong - identical fits collapsing to one row IS correct, and
+    the property worth pinning is that a fit which DIFFERS keeps its
+    predecessor.
+    """
     labels = _seed_store(store, n=60)
-    store.upsert_gold_labels(
-        C.assign_folds(labels, folds=cfg.calibration.folds, holdout=12)
-    )
-    C.run_calibration(store, cfg)
-    active_first = store.judge_thresholds(active_only=True)
-    assert active_first
-    C.run_calibration(store, cfg)
-    active_second = store.judge_thresholds(active_only=True)
-    # Exactly one live calibration per model, and the superseded rows are
-    # still there to read the new one against. A calib_id built without the
-    # timestamp would have REPLACED them and left only the current fit.
-    assert len(active_second) == len(active_first)
-    assert {row["calib_id"] for row in active_second}.isdisjoint(
-        {row["calib_id"] for row in active_first}
-    )
-    assert len(store.judge_thresholds(active_only=False)) == 2 * len(active_first)
-    assert all(row["active"] == 0 for row in store.judge_thresholds(active_only=False)
-               if row["calib_id"] in {r["calib_id"] for r in active_first})
+    store.upsert_gold_labels(C.assign_folds(labels, folds=cfg.calibration.folds, holdout=12))
+    calibration = C.calibrate(store, cfg)
+
+    first = C.threshold_rows(calibration, fitted_at="2026-08-17T09:00:00.000000Z")
+    second = C.threshold_rows(calibration, fitted_at="2026-08-17T10:00:00.000000Z")
+    assert first and len(first) == len(second)
+    assert {row["calib_id"] for row in first}.isdisjoint({row["calib_id"] for row in second})
+
+    store.record_judge_thresholds(first)
+    store.record_judge_thresholds(second)
+    live = store.judge_thresholds(active_only=True)
+    everything = store.judge_thresholds(active_only=False)
+    assert {row["calib_id"] for row in live} == {row["calib_id"] for row in second}
+    assert len(everything) == len(first) + len(second)
+    superseded = [row for row in everything if row["calib_id"] in {r["calib_id"] for r in first}]
+    assert superseded and all(row["active"] == 0 for row in superseded)
+
+
+def test_the_same_fit_at_the_same_instant_is_one_row_not_two(store, cfg):
+    # The other side of the id rule: nothing is lost by collapsing two
+    # byte-identical fits stamped the same, because there is only one fit.
+    labels = _seed_store(store, n=60)
+    store.upsert_gold_labels(C.assign_folds(labels, folds=cfg.calibration.folds, holdout=12))
+    calibration = C.calibrate(store, cfg)
+    rows = C.threshold_rows(calibration, fitted_at="2026-08-17T09:00:00.000000Z")
+    store.record_judge_thresholds(rows)
+    store.record_judge_thresholds(rows)
+    assert len(store.judge_thresholds(active_only=False)) == len(rows)
+    assert all(row["active"] == 1 for row in store.judge_thresholds(active_only=False))
 
 
 def test_the_export_is_the_same_180_rows_every_time(store, cfg):

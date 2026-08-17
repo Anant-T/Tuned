@@ -160,6 +160,25 @@ def test_the_draw_covers_every_family_and_every_posture_pair(selection, grid):
     assert len(pairs) == len(T.DATE_POSTURES) * len(T.PROCEDURAL_POSTURES) == 20
 
 
+def test_the_draw_is_stratified_and_not_merely_covering(selection):
+    """Every posture pair PRESENT is the weak claim; the brief asks for a
+    stratified sample, which is the even one.
+
+    Found by mutation: collapsing coverage_stride to 1 leaves every coverage
+    assertion above green - 1 is coprime with 80, so the sweep is still a
+    permutation and all 20 pairs and all 80 triples still appear - while the
+    per-pair counts go from 50-62 to 35-63. Presence was tested and EVENNESS
+    was not, so the mutant lived in the gap between them. Measured ratio is
+    1.24 with the real stride and 1.80 with the collapsed one.
+    """
+    counts: dict[tuple[str, str], int] = {}
+    for cell in selection.sample:
+        key = (cell.date_posture.name, cell.procedural_posture.name)
+        counts[key] = counts.get(key, 0) + 1
+    assert len(counts) == 20
+    assert max(counts.values()) / min(counts.values()) <= 1.5, counts
+
+
 def test_the_reserve_is_disjoint_from_the_sample_by_construction(selection):
     reserve = {c.cell_id for c in selection.reserve}
     sample = {c.cell_id for c in selection.sample}
