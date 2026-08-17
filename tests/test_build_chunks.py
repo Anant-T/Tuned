@@ -641,18 +641,72 @@ def test_predex_and_tathyanyaya_rows_are_never_touched_by_the_seed_driver(seed_s
 # --------------------------------------------------------------------------
 
 
-def test_the_real_pinned_tokenizer_counts_tokens_the_same_way_the_fake_claims():
-    transformers = pytest.importorskip("transformers")
-    from tuned.data.config import load_build_config
+def _real_pinned_tokenizer():
+    """The pinned tokenizer, however this machine can reach it.
 
+    Prefers transformers.AutoTokenizer. Falls back to loading the pinned
+    snapshot's tokenizer.json through `tokenizers` directly, which is the
+    exact backend AutoTokenizer would have wrapped for a fast-tokenizer-only
+    repo - because transformers is not importable in this environment and
+    the guard below is the ONLY check that the token counts this module
+    records are the counts the real tokenizer produces. Skipping it here
+    means it never runs anywhere.
+    """
     cfg = load_build_config("configs/data_law_v1.yaml")
-    tok = transformers.AutoTokenizer.from_pretrained(cfg.model_repo, revision=cfg.model_revision)
+    try:
+        import transformers
+    except ImportError:
+        pass
+    else:
+        return transformers.AutoTokenizer.from_pretrained(
+            cfg.model_repo, revision=cfg.model_revision
+        )
+
+    tokenizers = pytest.importorskip("tokenizers")
+    root = Path(os.environ.get("HF_HUB_CACHE") or Path.home() / ".cache/huggingface/hub")
+    snapshot = (
+        root / f"models--{cfg.model_repo.replace('/', '--')}" / "snapshots" / cfg.model_revision
+    )
+    if not (snapshot / "tokenizer.json").exists():
+        pytest.skip(f"pinned tokenizer snapshot not in the hub cache: {snapshot}")
+
+    inner = tokenizers.Tokenizer.from_file(str(snapshot / "tokenizer.json"))
+    inner.no_truncation()
+    inner.no_padding()
+
+    class _Pinned:
+        def encode(self, text, add_special_tokens=False):
+            return inner.encode(text, add_special_tokens=add_special_tokens).ids
+
+    return _Pinned()
+
+
+def test_the_real_pinned_tokenizer_counts_tokens_the_same_way_the_fake_claims():
+    tok = _real_pinned_tokenizer()
     text = numbered_paragraphs([300] * 4)
     segments = segment_document(text).segments
     chunks = pack_chunks(text, segments, tok)
     assert chunks
     for chunk in chunks:
         assert chunk.token_count == len(tok.encode(chunk.text, add_special_tokens=False))
+
+
+def test_the_real_pinned_tokenizer_sizes_a_chunk_whose_segments_do_not_align():
+    # L6 with the real tokenizer rather than a constructed one: a chunk
+    # whose internal segment boundaries fall MID-WORD is where the sum of
+    # the parts and the encoding of the whole diverge, and it is the shape
+    # the roles tier produces (its spans are not line-anchored). The recorded
+    # count has to be the second one.
+    tok = _real_pinned_tokenizer()
+    text = numbered_paragraphs([120] * 3)
+    cut = text.index("word") + 2  # mid-word, deliberately
+    segments = [Segment(0, cut, "a"), Segment(cut, len(text), "b")]
+    chunks = pack_chunks(text, segments, tok, max_tokens=10_000)
+    assert len(chunks) == 1
+    parts = sum(len(tok.encode(text[s.start : s.end], add_special_tokens=False)) for s in segments)
+    whole = len(tok.encode(chunks[0].text, add_special_tokens=False))
+    assert parts != whole, "fixture no longer straddles a token boundary"
+    assert chunks[0].token_count == whole
 
 
 # --------------------------------------------------------------------------
