@@ -496,6 +496,27 @@ def _push_of(raw: dict) -> PushCfg | None:
     repo_id = block["repo_id"]
     if not isinstance(repo_id, str) or not repo_id.strip():
         raise ValueError(f"push.repo_id must be a non-empty string, got {repo_id!r}")
+    # Control characters first, and named by SHAPE only - never echoed whole:
+    # a repo_id is written into refusal messages and printed output elsewhere
+    # in this pipeline, and a value carrying an embedded newline could forge
+    # a fake log line there. Every check after this one is safe to quote in
+    # full, because a string that reaches it is already known printable.
+    if not repo_id.isprintable():
+        raise ValueError(
+            f"push.repo_id contains a non-printable or control character "
+            f"({len(repo_id)} chars total) - the value itself is never echoed here; "
+            f"fix it in the config"
+        )
+    if repo_id != repo_id.strip():
+        raise ValueError(
+            f"push.repo_id must not carry leading/trailing whitespace, got {repo_id!r}"
+        )
+    halves = repo_id.split("/")
+    if len(halves) != 2 or not halves[0] or not halves[1]:
+        raise ValueError(
+            f"push.repo_id must be `namespace/name` (exactly one `/`, both halves "
+            f"non-empty), got {repo_id!r}"
+        )
     private = block.get("private", True)
     # Strict, like assembly.gates' toggles: bool("false") is True, so a quoted
     # "false" here would make a PRIVATE dataset repo PUBLIC, which is the one

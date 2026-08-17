@@ -15,11 +15,12 @@ from pipeline_fakes import paths_for, temp_config
 from test_build_config import _base_doc, _write
 from test_build_decontaminate import prose, row
 from test_build_assemble import FakeTokenizer
-from test_build_stats import SCALE, e2e_corpus, run_pipeline
+from test_build_stats import SCALE, e2e_corpus, run_pipeline, traced
 
 from tuned.data.acquire import sha256_file
 from tuned.data.assemble import main as assemble_main
 from tuned.data.config import PushCfg, load_build_config
+from tuned.data.decontaminate import SCRIPT_NONE
 from tuned.data.dedupe import main as dedupe_main
 from tuned.data.jsonl import read_jsonl, write_jsonl
 from tuned.data.push import (
@@ -29,6 +30,7 @@ from tuned.data.push import (
     README_FILENAME,
     TRAIN_FILENAME,
     CardDataMissing,
+    RemoteManifestCorrupt,
     build_manifest,
     bytes_refusal,
     chain_faults,
@@ -162,6 +164,39 @@ def test_repo_id_must_be_a_non_empty_string(tmp_path):
         load_build_config(_write(tmp_path, doc), allow_unpinned=True)
 
 
+def test_repo_id_rejects_leading_or_trailing_whitespace(tmp_path):
+    doc = _base_doc()
+    doc["push"] = {"repo_id": "  x/y  "}
+    with pytest.raises(ValueError, match="whitespace"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+def test_repo_id_must_be_namespace_slash_name(tmp_path):
+    doc = _base_doc()
+    doc["push"] = {"repo_id": "notarepo"}
+    with pytest.raises(ValueError, match="namespace/name"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+    doc["push"] = {"repo_id": "x/y/z"}
+    with pytest.raises(ValueError, match="namespace/name"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+    doc["push"] = {"repo_id": "/y"}
+    with pytest.raises(ValueError, match="namespace/name"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+def test_repo_id_rejects_control_characters_without_echoing_the_value(tmp_path):
+    doc = _base_doc()
+    suspect = "x/y\nevil-log-injection"
+    doc["push"] = {"repo_id": suspect}
+    with pytest.raises(ValueError) as exc_info:
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    message = str(exc_info.value)
+    assert "non-printable" in message or "control" in message
+    assert suspect not in message  # named by shape, never echoed whole
+
+
 def test_private_defaults_true_and_is_strict_about_yaml_booleans(tmp_path):
     doc = _base_doc()
     doc["push"] = {"repo_id": "x/y"}
@@ -232,6 +267,15 @@ def test_stats_refusal_on_an_incomplete_chain_even_when_green():
     assert msg is not None and "custody chain is incomplete" in msg and "decontamination" in msg
 
 
+def test_stats_refusal_on_a_non_green_verdict_even_with_no_red_gates():
+    """R1: `if red or report.get('verdict') != GREEN` is two clauses, not one
+    - a report with red == [] but a verdict that is not literally "green"
+    must still refuse, independent of whether anything is named in `red`."""
+    msg = stats_refusal(_report(red=[], verdict="yellow"), report_path=Path("x"),
+                        config_path="c.yaml")
+    assert msg is not None and "RED" in msg and "verdict is not green" in msg
+
+
 # --------------------------------------------------------------------------
 # bytes_refusal - pure, both directions.
 # --------------------------------------------------------------------------
@@ -288,6 +332,38 @@ def test_license_rows_refuses_when_counts_is_empty():
         license_rows({"gates": {"license": {"detail": {"counts": {}}}}})
 
 
+def test_license_rows_renders_an_explicit_unlicensed_row_when_non_zero():
+    """I2: `detail["unlicensed"]` sits in the same dict `detail["counts"]`
+    comes from - a card that renders one and drops the other under-reports
+    its own corpus (Licenses summing to 90 under `total: 100`, while Source
+    datasets says `unknown | 10` on the very same card)."""
+    report = {"gates": {"license": {"detail": {
+        "counts": {"Apache-2.0": 40, "CC-BY-4.0": 50}, "unlicensed": 10, "total": 100,
+    }}}}
+    rows = license_rows(report)
+    assert rows == [("Apache-2.0", 40), ("CC-BY-4.0", 50), ("unlicensed", 10)]
+    assert sum(count for _license, count in rows) == 100
+
+
+def test_license_rows_omits_the_unlicensed_row_when_zero():
+    report = {"gates": {"license": {"detail": {
+        "counts": {"Apache-2.0": 40, "CC-BY-4.0": 60}, "unlicensed": 0, "total": 100,
+    }}}}
+    rows = license_rows(report)
+    assert rows == [("Apache-2.0", 40), ("CC-BY-4.0", 60)]
+    assert "unlicensed" not in dict(rows)
+
+
+def test_license_rows_refuses_when_counts_and_unlicensed_do_not_sum_to_total():
+    """The table must sum to the total stats' report measured - enforced
+    here, not left for a human to notice a card that quietly under-reports."""
+    report = {"gates": {"license": {"detail": {
+        "counts": {"Apache-2.0": 40, "CC-BY-4.0": 50}, "unlicensed": 5, "total": 100,
+    }}}}
+    with pytest.raises(CardDataMissing, match="sum to 95, not the 100"):
+        license_rows(report)
+
+
 def test_mix_rows_reads_counts_shares_and_targets():
     report = {"gates": {"mix": {"detail": {
         "counts": {"replay": 24}, "shares": {"replay": 0.24}, "targets": {"replay": 0.24},
@@ -326,6 +402,31 @@ def test_decon_sections_separates_screened_waived_and_script_gaps():
 def test_decon_sections_on_an_empty_manifest_names_nothing():
     assert decon_sections(None) == ([], [], [])
     assert decon_sections({}) == ([], [], [])
+
+
+def test_decon_sections_gap_list_excludes_script_none_and_control_passed_no_index():
+    """I4: mirrors decontaminate.py:3336's own reader - a hole needs BOTH
+    "not screened" AND at least one item (eval_items or unscreened_rows) it
+    could have caught. SCRIPT_NONE's own manifest text ends "and not a hole",
+    and a script whose control PASSED but held no eval items was never a
+    hole either. A manifest with one true hole, one SCRIPT_NONE, and one
+    control-passed-no-index script must render exactly one gap line."""
+    scripts = {
+        "devanagari": {  # the true hole: unscreened, with items it could have caught
+            "control": "no discriminative power over this script",
+            "screened": False, "eval_items": 100, "unscreened_rows": 0,
+        },
+        SCRIPT_NONE: {  # counted, explicitly not a hole
+            "control": "no letters in these probes at all, so there is no eval question "
+                      "in them to miss - counted rather than screened, and not a hole",
+            "screened": False, "eval_items": 0, "unscreened_rows": 0,
+        },
+        "gujarati": {  # control passed, no index built - nothing to have missed
+            "control": "passed", "screened": False, "eval_items": 0, "unscreened_rows": 0,
+        },
+    }
+    _screened, _holes, gaps = decon_sections({"semantic_scripts": scripts})
+    assert [g[0] for g in gaps] == ["devanagari"]
 
 
 # --------------------------------------------------------------------------
@@ -391,6 +492,62 @@ def test_render_card_refuses_without_a_decon_version():
         render_card(report=report, decon={}, rows=rows, push_cfg=push_cfg, versions=versions)
 
 
+def _delete_rows(report):
+    del report["measurements"]["rows"]
+
+
+def _delete_sides(report):
+    del report["sides"]
+
+
+def _delete_profile(report):
+    del report["profile"]
+
+
+def _delete_tokenizer(report):
+    del report["tokenizer"]
+
+
+def _delete_license_gate(report):
+    del report["gates"]["license"]
+
+
+def _delete_mix_gate(report):
+    report["gates"]["mix"]["detail"]["targets"] = {}
+
+
+@pytest.mark.parametrize("mutate, match", [
+    (_delete_rows, "row count"),
+    (_delete_sides, "sides"),
+    (_delete_profile, "profile"),
+    (_delete_tokenizer, "tokenizer"),
+    (_delete_license_gate, "license"),
+    (_delete_mix_gate, "mix targets"),
+])
+def test_render_card_raises_named_for_every_missing_report_field(mutate, match):
+    """I3: render_card's own docstring promises every value either comes
+    from a real input or raises CardDataMissing naming the path - no third
+    behavior (a report missing `sides` must never render "train 0, eval 0"
+    beside a real total). Parametrized over every field the card prints:
+    delete its source, assert the named raise."""
+    report, decon, rows, push_cfg, versions = _card_fixture()
+    mutate(report)
+    with pytest.raises(CardDataMissing, match=match):
+        render_card(report=report, decon=decon, rows=rows, push_cfg=push_cfg, versions=versions)
+
+
+def test_render_card_raises_named_when_there_are_no_rows():
+    report, decon, _rows, push_cfg, versions = _card_fixture()
+    with pytest.raises(CardDataMissing, match="no rows"):
+        render_card(report=report, decon=decon, rows=[], push_cfg=push_cfg, versions=versions)
+
+
+def test_render_card_raises_named_when_the_decon_manifest_is_absent():
+    report, _decon, rows, push_cfg, versions = _card_fixture()
+    with pytest.raises(CardDataMissing, match="decon_version"):
+        render_card(report=report, decon=None, rows=rows, push_cfg=push_cfg, versions=versions)
+
+
 def test_render_card_appends_card_extra_when_given():
     report, decon, rows, push_cfg, versions = _card_fixture()
     card = render_card(report=report, decon=decon, rows=rows, push_cfg=push_cfg, versions=versions,
@@ -405,23 +562,72 @@ def test_render_card_appends_card_extra_when_given():
 def test_build_manifest_carries_versions_counts_and_outputs():
     report, decon, _rows, push_cfg, versions = _card_fixture()
     outputs = [{"path": "law_v1_train.jsonl", "rows": 90, "sha256": "a" * 64}]
+    chain = {"stage": "assemble", "assemble_version": 2,
+             "split": {"stage": "split", "split_version": 1,
+                       "dedupe": {"stage": "dedupe", "dedupe_version": 4,
+                                  "decontamination": {"stage": "decontaminate",
+                                                       "decon_version": 4}}}}
     manifest = build_manifest(report=report, decon=decon, push_cfg=push_cfg, versions=versions,
-                              outputs=outputs)
+                              outputs=outputs, chain=chain)
     assert manifest["push_version"] == PUSH_VERSION
     assert manifest["repo_id"] == "tantan01/tuned-law-v1-data"
     assert manifest["module_versions"] == versions
     assert manifest["counts"] == {"rows": 100, "train": 90, "eval": 10}
     assert manifest["outputs"] == outputs
     assert manifest["decontamination"]["eval_sets"]["aibe"]["allowed_missing"] is True
+    # I1: the whole chain, carried forward byte-for-byte - not a pointer.
+    assert manifest["chain"] == chain
+    assert manifest["chain"]["split"]["dedupe"]["decontamination"]["stage"] == "decontaminate"
 
 
 def test_same_uploaded_bytes_compares_outputs_only():
-    a = {"outputs": [{"path": "x", "sha256": "1"}, {"path": "y", "sha256": "2"}], "at": "t1"}
-    b = {"outputs": [{"path": "y", "sha256": "2"}, {"path": "x", "sha256": "1"}], "at": "t2"}
+    a = {"outputs": [{"path": TRAIN_FILENAME, "sha256": "1"}, {"path": EVAL_FILENAME, "sha256": "2"}],
+        "at": "t1"}
+    b = {"outputs": [{"path": EVAL_FILENAME, "sha256": "2"}, {"path": TRAIN_FILENAME, "sha256": "1"}],
+        "at": "t2"}
     assert same_uploaded_bytes(a, b) is True  # order-independent, timestamp-blind
-    c = {"outputs": [{"path": "x", "sha256": "DIFFERENT"}, {"path": "y", "sha256": "2"}]}
+    c = {"outputs": [{"path": TRAIN_FILENAME, "sha256": "DIFFERENT"},
+                     {"path": EVAL_FILENAME, "sha256": "2"}]}
     assert same_uploaded_bytes(a, c) is False
     assert same_uploaded_bytes(None, a) is False
+
+
+def test_same_uploaded_bytes_ignores_readme_and_stats_json_bytes():
+    """M2: README.md and stats.json both embed the stats report's own `at`
+    timestamp, so their bytes differ on every re-run even over byte-identical
+    train/eval data - comparing them would turn "same corpus" into "always
+    re-upload" on a stats-only re-run. Only the two data files decide."""
+    a = {"outputs": [
+        {"path": TRAIN_FILENAME, "sha256": "1"}, {"path": EVAL_FILENAME, "sha256": "2"},
+        {"path": README_FILENAME, "sha256": "readme-v1"},
+        {"path": REPORT_FILENAME, "sha256": "stats-v1"},
+    ]}
+    b = {"outputs": [
+        {"path": TRAIN_FILENAME, "sha256": "1"}, {"path": EVAL_FILENAME, "sha256": "2"},
+        {"path": README_FILENAME, "sha256": "readme-v2-different-timestamp"},
+        {"path": REPORT_FILENAME, "sha256": "stats-v2-different-timestamp"},
+    ]}
+    assert same_uploaded_bytes(a, b) is True
+
+
+def test_same_uploaded_bytes_raises_named_on_a_non_dict_remote_manifest():
+    """M3: a corrupt remote manifest is a named refusal, not a crash."""
+    with pytest.raises(RemoteManifestCorrupt, match="not a JSON object"):
+        same_uploaded_bytes(["not", "a", "dict"], {"outputs": []})
+
+
+def test_same_uploaded_bytes_raises_named_when_outputs_is_not_a_list():
+    with pytest.raises(RemoteManifestCorrupt, match="outputs is not a list"):
+        same_uploaded_bytes({"outputs": "nope"}, {"outputs": []})
+
+
+def test_same_uploaded_bytes_raises_named_on_a_malformed_outputs_entry():
+    with pytest.raises(RemoteManifestCorrupt, match=r"outputs\[0\]"):
+        same_uploaded_bytes({"outputs": [{"path": "x"}]}, {"outputs": []})  # no sha256
+    with pytest.raises(RemoteManifestCorrupt, match=r"outputs\[0\]"):
+        same_uploaded_bytes({"outputs": ["not-a-dict"]}, {"outputs": []})
+    with pytest.raises(RemoteManifestCorrupt, match=r"outputs\[0\]"):
+        same_uploaded_bytes({"outputs": [{"path": None, "sha256": "1"}]}, {"outputs": []})
 
 
 # --------------------------------------------------------------------------
@@ -446,9 +652,19 @@ def test_dry_run_renders_a_green_card_and_manifest_with_measured_numbers(tmp_pat
     assert manifest["counts"] == {"rows": 100, "train": 90, "eval": 10}
     assert manifest["module_versions"] == {
         "decontaminate": 4, "dedupe": 4, "split": 1, "assemble": 2, "stats": 1, "push": 1,
+        "extract": "per-document in the build store (document.extract_version); "
+                  "not reachable from the file chain",
     }
     paths_out = {o["path"] for o in manifest["outputs"]}
-    assert paths_out == {TRAIN_FILENAME, EVAL_FILENAME, README_FILENAME}
+    assert paths_out == {TRAIN_FILENAME, EVAL_FILENAME, README_FILENAME, REPORT_FILENAME}
+    # I1: the custody chain carried forward, not a 3-field pointer.
+    assert manifest["chain"]["stage"] == "assemble"
+    assert manifest["chain"]["split"]["dedupe"]["decontamination"]["decon_version"] == 4
+    # A reader of the published set alone can reconstruct the card's
+    # screened/waived/per-script-gap claims straight off build_manifest.json:
+    assert manifest["decontamination"]["eval_sets"]["bbl"]["status"] == "ok"
+    assert manifest["decontamination"]["eval_sets"]["aibe"]["allowed_missing"] is True
+    assert manifest["decontamination"]["semantic_scripts"]["devanagari"]["screened"] is False
 
 
 def test_dry_run_refuses_when_stats_never_ran(tmp_path):
@@ -490,12 +706,17 @@ def test_dry_run_refuses_when_the_chain_is_incomplete_even_though_stats_is_green
     assert code == 2  # push refuses anyway
 
 
-def test_dry_run_refuses_when_a_file_was_rewritten_after_stats_graded_it(tmp_path):
+@pytest.mark.parametrize("filename", [TRAIN_FILENAME, EVAL_FILENAME])
+def test_dry_run_refuses_when_a_file_was_rewritten_after_stats_graded_it(tmp_path, filename):
+    """R2: bytes_refusal's loop covers BOTH sides. The eval side is the half
+    of the corpus a leak would be planted in - before this test, nothing
+    tampered it, so a regression that dropped it from the loop would go
+    unnoticed."""
     cfg_path, _report, paths = green_pipeline(tmp_path)
-    train = paths.out_dir / TRAIN_FILENAME
-    rows = list(read_jsonl(train))
+    target = paths.out_dir / filename
+    rows = list(read_jsonl(target))
     rows[0]["messages"][1]["content"] += " tampered"
-    write_jsonl(train, rows)
+    write_jsonl(target, rows)
 
     code = push_main(["--config", cfg_path, "--dry-run"])
     assert code == 2
@@ -530,6 +751,10 @@ def test_module_versions_reads_every_reachable_stage(tmp_path):
     versions = module_versions(paths.out_dir, report)
     assert versions == {
         "decontaminate": 4, "dedupe": 4, "split": 1, "assemble": 2, "stats": 1, "push": 1,
+        # M1: extract.py's absence named, not silent - see module_versions'
+        # own docstring for why a string here changes nothing about the gate.
+        "extract": "per-document in the build store (document.extract_version); "
+                  "not reachable from the file chain",
     }
 
 
@@ -551,6 +776,57 @@ def test_a_config_with_no_push_block_refuses_by_name(tmp_path):
     assert code == 2
 
 
+def test_dry_run_refuses_when_the_report_does_not_name_exactly_two_inputs(tmp_path):
+    """R12: `if len(inputs) != 2` has no test - a stats report naming three
+    (or zero) input files must refuse by name rather than IndexError on
+    `inputs[1]`."""
+    cfg_path, _report, paths = green_pipeline(tmp_path)
+    report_path = paths.out_dir / REPORT_FILENAME
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["inputs"] = list(report["inputs"]) + ["extra.jsonl"]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    code = push_main(["--config", cfg_path, "--dry-run"])
+    assert code == 2
+
+
+def test_dry_run_refuses_when_push_card_extra_names_a_missing_file(tmp_path):
+    """R11: `if not extra_path.exists()` has no coverage at main() level."""
+    cfg_path, _report, paths = green_pipeline(tmp_path)
+    text = Path(cfg_path).read_text(encoding="utf-8")
+    patched = text.replace(
+        "push:\n  repo_id: tantan01/tuned-law-v1-data\n  private: true\n",
+        "push:\n  repo_id: tantan01/tuned-law-v1-data\n  private: true\n"
+        "  card_extra: nope/absent.md\n",
+    )
+    assert patched != text
+    Path(cfg_path).write_text(patched, encoding="utf-8")
+
+    code = push_main(["--config", cfg_path, "--dry-run"])
+    assert code == 2
+
+
+def test_dry_run_appends_card_extra_content_when_the_file_exists(tmp_path):
+    """R11's other half: the read-and-append path, also uncovered at main()
+    level before this."""
+    cfg_path, _report, paths = green_pipeline(tmp_path)
+    extra_path = paths.out_dir / "extra.md"
+    extra_path.write_text("EXTRA MARKER TEXT FROM CARD_EXTRA", encoding="utf-8")
+    text = Path(cfg_path).read_text(encoding="utf-8")
+    patched = text.replace(
+        "push:\n  repo_id: tantan01/tuned-law-v1-data\n  private: true\n",
+        f"push:\n  repo_id: tantan01/tuned-law-v1-data\n  private: true\n"
+        f"  card_extra: {extra_path.as_posix()}\n",
+    )
+    assert patched != text
+    Path(cfg_path).write_text(patched, encoding="utf-8")
+
+    code = push_main(["--config", cfg_path, "--dry-run"])
+    assert code == 0
+    readme = (paths.out_dir / README_FILENAME).read_text(encoding="utf-8")
+    assert "EXTRA MARKER TEXT FROM CARD_EXTRA" in readme
+
+
 # --------------------------------------------------------------------------
 # The live path, through the fake - upload, idempotence, and the missing
 # token refusal.
@@ -565,21 +841,39 @@ def test_missing_token_refuses_on_a_non_dry_run(tmp_path, monkeypatch):
 
 
 def test_a_live_push_uploads_through_the_fake_and_prints_the_revision(tmp_path, monkeypatch, capsys):
+    # M6: stub load_dotenv_keys so this test's HF_TOKEN monkeypatch is the
+    # only source of the token - load_dotenv_keys does os.environ.setdefault
+    # from inside the SUT, which monkeypatch cannot track or unwind.
+    monkeypatch.setattr("tuned.data.push.load_dotenv_keys", lambda *a, **kw: 0)
     monkeypatch.setenv("HF_TOKEN", "sk-test-dummy")
     cfg_path, _report, paths = green_pipeline(tmp_path)
+    from tuned.data.assemble import MANIFEST_FILENAME as ASSEMBLE_MANIFEST
+
+    on_disk_chain = json.loads((paths.out_dir / ASSEMBLE_MANIFEST).read_text(encoding="utf-8"))
     client = FakeHubClient()
     code = push_main(["--config", cfg_path], hub_client=client)
     assert code == 0
     assert client.ensure_calls == 1 and client.ensure_args == ("tantan01/tuned-law-v1-data", True)
     assert client.upload_calls == 1
+    # I1: stats.json now travels with the repo too, so the published set can
+    # corroborate the card's claims without reaching back to local disk.
     assert set(client.uploaded_files) == {TRAIN_FILENAME, EVAL_FILENAME, README_FILENAME,
-                                          MANIFEST_FILENAME}
+                                          MANIFEST_FILENAME, REPORT_FILENAME}
     out = capsys.readouterr().out
     assert "pushed tantan01/tuned-law-v1-data" in out
     assert "revision: rev1" in out
 
+    manifest = json.loads((paths.out_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    assert manifest["chain"] == on_disk_chain  # I1: carried forward byte-for-byte
+    assert manifest["chain"]["split"]["dedupe"]["decontamination"]["decon_version"] == 4
+    # The per-script gap claim the card makes is reconstructable too - not
+    # from `chain` (dedupe.py's own summary drops semantic_scripts), but from
+    # `decontamination` below, read off the same enriched manifest the card is.
+    assert manifest["decontamination"]["semantic_scripts"]["devanagari"]["screened"] is False
+
 
 def test_a_second_push_of_unchanged_bytes_is_a_no_op(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("tuned.data.push.load_dotenv_keys", lambda *a, **kw: 0)
     monkeypatch.setenv("HF_TOKEN", "sk-test-dummy")
     cfg_path, _report, paths = green_pipeline(tmp_path)
     client = FakeHubClient()
@@ -595,20 +889,79 @@ def test_a_second_push_of_unchanged_bytes_is_a_no_op(tmp_path, monkeypatch, caps
     assert "no-op" in out and "rev1" in out
 
 
-def test_changed_bytes_are_not_treated_as_a_no_op(tmp_path, monkeypatch):
-    """Idempotence is content-bound: a re-run over a DIFFERENT green corpus
-    uploads again rather than reusing the stale no-op path."""
+def test_a_stats_only_rerun_over_identical_bytes_is_still_a_no_op(tmp_path, monkeypatch):
+    """M2: idempotence must survive a stats.py re-run over byte-identical
+    data. Re-running ONLY stats.py regenerates stats.json (and therefore
+    README.md, which renders the report's own `at`) with a fresh timestamp
+    even though train.jsonl/eval.jsonl are untouched - same_uploaded_bytes
+    must still call that a no-op, derived from the corpus bytes, not the
+    report's clock."""
+    monkeypatch.setattr("tuned.data.push.load_dotenv_keys", lambda *a, **kw: 0)
     monkeypatch.setenv("HF_TOKEN", "sk-test-dummy")
     cfg_path, _report, paths = green_pipeline(tmp_path)
     client = FakeHubClient()
     assert push_main(["--config", cfg_path], hub_client=client) == 0
     assert client.upload_calls == 1
 
-    extra_rows = e2e_corpus() + [
-        row(prose(50_000, 30), prose(50_001, 25), source="synthesis", license="CC-BY-4.0",
-            reasoning=True)
-    ]
-    run_pipeline(tmp_path, extra_rows, cfg_path=cfg_path)
+    train_before = (paths.out_dir / TRAIN_FILENAME).read_bytes()
+    eval_before = (paths.out_dir / EVAL_FILENAME).read_bytes()
+    stats_before = (paths.out_dir / REPORT_FILENAME).read_text(encoding="utf-8")
+
+    assert stats_main(["--config", cfg_path], tokenizer=FakeTokenizer(SCALE)) == 0
+    assert (paths.out_dir / TRAIN_FILENAME).read_bytes() == train_before
+    assert (paths.out_dir / EVAL_FILENAME).read_bytes() == eval_before
+    stats_after = (paths.out_dir / REPORT_FILENAME).read_text(encoding="utf-8")
+    assert stats_after != stats_before  # the trap: a fresh `at`, same corpus
+
+    code = push_main(["--config", cfg_path], hub_client=client)
+    assert code == 0
+    assert client.upload_calls == 1  # NOT uploaded again - the corpus never changed
+
+
+def test_a_corrupt_remote_manifest_is_a_named_refusal_not_a_crash(tmp_path, monkeypatch, capsys):
+    """M3: data from outside this machine (the repo's own previous
+    build_manifest.json) must refuse by name, never crash with a bare
+    TypeError/AttributeError."""
+    monkeypatch.setattr("tuned.data.push.load_dotenv_keys", lambda *a, **kw: 0)
+    monkeypatch.setenv("HF_TOKEN", "sk-test-dummy")
+    cfg_path, _report, _paths = green_pipeline(tmp_path)
+    client = FakeHubClient(existing_manifest={"outputs": "not-a-list"}, existing_revision="rev0")
+
+    code = push_main(["--config", cfg_path], hub_client=client)
+    assert code == 2
+    out = capsys.readouterr().out
+    assert "REFUSES TO RUN" in out and "outputs is not a list" in out
+    assert client.upload_calls == 0
+
+
+def test_changed_bytes_are_not_treated_as_a_no_op(tmp_path, monkeypatch):
+    """Idempotence is content-bound: a re-run over a DIFFERENT green corpus
+    uploads again rather than reusing the stale no-op path.
+
+    The extra row must be one that actually SURVIVES assemble.py (a real
+    <think> scaffold via `traced()`, not a bare `row()` with no scaffold at
+    all, which assemble.py's own no_think_scaffold filter drops) - now that
+    M2 measures idempotence off train/eval bytes alone, a row that never
+    reaches the shipped files would make this test pass for the wrong
+    reason: the "different" corpus would ship byte-identical either way.
+    """
+    monkeypatch.setattr("tuned.data.push.load_dotenv_keys", lambda *a, **kw: 0)
+    monkeypatch.setenv("HF_TOKEN", "sk-test-dummy")
+    cfg_path, _report, paths = green_pipeline(tmp_path)
+    client = FakeHubClient()
+    assert push_main(["--config", cfg_path], hub_client=client) == 0
+    assert client.upload_calls == 1
+
+    train_before = (paths.out_dir / TRAIN_FILENAME).read_bytes()
+    eval_before = (paths.out_dir / EVAL_FILENAME).read_bytes()
+
+    extra_rows = e2e_corpus() + [traced(50_000, source="synthesis", license_="CC-BY-4.0")]
+    codes, report, _paths = run_pipeline(tmp_path, extra_rows, cfg_path=cfg_path)
+    assert codes == {"dedupe": 0, "split": 0, "assemble": 0, "stats": 0}
+    assert report["verdict"] == "green" and report["red"] == []
+    # The trap this test is for: the corpus really did change on disk.
+    assert (paths.out_dir / TRAIN_FILENAME).read_bytes() != train_before or \
+        (paths.out_dir / EVAL_FILENAME).read_bytes() != eval_before
     enrich_decon(paths)
     assert push_main(["--config", cfg_path], hub_client=client) == 0
     assert client.upload_calls == 2

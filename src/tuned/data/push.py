@@ -68,10 +68,16 @@ IDEMPOTENCE
 -----------
 A re-run against unchanged inputs is a no-op, not a duplicate upload: before
 touching the repo, push.py asks the client for the repo's current
-`build_manifest.json` (`current_manifest`) and compares its `outputs` (path,
-sha256 pairs) against the manifest it just built locally. An exact match
-prints the existing revision and returns without calling `ensure_repo` or
-`upload` at all.
+`build_manifest.json` (`current_manifest`) and compares outputs against the
+manifest it just built locally. An exact match prints the existing revision
+and returns without calling `ensure_repo` or `upload` at all. The comparison
+is over `law_v1_train.jsonl`/`law_v1_eval.jsonl` ONLY - the actual corpus
+bytes - never `README.md` or `stats.json`: both embed the stats report's own
+`at` timestamp, so a stats.py re-run over byte-identical rows would still
+change THEIR bytes on every push, turning "same corpus" into "always
+re-upload" and defeating the instrument. A malformed remote manifest (data
+from outside this machine, not from this run) is a named refusal
+(`RemoteManifestCorrupt`), never a crash.
 
 Build:  python -m tuned.data.push --config configs/data_law_v1.yaml
         [--dry-run] [--report PATH] [--out DIR]
@@ -208,16 +214,25 @@ def bytes_refusal(report: dict, *, train_path: Path, eval_path: Path) -> str | N
 # Module versions, read straight off the files this chain writes.
 # --------------------------------------------------------------------------
 
-def module_versions(out_dir: Path, report: dict) -> dict[str, int | None]:
+def module_versions(out_dir: Path, report: dict) -> dict[str, int | str | None]:
     """Every module version reachable from push.py's own inputs.
 
-    NOT extract.py: `extract_version` lives per-document in the SQLite store
-    (store.py's `document` table), and nothing in the file-based manifest
-    chain push.py reads - decontamination.json, dedupe.json, split.json,
-    assemble.json, stats.json - carries it forward. `_prov` on a built row is
-    exactly `{source, license, native_id, reasoning}` (see split.py's module
-    docstring, measured against every row builder this pipeline ships), so a
-    push.py that claimed an extract_version would be inventing one.
+    NOT a real version for extract.py: `extract_version` lives per-document in
+    the SQLite store (store.py's `document` table), and nothing in the
+    file-based manifest chain push.py reads - decontamination.json,
+    dedupe.json, split.json, assemble.json, stats.json - carries it forward.
+    Row builders do not even agree on one `_prov` shape to read it off of
+    (curated.py and replay.py write `license`; `decontaminate.generated_rows`
+    does not - see `license_rows`, which has to account for that gap), but
+    NONE of them writes extract_version either, so push.py that claimed one
+    would be inventing it regardless.
+
+    That absence is named here rather than left silent: `build_manifest.json`
+    is the only provenance file that leaves the machine, and a reader on the
+    Hub cannot otherwise tell "extraction was unversioned" from "extraction's
+    version lives somewhere this file cannot reach." `version_faults` (the
+    caller in `main()`) only refuses on `None`, so a string here changes
+    nothing about the terminal gate.
     """
     decon = read_manifest(out_dir / DECON_MANIFEST_FILENAME)
     dedupe = read_manifest(out_dir / DEDUPE_MANIFEST_FILENAME)
@@ -230,6 +245,8 @@ def module_versions(out_dir: Path, report: dict) -> dict[str, int | None]:
         "assemble": (assemble or {}).get("assemble_version"),
         "stats": report.get("stats_version"),
         "push": PUSH_VERSION,
+        "extract": "per-document in the build store (document.extract_version); "
+                   "not reachable from the file chain",
     }
 
 
@@ -250,10 +267,34 @@ def _gate_detail(report: dict, gate: str) -> dict:
 
 
 def license_rows(report: dict) -> list[tuple[str, int]]:
-    counts = _gate_detail(report, "license").get("counts")
+    """The Licenses table - every row stats measured, none dropped.
+
+    `detail["unlicensed"]` sits in the SAME dict `detail["counts"]` comes
+    from (`stats.gate_license`); rendering one and discarding the other is
+    how a card under-reports its own corpus - the Source datasets table
+    (`source_license_rows`) already renders these rows as `unknown`, so a
+    Licenses table that silently sums short of `total` disagrees with a
+    table on the same card. Live path: `decontaminate.generated_rows` writes
+    `_prov` with no `license` key at all, so this is not hypothetical - it is
+    the entire `grounded_synthesis` stream whenever `require_license: false`.
+    """
+    detail = _gate_detail(report, "license")
+    counts = detail.get("counts")
     if not counts:
         raise CardDataMissing("stats' report carries no license counts")
-    return sorted(counts.items())
+    rows = dict(counts)
+    unlicensed = detail.get("unlicensed") or 0
+    if unlicensed:
+        rows["unlicensed"] = unlicensed
+    total = detail.get("total")
+    measured = sum(rows.values())
+    if total is not None and measured != total:
+        raise CardDataMissing(
+            f"license rows ({dict(sorted(rows.items()))}) sum to {measured}, not the "
+            f"{total} rows stats' report measured - the license gate's counts and "
+            f"unlicensed total do not add up to its own total"
+        )
+    return sorted(rows.items())
 
 
 def mix_rows(report: dict) -> list[tuple[str, int, float, float]]:
@@ -311,7 +352,15 @@ def decon_sections(
     gaps = [
         (script, entry.get("control"), entry.get("eval_items"))
         for script, entry in sorted(scripts.items())
-        if not entry.get("screened")
+        # Mirrors decontaminate.py's own reader (decontaminate.py:3336): a
+        # hole needs BOTH "not screened" AND at least one item it could have
+        # caught. `not entry.get("screened")` alone also catches SCRIPT_NONE
+        # (whose own manifest text ends "and not a hole" - no letters, so no
+        # eval question in it to miss) and a script whose control PASSED but
+        # held no eval items at all (nothing built, nothing to have missed) -
+        # neither is a gap, and printing them under "Per-script gaps" states
+        # a reason that contradicts the manifest.
+        if not entry.get("screened") and (entry.get("eval_items") or entry.get("unscreened_rows"))
     ]
     return screened, holes, gaps
 
@@ -324,8 +373,15 @@ def render_card(
     rows_total = report.get("measurements", {}).get("rows")
     if rows_total is None:
         raise CardDataMissing("stats' report carries no row count")
-    sides = report.get("sides") or {}
-    tokenizer = report.get("tokenizer") or {}
+    sides = report.get("sides")
+    if not sides:
+        raise CardDataMissing("stats' report carries no sides (train/eval split)")
+    profile = report.get("profile")
+    if profile is None:
+        raise CardDataMissing("stats' report carries no profile")
+    tokenizer = report.get("tokenizer")
+    if not tokenizer:
+        raise CardDataMissing("stats' report carries no tokenizer")
     licenses = license_rows(report)
     mix = mix_rows(report)
     sources = source_license_rows(rows)
@@ -348,7 +404,7 @@ def render_card(
     lines.append(
         f"- total: {rows_total} (train {sides.get('train', 0)}, eval {sides.get('eval', 0)})"
     )
-    lines.append(f"- mix profile graded: `{report.get('profile')}`")
+    lines.append(f"- mix profile graded: `{profile}`")
     lines.append(f"- tokenizer: `{tokenizer.get('repo')}` @ `{tokenizer.get('revision')}`")
     lines.append("")
     lines.append("## Mix")
@@ -445,6 +501,7 @@ def render_card(
 
 def build_manifest(
     *, report: dict, decon: dict | None, push_cfg, versions: dict, outputs: Sequence[dict],
+    chain: dict | None,
 ) -> dict:
     from tuned.data.store import utcnow
 
@@ -463,32 +520,101 @@ def build_manifest(
         "tokenizer": report.get("tokenizer"),
         # Every module version this run could reach - see module_versions.
         "module_versions": versions,
-        # A pointer back to the report that authorised this push, not a copy
-        # of the whole thing: the report itself travels alongside it in the
-        # repo (nothing here duplicates stats.json's content).
+        # The custody chain, carried forward the way the rest of this pipeline
+        # does: assemble.json["split"] is the WHOLE split.json, and
+        # split.json["dedupe"] is the WHOLE dedupe.json (split.py's own
+        # comment: "carried whole rather than summarised"). One level deeper,
+        # dedupe.json["decontamination"] is NOT the whole decontamination.json
+        # - dedupe.py deliberately narrows it to a custody-verification
+        # summary (`at`/`decon_version`/`counts`/`eval_sets`/`semantic`, no
+        # `semantic_scripts`) - so this field alone cannot reconstruct the
+        # card's per-script gap claims. `decontamination` below closes that
+        # gap directly from the same enriched decon manifest the card itself
+        # reads, rather than reaching through dedupe.py's summary.
+        "chain": chain,
+        # A pointer back to the report that authorised this push (its own
+        # `at`/`verdict`/`red`, not the whole thing - `chain` above already
+        # carries most of the custody tree). `stats.json` itself now travels
+        # in the uploaded set too (see main()), so this pointer's `at` can be
+        # cross-checked against the file sitting right beside it in the repo.
         "stats_report": {
             "at": report.get("at"), "verdict": report.get("verdict"), "red": report.get("red"),
         },
+        # The full detail behind the card's "Decontamination" section -
+        # screened/waived eval sets AND per-script semantic gaps - read off
+        # the SAME `decon` manifest render_card() does, so this can never
+        # drift from what the card actually claims. `chain` above cannot
+        # substitute for this: see the comment there.
         "decontamination": {
             "decon_version": (decon or {}).get("decon_version"),
             "eval_sets": {
-                key: {"status": v.get("status"), "allowed_missing": v.get("allowed_missing")}
+                key: {
+                    "status": v.get("status"), "allowed_missing": v.get("allowed_missing"),
+                    "items": v.get("items"),
+                }
                 for key, v in ((decon or {}).get("eval_sets") or {}).items()
             },
+            "semantic_scripts": (decon or {}).get("semantic_scripts") or {},
         },
-        # sha256 of every uploaded file. This IS the idempotence instrument:
-        # same_uploaded_bytes compares exactly this list against the repo's
-        # own previous build_manifest.json.
+        # sha256 of every uploaded file - the full audit record. NOT what
+        # idempotence is measured against (see same_uploaded_bytes): README
+        # and stats.json both embed the report's own timestamp, so listing
+        # them here is provenance, not the instrument.
         "outputs": list(outputs),
     }
 
 
+class RemoteManifestCorrupt(RuntimeError):
+    """The repo's own build_manifest.json is not shaped like one this module
+    wrote. That manifest comes from OUTSIDE this machine - refuse rather than
+    let a malformed shape crash with a bare TypeError/AttributeError, the way
+    every other input this module reads already refuses on."""
+
+
+# The only outputs idempotence is measured against: the actual corpus bytes.
+# README.md and stats.json both render the stats report's own `at`
+# timestamp into their content, so a stats.py re-run over byte-identical
+# rows still changes THEIR sha256 - comparing them would defeat "unchanged
+# input set -> no-op" on every re-run, not just ones that changed the corpus.
+_CONTENT_OUTPUTS = frozenset({TRAIN_FILENAME, EVAL_FILENAME})
+
+
 def same_uploaded_bytes(current: dict | None, manifest: dict) -> bool:
+    """True when `current` (the repo's own last build_manifest.json) already
+    carries the same train/eval bytes as `manifest` (the one this run just
+    built). Raises RemoteManifestCorrupt if `current`'s shape cannot be read
+    at all - see the class docstring for why that is a refusal, not a crash.
+    """
     if current is None:
         return False
+    if not isinstance(current, dict):
+        raise RemoteManifestCorrupt(
+            f"the repo's build_manifest.json is not a JSON object (found "
+            f"{type(current).__name__})"
+        )
+    outputs = current.get("outputs")
+    if not isinstance(outputs, list):
+        raise RemoteManifestCorrupt(
+            f"the repo's build_manifest.json's outputs is not a list (found "
+            f"{type(outputs).__name__})"
+        )
+    for i, o in enumerate(outputs):
+        if (
+            not isinstance(o, dict)
+            or not isinstance(o.get("path"), str)
+            or not isinstance(o.get("sha256"), str)
+        ):
+            raise RemoteManifestCorrupt(
+                f"the repo's build_manifest.json's outputs[{i}] is not a "
+                f"{{path, sha256}} pair (found {o!r})"
+            )
 
     def key(m: dict) -> list[tuple]:
-        return sorted((o.get("path"), o.get("sha256")) for o in (m.get("outputs") or []))
+        return sorted(
+            (o.get("path"), o.get("sha256"))
+            for o in (m.get("outputs") or [])
+            if o.get("path") in _CONTENT_OUTPUTS
+        )
 
     return key(current) == key(manifest)
 
@@ -614,6 +740,9 @@ def main(argv: Sequence[str] | None = None, *, hub_client=None) -> int:
         return 2
 
     decon = read_manifest(paths.out_dir / DECON_MANIFEST_FILENAME)
+    # The whole custody chain, carried forward - assemble.json already nests
+    # split.json, which nests dedupe.json, which nests decontamination.json.
+    chain = read_manifest(paths.out_dir / ASSEMBLE_MANIFEST_FILENAME)
     versions = module_versions(paths.out_dir, report)
     version_faults = sorted(name for name, v in versions.items() if v is None and name != "push")
     if version_faults:
@@ -659,9 +788,14 @@ def main(argv: Sequence[str] | None = None, *, hub_client=None) -> int:
         {"path": EVAL_FILENAME, "rows": (report.get("sides") or {}).get("eval", 0),
          "sha256": sha256_file(eval_path)},
         {"path": README_FILENAME, "sha256": sha256_file(readme_path)},
+        # stats.json travels with the repo now too, so the `stats_report`
+        # pointer in build_manifest.json points at a file actually sitting
+        # beside it - not one that only exists on the operator's disk.
+        {"path": STATS_REPORT_FILENAME, "sha256": sha256_file(report_path)},
     ]
     manifest = build_manifest(
         report=report, decon=decon, push_cfg=cfg.push, versions=versions, outputs=outputs,
+        chain=chain,
     )
     write_manifest(manifest_path, manifest)
 
@@ -685,7 +819,17 @@ def main(argv: Sequence[str] | None = None, *, hub_client=None) -> int:
 
     client = hub_client if hub_client is not None else RealHubClient(token)
     current, current_revision = client.current_manifest(cfg.push.repo_id)
-    if same_uploaded_bytes(current, manifest):
+    try:
+        unchanged = same_uploaded_bytes(current, manifest)
+    except RemoteManifestCorrupt as exc:
+        print(
+            f"push REFUSES TO RUN: {exc}.\n"
+            f"  remedy: inspect {cfg.push.repo_id}'s build_manifest.json by hand, or delete "
+            f"it and let this push recreate it\n"
+            f"  nothing was uploaded."
+        )
+        return 2
+    if unchanged:
         print(f"push: {cfg.push.repo_id} already carries these exact bytes - no-op.")
         print(f"revision: {current_revision}")
         return 0
@@ -696,6 +840,7 @@ def main(argv: Sequence[str] | None = None, *, hub_client=None) -> int:
         {
             TRAIN_FILENAME: train_path, EVAL_FILENAME: eval_path,
             README_FILENAME: readme_path, MANIFEST_FILENAME: manifest_path,
+            STATS_REPORT_FILENAME: report_path,
         },
         commit_message=f"push_version {PUSH_VERSION}: {report.get('sides')}",
     )
