@@ -488,10 +488,21 @@ class QuestionForm:
 # grounding text, and a trace that echoed thirty characters of it would trip
 # the verbatim gate on a sentence this module wrote rather than on anything
 # the teacher copied.
+# It says "the ANSWER too" in as many words, because the version that did not
+# was read - correctly - as licensing exactly the artefact it exists to
+# prevent: the recorded effect HAS been shown, so "do not quote words you have
+# not been shown" left quoting it as enacted text permitted, and an answer that
+# did so passed every gate. gates.check_statutory_quotation is the other half;
+# a caution the gates do not enforce is a request, and a gate the prompt does
+# not warn about is a trap.
 NO_QUOTATION_CAUTION = (
     "You have been given each provision's identity and the effect this build's statute "
     "table records for it, not the section as enacted. Do not quote words you have not "
-    "been shown, and do not name any provision that is not before you."
+    "been shown, and do not name any provision that is not before you. The recorded "
+    "effect is this build's statement of the rule and not the section's words, so do not "
+    "present it - or any words at all - as text quoted from a section: no quotation marks "
+    "attributed to a provision, in your reasoning or in your answer. State the effect in "
+    "your own words and name the section you take it from."
 )
 
 QUESTION_FORMS = (

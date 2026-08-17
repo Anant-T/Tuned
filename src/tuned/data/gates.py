@@ -60,6 +60,7 @@ from tuned.data.statutes import (
     extract_sections,
     normalize_number,
     resolve_code,
+    statute_pattern,
 )
 
 # The two task.stream values that change gate behaviour.
@@ -74,6 +75,7 @@ GATE_ORDER = (
     "self_verification",
     "irac_placement",
     "verbatim_overlap",
+    "statutory_quotation",
     "banned_meta",
     "answer_key",
 )
@@ -212,6 +214,39 @@ _CLAUSE_BREAK_RE = re.compile(r"[.;:!?]\s")
 # Shingle stride for the verbatim scan; see find_verbatim_run.
 SHINGLE_STEP = 10
 DEFAULT_MAX_RUN = 30
+
+# A QUOTATION ATTRIBUTED TO A SECTION, which on the transition stream is a
+# thing no row may carry. This repository holds no bare-act corpus: what a
+# transition prompt shows the teacher is each provision's identity, its
+# marginal note, and the OPERATIVE EFFECT this build's statute table records
+# for it, labelled in the teacher's own words as not a quotation. So a span in
+# quotation marks attributed to a section is either the build's paraphrase
+# passed off as enacted words or words from nowhere at all, and nothing in the
+# repository could tell the two apart. The form is refused outright.
+#
+# Measured before this gate existed: an answer reading `Section 358(2) ...
+# provides: "The repeal of the Indian Penal Code, 1860 does not affect any
+# right, privilege, obligation or liability ..."` passed all nine gates clean.
+# The identical lift inside the TRACE was caught by verbatim_overlap, so the
+# hole was the answer side exactly.
+#
+# Three shapes make an attribution, and all three are needed:
+#   a quoted span,
+#   a section named before it - by number ("Section 358(2) of the BNS") or by
+#   word ("the provision", "the Sanhita"),
+#   and no sentence break between the two.
+# The last is what keeps "Section 302 IPC governs. The informant said 'he
+# struck him'" out of it: that quote is attributed to a witness, not to a
+# section, and the full stop says so.
+ATTRIBUTION_WINDOW = 160
+_QUOTE_RE = re.compile(r"[\"“]([^\"“”]{12,}?)[\"”]")
+_SECTION_SUBJECT_RE = re.compile(
+    r"\b(?:sections?|sub-?sections?|clauses?|provisions?|sanhita|adhiniyam"
+    r"|penal\s{1,4}code|criminal\s{1,4}procedure|evidence\s{1,4}act"
+    r"|the\s{1,4}act|the\s{1,4}code)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_BREAK_RE = re.compile(r"[.!?]\s")
 
 
 @dataclass(frozen=True)
@@ -599,6 +634,61 @@ def check_verbatim_overlap(
     return GateResult("verbatim_overlap", match is None, detail)
 
 
+def check_statutory_quotation(content: str, ctx: GateContext) -> GateResult:
+    """No quoted span attributed to a section. TRANSITION STREAM ONLY.
+
+    Every other stream is grounded in judgment text, where a quoted holding is
+    a legitimate and useful thing for an answer to carry; check_verbatim_
+    overlap already keeps that out of the TRACE and nothing keeps it out of the
+    answer, deliberately. The transition stream is the one where the grounding
+    is not statute text at all, so the same act means something different: see
+    ATTRIBUTION_WINDOW.
+
+    WHOLE CONTENT, trace included, on the same reasoning as check_temporal - a
+    fabricated statutory quotation is no better inside the reasoning, and the
+    prompt's caution now forbids both.
+
+    NOT a permanent gate, and that is this repository's own rule rather than a
+    softening: PERMANENT means "the example is wrong about the law and
+    rewriting the prose cannot make it right". Here rewriting the prose is
+    exactly what makes it right - the same sentence without the quotation marks
+    and the attribution is a true statement of the recorded effect - so this is
+    a regenerate. The row cannot reach the dataset either way: only a clean
+    disposition promotes.
+
+    `reproduces_grounding` is recorded and NOT part of the verdict. It says
+    whether the quoted words were the build's own paraphrase or came from
+    nowhere, which is worth counting over a pilot; both are refused, because
+    with no bare-act corpus neither can be verified as the section's words.
+    """
+    if ctx.stream != TRANSITION_STREAM:
+        return GateResult("statutory_quotation", True, {"skipped": "not-transition"})
+
+    text = _norm_ws(content)
+    source = _norm_ws(ctx.source_text)
+    hits: list[dict] = []
+    for match in _QUOTE_RE.finditer(text):
+        window = text[max(0, match.start() - ATTRIBUTION_WINDOW) : match.start()]
+        ends = [m.end() for m in _SECTION_SUBJECT_RE.finditer(window)]
+        ends += [m.end() for m in statute_pattern().finditer(window)]
+        if not ends:
+            continue
+        between = window[max(ends) :]
+        if _SENTENCE_BREAK_RE.search(between):
+            continue
+        quoted = match.group(1)
+        hits.append(
+            {
+                "quoted": quoted[:80],
+                "attribution": (between.strip() or window[-40:].strip())[:60],
+                "reproduces_grounding": find_verbatim_run(quoted, source, DEFAULT_MAX_RUN)
+                is not None,
+            }
+        )
+    detail = {"quotations": hits, "window": ATTRIBUTION_WINDOW}
+    return GateResult("statutory_quotation", not hits, detail)
+
+
 def check_banned_meta(think: str | None, ctx: GateContext) -> GateResult:
     """No harness leakage in the trace."""
     if not ctx.expect_reasoning:
@@ -845,6 +935,7 @@ def run_all(content: str, prompt_est_tokens: int, ctx: GateContext) -> list[Gate
         check_self_verification(think, ctx),
         check_irac_placement(think, answer, ctx),
         check_verbatim_overlap(think, ctx),
+        check_statutory_quotation(text, ctx),
         check_banned_meta(think, ctx),
         check_answer_key(answer, ctx, think=think),
     ]

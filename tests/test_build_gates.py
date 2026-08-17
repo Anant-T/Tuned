@@ -24,6 +24,7 @@ from tuned.data.gates import (
     check_self_verification,
     check_temporal,
     check_think_format,
+    check_statutory_quotation,
     check_verbatim_overlap,
     disposition,
     find_verbatim_run,
@@ -205,10 +206,16 @@ def test_gate_order_and_permanent_gates():
         "self_verification",
         "irac_placement",
         "verbatim_overlap",
+        "statutory_quotation",
         "banned_meta",
         "answer_key",
     )
     assert PERMANENT_GATES == frozenset({"citations", "temporal", "answer_key"})
+    # statutory_quotation is deliberately NOT permanent: the same sentence
+    # without the quotation marks is a true statement of the recorded effect,
+    # so rewriting the prose does make it right, which is this module's own
+    # definition of a regenerate.
+    assert "statutory_quotation" not in PERMANENT_GATES
     assert PERMANENT_GATES <= set(GATE_ORDER)
 
 
@@ -679,6 +686,141 @@ def test_irac_placement_skipped_when_no_reasoning_expected():
     result = check_irac_placement(None, "no headings", _ctx(expect_reasoning=False))
     assert result.passed
     assert result.detail == {"skipped": "no-reasoning-expected"}
+
+
+# --------------------------------------------------------------------------
+# check_statutory_quotation
+# --------------------------------------------------------------------------
+
+# What a transition prompt actually shows the teacher: the provision's
+# identity, its marginal note, and the effect this build RECORDS for it,
+# labelled as not a quotation. There is no bare-act corpus behind it.
+RECORDED_EFFECT = (
+    "Section 358 of the Bharatiya Nyaya Sanhita, 2023 (Repeal and savings).\n"
+    "Operative effect as recorded in this build's statute table (not a quotation): "
+    "The repeal of the Indian Penal Code, 1860 does not affect any right, privilege, "
+    "obligation or liability acquired, accrued or incurred under it."
+)
+
+
+def _quotation_ctx(**over):
+    over.setdefault("source_text", RECORDED_EFFECT)
+    return _ctx(stream="transition", **over)
+
+
+def test_statutory_quotation_the_paraphrase_quoted_as_the_sections_words_fails():
+    """The artefact the whole "not a quotation" label exists to prevent.
+
+    Measured before this gate: this exact answer passed all nine gates and
+    entered the dataset presenting the build's own paraphrase as the enacted
+    words of s.358(2).
+    """
+    answer = (
+        'Section 358(2) of the Bharatiya Nyaya Sanhita, 2023 provides: "The repeal of '
+        'the Indian Penal Code, 1860 does not affect any right, privilege, obligation '
+        'or liability acquired, accrued or incurred under it". The charge therefore '
+        "stands under the old Code."
+    )
+    result = check_statutory_quotation(answer, _quotation_ctx())
+    assert not result.passed
+    hit = result.detail["quotations"][0]
+    assert "provides" in hit["attribution"]
+    # Recorded, not part of the verdict: these words WERE the build's own.
+    assert hit["reproduces_grounding"] is True
+    assert disposition([result]) == "regenerate"
+
+
+def test_statutory_quotation_an_unquoted_faithful_restatement_passes():
+    """The other direction, and the one that matters for yield: saying the
+    same thing in the answer's own words is exactly what the prompt asks
+    for."""
+    answer = (
+        "Section 358(2) of the Bharatiya Nyaya Sanhita preserves rights, obligations "
+        "and liabilities already accrued under the repealed Indian Penal Code, so the "
+        "charge stands under the old Code however long afterwards it is taken up."
+    )
+    result = check_statutory_quotation(answer, _quotation_ctx())
+    assert result.passed
+    assert result.detail["quotations"] == []
+
+
+def test_statutory_quotation_invented_words_are_refused_too():
+    # Nothing in this repository could check a quotation against the Act, so
+    # words from nowhere are refused on the same footing as the paraphrase.
+    answer = 'Section 531 BNSS reads: "every proceeding shall abate upon commencement".'
+    result = check_statutory_quotation(answer, _quotation_ctx())
+    assert not result.passed
+    assert result.detail["quotations"][0]["reproduces_grounding"] is False
+
+
+@pytest.mark.parametrize(
+    "lead",
+    [
+        'Section 358(2) of the BNS provides: ',
+        'Section 358 BNS states: ',
+        'Section 358 BNS reads, in terms, ',
+        'The provision is in these words: ',
+        'The Sanhita says: ',
+        'That sub-section runs ',
+    ],
+)
+def test_statutory_quotation_reads_the_attribution_shapes(lead):
+    answer = lead + '"the repeal does not affect any liability already incurred".'
+    assert not check_statutory_quotation(answer, _quotation_ctx()).passed
+
+
+def test_statutory_quotation_a_quote_attributed_to_someone_else_passes():
+    """The sentence break is the discriminator, and it is doing work: a
+    quotation attributed to a witness is not a statement about what a section
+    says, and rejecting it would be a gate firing on the wrong artefact."""
+    answer = (
+        'Section 302 IPC governs the charge. The informant said "he struck him twice '
+        'with the rod" and the witness confirmed it.'
+    )
+    assert check_statutory_quotation(answer, _quotation_ctx()).passed
+
+
+def test_statutory_quotation_a_short_quoted_phrase_is_not_an_attribution():
+    # A word or two in quotes is a term of art being named, not a passage
+    # being passed off as enacted text.
+    answer = 'Section 358 BNS turns on whether a liability was "incurred" before the day.'
+    assert check_statutory_quotation(answer, _quotation_ctx()).passed
+
+
+def test_statutory_quotation_skipped_off_the_transition_stream():
+    """Every other stream is grounded in judgment text, where quoting a
+    holding in the answer is legitimate and useful."""
+    answer = 'The Court held, in Anwar Ali: "the chain of circumstances must be complete".'
+    result = check_statutory_quotation(answer, _ctx(stream="synthesis"))
+    assert result.passed
+    assert result.detail == {"skipped": "not-transition"}
+
+
+def test_statutory_quotation_catches_the_trace_too():
+    # Same reasoning as check_temporal: a fabricated statutory quotation is no
+    # better inside the reasoning, and the caution now forbids both.
+    content = _content(
+        'let me check - section 358 BNS provides: "the repeal does not affect any '
+        'liability already incurred" - so the old Code stands.',
+        "Conclusion: the old Code governs the charge.",
+    )
+    assert not check_statutory_quotation(content, _quotation_ctx()).passed
+
+
+def test_statutory_quotation_survives_reflowed_whitespace():
+    answer = (
+        'Section 358(2)\n   of the BNS\n   provides:\n   "the repeal does not affect '
+        'any liability already incurred".'
+    )
+    assert not check_statutory_quotation(answer, _quotation_ctx()).passed
+
+
+def test_statutory_quotation_reads_curly_quotation_marks():
+    answer = (
+        "Section 358(2) of the BNS provides: “the repeal does not affect any "
+        "liability already incurred”."
+    )
+    assert not check_statutory_quotation(answer, _quotation_ctx()).passed
 
 
 # --------------------------------------------------------------------------

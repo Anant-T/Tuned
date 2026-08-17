@@ -1151,6 +1151,51 @@ def test_the_question_slot_carries_the_no_quotation_caution(selection, provision
     assert T.NO_QUOTATION_CAUTION not in row["text"]
 
 
+def test_the_caution_forbids_the_answer_side_quote_too(selection, provisions):
+    # The earlier wording said "do not quote words you have not been shown",
+    # and the recorded effect HAS been shown - so it licensed exactly the
+    # artefact it existed to prevent. It now says answer as well as reasoning,
+    # in as many words.
+    row = T.seed_row(selection.sample[0], provisions, held_out=False)
+    caution = row["meta_json"]["question"]
+    assert T.NO_QUOTATION_CAUTION in caution
+    assert "in your reasoning or in your answer" in T.NO_QUOTATION_CAUTION
+    assert "not the section's words" in T.NO_QUOTATION_CAUTION
+
+
+def test_an_answer_quoting_the_build_paraphrase_as_the_statute_is_caught(
+    cfg, selection, provisions
+):
+    """END TO END, on a real cell, through the whole gate stack.
+
+    Measured at HEAD: this answer passed all nine gates and its disposition
+    was clean, so a row presenting this build's paraphrase as the enacted
+    words of s.358(2) would have entered the dataset. Only the trace side was
+    caught, by verbatim_overlap.
+    """
+    cell = selection.sample[0]
+    row = T.seed_row(cell, provisions, held_out=False)
+    _, ctx = _ctx_for(cfg, row)
+    key = row["answer_key_json"]
+
+    faithful = _ideal_answer(key) + (
+        " Section 358 of the Bharatiya Nyaya Sanhita preserves liabilities already "
+        "incurred under the repealed Code, stated here in my own words."
+    )
+    quoted = _ideal_answer(key) + (
+        ' Section 358(2) of the Bharatiya Nyaya Sanhita, 2023 provides: "The repeal of '
+        'the Indian Penal Code, 1860 does not affect any right, privilege, obligation '
+        'or liability acquired, accrued or incurred under it".'
+    )
+    assert gates.check_statutory_quotation(faithful, ctx).passed
+    caught = gates.check_statutory_quotation(quoted, ctx)
+    assert not caught.passed
+    assert caught.detail["quotations"][0]["reproduces_grounding"] is True
+    # The answer key and the temporal gate see nothing wrong with either, which
+    # is precisely why the finding needed a gate of its own.
+    assert gates.check_answer_key(quoted, ctx, think="x").passed
+
+
 def test_the_seed_row_fills_every_slot_generate_requires(selection, provisions):
     row = T.seed_row(selection.sample[3], provisions, held_out=False)
     for name in ("scenario", "old_section_text", "new_section_text", "savings_text"):
