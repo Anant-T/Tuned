@@ -204,8 +204,22 @@ def _candidate_seeds(store, *, limit: int, sources: Sequence[str] | None) -> lis
     Ordered (n_tasks ASC, seed_id ASC): unused seeds before resampled ones,
     and a total order inside each tier so the choice never depends on SQLite's
     row layout.
+
+    A seed chunks.py flagged `oversize` is never offered. That flag means
+    "this is one paragraph the packer was contractually forbidden to split,
+    and it is over the token band" - measured at 26,818 tokens on one real
+    judgment - so planning against it is exactly the prompt-budget blowout
+    chunking exists to prevent. The flag was written from the first cut and
+    read by nothing; this is where it is read. `json_valid` guards the
+    extract so a row whose meta_json is not JSON (nothing this pipeline
+    writes, but the column is free text) is treated as un-flagged rather
+    than failing the whole query.
     """
-    clauses = ["COALESCE(t.n, 0) < ?"]
+    clauses = [
+        "COALESCE(t.n, 0) < ?",
+        "COALESCE(CASE WHEN json_valid(s.meta_json) "
+        "THEN json_extract(s.meta_json, '$.oversize') END, 0) = 0",
+    ]
     params: list = [PER_SEED_CAP]
     if sources:
         clauses.append(f"s.source_id IN ({', '.join('?' * len(sources))})")

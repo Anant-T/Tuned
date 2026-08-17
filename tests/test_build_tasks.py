@@ -1,7 +1,7 @@
 import hashlib
 
 import pytest
-from pipeline_fakes import build_cfg, open_store, paths_for, seed_rows, temp_config
+from pipeline_fakes import SOURCE_ID, build_cfg, open_store, paths_for, seed_rows, temp_config
 
 from tuned.data import prompt_registry
 from tuned.data.tasks import main as tasks_main
@@ -314,6 +314,44 @@ def test_replanning_a_rejected_seed_is_bounded_by_the_per_seed_cap(tmp_path, cfg
         # ...and it stays that way however often the operator re-runs it.
         assert plan_wave(store, cfg, "synthesis", 100) == 0
         assert store.conn.execute("SELECT COUNT(*) FROM task").fetchone()[0] == PER_SEED_CAP
+
+
+def test_a_chunk_flagged_oversize_is_never_planned_against(tmp_path, cfg):
+    """chunks.py writes `meta_json.oversize` on a chunk that is one
+    paragraph the packer was forbidden to split and is over the token band -
+    measured at 26,818 tokens on one real judgment. It was written from the
+    first cut and read by nothing, so the planner would happily build a
+    prompt around it: exactly the budget blowout chunking exists to prevent.
+    Both directions - the ordinary chunk beside it is still selected."""
+    import json as _json
+
+    with open_store(tmp_path, n_seeds=0) as store:
+        store.upsert_seeds([
+            {"seed_id": "ok1", "source_id": SOURCE_ID, "text": "t", "token_count": 1200,
+             "case_type": "bail", "code_era": "bns",
+             "meta_json": _json.dumps({"kind": "chunk", "oversize": False})},
+            {"seed_id": "big1", "source_id": SOURCE_ID, "text": "t", "token_count": 40003,
+             "case_type": "bail", "code_era": "bns",
+             "meta_json": _json.dumps({"kind": "chunk", "oversize": True})},
+            {"seed_id": "plain", "source_id": SOURCE_ID, "text": "t", "token_count": 900,
+             "case_type": "bail", "code_era": "bns"},  # no meta at all
+        ])
+        assert plan_wave(store, cfg, "synthesis", 12) > 0
+        planned = {r[0] for r in store.conn.execute("SELECT DISTINCT seed_id FROM task")}
+        assert "big1" not in planned
+        assert {"ok1", "plain"} <= planned
+
+
+def test_a_seed_whose_meta_is_not_json_is_still_planned_against(tmp_path, cfg):
+    # The `json_valid` guard: meta_json is a free-text column, and a row
+    # holding something that is not JSON must read as un-flagged rather than
+    # failing the planner's whole query.
+    with open_store(tmp_path, n_seeds=0) as store:
+        store.upsert_seeds([
+            {"seed_id": "weird", "source_id": SOURCE_ID, "text": "t", "token_count": 900,
+             "case_type": "bail", "code_era": "bns", "meta_json": "not json at all"},
+        ])
+        assert plan_wave(store, cfg, "synthesis", 2) > 0
 
 
 def test_reopen_returns_parked_rows_to_the_queue_that_owns_them(store, cfg):
