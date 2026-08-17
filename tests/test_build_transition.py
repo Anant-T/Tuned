@@ -1299,6 +1299,48 @@ def test_clearing_the_held_out_mark_makes_the_same_seed_plannable(store, cfg, ma
     assert victim in {row["seed_id"] for row in tasks.plan_rows(store, cfg, T.STREAM, 5000)}
 
 
+def test_a_transition_seed_is_never_drawn_into_another_stream(store, cfg, mapping, provisions):
+    """The CLI default is `--source` unset, so a synthesis wave sees the whole
+    seed table - and the transition grid is now in it.
+
+    Measured before the clause landed, on a store holding nothing else: eight
+    tasks across drafting, irac_analysis, statute_qa and summarization, each on
+    a transition seed. The transition QUESTION rode into them (meta_json.
+    question overrides the task-type default), so the teacher was asked which
+    enactment governs with no provision block in front of it, and
+    check_answer_key skipped the row for not being on the transition stream -
+    a row with an answer key, ungraded against it.
+    """
+    T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
+    for other in ("synthesis", "curated_c2"):
+        assert tasks.plan_rows(store, cfg, other, 8, sources=None) == []
+    # The other direction: its OWN wave still draws it, or the clause would be
+    # satisfied by planning nothing at all.
+    own = tasks.plan_rows(store, cfg, T.STREAM, 8)
+    assert len(own) == 8
+    assert {row["task_type"] for row in own} == {T.TASK_TYPE}
+
+
+def test_a_seed_that_declares_no_stream_is_offered_to_every_wave(store, cfg):
+    """The clause must be inert for every other builder: transition.py is the
+    only writer of meta_json.stream, and a planner that treated a missing
+    declaration as a refusal would empty every wave in the build."""
+    store.upsert_source("fixture/source", "CC0")
+    store.upsert_seeds(
+        [
+            {
+                "seed_id": "streamless00001",
+                "source_id": "fixture/source",
+                "text": "x" * 600,
+                "meta_json": {"estimator": "chars/4"},
+            }
+        ]
+    )
+    for stream in ("synthesis", "curated_c2", T.STREAM):
+        planned = {row["seed_id"] for row in tasks.plan_rows(store, cfg, stream, 2)}
+        assert "streamless00001" in planned, stream
+
+
 def test_a_seed_with_no_held_out_key_is_still_plannable(store, cfg):
     # Every other source writes meta_json without the key, and treating a
     # missing flag as "held out" would empty every wave in the build.

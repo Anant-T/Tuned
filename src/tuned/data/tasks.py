@@ -198,7 +198,9 @@ def _existing_in_queue(store, stream: str, arm: str | None) -> int:
     )
 
 
-def _candidate_seeds(store, *, limit: int, sources: Sequence[str] | None) -> list[tuple[str, int]]:
+def _candidate_seeds(
+    store, *, limit: int, sources: Sequence[str] | None, stream: str
+) -> list[tuple[str, int]]:
     """(seed_id, tasks already planned on it), fewest-first, under the cap.
 
     Ordered (n_tasks ASC, seed_id ASC): unused seeds before resampled ones,
@@ -224,6 +226,31 @@ def _candidate_seeds(store, *, limit: int, sources: Sequence[str] | None) -> lis
     the second half, and it is the half that matters, because a wave planned
     over every seed in the table would otherwise generate against the eval
     without anything in the pipeline noticing.
+
+    A seed that DECLARES a stream is offered only to that stream's wave, and
+    that is the third exclusion of the same shape - a property the seed states
+    about itself, honoured here whoever called. Measured before the clause
+    existed, on a store holding the transition grid: `plan_rows(store, cfg,
+    "synthesis", 8)` - the CLI's own default, since --source defaults to None -
+    planned eight tasks across drafting, irac_analysis, statute_qa and
+    summarization on transition seeds. The transition QUESTION survived into
+    them, because build_slots lets meta_json.question override the task-type
+    default, so the teacher was asked which enactment governs with no provision
+    block in front of it; and check_answer_key skipped the row entirely because
+    ctx.stream was not "transition". A row carrying an answer key, ungraded
+    against it.
+
+    THE CLAUSE RATHER THAN A NARROWER CLI DEFAULT, decided by measurement:
+    --source restricts by source_id and this module holds no map from a source
+    to the stream it belongs to (the config's only source map is assemble's
+    mix BUCKET map, which answers a different question). Excluding transition
+    seeds by default would mean hard-coding another module's
+    TRANSITION_SOURCE_ID here, and it would fix exactly one caller - the CLI -
+    while plan_rows and plan_wave stayed open to every other.
+
+    A seed that declares NOTHING stays eligible for any wave, which is every
+    other builder's contract today: transition.py is the only writer of
+    meta_json.stream on a seed row in the tree.
     """
     clauses = [
         "COALESCE(t.n, 0) < ?",
@@ -231,8 +258,10 @@ def _candidate_seeds(store, *, limit: int, sources: Sequence[str] | None) -> lis
         "THEN json_extract(s.meta_json, '$.oversize') END, 0) = 0",
         "COALESCE(CASE WHEN json_valid(s.meta_json) "
         "THEN json_extract(s.meta_json, '$.held_out') END, 0) = 0",
+        "COALESCE(CASE WHEN json_valid(s.meta_json) "
+        "THEN json_extract(s.meta_json, '$.stream') END, ?) = ?",
     ]
-    params: list = [PER_SEED_CAP]
+    params: list = [PER_SEED_CAP, stream, stream]
     if sources:
         clauses.append(f"s.source_id IN ({', '.join('?' * len(sources))})")
         params.extend(sources)
@@ -300,7 +329,7 @@ def plan_rows(
         prompt_registry.variants(task_type)
     quota = allocate(mix, wanted)
 
-    candidates = _candidate_seeds(store, limit=wanted, sources=sources)
+    candidates = _candidate_seeds(store, limit=wanted, sources=sources, stream=stream)
     if not candidates:
         return []
     pair_counts = _sample_counts(store, [seed_id for seed_id, _ in candidates])

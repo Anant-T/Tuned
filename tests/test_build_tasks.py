@@ -342,6 +342,42 @@ def test_a_chunk_flagged_oversize_is_never_planned_against(tmp_path, cfg):
         assert {"ok1", "plain"} <= planned
 
 
+def test_a_seed_that_declares_a_stream_is_only_planned_into_that_stream(tmp_path, cfg):
+    """The third seed-level exclusion, and the same shape as the other two: a
+    property the SEED states about itself, honoured by the planner whoever
+    called it.
+
+    A seed whose meta carries scenario/provisions/answer key for one stream is
+    meaningless in another - the wave would put its question without its
+    grounding, and the stream-specific gate would skip the row it was written
+    for. Both directions here, plus the seed that declares nothing.
+    """
+    import json as _json
+
+    with open_store(tmp_path, n_seeds=0) as store:
+        store.upsert_seeds([
+            {"seed_id": "trans1", "source_id": SOURCE_ID, "text": "t", "token_count": 900,
+             "case_type": "criminal", "code_era": "ipc",
+             "meta_json": _json.dumps({"stream": "transition", "question": "which code?"})},
+            {"seed_id": "plain1", "source_id": SOURCE_ID, "text": "t", "token_count": 900,
+             "case_type": "bail", "code_era": "bns"},
+        ])
+        assert plan_wave(store, cfg, "synthesis", 6) > 0
+        planned = {r[0] for r in store.conn.execute("SELECT DISTINCT seed_id FROM task")}
+        assert "trans1" not in planned
+        assert "plain1" in planned
+
+        # ...and its own wave still draws it, or the exclusion above would be
+        # satisfied by a planner that plans nothing.
+        assert plan_wave(store, cfg, "transition", 2, task_type_mix={"transition": 1.0}) > 0
+        own = {
+            r[0] for r in store.conn.execute(
+                "SELECT DISTINCT seed_id FROM task WHERE stream = 'transition'"
+            )
+        }
+        assert "trans1" in own
+
+
 def test_a_seed_whose_meta_is_not_json_is_still_planned_against(tmp_path, cfg):
     # The `json_valid` guard: meta_json is a free-text column, and a row
     # holding something that is not JSON must read as un-flagged rather than
