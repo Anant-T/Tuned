@@ -186,6 +186,43 @@ def test_spans_field_with_the_wrong_shape_is_bad_output():
     assert excinfo.value.kind == "bad_output"
 
 
+def test_a_reversed_span_is_bad_output_not_a_result_the_caller_has_to_survive():
+    # Span CONTENT, which the shape check above does not reach: [10, 3] is a
+    # well-typed triple and a malformed interval. segment.py turns each span
+    # into a Segment, and Segment's own ValueError is not a RolesBridgeError
+    # - so an unvalidated one travelled out of segment_document and ended
+    # the whole chunking pass on one bad reply.
+    spawn = fake_spawn(reply={"spans": [[0, 5, "FAC"], [10, 3, "ANALYSIS"]]})
+    with pytest.raises(RolesBridgeError) as excinfo:
+        infer_roles("x" * 40, backend=BACKEND_SUBPROCESS, spawn=spawn)
+    assert excinfo.value.kind == "bad_output"
+    assert "not an interval" in str(excinfo.value)
+
+
+def test_a_negative_span_start_is_bad_output():
+    spawn = fake_spawn(reply={"spans": [[-1, 5, "FAC"]]})
+    with pytest.raises(RolesBridgeError) as excinfo:
+        infer_roles("x" * 40, backend=BACKEND_SUBPROCESS, spawn=spawn)
+    assert excinfo.value.kind == "bad_output"
+
+
+def test_a_zero_length_span_is_accepted_as_an_interval():
+    # The edge the validation must NOT reject: start == end is a degenerate
+    # but well-formed interval, and Segment allows it.
+    spawn = fake_spawn(reply={"spans": [[5, 5, "FAC"]]})
+    assert infer_roles("x" * 40, backend=BACKEND_SUBPROCESS, spawn=spawn).spans[0].end == 5
+
+
+def test_a_span_running_past_the_text_is_returned_for_the_caller_to_clip():
+    # Deliberately NOT an error: segment._normalize_segments clips it
+    # forward to len(text), because a model overshooting its last span is a
+    # nuisance to repair rather than a reply to throw away. The two halves
+    # of M3 are split on purpose and this pins which half owns which case.
+    spawn = fake_spawn(reply={"spans": [[0, 10_000, "FAC"]]})
+    result = infer_roles("x" * 40, backend=BACKEND_SUBPROCESS, spawn=spawn)
+    assert result.spans[0].end == 10_000
+
+
 def test_worker_writes_multiple_lines_only_the_last_is_read_as_the_reply():
     # A worker that logs progress to stdout before its final JSON line must
     # not be mistaken for a broken one - only the LAST line is the protocol.

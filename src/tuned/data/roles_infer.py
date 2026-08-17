@@ -50,11 +50,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 # Bump when the wire format or the worker's own behaviour changes in a way
-# that could move what a document's role spans are, recorded in every chunk
-# that used this tier (segment.py folds it into the chunk's meta).
+# that could move what a document's role spans are. Recorded on every chunk's
+# meta and on its chunk_manifest row by chunks.py, and compared there on
+# resume exactly like SEGMENT_VERSION and CHUNK_VERSION - a roles rule that
+# moved has to invalidate the chunks it produced, or roles-tier chunks are
+# stale forever.
 #
 #   1  first cut: one JSON line in (`{"text": ...}`), one JSON line out
-#      (`{"spans": [[start, end, label], ...]}` or `{"error": ...}`).
+#      (`{"spans": [[start, end, label], ...]}` or `{"error": ...}`), spans
+#      validated as intervals before they reach the caller.
 ROLES_VERSION = 1
 
 BACKEND_NONE = "none"
@@ -187,6 +191,28 @@ def infer_roles(
             f"roles worker 'spans' field is not a list of (start, end, label): {exc}",
             kind="bad_output",
         ) from exc
+    for span in spans:
+        # Span CONTENT, not only span shape. The shape checks above catch a
+        # reply of the wrong arity or type; this catches a well-typed span
+        # that is not an interval. It matters because segment.py builds a
+        # Segment out of each one, and Segment rejects end < start with a
+        # plain ValueError - which is not a RolesBridgeError, so it would
+        # travel straight out of segment_document and end the whole
+        # chunking pass on one bad reply from a model this repository does
+        # not control. Reported here as bad_output, it degrades that ONE
+        # document to packing with the reason recorded, which is the
+        # contract this bridge exists to keep.
+        #
+        # An end running PAST the document is deliberately not rejected
+        # here: segment._normalize_segments clips it forward to len(text),
+        # because a model overshooting the last span is a nuisance to
+        # repair, not a reply to throw away.
+        if span.start < 0 or span.end < span.start:
+            raise RolesBridgeError(
+                f"roles worker returned a span that is not an interval: "
+                f"({span.start}, {span.end}, {span.label!r})",
+                kind="bad_output",
+            )
     return RolesResult(spans=spans)
 
 
@@ -195,11 +221,17 @@ def infer_roles(
 # --------------------------------------------------------------------------
 
 
-def _opennyai_spans(text: str) -> list[tuple[int, int, str]]:  # pragma: no cover - needs opennyai
+def _opennyai_spans(text: str) -> list[RoleSpan]:  # pragma: no cover - needs opennyai
     """The one call into the real model. Never reached without opennyai
     installed, and not exercised by any test in this repository - see the
     `@pytest.mark.live` tests for what would cover it on a machine that has
     the package.
+
+    Returns RoleSpan objects, which is what _run_worker below consumes
+    (`s.start`/`s.end`/`s.label`). The first cut annotated this as a list of
+    tuples while the consumer read attributes off it - a contradiction only
+    the person wiring the real model would ever have hit, and they would
+    have hit it immediately.
     """
     import opennyai  # noqa: F401
 
