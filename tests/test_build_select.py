@@ -694,6 +694,38 @@ def test_metadata_rows_reads_the_parquet_acquire_recorded(store, tmp_path):
     assert rows[0]["year"] == 2015
 
 
+def test_metadata_rows_survive_the_hive_partition_directory_they_really_live_in(store, tmp_path):
+    """The layout acquire ACTUALLY produces, which the fixture above flattens
+    away: the file sits under a `year=YYYY/` ancestor AND carries its own
+    embedded `year` column. `pq.read_table` routes through the dataset API,
+    infers Hive partitioning from the path segment, and the inferred `year`
+    collides with the embedded one (ArrowTypeError: incompatible types -
+    found on Kaggle 2026-08-17, reproducible anywhere). The reader must open
+    the one file and infer nothing from where it sits."""
+    pq = pytest.importorskip("pyarrow.parquet")
+    pa = pytest.importorskip("pyarrow")
+
+    store.upsert_source(SC_SOURCE_ID, "CC-BY-4.0")
+    partition = tmp_path / "metadata" / "parquet" / "year=2015"
+    partition.mkdir(parents=True)
+    path = partition / "part-0.parquet"
+    pq.write_table(
+        pa.table({"case_id": ["CA 77"], "year": ["2015"], "citation": ["[2015] 2 S.C.R. 9"]}),
+        path,
+    )
+    store.record_artifact(
+        SC_SOURCE_ID,
+        "metadata/parquet/year=2015/part-0.parquet",
+        local_path=path,
+        size_bytes=path.stat().st_size,
+        sha256="x",
+    )
+
+    rows = list(metadata_rows(store, (2015,)))
+    assert [r["case_id"] for r in rows] == ["CA 77"]
+    assert rows[0]["year"] == "2015"  # the embedded cell, untouched - not the inferred partition
+
+
 def test_a_null_year_cell_under_a_year_partition_takes_the_partitions_year(store, tmp_path):
     pq = pytest.importorskip("pyarrow.parquet")
     pa = pytest.importorskip("pyarrow")

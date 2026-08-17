@@ -660,7 +660,14 @@ def metadata_rows(store, years=DEV_YEARS) -> Iterator[dict]:
         year = parse_year(key)
         if year is not None and year not in years:
             continue
-        for record in pq.read_table(artifact["local_path"]).to_pylist():
+        # ParquetFile, not read_table: read_table routes through the dataset
+        # API, which infers Hive partitioning from any `key=value` ancestor
+        # directory in the path - and acquire lays these files under
+        # `year=YYYY/`, so the inferred `year` collides with the file's own
+        # embedded `year` column (ArrowTypeError: incompatible types, found
+        # on Kaggle 2026-08-17 and reproducible locally). ParquetFile opens
+        # exactly the one file and infers nothing from where it sits.
+        for record in pq.ParquetFile(artifact["local_path"]).read().to_pylist():
             # A missing KEY and a null CELL are the same fact about the row
             # and a different fact about the dict, so `setdefault` is not
             # enough: a parquet `year` column that is null for this row would
