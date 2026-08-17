@@ -227,16 +227,18 @@ providers:
         roles: [judge]
         limits: {rpm: 30, tpm: 6000, tpd: 200000, rpd: 1000, max_context: 131072, max_output: 16384}
         params: {temperature: 0.2}
+      # Also the difficulty probe since 2026-08-17: Groq retired its llama chat
+      # lineup (llama-3.1-8b-instant 404s; live models endpoint carries only
+      # allam-2-7b, the gpt-oss pair and qwen3.6-27b). Calibration adapts its
+      # bands to whatever spread this model produces; the calibration report is
+      # the instrument that would expose solve-rate compression - revisit there,
+      # not here. Probing is not judging, so sharing the generator's family is
+      # not a separation concern.
       - id: openai/gpt-oss-20b
         family: gpt-oss
-        roles: [tiebreak]
+        roles: [tiebreak, probe]
         limits: {rpm: 30, tpm: 8000, tpd: 200000, rpd: 1000, max_context: 131072, max_output: 65536}
         params: {temperature: 0.2}
-      - id: llama-3.1-8b-instant
-        family: llama
-        roles: [probe]
-        limits: {rpm: 30, tpm: 6000, tpd: 500000, rpd: 14400, max_context: 131072, max_output: 32768}
-        params: {temperature: 0.6}
   - name: mistral
     base_url: https://api.mistral.ai/v1
     api_key_env: MISTRAL_API_KEY
@@ -391,6 +393,6 @@ routing:
           openai/gpt-5-mini, openai/gpt-5-nano]
   tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b, cerebras/zai-glm-4.7,
              openai/gpt-5-mini, openai/gpt-5-nano]
-  probe: [groq/llama-3.1-8b-instant]
+  probe: [groq/openai/gpt-oss-20b]
   family_separation: true
   judge_mode: dual        # dual | audit

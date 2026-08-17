@@ -786,7 +786,7 @@ def test_pick_respects_configured_order(cfg, keys):
     router = _router(cfg)
     assert router.pick("judge").ref == MISTRAL_JUDGE
     assert router.pick("generator").ref == ModelRef("cerebras", "gpt-oss-120b")
-    assert router.pick("probe").ref == ModelRef("groq", "llama-3.1-8b-instant")
+    assert router.pick("probe").ref == ModelRef("groq", "openai/gpt-oss-20b")
 
 
 def test_pick_excludes_families_at_call_time(cfg, keys):
@@ -827,7 +827,7 @@ def test_pick_skips_over_budget(cfg, keys):
 def test_pick_returns_none_when_nothing_eligible(cfg, keys):
     router = _router(cfg, budget_ok=lambda provider, model, tokens: False)
     assert router.pick("judge") is None
-    assert router.pick("probe", exclude_families=frozenset({"llama"})) is None
+    assert router.pick("probe", exclude_families=frozenset({"gpt-oss"})) is None
 
 
 def test_router_forwards_the_client_knobs(cfg, keys):
@@ -1128,10 +1128,10 @@ def test_complete_charges_the_bucket_of_the_ref_it_used(cfg, keys):
     )
     asyncio.run(router.complete("probe", [{"role": "user", "content": "hi"}], est_tokens=4000))
 
-    bucket = router.routed(ModelRef("groq", "llama-3.1-8b-instant")).bucket
-    # probe limits: rpm 30, tpm 6000 -> 4000 charged leaves 2000.
-    assert bucket.next_wait(2000) == 0.0
-    assert bucket.next_wait(6000) == pytest.approx(40.0)
+    bucket = router.routed(ModelRef("groq", "openai/gpt-oss-20b")).bucket
+    # probe limits: rpm 30, tpm 8000 -> 4000 charged leaves 4000.
+    assert bucket.next_wait(4000) == 0.0
+    assert bucket.next_wait(8000) == pytest.approx(30.0)
 
 
 def test_complete_forwards_params_and_max_tokens(cfg, keys):
@@ -1399,7 +1399,7 @@ def test_build_check_request_is_pure():
 def test_check_refs_covers_every_configured_model(cfg):
     refs = check_refs(cfg)
     expected = sum(len(p.models) for p in cfg.providers)
-    assert len(refs) == expected == 10
+    assert len(refs) == expected == 9
     assert ModelRef("groq", "qwen/qwen3.6-27b") in refs
     assert check_refs(cfg, "groq/qwen/qwen3.6-27b") == (ModelRef("groq", "qwen/qwen3.6-27b"),)
     with pytest.raises(KeyError):
@@ -1501,7 +1501,7 @@ def test_a_family_exclusion_is_reported_separately_from_a_missing_key(cfg, keys)
             _router(cfg).complete(
                 "probe",
                 [{"role": "user", "content": "hi"}],
-                exclude_families=frozenset({"llama"}),
+                exclude_families=frozenset({"gpt-oss"}),
             )
         )
     assert excinfo.value.skipped == frozenset({"family-excluded"})
