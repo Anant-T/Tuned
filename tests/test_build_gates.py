@@ -780,6 +780,24 @@ def test_statutory_quotation_a_quote_attributed_to_someone_else_passes():
     assert check_statutory_quotation(answer, _quotation_ctx()).passed
 
 
+def test_statutory_quotation_a_quotation_attributed_to_nothing_passes():
+    """No section named anywhere before the quote, so nothing is being passed
+    off as a section's words - and the gate must neither fail it nor raise.
+
+    Found by mutation: removing the "is a section named at all?" guard left
+    every assertion above green, because every other fixture here names one.
+    The gate does not merely mis-fire without the guard - `max()` over an
+    empty sequence raises, and a gate that raises takes the whole run with it.
+    """
+    answer = (
+        'The papers record that the accused "stands charged and has pleaded not guilty", '
+        "and nothing in this point turns on how that was put."
+    )
+    result = check_statutory_quotation(answer, _quotation_ctx())
+    assert result.passed
+    assert result.detail["quotations"] == []
+
+
 def test_statutory_quotation_a_short_quoted_phrase_is_not_an_attribution():
     # A word or two in quotes is a term of art being named, not a passage
     # being passed off as enacted text.
