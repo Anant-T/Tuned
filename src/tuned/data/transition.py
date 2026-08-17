@@ -25,13 +25,16 @@ struck-down section be named as the section the charge lies under, which made
 The four factors:
 
 * the FAMILIES are resources/ipc_bns_map.jsonl, through Mapping.require_verified
-  and nothing else. The 17 rows whose `verified_by` is still null cannot emit a
-  single cell, and they are not skipped silently - build_grid records each one
+  and nothing else. Any row whose `verified_by` is still null cannot emit a
+  single cell, and it is not skipped silently - build_grid records each one
   in the manifest with the refusal statutes.py itself raised. When the operator
-  signs a row off the grid grows and no code changes. A row whose audited NOTE
-  records a judicial event this module has no dated constant for is refused the
-  same way, for the same reason: the build cannot say whether the section was
-  in force on the day of the conduct, so it does not guess;
+  signs a row off the grid grows and no code changes - the 2026-08-17 operator
+  ruling closed the last 17 sheet rows this way (IPC 146 flipping kind, the
+  other 16 confirming theirs), so the shipped map now verifies all 171 rows and
+  none are refused on this ground. A row whose audited NOTE records a judicial
+  event this module has no dated constant for is refused the same way, for the
+  same reason: the build cannot say whether the section was in force on the day
+  of the conduct, so it does not guess;
 * the DATE POSTURES and PROCEDURAL POSTURES are here, because they are the two
   axes the two savings rules turn on and their intersection is the whole point
   of the stream;
@@ -46,9 +49,9 @@ NO MODEL-GENERATED FACTS, ANYWHERE. The papers are a template with the dates
 filled in; the provisions are the mapping's own audited section numbers and
 marginal notes; the savings blocks are resources/transition_provisions.jsonl.
 A fact skeleton is deliberately abstract about the conduct ("the conduct
-described in the provisions set out below") because 154 verified rows include
-general clauses as well as offences, and a template that narrated an offence
-would be narrating the wrong thing for those.
+described in the provisions set out below") because the 171 verified rows
+include general clauses as well as offences, and a template that narrated an
+offence would be narrating the wrong thing for those.
 
 WHAT THE PROMPTS ACTUALLY CARRY, AND WHAT THEY DO NOT
 -----------------------------------------------------
@@ -764,8 +767,11 @@ def families(mapping: Mapping) -> tuple[list[Family], list[dict]]:
     rows`. Reading the verified rows directly would produce the same list
     today and would stop being the same list the moment the refusal changed;
     routing every family through the pipeline's own refusal is what makes
-    "the 17 unverified rows cannot emit" a property of statutes.py rather
-    than a habit of this module.
+    "an unverified row cannot emit" a property of statutes.py rather than a
+    habit of this module. The shipped map verifies all 171 rows since the
+    2026-08-17 operator ruling closed the last 17 sheet rows, so nothing is
+    refused on this ground today - the gate still fires the moment a row's
+    verified_by is nulled again.
     """
     ok: list[Family] = []
     refused: list[dict] = []

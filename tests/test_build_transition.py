@@ -93,16 +93,16 @@ def test_the_grid_is_the_verified_map_crossed_with_the_postures(grid, mapping):
     assert len(T.POSTURE_CELLS) == (
         len(T.DATE_POSTURES) * len(T.PROCEDURAL_POSTURES) * len(T.QUESTION_FORMS)
     )
-    assert len(mapping.verified_rows()) == 154
-    # 153, not 154: IPC 377 is verified and emits nothing at all, because no
+    assert len(mapping.verified_rows()) == 171
+    # 170, not 171: IPC 377 is verified and emits nothing at all, because no
     # posture of it can be keyed with certainty (see the judicial tests below).
-    assert len(families) == 153
-    # 154 x 80 minus the cells that cannot be built - the ones no gate stack
+    assert len(families) == 170
+    # 171 x 80 minus the cells that cannot be built - the ones no gate stack
     # could accept AND the ones whose law this build cannot state - which is
     # the whole of the difference.
     ungateable = [entry for entry in refused if "cell" in entry]
     assert len(cells) == len(mapping.verified_rows()) * len(T.POSTURE_CELLS) - len(ungateable)
-    assert len(cells) == 12144
+    assert len(cells) == 13504
 
 
 def test_every_cell_id_is_unique_and_content_keyed(grid):
@@ -149,11 +149,11 @@ def test_the_draw_covers_every_family_and_every_posture_pair(selection, grid):
     per_family: dict[str, int] = {}
     for cell in selection.sample:
         per_family[cell.family.key] = per_family.get(cell.family.key, 0) + 1
-    assert len(per_family) == len({c.family.key for c in cells}) == 153
+    assert len(per_family) == len({c.family.key for c in cells}) == 170
     # A prefix of the coverage order gives every family within one cell of
     # every other - no family is left out of a 1,100-cell draw.
     assert max(per_family.values()) - min(per_family.values()) <= 1
-    assert (min(per_family.values()), max(per_family.values())) == (7, 8)
+    assert (min(per_family.values()), max(per_family.values())) == (6, 7)
 
     triples = {
         (c.date_posture.name, c.procedural_posture.name, c.question_form.name)
@@ -232,23 +232,34 @@ def test_the_stride_makes_each_family_walk_every_posture_exactly_once(selection,
 
 
 # --------------------------------------------------------------------------
-# require_verified: the 17 rows that cannot emit, both directions.
+# require_verified: an unaudited row cannot emit, both directions. The
+# 2026-08-17 operator ruling closed the last 17 sheet rows, so the shipped
+# map has no unverified rows left (grid, mapping) below proves that - the
+# refusal side is proven on constructed fixtures instead, copies of real
+# rows with verified_by nulled, which is exactly what an unaudited row is.
 # --------------------------------------------------------------------------
 
-def test_the_unverified_mapping_rows_emit_nothing(grid, mapping):
+def test_the_shipped_map_has_no_unverified_rows_left(grid, mapping):
     cells, refused = grid
-    unverified = {
-        str(SectionRef(row["old_code"] or row["new_code"], row["old_section"] or row["new_section"]))
-        for row in mapping.unverified_rows()
-    }
-    assert len(unverified) == 17
-    assert not (unverified & {cell.family.key for cell in cells})
+    assert mapping.unverified_rows() == []
+    family_refusals = {entry["family"]: entry["reason"] for entry in refused if "cell" not in entry}
+    assert not any("unverified" in reason for reason in family_refusals.values())
+
+
+def test_an_unaudited_row_emits_nothing(mapping, provisions):
+    rows = copy.deepcopy(mapping.rows)
+    victim = next(row for row in rows if row.get("verified_by") and row["kind"] == "changed")
+    key = str(SectionRef(victim["old_code"], victim["old_section"]))
+    victim["verified_by"] = None
+
+    cells, refused = T.build_grid(Mapping(rows), provisions=provisions)
+    assert key not in {cell.family.key for cell in cells}
 
     # And the manifest says WHY, in statutes.py's own words.
-    family_refusals = {entry["family"]: entry["reason"] for entry in refused if "cell" not in entry}
-    assert set(family_refusals) == unverified
-    for reason in family_refusals.values():
-        assert "unverified" in reason and "verified_by is null" in reason
+    reason = next(
+        entry["reason"] for entry in refused if "cell" not in entry and entry["family"] == key
+    )
+    assert "unverified" in reason and "verified_by is null" in reason
 
 
 def test_flipping_one_verified_row_to_null_removes_exactly_its_cells(mapping, provisions):
@@ -268,12 +279,16 @@ def test_flipping_one_verified_row_to_null_removes_exactly_its_cells(mapping, pr
 
 
 def test_signing_one_unverified_row_off_grows_the_grid_with_no_code_change(mapping, provisions):
-    before, _ = T.build_grid(mapping, provisions=provisions)
     rows = copy.deepcopy(mapping.rows)
-    victim = next(row for row in rows if not row.get("verified_by"))
+    victim = next(row for row in rows if row.get("verified_by") and row["kind"] == "changed")
     key = str(SectionRef(victim["old_code"], victim["old_section"]))
+    original_verified_by = victim["verified_by"]
 
-    victim["verified_by"] = "operator sign-off (fixture)"
+    victim["verified_by"] = None
+    before, _ = T.build_grid(Mapping(rows), provisions=provisions)
+    assert key not in {cell.family.key for cell in before}
+
+    victim["verified_by"] = original_verified_by
     after, _ = T.build_grid(Mapping(rows), provisions=provisions)
     assert key in {cell.family.key for cell in after}
     assert len(after) == len(before) + len(T.POSTURE_CELLS)
@@ -331,7 +346,7 @@ def test_no_cell_narrates_a_record_that_could_not_exist_yet(grid):
     # Only the FIR stage, where an information recorded on the day of the
     # conduct is the ordinary case rather than an impossible record.
     assert {c.procedural_posture.name for c in same_day} == {"fir"}
-    assert len(same_day) == 600
+    assert len(same_day) == 668
     appeals = [c for c in cells if c.procedural_posture.name == "appeal"]
     assert appeals
     assert min((c.proceeding_started - c.offence_date).days for c in appeals) == 180
@@ -356,7 +371,7 @@ def test_the_on_appointed_day_question_is_still_about_the_offence_date(grid, pro
     """The conduct stays exactly on the boundary; only the record moves out."""
     cells, _ = grid
     on_day = [c for c in cells if c.date_posture.name == "on_appointed_day"]
-    assert len(on_day) == 2400
+    assert len(on_day) == 2672
     for cell in on_day:
         assert cell.offence_date == APPOINTED_DAY
         assert cell.proceeding_started == APPOINTED_DAY + timedelta(
@@ -1217,9 +1232,9 @@ def test_the_stream_and_task_type_are_the_ones_the_rest_of_the_pipeline_uses():
 
 def test_build_transition_writes_the_draw_and_reports_the_shape(store, cfg, mapping, provisions):
     manifest = T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
-    assert manifest["grid_cells"] == 12144
-    assert manifest["families_emitting"] == 153
-    assert manifest["families_refused"] == 17
+    assert manifest["grid_cells"] == 13504
+    assert manifest["families_emitting"] == 170
+    assert manifest["families_refused"] == 0
     assert manifest["cells_refused"] == 176
     assert manifest["cells_refused_by_basis"] == {"legal-certainty": 96, "gate-stack": 80}
     # The family that passes every audit gate and still emits nothing is named
@@ -1230,7 +1245,7 @@ def test_build_transition_writes_the_draw_and_reports_the_shape(store, cfg, mapp
     assert (manifest["deleted"], manifest["seeds_pruned"], manifest["retired_reserve"]) == (
         0, 0, 0
     )
-    assert manifest["sample_families_covered"] == 153
+    assert manifest["sample_families_covered"] == 170
     assert manifest["sample_posture_pairs"] == manifest["posture_pairs_total"] == 20
     assert store.seed_count(T.TRANSITION_SOURCE_ID) == 1250
     assert [event["kind"] for event in store.events("transition_grid_built")]
@@ -1248,7 +1263,7 @@ def test_a_dry_run_measures_and_writes_nothing(store, cfg, mapping, provisions):
         store, cfg, mapping=mapping, provisions=provisions, dry_run=True
     )
     assert manifest["written"] == 0
-    assert manifest["grid_cells"] == 12144
+    assert manifest["grid_cells"] == 13504
     assert store.seed_count() == 0
 
 
@@ -1293,12 +1308,18 @@ def test_an_identical_rebuild_changes_nothing(store, cfg, mapping, provisions):
 def test_signing_a_row_off_reconciles_rather_than_accumulates(store, cfg, mapping, provisions):
     """Measured before reconciliation: 1,250 -> 1,522 seeds, with the eval
     reserve drifting to 180 because the old draw's held-out cells were still
-    sitting in the table beside the new one's."""
-    T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
-    rows = copy.deepcopy(mapping.rows)
-    victim = next(row for row in rows if not row.get("verified_by"))
-    victim["verified_by"] = "operator sign-off (fixture)"
+    sitting in the table beside the new one's.
 
+    The shipped map has no unverified rows left, so "before signing" is
+    constructed: a real row copied with verified_by nulled - exactly what an
+    unaudited row looks like - built first, then signed and rebuilt."""
+    rows = copy.deepcopy(mapping.rows)
+    victim = next(row for row in rows if row.get("verified_by") and row["kind"] == "changed")
+    original_verified_by = victim["verified_by"]
+    victim["verified_by"] = None
+    T.build_transition(store, cfg, mapping=Mapping(rows), provisions=provisions)
+
+    victim["verified_by"] = original_verified_by
     manifest = T.build_transition(store, cfg, mapping=Mapping(rows), provisions=provisions)
     marks = _marks(store)
     # The eval is exactly the reserve the config asks for - no drift.
@@ -1375,8 +1396,10 @@ def test_growing_the_reserve_refuses_to_take_a_cell_a_teacher_has_answered(
     """The other direction of the same contamination, which the review did not
     measure: growing the reserve moves cells OUT of the sample and into the
     eval, and a cell the teacher has already been asked about is not an eval
-    cell. Measured before: with a 40-task wave planned, 150 -> 180 promoted 4
-    already-planned cells into the reserve."""
+    cell. Measured after the 2026-08-17 operator ruling grew the grid to 171
+    verified rows / 170 emitting families: with a 40-task wave planned, 150 ->
+    250 promoted 2 already-planned cells into the reserve (150 -> 180, which
+    used to collide, no longer does against this grid's coverage order)."""
     import dataclasses
 
     T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
@@ -1387,7 +1410,7 @@ def test_growing_the_reserve_refuses_to_take_a_cell_a_teacher_has_answered(
     assert len(tasked) == 40
 
     bigger = dataclasses.replace(
-        cfg, transition=dataclasses.replace(cfg.transition, eval_reserve=180)
+        cfg, transition=dataclasses.replace(cfg.transition, eval_reserve=250)
     )
     with pytest.raises(ValueError, match="already been asked about"):
         T.build_transition(store, bigger, mapping=mapping, provisions=provisions)
@@ -1400,7 +1423,7 @@ def test_growing_the_reserve_refuses_to_take_a_cell_a_teacher_has_answered(
     preview = T.build_transition(
         store, bigger, mapping=mapping, provisions=provisions, dry_run=True
     )
-    assert preview["reserve_blocked_by_tasks"] == 4
+    assert preview["reserve_blocked_by_tasks"] == 2
 
 
 def test_a_rebuild_that_would_drop_a_generated_cell_is_refused_not_orphaned(

@@ -546,14 +546,18 @@ def test_mapping_loads_the_starter_rows():
 def test_the_audited_map_is_mostly_verified_and_the_remainder_is_named():
     """The 2026-08-16 source audit stamped every row where two independent
     sources - at least one official, current-edition bare acts preferred -
-    agree on every cell. The 17 unverified rows are exactly the operator
-    decision sheet (kind-only questions; every BNS number two-source
-    agreed). These pins MOVE when the operator rules on a sheet row:
-    update them with the ruling, never loosen them to inequalities."""
+    agree on every cell. The 17 rows it could not close on kind alone (every
+    BNS number two-source agreed; only one_to_one/changed was open) went to
+    an operator decision sheet, and the operator ruled on all 17 on
+    2026-08-17 (9 changed / 8 one_to_one - IPC 146 flipping from the shipped
+    changed to one_to_one, every other row confirming its shipped kind), so
+    the map now ships with no unverified rows. These pins MOVE when the
+    operator rules on a sheet row: update them with the ruling, never loosen
+    them to inequalities."""
     mapping = Mapping.load()
     assert len(mapping) == 171
-    assert len(mapping.verified_rows()) == 154
-    assert len(mapping.unverified_rows()) == 17
+    assert len(mapping.verified_rows()) == 171
+    assert len(mapping.unverified_rows()) == 0
     assert len(mapping.verified_rows()) + len(mapping.unverified_rows()) == len(mapping)
 
 
@@ -615,25 +619,43 @@ def test_counterpart_unmapped():
     assert mapping.row(SectionRef("IPC", "999")) is None
 
 
-def test_require_verified_passes_audited_rows_and_refuses_the_sheet():
-    """IPC 302 carries a two-source stamp and flows. IPC 375 ships a kind
-    at low confidence and sits on the operator decision sheet, so it must
-    refuse until a human rules - rape is exactly the section where a token
-    comparison is not an instrument and the audit said so out loud."""
+def test_require_verified_passes_audited_rows_and_now_375_too():
+    """IPC 302 carries a two-source stamp and flows. IPC 375 shipped a kind
+    at low confidence and sat on the operator decision sheet - rape is
+    exactly the section where a token comparison is not an instrument, and
+    the audit said so out loud - but the operator ruled `changed` on
+    2026-08-17, so it is verified and flows now too. The shipped map has no
+    unverified rows left, so the refusal direction is proven on a
+    constructed fixture: a copy of a real row's shape with verified_by
+    nulled, which is exactly what an unaudited row looks like."""
     mapping = Mapping.load()
     assert mapping.require_verified(SectionRef("IPC", "302"))["new_section"] == "103"
+    assert mapping.require_verified(SectionRef("IPC", "375"))["new_section"] == "63"
+
+    unaudited = Mapping([
+        {
+            "old_code": "IPC", "old_section": "302", "new_code": "BNS", "new_section": "103",
+            "kind": "one_to_one", "verified_by": None, "notes": "fixture: unaudited row",
+        }
+    ])
     with pytest.raises(ValueError, match="unverified"):
-        mapping.require_verified(SectionRef("IPC", "375"))
+        unaudited.require_verified(SectionRef("IPC", "302"))
     with pytest.raises(ValueError, match="no mapping row"):
         mapping.require_verified(SectionRef("IPC", "999"))
 
 
 def test_require_verified_error_names_the_row():
-    # 375 rather than 420: the audit verified 420, and the row this error
-    # names must be one that actually refuses.
-    mapping = Mapping.load()
+    # IPC 375 is fully verified now (operator ruling, 2026-08-17), so the
+    # refusal message is proven on a constructed fixture built to its exact
+    # shape rather than a row that ships.
+    unaudited = Mapping([
+        {
+            "old_code": "IPC", "old_section": "375", "new_code": "BNS", "new_section": "63",
+            "kind": "changed", "verified_by": None, "notes": "fixture: unaudited row",
+        }
+    ])
     with pytest.raises(ValueError) as exc:
-        mapping.require_verified(SectionRef("IPC", "375"))
+        unaudited.require_verified(SectionRef("IPC", "375"))
     message = str(exc.value)
     assert "IPC 375" in message and "BNS 63" in message
 
