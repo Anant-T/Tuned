@@ -116,12 +116,34 @@ meta_json.held_out = true, and tasks._candidate_seeds refuses a held-out seed
 the same way it refuses an oversize one - so the eval can never be planned as
 a teacher generation. Both halves are asserted.
 
+THAT IS A PROPERTY OF ONE RUN, AND THE STORE OUTLIVES RUNS. build_transition
+therefore RECONCILES rather than upserts: this source's seeds become exactly
+this draw, in one transaction, and a cell no longer drawn is removed. Without
+it the seed table was a cache of every grid ever built - un-signing one mapping
+row left 1,250 seeds at 2,114 with eight cells of the now-unverified family
+still plannable, and shrinking eval_reserve silently demoted 30 eval cells to
+training. Three states, not two:
+
+    held_out=1 eval_reserve=1   the eval. Never planned.
+    held_out=1 eval_reserve=0   RETIRED: reserved by an earlier build, not by
+                                this one. Never planned, not measured. The
+                                sample is topped up from further down the same
+                                order, so shrinking the reserve costs nothing
+                                and demotes nothing.
+    held_out=0 eval_reserve=0   the training sample.
+
+Two things REFUSE by name rather than deciding for the operator: a rebuild that
+would drop a cell some task already points at, and a reserve that would grow to
+take in a cell a teacher has already been asked about. Both mean the draw moved
+under work already spent.
+
 Build:  python -m tuned.data.transition --config configs/data_law_v1.yaml
         [--dry-run]
 """
 
 import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, timedelta
 from math import gcd
@@ -1028,8 +1050,22 @@ def selection_order(cells: list[Cell]) -> list[Cell]:
     return out
 
 
-def select_cells(cells: list[Cell], *, sample: int, reserve: int) -> Selection:
-    """`reserve` eval cells, then `sample` training cells, off one order."""
+def select_cells(
+    cells: list[Cell],
+    *,
+    sample: int,
+    reserve: int,
+    exclude_from_sample: Iterable[str] = (),
+) -> Selection:
+    """`reserve` eval cells, then `sample` training cells, off one order.
+
+    `exclude_from_sample` is the RETIRED RESERVE: cells the store has already
+    marked as eval and that this draw's reserve no longer holds. They are
+    skipped when the training sample is taken and the sample is topped up from
+    further down the same order, so shrinking the reserve cannot quietly hand
+    an eval cell to the teacher. It affects the sample only - a cell in it is
+    by definition not in the new reserve prefix.
+    """
     order = selection_order(cells)
     if sample + reserve > len(order):
         raise ValueError(
@@ -1037,9 +1073,17 @@ def select_cells(cells: list[Cell], *, sample: int, reserve: int) -> Selection:
             f"plus {sample} sampled. Either the mapping lost verified rows or the config "
             f"is asking for more of the grid than exists."
         )
-    return Selection(
-        reserve=order[:reserve], sample=order[reserve : reserve + sample], order=order
-    )
+    retired = set(exclude_from_sample)
+    reserve_cells = order[:reserve]
+    rest = [cell for cell in order[reserve:] if cell.cell_id not in retired]
+    if len(rest) < sample:
+        raise ValueError(
+            f"the grid holds {len(order)} cells, of which {len(retired)} were reserved by "
+            f"an earlier build and stay excluded from training, leaving {len(rest)} behind "
+            f"the {reserve}-cell reserve - not the {sample} this config samples. Shrink "
+            f"transition.sample, or retire this source's seeds deliberately."
+        )
+    return Selection(reserve=reserve_cells, sample=rest[:sample], order=order)
 
 
 # --------------------------------------------------------------------------
@@ -1360,8 +1404,24 @@ def render_cell(cell: Cell, provisions: dict[str, Provision]) -> dict:
     }
 
 
-def seed_row(cell: Cell, provisions: dict[str, Provision], *, held_out: bool) -> dict:
-    """One store.seed row. `held_out` is the eval reserve's mark."""
+def seed_row(
+    cell: Cell,
+    provisions: dict[str, Provision],
+    *,
+    held_out: bool,
+    eval_reserve: bool | None = None,
+) -> dict:
+    """One store.seed row.
+
+    TWO marks, because there are three states and not two. `held_out` is the
+    PLANNER's exclusion - tasks._candidate_seeds refuses it - and
+    `eval_reserve` is the EVAL's membership. They differ on exactly one kind of
+    row: a cell an earlier build reserved that this draw's reserve no longer
+    holds stays held_out (it must never become training material) and is not
+    eval_reserve (it is not part of the measurement any more). Defaulting
+    eval_reserve to held_out keeps the ordinary two states a one-word call.
+    """
+    eval_reserve = held_out if eval_reserve is None else eval_reserve
     slots = render_cell(cell, provisions)
     key = answer_key_for(cell, provisions)
     return {
@@ -1395,6 +1455,9 @@ def seed_row(cell: Cell, provisions: dict[str, Provision], *, held_out: bool) ->
             # THE RESERVE MARK. tasks._candidate_seeds refuses a held-out seed,
             # so an eval cell can never be planned as a teacher generation.
             "held_out": held_out,
+            # ...and whether it is in the CURRENT eval. See the docstring: a
+            # retired reserve cell is held_out and not eval_reserve.
+            "eval_reserve": eval_reserve,
             **cell.coordinates,
         },
     }
@@ -1430,9 +1493,43 @@ def build_transition(
     provisions = load_provisions() if provisions is None else provisions
 
     cells, refused = build_grid(mapping, provisions=provisions)
-    selection = select_cells(
+
+    # WHAT THE STORE ALREADY HOLDS, before anything is drawn. The seed table is
+    # the artefact the rest of the pipeline reads, and until this call it was a
+    # cache of every grid ever built rather than a picture of this one: a
+    # rebuild upserted the new draw on top of the old and pruned nothing, so
+    # un-signing one mapping row took the table from 1,250 seeds to 2,114 with
+    # eight cells of the now-unverified family still sitting there, seven of
+    # them plannable. Reconciliation is the whole of the fix, and it is the
+    # same lesson as the resurrected parent row in chunks.py: doing the new
+    # work correctly is not the same as removing the old.
+    marks = store.seed_flags(TRANSITION_SOURCE_ID, ("held_out", "eval_reserve"))
+    ever_reserved = {seed_id for seed_id, flag in marks.items() if flag.get("held_out")}
+
+    grid_ids = {cell.cell_id for cell in cells}
+    provisional = select_cells(
         cells, sample=cfg.transition.sample, reserve=cfg.transition.eval_reserve
     )
+    # THE RETIRED RESERVE. A cell this store has already marked as eval, still
+    # in the grid, and no longer in the reserve prefix - which is what shrinking
+    # transition.eval_reserve produces, and what re-rolling the coverage order
+    # produces wholesale. Measured before this: 150 -> 120 flipped 30 eval cells
+    # to held_out = 0 and every one of them was then offered to the wave
+    # planner. They stay excluded from training and stop being part of the
+    # measurement; the sample is topped up from further down the same order, so
+    # the training draw is still the size the config asked for.
+    retired_ids = (ever_reserved & grid_ids) - {cell.cell_id for cell in provisional.reserve}
+    selection = (
+        provisional
+        if not retired_ids
+        else select_cells(
+            cells,
+            sample=cfg.transition.sample,
+            reserve=cfg.transition.eval_reserve,
+            exclude_from_sample=retired_ids,
+        )
+    )
+    retired = [cell for cell in cells if cell.cell_id in retired_ids]
 
     reserve_ids = {cell.cell_id for cell in selection.reserve}
     sample_ids = {cell.cell_id for cell in selection.sample}
@@ -1442,8 +1539,36 @@ def build_transition(
             f"{len(overlap)} cells are in BOTH the eval reserve and the training sample; "
             f"the two are prefixes of one order and must be disjoint by construction"
         )
+    if retired_ids & (reserve_ids | sample_ids):  # pragma: no cover - set arithmetic
+        raise AssertionError(
+            "a retired reserve cell is in this draw; it is defined as a cell the draw "
+            "does not hold"
+        )
 
-    rows = [seed_row(cell, provisions, held_out=True) for cell in selection.reserve]
+    # THE OTHER DIRECTION OF THE SAME CONTAMINATION, and it is not the one the
+    # review measured: GROWING the reserve moves cells out of the sample into
+    # the eval, and a cell a teacher has already answered cannot be part of the
+    # measurement. Measured: with a 40-task wave planned, 150 -> 180 promoted 4
+    # already-generated cells into the reserve. Refused by name; the operator
+    # sizes the reserve before the waves, not after.
+    promoted = sorted(reserve_ids - ever_reserved)
+    answered = sorted(store.seeds_with_tasks(promoted))
+    if answered and not dry_run:
+        raise ValueError(
+            f"transition.eval_reserve cannot take {len(answered)} cell(s) a teacher has "
+            f"already been asked about (first: {answered[:5]}). An eval the model's "
+            f"teacher has answered is not an eval. Nothing has been written; size the "
+            f"reserve before planning waves against this source, or retire its seeds "
+            f"deliberately"
+        )
+
+    rows = [
+        seed_row(cell, provisions, held_out=True, eval_reserve=True)
+        for cell in selection.reserve
+    ]
+    rows += [
+        seed_row(cell, provisions, held_out=True, eval_reserve=False) for cell in retired
+    ]
     rows += [seed_row(cell, provisions, held_out=False) for cell in selection.sample]
 
     per_family: dict[str, int] = {}
@@ -1479,6 +1604,13 @@ def build_transition(
         "posture_cells": len(POSTURE_CELLS),
         "sample": len(selection.sample),
         "reserve": len(selection.reserve),
+        # Cells an earlier build reserved that this one does not: kept out of
+        # training, out of the eval, and out of nothing else.
+        "retired_reserve": len(retired),
+        "seeds_pruned": len(set(marks) - {row["seed_id"] for row in rows}),
+        # Reported rather than only raised, so a --dry-run says what a real run
+        # would refuse instead of leaving the operator to find out on the write.
+        "reserve_blocked_by_tasks": len(answered),
         "sample_families_covered": len(per_family),
         "sample_per_family_min": min(per_family.values()) if per_family else 0,
         "sample_per_family_max": max(per_family.values()) if per_family else 0,
@@ -1492,7 +1624,18 @@ def build_transition(
         return manifest
 
     store.upsert_source(TRANSITION_SOURCE_ID, TRANSITION_LICENSE, url=None)
-    manifest["written"] = store.upsert_seeds(rows)
+    # RECONCILE, never accumulate: this source's seeds become exactly this
+    # draw, in one transaction, and a cell that some task already points at
+    # refuses the build rather than being deleted or left behind.
+    try:
+        written = store.replace_source_seeds(TRANSITION_SOURCE_ID, rows)
+    except ValueError as exc:
+        raise ValueError(
+            f"the transition grid cannot be rebuilt over the seeds already in this store: "
+            f"{exc}"
+        ) from exc
+    manifest["written"] = written["written"]
+    manifest["deleted"] = written["deleted"]
     store.log_event("transition_grid_built", manifest)
     return manifest
 
@@ -1543,6 +1686,12 @@ def main(argv=None) -> int:
         f"  reserve {manifest['reserve']}  sample {manifest['sample']}  "
         f"written {manifest['written']}"
     )
+    if manifest["retired_reserve"] or manifest["seeds_pruned"]:
+        print(
+            f"  reconciled: {manifest['seeds_pruned']} seed(s) no longer drawn were "
+            f"removed, {manifest['retired_reserve']} once-reserved cell(s) stay excluded "
+            f"from training and out of the eval"
+        )
     print(
         f"  sample covers {manifest['sample_families_covered']}/{manifest['families_emitting']} "
         f"families ({manifest['sample_per_family_min']}-{manifest['sample_per_family_max']} "

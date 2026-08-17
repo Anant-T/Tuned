@@ -1326,6 +1326,119 @@ def test_delete_seeds_refuses_to_orphan_a_referencing_task(store):
         store.delete_seeds(["sd0"])
 
 
+# --------------------------------- 12b. seed_flags / seeds_with_tasks /
+#                                        replace_source_seeds
+
+
+def _flagged(store, source_id="a", **flags):
+    store.upsert_source(source_id, "CC-BY-4.0")
+    rows = []
+    for seed_id, meta in flags.items():
+        rows.append(
+            {"seed_id": seed_id, "source_id": source_id, "text": "t", "token_count": 1,
+             "meta_json": meta}
+        )
+    store.upsert_seeds(rows)
+    return rows
+
+
+def test_seed_flags_projects_the_marks_without_the_text(store):
+    _flagged(
+        store,
+        s1={"held_out": True, "eval_reserve": True},
+        s2={"held_out": False, "eval_reserve": False},
+        s3={"other": 1},
+    )
+    flags = store.seed_flags("a", ("held_out", "eval_reserve"))
+    assert set(flags) == {"s1", "s2", "s3"}
+    assert flags["s1"] == {"held_out": 1, "eval_reserve": 1}
+    assert flags["s2"] == {"held_out": 0, "eval_reserve": 0}
+    # A missing key reads as absent, not as false-y noise from another row.
+    assert flags["s3"] == {"held_out": None, "eval_reserve": None}
+    assert store.seed_flags("a", ()) == {"s1": {}, "s2": {}, "s3": {}}
+    assert store.seed_flags("nonexistent", ("held_out",)) == {}
+
+
+def test_seed_flags_treats_unparseable_meta_as_unmarked(store):
+    # meta_json is free text; a row holding something that is not JSON must
+    # read as unmarked rather than failing the whole query.
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_seeds([
+        {"seed_id": "weird", "source_id": "a", "text": "t", "meta_json": "not json"},
+    ])
+    assert store.seed_flags("a", ("held_out",)) == {"weird": {"held_out": None}}
+
+
+def test_seeds_with_tasks_names_the_work_already_planned(store):
+    _populate(store, n=1)  # sd0 carries a task
+    store.upsert_seeds([
+        {"seed_id": "sd_free", "source_id": "ikanoon", "text": "t", "token_count": 1},
+    ])
+    assert store.seeds_with_tasks(["sd0", "sd_free"]) == {"sd0"}
+    assert store.seeds_with_tasks([]) == set()
+    # Chunked at 500: a call bigger than SQLITE_MAX_VARIABLE_NUMBER still
+    # answers, and answers the same thing.
+    assert store.seeds_with_tasks(["sd0"] + [f"ghost{i}" for i in range(1200)]) == {"sd0"}
+
+
+def test_replace_source_seeds_makes_the_source_exactly_the_rows_given(store):
+    _flagged(store, s1={"n": 1}, s2={"n": 2}, s3={"n": 3})
+    result = store.replace_source_seeds(
+        "a",
+        [
+            {"seed_id": "s2", "source_id": "a", "text": "t2", "meta_json": {"n": 22}},
+            {"seed_id": "s9", "source_id": "a", "text": "t9", "meta_json": {"n": 9}},
+        ],
+    )
+    assert {r["seed_id"] for r in store.seeds_by_source("a")} == {"s2", "s9"}
+    assert result == {"written": 2, "deleted": 2}
+    assert store.seed_flags("a", ("n",))["s2"] == {"n": 22}  # replaced, not merely kept
+
+
+def test_replace_source_seeds_leaves_other_sources_alone(store):
+    _flagged(store, s1={"n": 1})
+    _flagged(store, source_id="b", t1={"n": 1})
+    store.replace_source_seeds("a", [])
+    assert store.seeds_by_source("a") == []
+    assert [r["seed_id"] for r in store.seeds_by_source("b")] == ["t1"]
+
+
+def test_replace_source_seeds_refuses_rows_from_another_source(store):
+    _flagged(store, s1={"n": 1})
+    store.upsert_source("b", "CC-BY-4.0")
+    with pytest.raises(ValueError, match="can only reconcile one source"):
+        store.replace_source_seeds(
+            "a", [{"seed_id": "x", "source_id": "b", "text": "t"}]
+        )
+    assert {r["seed_id"] for r in store.seeds_by_source("a")} == {"s1"}
+
+
+def test_replace_source_seeds_refuses_to_drop_a_seed_a_task_points_at(store):
+    """The refusal is the point: a row this call would delete that some task
+    already references means the draw moved under work already planned or paid
+    for. Nothing is written - not even the rows that were fine."""
+    _populate(store, n=2)  # sd0, sd1 both carry tasks
+    before = {r["seed_id"] for r in store.seeds_by_source("ikanoon")}
+    with pytest.raises(ValueError, match="already referenced by a task"):
+        store.replace_source_seeds(
+            "ikanoon",
+            [{"seed_id": "brand_new", "source_id": "ikanoon", "text": "t"}],
+        )
+    assert {r["seed_id"] for r in store.seeds_by_source("ikanoon")} == before
+    assert store.get_seed("brand_new") is None
+
+
+def test_replace_source_seeds_deletes_and_writes_in_one_transaction(store):
+    """A delete that landed without its insert would be a draw with a hole in
+    it, so the two halves are one transaction. Forced by making the INSERT
+    fail: the DELETE that ran first must not survive it."""
+    _flagged(store, s1={"n": 1}, s2={"n": 2})
+    bad = [{"seed_id": "s3", "source_id": "a"}]  # text is NOT NULL
+    with pytest.raises(sqlite3.IntegrityError):
+        store.replace_source_seeds("a", bad)
+    assert {r["seed_id"] for r in store.seeds_by_source("a")} == {"s1", "s2"}
+
+
 # ------------------------------------------------------- 13. seeds_by_source
 
 

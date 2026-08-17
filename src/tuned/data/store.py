@@ -29,7 +29,7 @@ Conventions
 import json
 import sqlite3
 import threading
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -691,6 +691,115 @@ class Store:
         return self._conn.execute(
             "SELECT COUNT(*) FROM chunk_manifest WHERE source_id = ?", (source_id,)
         ).fetchone()[0]
+
+    def seed_flags(self, source_id: str, keys: Sequence[str]) -> dict[str, dict]:
+        """seed_id -> {key: value} read out of meta_json, for ONE source.
+
+        The cheap projection, and that is the point: a builder reconciling a
+        12,000-cell grid needs to know which of its seeds exist and how they
+        are marked, and `seeds_by_source` would carry every row's TEXT along
+        with the answer. `json_valid` guards the extract the same way
+        tasks._candidate_seeds does - meta_json is a free-text column, and a
+        row holding something that is not JSON reads as unmarked rather than
+        failing the query.
+        """
+        keys = list(keys)
+        if not keys:
+            return {
+                row[0]: {}
+                for row in self._conn.execute(
+                    "SELECT seed_id FROM seed WHERE source_id = ?", (source_id,)
+                )
+            }
+        projection = ", ".join(
+            f"CASE WHEN json_valid(meta_json) THEN json_extract(meta_json, '$.{key}') END"
+            for key in keys
+        )
+        rows = self._conn.execute(
+            f"SELECT seed_id, {projection} FROM seed WHERE source_id = ?", (source_id,)
+        ).fetchall()
+        return {row[0]: dict(zip(keys, row[1:])) for row in rows}
+
+    def seeds_with_tasks(self, seed_ids: Iterable[str]) -> set[str]:
+        """Which of these seeds a task row already points at.
+
+        Work already planned or paid for, in one question. Chunked at 500 for
+        the same reason _sample_counts is: SQLITE_MAX_VARIABLE_NUMBER is 999
+        on older builds and this is called with a whole draw.
+        """
+        ids = list(dict.fromkeys(seed_ids))
+        found: set[str] = set()
+        for start in range(0, len(ids), 500):
+            chunk = ids[start : start + 500]
+            found.update(
+                row[0]
+                for row in self._conn.execute(
+                    f"SELECT DISTINCT seed_id FROM task "
+                    f"WHERE seed_id IN ({', '.join('?' * len(chunk))})",
+                    chunk,
+                )
+            )
+        return found
+
+    def replace_source_seeds(self, source_id: str, rows: Iterable[dict]) -> dict:
+        """Make this source's seeds EXACTLY `rows`, in one transaction.
+
+        upsert_seeds accumulates: a builder whose draw moved leaves every cell
+        it ever wrote behind it, and the table becomes a cache of every run
+        rather than a picture of this one. That is not hypothetical - it is
+        how a rebuilt transition grid grew 1,250 -> 2,114 seeds with the
+        orphans still plannable. This is the reconciling form, and the two
+        halves are in ONE transaction because a delete that lands without its
+        insert is a draw with a hole in it.
+
+        A row this call would DELETE that some task already points at is a
+        REFUSAL, not a silent orphan and not a cascade: it means the draw moved
+        under work already planned or paid for, which is a thing the operator
+        has to decide about rather than a thing a rebuild may decide for them.
+        Nothing is written when it refuses.
+
+        Returns {"written": n, "deleted": n}.
+        """
+        payload_rows = [dict(row) for row in rows]
+        wrong = {
+            row.get("source_id") for row in payload_rows if row.get("source_id") != source_id
+        }
+        if wrong:
+            raise ValueError(
+                f"replace_source_seeds({source_id!r}) was given rows belonging to "
+                f"{sorted(str(x) for x in wrong)}: it can only reconcile one source, and a "
+                f"row from another would be written and then never managed"
+            )
+        keep = {row["seed_id"] for row in payload_rows}
+        existing = {
+            row[0]
+            for row in self._conn.execute(
+                "SELECT seed_id FROM seed WHERE source_id = ?", (source_id,)
+            )
+        }
+        doomed = sorted(existing - keep)
+        blocked = sorted(self.seeds_with_tasks(doomed))
+        if blocked:
+            raise ValueError(
+                f"cannot reconcile {source_id!r}: {len(blocked)} of the {len(doomed)} seed "
+                f"rows this build no longer draws are already referenced by a task "
+                f"(first: {blocked[:5]}). The draw moved under work that has already been "
+                f"planned or paid for. Nothing has been written; retire the source "
+                f"deliberately, or rebuild on the inputs the wave was planned against"
+            )
+        payload = [_pack(row, _SEED_COLS) for row in payload_rows]
+        with self._write_txn() as conn:
+            deleted = 0
+            if doomed:
+                deleted = conn.executemany(
+                    "DELETE FROM seed WHERE seed_id = ?", [(i,) for i in doomed]
+                ).rowcount
+            written = 0
+            if payload:
+                written = conn.executemany(
+                    _insert_sql("seed", _SEED_COLS, "INSERT OR REPLACE"), payload
+                ).rowcount
+        return {"written": max(written, 0), "deleted": max(deleted, 0)}
 
     def delete_seeds(self, seed_ids: Iterable[str]) -> int:
         """Delete seed rows by id; returns how many rows were actually removed.

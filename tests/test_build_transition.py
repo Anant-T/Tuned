@@ -1227,6 +1227,9 @@ def test_build_transition_writes_the_draw_and_reports_the_shape(store, cfg, mapp
     assert manifest["families_emitting_nothing"] == ["IPC 377"]
     assert (manifest["sample"], manifest["reserve"]) == (1100, 150)
     assert manifest["written"] == 1250
+    assert (manifest["deleted"], manifest["seeds_pruned"], manifest["retired_reserve"]) == (
+        0, 0, 0
+    )
     assert manifest["sample_families_covered"] == 153
     assert manifest["sample_posture_pairs"] == manifest["posture_pairs_total"] == 20
     assert store.seed_count(T.TRANSITION_SOURCE_ID) == 1250
@@ -1255,6 +1258,206 @@ def test_a_config_without_a_transition_block_is_refused(store, cfg, mapping, pro
     naked = dataclasses.replace(cfg, transition=None)
     with pytest.raises(ValueError, match="transition.sample"):
         T.build_transition(store, naked, mapping=mapping, provisions=provisions)
+
+
+# --------------------------------------------------------------------------
+# Reconciliation: the seed table is a picture of THIS draw, not a cache of
+# every draw. Every direction - sign, un-sign, shrink, grow, no change.
+# --------------------------------------------------------------------------
+
+def _marks(store):
+    """seed_id -> (held_out, eval_reserve) for the transition source."""
+    return {
+        seed_id: (bool(flag["held_out"]), bool(flag["eval_reserve"]))
+        for seed_id, flag in store.seed_flags(
+            T.TRANSITION_SOURCE_ID, ("held_out", "eval_reserve")
+        ).items()
+    }
+
+
+def _plannable(store, cfg):
+    return {row["seed_id"] for row in tasks.plan_rows(store, cfg, T.STREAM, 5000)}
+
+
+def test_an_identical_rebuild_changes_nothing(store, cfg, mapping, provisions):
+    T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
+    before = _marks(store)
+    manifest = T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
+    assert _marks(store) == before
+    assert store.seed_count(T.TRANSITION_SOURCE_ID) == 1250
+    assert (manifest["deleted"], manifest["retired_reserve"], manifest["seeds_pruned"]) == (
+        0, 0, 0
+    )
+
+
+def test_signing_a_row_off_reconciles_rather_than_accumulates(store, cfg, mapping, provisions):
+    """Measured before reconciliation: 1,250 -> 1,522 seeds, with the eval
+    reserve drifting to 180 because the old draw's held-out cells were still
+    sitting in the table beside the new one's."""
+    T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
+    rows = copy.deepcopy(mapping.rows)
+    victim = next(row for row in rows if not row.get("verified_by"))
+    victim["verified_by"] = "operator sign-off (fixture)"
+
+    manifest = T.build_transition(store, cfg, mapping=Mapping(rows), provisions=provisions)
+    marks = _marks(store)
+    # The eval is exactly the reserve the config asks for - no drift.
+    assert sum(1 for _, (_, ev) in marks.items() if ev) == 150 == manifest["reserve"]
+    # The training draw is still the size the config asks for, and still
+    # plannable in full.
+    assert sum(1 for _, (held, _) in marks.items() if not held) == 1100
+    assert len(_plannable(store, cfg)) == 1100
+    # What is left over is named: cells the old reserve held and this one does
+    # not, kept out of training rather than quietly handed to the teacher.
+    assert manifest["retired_reserve"] == len(marks) - 1250
+    assert all(held for seed_id, (held, ev) in marks.items() if not ev and held)
+
+
+def test_un_signing_a_row_removes_its_cells_including_the_plannable_ones(
+    store, cfg, mapping, provisions
+):
+    """Measured before reconciliation: 1,250 -> 2,114 seeds, with 8 cells of
+    the now-UNVERIFIED family still in the table and 7 of them plannable. The
+    invariant the whole stream rests on - an unsigned row emits nothing - was
+    a property of build_grid and not of the artefact the pipeline reads."""
+    T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
+    rows = copy.deepcopy(mapping.rows)
+    victim = next(row for row in rows if row.get("old_section") == "34")
+    key = str(SectionRef(victim["old_code"], victim["old_section"]))
+    victim["verified_by"] = None
+
+    manifest = T.build_transition(store, cfg, mapping=Mapping(rows), provisions=provisions)
+    stale = [
+        seed_id
+        for seed_id, flag in store.seed_flags(T.TRANSITION_SOURCE_ID, ("family",)).items()
+        if flag["family"] == key
+    ]
+    assert stale == []
+    assert not (set(stale) & _plannable(store, cfg))
+    assert manifest["seeds_pruned"] > 0 and manifest["deleted"] > 0
+    assert sum(1 for _, (_, ev) in _marks(store).items() if ev) == 150
+
+
+def test_shrinking_the_reserve_never_demotes_an_eval_cell_to_training(
+    store, cfg, mapping, provisions
+):
+    """THE forbidden outcome. Measured before: transition.eval_reserve 150 ->
+    120 flipped 30 cells from held_out 1 to 0, and every one of the 30 was then
+    offered to the wave planner - eval cells becoming training rows with
+    nothing in the manifest saying so."""
+    import dataclasses
+
+    T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
+    was_reserved = {seed_id for seed_id, (held, _) in _marks(store).items() if held}
+    assert len(was_reserved) == 150
+
+    smaller = dataclasses.replace(
+        cfg, transition=dataclasses.replace(cfg.transition, eval_reserve=120)
+    )
+    manifest = T.build_transition(store, smaller, mapping=mapping, provisions=provisions)
+    marks = _marks(store)
+
+    # The eval is the 120 the config now asks for...
+    assert sum(1 for _, (_, ev) in marks.items() if ev) == 120 == manifest["reserve"]
+    # ...the 30 that left it are still held out of training, and none of them
+    # can be planned against.
+    assert manifest["retired_reserve"] == 30
+    assert all(marks[seed_id][0] for seed_id in was_reserved)
+    assert not (was_reserved & _plannable(store, cfg))
+    # ...and the training draw is still 1,100, topped up from further down the
+    # same order rather than left short.
+    assert manifest["sample"] == 1100 == len(_plannable(store, cfg))
+
+
+def test_growing_the_reserve_refuses_to_take_a_cell_a_teacher_has_answered(
+    store, cfg, mapping, provisions
+):
+    """The other direction of the same contamination, which the review did not
+    measure: growing the reserve moves cells OUT of the sample and into the
+    eval, and a cell the teacher has already been asked about is not an eval
+    cell. Measured before: with a 40-task wave planned, 150 -> 180 promoted 4
+    already-planned cells into the reserve."""
+    import dataclasses
+
+    T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
+    tasks.plan_wave(store, cfg, T.STREAM, 40)
+    tasked = {
+        row[0] for row in store.conn.execute("SELECT DISTINCT seed_id FROM task")
+    }
+    assert len(tasked) == 40
+
+    bigger = dataclasses.replace(
+        cfg, transition=dataclasses.replace(cfg.transition, eval_reserve=180)
+    )
+    with pytest.raises(ValueError, match="already been asked about"):
+        T.build_transition(store, bigger, mapping=mapping, provisions=provisions)
+    # Nothing was written: the store is exactly as the refused build found it.
+    marks = _marks(store)
+    assert sum(1 for _, (_, ev) in marks.items() if ev) == 150
+    assert not (tasked & {seed_id for seed_id, (held, _) in marks.items() if held})
+    # A dry run says what the real one would refuse, rather than reporting
+    # health and leaving the operator to find out on the write.
+    preview = T.build_transition(
+        store, bigger, mapping=mapping, provisions=provisions, dry_run=True
+    )
+    assert preview["reserve_blocked_by_tasks"] == 4
+
+
+def test_a_rebuild_that_would_drop_a_generated_cell_is_refused_not_orphaned(
+    store, cfg, mapping, provisions
+):
+    """Pruning is a refusal, never a cascade: a cell some task points at means
+    the draw moved under work already planned or paid for, which is the
+    operator's decision and not a rebuild's.
+
+    Shrinking transition.sample is the isolating case - the reserve prefix
+    does not move, so this refusal fires on its own rather than behind the
+    promotion one.
+    """
+    import dataclasses
+
+    T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
+    tasks.plan_wave(store, cfg, T.STREAM, 200)
+    tasked = {row[0] for row in store.conn.execute("SELECT DISTINCT seed_id FROM task")}
+
+    smaller = dataclasses.replace(
+        cfg, transition=dataclasses.replace(cfg.transition, sample=900)
+    )
+    # The 200 cells this config no longer draws, and the overlap with the wave
+    # - asserted so the refusal below can never be vacuous.
+    kept = {
+        cell.cell_id
+        for cell in T.select_cells(
+            T.build_grid(mapping, provisions=provisions)[0], sample=900, reserve=150
+        ).sample
+    }
+    dropped_and_paid_for = tasked - kept
+    assert dropped_and_paid_for
+
+    before = _marks(store)
+    with pytest.raises(ValueError, match="already referenced by a task"):
+        T.build_transition(store, smaller, mapping=mapping, provisions=provisions)
+    assert _marks(store) == before  # nothing written, nothing deleted
+
+
+def test_a_rebuild_that_re_rolls_the_order_under_a_wave_is_refused_too(
+    store, cfg, mapping, provisions
+):
+    """The same thing at the scale it will really happen: an audit-sheet change
+    big enough to re-roll the coverage order moves the draw wholesale, and the
+    build refuses rather than deciding for the operator which spent work to
+    keep. Either refusal is correct here; what must not happen is a write."""
+    T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
+    tasks.plan_wave(store, cfg, T.STREAM, 200)
+    rows = copy.deepcopy(mapping.rows)
+    for row in rows:
+        if row.get("verified_by") and row["kind"] == "one_to_one":
+            row["verified_by"] = None
+
+    before = _marks(store)
+    with pytest.raises(ValueError, match="Nothing has been written"):
+        T.build_transition(store, cfg, mapping=Mapping(rows), provisions=provisions)
+    assert _marks(store) == before
 
 
 # --------------------------------------------------------------------------
