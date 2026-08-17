@@ -1,0 +1,5 @@
+<!-- papers -->
+The papers are the investigating officer's final report and the material filed with it. One accused is named; one informant complains. Neither acts in the capacity of a public servant, and no question of sanction arises on this record. The conduct complained of is the conduct described in the provisions set out below, and nothing in the papers puts the date on which it is said to have occurred in dispute. The place is within the local limits of the court before which the report has been placed. Cognizance is being taken now; no charge has yet been framed and no witness has been examined.
+
+<!-- posture -->
+The conduct is alleged to have taken place on {offence_date}. The investigation into it began on {proceeding_date}, and the final report founded upon that investigation has since been placed before the court. The matter stands at the stage of cognizance: what the court must decide first is the enactment under which the accused stands charged, and only then how the proceeding upon that report is to be conducted from here.

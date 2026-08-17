@@ -214,11 +214,23 @@ def _candidate_seeds(store, *, limit: int, sources: Sequence[str] | None) -> lis
     extract so a row whose meta_json is not JSON (nothing this pipeline
     writes, but the column is free text) is treated as un-flagged rather
     than failing the whole query.
+
+    A seed transition.py flagged `held_out` is never offered either, for a
+    different reason with the same shape. Those are the eval reserve of the
+    transition grid - cells kept back so the s.358 stream can be MEASURED,
+    which only works while no teacher has ever answered them. transition.py
+    already takes the reserve and the sample as disjoint prefixes of one
+    order, so nothing here can put a reserved cell into the sample; this is
+    the second half, and it is the half that matters, because a wave planned
+    over every seed in the table would otherwise generate against the eval
+    without anything in the pipeline noticing.
     """
     clauses = [
         "COALESCE(t.n, 0) < ?",
         "COALESCE(CASE WHEN json_valid(s.meta_json) "
         "THEN json_extract(s.meta_json, '$.oversize') END, 0) = 0",
+        "COALESCE(CASE WHEN json_valid(s.meta_json) "
+        "THEN json_extract(s.meta_json, '$.held_out') END, 0) = 0",
     ]
     params: list = [PER_SEED_CAP]
     if sources:

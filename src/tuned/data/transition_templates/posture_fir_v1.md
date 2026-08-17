@@ -1,0 +1,5 @@
+<!-- papers -->
+The papers are an information recorded at a police station and the investigating officer's first report upon it. One accused is named; one informant complains. Neither acts in the capacity of a public servant, and no question of sanction arises on this record. The conduct complained of is the conduct described in the provisions set out below, and nothing in the papers puts the date on which it is said to have occurred in dispute. The place is within the local limits of the court that would try the matter. No charge has been framed, no final report has been filed, and no witness has been examined.
+
+<!-- posture -->
+The conduct is alleged to have taken place on {offence_date}. The information was recorded and the investigation into it began on {proceeding_date}. The matter stands at the investigation stage and has gone no further: the officer is still gathering the material on which a report would be founded, and nothing has yet been placed before a court. No question of the reception of evidence has arisen in a trial, but statements are being recorded now and the rules under which they are recorded are in issue.
