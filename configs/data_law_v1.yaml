@@ -129,6 +129,65 @@ assembly:
     require_chain: true
 
 # --------------------------------------------------------------------------
+# transition.py - the s.358 grid.
+# --------------------------------------------------------------------------
+# The grid is NOT sized here and cannot be: it is one cell per
+# (verified mapping row x date posture x procedural posture x question form),
+# and the first factor is the operator's audit sheet
+# (resources/ipc_bns_map.jsonl, verified_by). When the operator signs off the
+# 17 rows that are still null the grid grows and nothing in this file changes.
+# What is a CHOICE is how much of it is drawn.
+#
+# sample 1,100 is the plan's transition-stream size and is what
+# assembly.profiles' derived v1.0-MVP synthesis share already counts
+# (1,100 + the 2,000-row core = 3,100). eval_reserve 150 cells are chosen
+# BEFORE the sample out of the same deterministic order, so the two sets are
+# disjoint by construction rather than by a filter that could be forgotten -
+# and reserved cells are marked held_out in the store, which is what keeps
+# tasks.py from ever planning a teacher generation against the eval.
+transition:
+  sample: 1100
+  eval_reserve: 150
+
+# --------------------------------------------------------------------------
+# calibrate.py - judge thresholds from human gold labels (P5).
+# --------------------------------------------------------------------------
+# GOLD LABELS ARE HUMAN-ONLY. Nothing in this block, and nothing in
+# calibrate.py, may produce one: a model-written gold label would calibrate
+# the judges against a judge, and the number that comes out would measure
+# agreement rather than accuracy.
+#
+# 180 exported, 40 of them held out entirely, the remaining 140 split into 5
+# folds of 28. min_recall/min_precision ARE the P5 gate from the plan:
+# maximise precision subject to recall >= 0.60, then disqualify any judge
+# whose holdout precision is under 0.75 and swap the next model in
+# routing.judge into its slot.
+calibration:
+  pilot_export: 180
+  holdout: 40
+  folds: 5
+  thresholds: [3, 4, 5]
+  rules: [min_axis, mean, both]
+  min_recall: 0.60
+  min_precision: 0.75
+
+# --------------------------------------------------------------------------
+# difficulty.py - probe-calibrated length proxy (P9).
+# --------------------------------------------------------------------------
+# probe_sample is a CEILING on rows that ever reach the probe model, not a
+# batch size. Per-row probing was costed at 32M tokens / 65 days on this
+# corpus, so the design is one 1,000-row calibration pass that fixes the
+# length bands and a pure length proxy for every row after it.
+#
+# The target mix is build.difficulty_target (0.34 / 0.50 / 0.16) and is NOT
+# restated here - one definition, the same rule the eval fraction and the mix
+# targets follow. mix_tolerance is how far the labelled corpus may sit from
+# it before difficulty.py refuses the bands it just fitted.
+difficulty:
+  probe_sample: 1000
+  mix_tolerance: 0.05
+
+# --------------------------------------------------------------------------
 # push.py: the HF dataset repo the training lane pins against (HubCfg.
 # dataset_repo in configs/law_v1_8b_ddp.yaml, via scripts/pin_dataset.py -
 # push.py's own job ends at "repo exists, revision printed").

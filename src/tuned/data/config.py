@@ -160,6 +160,75 @@ def _parse_ref(ref: str) -> ModelRef:
     return ModelRef(*ref.split("/", 1))
 
 
+# The judge score range, owned here because CalibrationCfg.thresholds are
+# graded against it and config.py cannot import judge.py (judge.py imports
+# this module for LengthBand). judge.SCORE_RANGE is the other copy and a test
+# pins the two together - the same treatment JUDGE_MAX_TOKENS /
+# DEFAULT_JUDGE_REPLY_TOKENS already get.
+JUDGE_SCORE_RANGE = (1, 5)
+
+# The decision rules calibrate.py fits over. Owned here for the same reason:
+# `calibration.rules` is validated at load, calibrate.py imports this tuple
+# rather than restating it, so a rule name cannot exist in one place only.
+#
+#   min_axis  the harshest axis clears the threshold
+#   mean      the mean of the three axes clears it
+#   both      min_axis AND mean clear it
+CALIBRATION_RULES = ("min_axis", "mean", "both")
+
+
+@dataclass(frozen=True)
+class TransitionCfg:
+    """transition.py's grid sizing. The GRID itself is not sized here.
+
+    Its size is `verified mapping rows x date postures x procedural postures
+    x question forms`, and every one of those factors is owned by code or by
+    the mapping resource - so a `cells:` key here would be a number that
+    disagrees with the grid the moment an operator signs off one more mapping
+    row. What IS a choice is how much of the grid is drawn: `sample` training
+    cells and `eval_reserve` cells held back as the transition-accuracy eval.
+    """
+
+    sample: int
+    eval_reserve: int
+
+
+@dataclass(frozen=True)
+class CalibrationCfg:
+    """calibrate.py's bounds. `pilot_export` generations are exported for the
+    operator to label by hand, `holdout` of them are kept out of the fit
+    entirely and the rest are split into `folds` cross-validation folds.
+
+    min_recall / min_precision are the P5 gate: maximise precision subject to
+    recall >= min_recall, then disqualify any judge whose HOLDOUT precision is
+    below min_precision.
+    """
+
+    pilot_export: int
+    holdout: int
+    folds: int
+    thresholds: tuple[int, ...]
+    rules: tuple[str, ...]
+    min_recall: float
+    min_precision: float
+
+
+@dataclass(frozen=True)
+class DifficultyCfg:
+    """difficulty.py's bounds. `probe_sample` is a CEILING on how many rows
+    ever reach the probe model - the whole design is one calibration sample
+    and a length proxy for everything else, because per-row probing was
+    measured at 32M tokens / 65 days.
+
+    The target mix is build.difficulty_target and is deliberately NOT
+    restated here; `mix_tolerance` is how far the labelled corpus may sit
+    from it before difficulty.py refuses its own bands.
+    """
+
+    probe_sample: int
+    mix_tolerance: float
+
+
 @dataclass(frozen=True)
 class PushCfg:
     """push.py's target: the HF dataset repo, and nothing push.py should ever
@@ -194,6 +263,17 @@ class BuildConfig:
     max_seq_length: int
     # None when the config carries no `push:` block at all - see PushCfg.
     push: PushCfg | None = None
+    # None when the config carries no block of that name. OPTIONAL like
+    # `push:` and unlike `assembly:`, and the split is not a preference: every
+    # module in the assembly tail grades EVERY corpus, so a missing
+    # `assembly:` is a builder with no targets, whereas a config that never
+    # builds the transition grid, never calibrates a judge and never labels
+    # difficulty is a real configuration (every fixture in this suite is one).
+    # The three modules refuse by name when their own block is absent, which
+    # is a better message than a loader error can give.
+    transition: TransitionCfg | None = None
+    calibration: CalibrationCfg | None = None
+    difficulty: DifficultyCfg | None = None
 
     def model_for(self, ref: ModelRef) -> tuple[ProviderCfg, ModelCfg]:
         for provider in self.providers:
@@ -257,6 +337,21 @@ def _validate(cfg: BuildConfig) -> None:
         )
     if cfg.build.overgeneration < 1.0:
         raise ValueError(f"build.overgeneration must be >= 1.0, got {cfg.build.overgeneration}")
+    # build.difficulty_target is a SHARE table over every row difficulty.py
+    # labels, exactly like build.mix is over streams, so it is graded the same
+    # way. It went unchecked while nothing read it; difficulty.py grades its
+    # own bands against it (within difficulty.mix_tolerance), and a table that
+    # sums to 0.9 makes the band that can satisfy it non-existent.
+    for label, share in sorted(cfg.build.difficulty_target.items()):
+        if isinstance(share, bool) or not isinstance(share, (int, float)):
+            raise ValueError(f"build.difficulty_target.{label} must be a number, got {share!r}")
+        if not (0.0 <= float(share) <= 1.0):
+            raise ValueError(f"build.difficulty_target.{label} must be in [0, 1], got {share}")
+    difficulty_total = sum(float(v) for v in cfg.build.difficulty_target.values())
+    if abs(difficulty_total - 1.0) > 0.001:
+        raise ValueError(
+            f"build.difficulty_target values must sum to 1.0, got {difficulty_total}"
+        )
 
     # 5: the assembly block. Every rule here is one stats.py would otherwise
     # discover at the end of a multi-day build, on the corpus.
@@ -533,6 +628,163 @@ def _push_of(raw: dict) -> PushCfg | None:
     return PushCfg(repo_id=repo_id, private=private, card_extra=card_extra)
 
 
+def _block(raw: dict, name: str) -> dict | None:
+    """An optional top-level block, refused if it is present but not a block.
+
+    `foo:` with nothing under it parses as None, which is indistinguishable
+    from an absent key and is treated as absent. Anything else that is not a
+    mapping is a typo worth naming.
+    """
+    value = raw.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"`{name}:` must be a block of keys, got {type(value).__name__}")
+    return value
+
+
+def _positive_int(block: dict, key: str, *, where: str, purpose: str) -> int:
+    value = _required(block, key, where=where, purpose=purpose)
+    # bool before int: `True` is an int in Python and would load as 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{where}.{key} must be a whole number, got {value!r}")
+    if value < 1:
+        raise ValueError(f"{where}.{key} must be >= 1, got {value}")
+    return value
+
+
+def _unit_float(block: dict, key: str, *, where: str, purpose: str) -> float:
+    value = _required(block, key, where=where, purpose=purpose)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where}.{key} must be a number, got {value!r}")
+    if not (0.0 < float(value) <= 1.0):
+        raise ValueError(f"{where}.{key} must be in (0, 1], got {value}")
+    return float(value)
+
+
+_TRANSITION_KEYS = {
+    "sample": "how many grid cells become training seeds",
+    "eval_reserve": "how many cells are held back as the transition-accuracy eval",
+}
+_CALIBRATION_KEYS = {
+    "pilot_export": "how many pilot generations the operator is asked to label",
+    "holdout": "how many of them never enter the fit at all",
+    "folds": "the cross-validation fold count over the rest",
+    "thresholds": "the candidate score thresholds the fit sweeps",
+    "rules": "the candidate decision rules the fit sweeps",
+    "min_recall": "the recall floor the precision maximisation is subject to",
+    "min_precision": "the HOLDOUT precision below which a judge is disqualified",
+}
+_DIFFICULTY_KEYS = {
+    "probe_sample": "the ceiling on how many rows ever reach the probe model",
+    "mix_tolerance": "how far the labelled mix may sit from build.difficulty_target",
+}
+
+
+def _transition_of(raw: dict) -> TransitionCfg | None:
+    block = _block(raw, "transition")
+    if block is None:
+        return None
+    cfg = TransitionCfg(
+        **{
+            key: _positive_int(block, key, where="transition", purpose=purpose)
+            for key, purpose in _TRANSITION_KEYS.items()
+        }
+    )
+    if cfg.eval_reserve >= cfg.sample:
+        # Not an arbitrary ordering: the reserve is a held-back MEASUREMENT of
+        # a stream whose rows are the sample. A reserve at or above the sample
+        # is a build that holds back more than it ships, which is a
+        # mis-transcribed pair of numbers every time.
+        raise ValueError(
+            f"transition.eval_reserve ({cfg.eval_reserve}) must be smaller than "
+            f"transition.sample ({cfg.sample}): the reserve is an eval slice held "
+            f"back from the stream, not the stream"
+        )
+    return cfg
+
+
+def _calibration_of(raw: dict) -> CalibrationCfg | None:
+    block = _block(raw, "calibration")
+    if block is None:
+        return None
+    for key, purpose in _CALIBRATION_KEYS.items():
+        _required(block, key, where="calibration", purpose=purpose)
+
+    thresholds = block["thresholds"]
+    if isinstance(thresholds, str) or not isinstance(thresholds, (list, tuple)) or not thresholds:
+        raise ValueError(
+            f"calibration.thresholds must be a non-empty LIST of scores, got {thresholds!r}"
+        )
+    low, high = JUDGE_SCORE_RANGE
+    for value in thresholds:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"calibration.thresholds must be whole scores, got {value!r}")
+        if not (low <= value <= high):
+            raise ValueError(
+                f"calibration.thresholds entry {value} is outside the judge score range "
+                f"{low}-{high}; a threshold no judgement can reach fits nothing"
+            )
+
+    rules = block["rules"]
+    if isinstance(rules, str) or not isinstance(rules, (list, tuple)) or not rules:
+        raise ValueError(f"calibration.rules must be a non-empty LIST of rule names, got {rules!r}")
+    unknown = [rule for rule in rules if rule not in CALIBRATION_RULES]
+    if unknown:
+        raise ValueError(
+            f"calibration.rules names {unknown}, which calibrate.py cannot fit; the rules "
+            f"are {list(CALIBRATION_RULES)}"
+        )
+
+    cfg = CalibrationCfg(
+        pilot_export=_positive_int(
+            block, "pilot_export", where="calibration", purpose=_CALIBRATION_KEYS["pilot_export"]
+        ),
+        holdout=_positive_int(
+            block, "holdout", where="calibration", purpose=_CALIBRATION_KEYS["holdout"]
+        ),
+        folds=_positive_int(block, "folds", where="calibration", purpose=_CALIBRATION_KEYS["folds"]),
+        thresholds=tuple(sorted(dict.fromkeys(thresholds))),
+        rules=tuple(dict.fromkeys(rules)),
+        min_recall=_unit_float(
+            block, "min_recall", where="calibration", purpose=_CALIBRATION_KEYS["min_recall"]
+        ),
+        min_precision=_unit_float(
+            block, "min_precision", where="calibration", purpose=_CALIBRATION_KEYS["min_precision"]
+        ),
+    )
+    if cfg.folds < 2:
+        raise ValueError(
+            f"calibration.folds must be >= 2, got {cfg.folds}: one fold is not "
+            f"cross-validation, it is the fit measuring itself"
+        )
+    fitted = cfg.pilot_export - cfg.holdout
+    if fitted < cfg.folds:
+        raise ValueError(
+            f"calibration.pilot_export ({cfg.pilot_export}) minus holdout ({cfg.holdout}) "
+            f"leaves {fitted} labelled rows for {cfg.folds} folds. The holdout comes out of "
+            f"the export, so the export must exceed it by at least one row per fold."
+        )
+    return cfg
+
+
+def _difficulty_of(raw: dict) -> DifficultyCfg | None:
+    block = _block(raw, "difficulty")
+    if block is None:
+        return None
+    probe_sample = _positive_int(
+        block, "probe_sample", where="difficulty", purpose=_DIFFICULTY_KEYS["probe_sample"]
+    )
+    tolerance = _required(
+        block, "mix_tolerance", where="difficulty", purpose=_DIFFICULTY_KEYS["mix_tolerance"]
+    )
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError(f"difficulty.mix_tolerance must be a number, got {tolerance!r}")
+    if not (0.0 <= float(tolerance) <= 1.0):
+        raise ValueError(f"difficulty.mix_tolerance must be in [0, 1], got {tolerance}")
+    return DifficultyCfg(probe_sample=probe_sample, mix_tolerance=float(tolerance))
+
+
 def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> BuildConfig:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
@@ -593,6 +845,9 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
         main_dataset_path=train_cfg.train.main.dataset,
         max_seq_length=train_cfg.train.main.max_seq_length,
         push=_push_of(raw),
+        transition=_transition_of(raw),
+        calibration=_calibration_of(raw),
+        difficulty=_difficulty_of(raw),
     )
     _validate(cfg)
     return cfg

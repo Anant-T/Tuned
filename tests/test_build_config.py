@@ -4,7 +4,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tuned.data.config import load_build_config
+from tuned.data.config import (
+    CALIBRATION_RULES,
+    JUDGE_SCORE_RANGE,
+    DifficultyCfg,
+    TransitionCfg,
+    load_build_config,
+)
 from tuned.train.config import load_config
 
 DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
@@ -472,6 +478,169 @@ def test_hub_dataset_fields_load_when_set(tmp_path):
     assert cfg.hub.dataset_repo == "tantan01/tuned-law-v1-data"
     assert cfg.hub.dataset_revision == "deadbeefcafe"
     assert cfg.hub.dataset_sha256 == "abc123"
+
+
+# --- the transition / calibration / difficulty blocks -----------------------
+
+
+def _shipped_blocks() -> dict:
+    """The three blocks AS SHIPPED, read out of configs/data_law_v1.yaml.
+
+    Copied rather than retyped so the validation table below cannot pass
+    against a fixture that has drifted from the config an operator actually
+    runs - the mutation tests are only attributable while the unmutated base
+    is the real thing (test_each_new_block_loads_when_it_is_correct is the
+    other direction of that).
+    """
+    raw = yaml.safe_load(DATA_CONFIG.read_text(encoding="utf-8"))
+    return {name: dict(raw[name]) for name in ("transition", "calibration", "difficulty")}
+
+
+def _t_doc(tmp_path: Path, **blocks) -> Path:
+    doc = _base_doc()
+    doc.update(blocks)
+    return _write(tmp_path, doc)
+
+
+def test_the_three_new_blocks_are_absent_from_the_minimal_fixture(tmp_path):
+    # OPTIONAL like `push:`: a config that never builds the transition grid,
+    # never calibrates and never labels difficulty still loads. The three
+    # modules refuse by name; the loader does not.
+    cfg = load_build_config(_write(tmp_path, _base_doc()), allow_unpinned=True)
+    assert cfg.transition is None
+    assert cfg.calibration is None
+    assert cfg.difficulty is None
+
+
+def test_the_shipped_config_carries_all_three_blocks():
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    assert cfg.transition == TransitionCfg(sample=1100, eval_reserve=150)
+    assert cfg.calibration.pilot_export == 180
+    assert cfg.calibration.holdout == 40
+    assert cfg.calibration.folds == 5
+    assert cfg.calibration.thresholds == (3, 4, 5)
+    assert cfg.calibration.rules == ("min_axis", "mean", "both")
+    assert cfg.calibration.min_recall == 0.60
+    assert cfg.calibration.min_precision == 0.75
+    assert cfg.difficulty == DifficultyCfg(probe_sample=1000, mix_tolerance=0.05)
+
+
+def test_the_judge_score_range_has_one_definition():
+    # config.py cannot import judge.py (judge.py imports config for
+    # LengthBand), so the range is stated here and the copy is pinned - the
+    # same treatment JUDGE_MAX_TOKENS / DEFAULT_JUDGE_REPLY_TOKENS get. A
+    # threshold outside the range fits nothing, and the refusal that says so
+    # is only correct while the two agree.
+    from tuned.data.judge import SCORE_RANGE
+
+    assert SCORE_RANGE == JUDGE_SCORE_RANGE
+
+
+def test_the_calibration_rule_vocabulary_is_closed():
+    # A rule name that is not in this tuple is refused at LOAD, months before
+    # the fit would have quietly skipped it.
+    assert CALIBRATION_RULES == ("min_axis", "mean", "both")
+
+
+@pytest.mark.parametrize(
+    "block,mutate,match",
+    [
+        # transition
+        ("transition", lambda b: b.pop("sample"), "transition.sample"),
+        ("transition", lambda b: b.pop("eval_reserve"), "transition.eval_reserve"),
+        ("transition", lambda b: b.__setitem__("sample", 0), ">= 1"),
+        ("transition", lambda b: b.__setitem__("sample", 1.5), "whole number"),
+        ("transition", lambda b: b.__setitem__("sample", True), "whole number"),
+        ("transition", lambda b: b.__setitem__("eval_reserve", 1100), "smaller than"),
+        ("transition", lambda b: b.__setitem__("eval_reserve", 2000), "smaller than"),
+        # calibration
+        ("calibration", lambda b: b.pop("min_recall"), "calibration.min_recall"),
+        ("calibration", lambda b: b.__setitem__("folds", 1), ">= 2"),
+        ("calibration", lambda b: b.__setitem__("thresholds", []), "non-empty"),
+        ("calibration", lambda b: b.__setitem__("thresholds", "345"), "non-empty"),
+        ("calibration", lambda b: b.__setitem__("thresholds", [6]), "score range"),
+        ("calibration", lambda b: b.__setitem__("thresholds", [0]), "score range"),
+        ("calibration", lambda b: b.__setitem__("rules", ["median"]), "median"),
+        ("calibration", lambda b: b.__setitem__("rules", "mean"), "non-empty"),
+        ("calibration", lambda b: b.__setitem__("min_recall", 0.0), r"\(0, 1\]"),
+        ("calibration", lambda b: b.__setitem__("min_precision", 1.5), r"\(0, 1\]"),
+        ("calibration", lambda b: b.__setitem__("holdout", 180), "at least one row per fold"),
+        ("calibration", lambda b: b.__setitem__("holdout", 177), "at least one row per fold"),
+        # difficulty
+        ("difficulty", lambda b: b.pop("probe_sample"), "difficulty.probe_sample"),
+        ("difficulty", lambda b: b.__setitem__("mix_tolerance", -0.1), r"\[0, 1\]"),
+        ("difficulty", lambda b: b.__setitem__("mix_tolerance", 1.1), r"\[0, 1\]"),
+        ("difficulty", lambda b: b.__setitem__("mix_tolerance", "0.05"), "must be a number"),
+    ],
+)
+def test_each_new_block_is_validated_key_by_key(tmp_path, block, mutate, match):
+    blocks = _shipped_blocks()
+    mutate(blocks[block])
+    with pytest.raises(ValueError, match=match):
+        load_build_config(_t_doc(tmp_path, **blocks), allow_unpinned=True)
+
+
+def test_each_new_block_loads_when_it_is_correct(tmp_path):
+    # The other direction of the table above: the same three blocks, unmutated,
+    # on the same minimal fixture. Without this the refusals could all be
+    # firing on the fixture rather than on the mutation.
+    cfg = load_build_config(_t_doc(tmp_path, **_shipped_blocks()), allow_unpinned=True)
+    assert (cfg.transition.sample, cfg.transition.eval_reserve) == (1100, 150)
+    assert cfg.calibration.folds == 5
+    assert cfg.difficulty.probe_sample == 1000
+
+
+@pytest.mark.parametrize("name", ["transition", "calibration", "difficulty"])
+def test_a_new_block_that_is_not_a_block_is_refused(tmp_path, name):
+    blocks = _shipped_blocks()
+    blocks[name] = ["sample", 1100]
+    with pytest.raises(ValueError, match=f"`{name}:`"):
+        load_build_config(_t_doc(tmp_path, **blocks), allow_unpinned=True)
+
+
+@pytest.mark.parametrize("name", ["transition", "calibration", "difficulty"])
+def test_an_empty_new_block_reads_as_absent_not_as_a_partial_one(tmp_path, name):
+    # `transition:` with nothing under it parses as None, which YAML cannot
+    # tell from an absent key. Treating it as absent is the only reading that
+    # does not depend on a distinction the file format does not carry.
+    blocks = _shipped_blocks()
+    blocks[name] = None
+    cfg = load_build_config(_t_doc(tmp_path, **blocks), allow_unpinned=True)
+    assert getattr(cfg, name) is None
+
+
+def test_thresholds_are_deduped_and_sorted_so_the_sweep_order_is_fixed(tmp_path):
+    blocks = _shipped_blocks()
+    blocks["calibration"]["thresholds"] = [5, 3, 4, 3]
+    blocks["calibration"]["rules"] = ["mean", "min_axis", "mean"]
+    cfg = load_build_config(_t_doc(tmp_path, **blocks), allow_unpinned=True)
+    assert cfg.calibration.thresholds == (3, 4, 5)
+    # Rules keep the operator's ORDER (first-wins ties are broken by it),
+    # duplicates removed.
+    assert cfg.calibration.rules == ("mean", "min_axis")
+
+
+def test_the_difficulty_target_is_graded_like_the_mix_it_is(tmp_path):
+    doc = _base_doc()
+    doc["build"]["difficulty_target"] = {"easy": 0.5, "hard": 0.4}
+    with pytest.raises(ValueError, match="difficulty_target"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+    doc["build"]["difficulty_target"] = {"easy": 1.2, "hard": -0.2}
+    with pytest.raises(ValueError, match=r"difficulty_target.easy"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+    doc["build"]["difficulty_target"] = {"easy": 0.34, "medium": 0.50, "hard": 0.16}
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.difficulty_target["medium"] == 0.50
+
+
+def test_the_difficulty_target_is_not_restated_in_the_difficulty_block():
+    # Same rule as assembly.profiles' v1.1-full: build.difficulty_target is
+    # the ONE definition, and difficulty.py reads it there.
+    raw = yaml.safe_load(DATA_CONFIG.read_text(encoding="utf-8"))
+    assert "difficulty_target" not in raw["difficulty"]
+    assert set(raw["difficulty"]) == {"probe_sample", "mix_tolerance"}
 
 
 # --- pin_dataset.py pure rewrite --------------------------------------------
