@@ -185,6 +185,14 @@ _JUDGEMENT_COLS = (
     "grounding", "validity", "coverage", "rationale",
     "raw_path", "raw_offset", "created_at",
 )
+_GOLD_COLS = (
+    "gen_id", "verdict", "grounding", "validity", "coverage",
+    "notes", "labeled_at", "fold",
+)
+_THRESHOLD_COLS = (
+    "calib_id", "judge_slot", "model", "rule", "threshold",
+    "precision", "recall", "n_gold", "fitted_at", "active",
+)
 _DOCUMENT_COLS = (
     "source_id", "object_key", "status", "reason", "text_path",
     "case_id", "citation", "year",
@@ -973,6 +981,117 @@ class Store:
             dict(row)
             for row in self._conn.execute(
                 "SELECT * FROM judgement WHERE gen_id = ? ORDER BY judge_slot", (gen_id,)
+            ).fetchall()
+        ]
+
+    # ------------------------------------------------------- gold + calibration
+
+    def judged_generations(self, streams: Iterable[str] | None = None) -> list[dict]:
+        """Every generation that at least one judge has scored, oldest first.
+
+        calibrate.py's population: a generation nobody judged has nothing to
+        calibrate a judge against. Joined to its task row for the stream and
+        prompt columns the export stratifies on, and ordered by gen_id for the
+        same reason latest_generations is - the pilot export is a stratified
+        prefix of this list, so its order decides WHICH rows the operator is
+        asked to label, not merely the order they are printed in.
+        """
+        clause = ""
+        params: tuple = ()
+        if streams is not None:
+            names = tuple(streams)
+            if not names:
+                return []
+            clause = f"AND t.stream IN ({', '.join('?' * len(names))})"
+            params = names
+        return [
+            dict(row)
+            for row in self._conn.execute(
+                "SELECT g.*, t.stream, t.seed_id, t.task_type, t.prompt_id, t.arm, "
+                "       t.state AS task_state "
+                "FROM generation g "
+                "JOIN task t ON t.task_id = g.task_id "
+                "WHERE EXISTS (SELECT 1 FROM judgement j WHERE j.gen_id = g.gen_id) "
+                f"{clause} ORDER BY g.gen_id",
+                params,
+            ).fetchall()
+        ]
+
+    def judgements_by_gen(self, gen_ids: Iterable[int]) -> dict[int, list[dict]]:
+        """gen_id -> its judgement rows, for many generations at once.
+
+        judgements_for answers this one row at a time, which is right for a
+        judge worker deciding one task. The calibration fit reads every
+        judgement of every labelled generation at once, and a row-at-a-time
+        read there is one query per gold label for a number that is a single
+        pass over the table.
+        """
+        ids = list(dict.fromkeys(int(gen_id) for gen_id in gen_ids))
+        out: dict[int, list[dict]] = {gen_id: [] for gen_id in ids}
+        for start in range(0, len(ids), 500):  # SQLITE_MAX_VARIABLE_NUMBER
+            chunk = ids[start : start + 500]
+            rows = self._conn.execute(
+                f"SELECT * FROM judgement WHERE gen_id IN ({', '.join('?' * len(chunk))}) "
+                f"ORDER BY gen_id, judge_slot",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                out[row["gen_id"]].append(dict(row))
+        return out
+
+    def upsert_gold_labels(self, rows: Iterable[dict]) -> int:
+        """INSERT OR REPLACE human gold labels; returns rows written.
+
+        REPLACE because the operator labels in sittings and may correct a
+        verdict in a later one - the second file is the authority, and a
+        pipeline that refused it would leave the mistake in the fit forever.
+        """
+        payload = [_pack(_fill(dict(row), labeled_at=utcnow()), _GOLD_COLS) for row in rows]
+        if not payload:
+            return 0
+        before = self._conn.total_changes
+        with self._write_txn() as conn:
+            conn.executemany(_insert_sql("gold_label", _GOLD_COLS, "INSERT OR REPLACE"), payload)
+        return self._conn.total_changes - before
+
+    def gold_labels(self) -> list[dict]:
+        return [
+            dict(row)
+            for row in self._conn.execute("SELECT * FROM gold_label ORDER BY gen_id").fetchall()
+        ]
+
+    def gold_label_count(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM gold_label").fetchone()[0])
+
+    def record_judge_thresholds(self, rows: Iterable[dict]) -> int:
+        """Replace the ACTIVE calibration with this one, in one transaction.
+
+        Deactivating the previous rows and inserting the new ones has to be
+        atomic: judge.thresholds_active counts active rows to decide whether
+        its decisions are provisional, and a crash between the two writes
+        would leave the fleet either double-calibrated (two rules for one
+        model) or reading as provisional while a fitted calibration exists.
+        Superseded rows are kept with active = 0 rather than deleted - the
+        report of a later run is only interpretable against the fit it
+        replaced.
+        """
+        payload = [_pack(_fill(dict(row), fitted_at=utcnow(), active=1), _THRESHOLD_COLS) for row in rows]
+        if not payload:
+            return 0
+        before = self._conn.total_changes
+        with self._write_txn() as conn:
+            conn.execute("UPDATE judge_threshold SET active = 0 WHERE active = 1")
+            conn.executemany(
+                _insert_sql("judge_threshold", _THRESHOLD_COLS, "INSERT OR REPLACE"), payload
+            )
+        return self._conn.total_changes - before
+
+    def judge_thresholds(self, *, active_only: bool = True) -> list[dict]:
+        clause = "WHERE active = 1" if active_only else ""
+        return [
+            dict(row)
+            for row in self._conn.execute(
+                f"SELECT * FROM judge_threshold {clause} ORDER BY calib_id, model, judge_slot"
             ).fetchall()
         ]
 

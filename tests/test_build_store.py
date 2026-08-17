@@ -1368,3 +1368,121 @@ def test_iter_seeds_by_source_pages_and_survives_the_caller_deleting_as_it_walks
         store.delete_seeds([row["seed_id"]])
     assert seen == [f"sd{i}" for i in range(9)]
     assert store.seed_count("a") == 0
+
+
+# ------------------------------------------- gold labels and judge thresholds
+
+
+def _judged(store, n=6):
+    """n generations, each scored by two judges. Returns their gen_ids."""
+    _populate(store, n=n)
+    gen_ids = []
+    for i in range(n):
+        gen_id = store.record_generation(
+            {**_gen_envelope(f"t{i}", attempt=1), "raw_path": "raw.ndjson", "raw_offset": i}
+        )
+        for slot, model in (("a", "judge/one"), ("b", "judge/two")):
+            store.record_judgement(
+                gen_id,
+                slot,
+                {"provider": "p", "model": model, "grounding": 5, "validity": 4, "coverage": 3},
+            )
+        gen_ids.append(gen_id)
+    return gen_ids
+
+
+def test_judged_generations_are_the_ones_a_judge_actually_scored(store):
+    gen_ids = _judged(store, n=3)
+    store.create_tasks(
+        [
+            {
+                "task_id": "unjudged",
+                "seed_id": "sd0",
+                "stream": "analysis",
+                "task_type": "reason",
+                "prompt_id": "p1",
+                "prompt_sha": "deadbeef",
+                "sample_ix": 7,
+            }
+        ]
+    )
+    lonely = store.record_generation(
+        {**_gen_envelope("unjudged"), "raw_path": "raw.ndjson", "raw_offset": 99}
+    )
+    rows = store.judged_generations()
+    assert [row["gen_id"] for row in rows] == gen_ids
+    assert lonely not in {row["gen_id"] for row in rows}
+    # Joined to the task, because the calibration export stratifies on it.
+    assert {row["stream"] for row in rows} == {"analysis"}
+    assert rows[0]["task_type"] == "reason"
+
+
+def test_judged_generations_filters_by_stream_and_reads_an_empty_filter_as_empty(store):
+    _judged(store, n=2)
+    assert len(store.judged_generations(["analysis"])) == 2
+    assert store.judged_generations(["transition"]) == []
+    # An empty list is "no streams", not "every stream": the caller asked for
+    # nothing and getting everything back is the expensive direction to be
+    # wrong in.
+    assert store.judged_generations([]) == []
+
+
+def test_judgements_by_gen_reads_many_at_once_and_matches_the_row_at_a_time_path(store):
+    gen_ids = _judged(store, n=4)
+    bulk = store.judgements_by_gen(gen_ids)
+    assert set(bulk) == set(gen_ids)
+    for gen_id in gen_ids:
+        assert bulk[gen_id] == store.judgements_for(gen_id)
+    # A generation nobody judged comes back as an empty list rather than
+    # missing, so the caller's dict lookup cannot KeyError on it.
+    assert store.judgements_by_gen([9999]) == {9999: []}
+
+
+def test_gold_labels_round_trip_and_the_second_file_wins(store):
+    gen_ids = _judged(store, n=3)
+    assert store.upsert_gold_labels(
+        [{"gen_id": gen_ids[0], "verdict": "accept", "fold": 0}]
+    ) == 1
+    assert store.gold_label_count() == 1
+    row = store.gold_labels()[0]
+    assert (row["verdict"], row["fold"]) == ("accept", 0)
+    assert _TS_RE.match(row["labeled_at"])
+
+    store.upsert_gold_labels([{"gen_id": gen_ids[0], "verdict": "reject", "fold": 5}])
+    assert store.gold_label_count() == 1
+    assert store.gold_labels()[0]["verdict"] == "reject"
+    assert store.upsert_gold_labels([]) == 0
+
+
+def test_a_gold_label_for_a_generation_that_does_not_exist_is_refused(store):
+    # The label is irreplaceable operator hours attached to a specific
+    # generation; a dangling one is hours nobody can trace back to an answer.
+    with pytest.raises(sqlite3.IntegrityError):
+        store.upsert_gold_labels([{"gen_id": 4242, "verdict": "accept", "fold": 0}])
+
+
+def test_recording_thresholds_deactivates_the_previous_calibration(store):
+    first = [
+        {"calib_id": "c1", "model": "judge/one", "rule": "min_axis", "threshold": 4},
+        {"calib_id": "c2", "model": "judge/two", "rule": "mean", "threshold": 4},
+    ]
+    assert store.record_judge_thresholds(first) == 2
+    assert [row["model"] for row in store.judge_thresholds()] == ["judge/one", "judge/two"]
+    assert all(row["active"] == 1 for row in store.judge_thresholds())
+
+    store.record_judge_thresholds(
+        [{"calib_id": "c3", "model": "judge/one", "rule": "both", "threshold": 5}]
+    )
+    live = store.judge_thresholds()
+    assert [row["calib_id"] for row in live] == ["c3"]
+    # Superseded rows are KEPT: a later report is only interpretable against
+    # the fit it replaced.
+    everything = store.judge_thresholds(active_only=False)
+    assert {row["calib_id"] for row in everything} == {"c1", "c2", "c3"}
+    assert {row["calib_id"] for row in everything if row["active"] == 0} == {"c1", "c2"}
+
+
+def test_recording_no_thresholds_leaves_the_previous_calibration_alone(store):
+    store.record_judge_thresholds([{"calib_id": "c1", "model": "m", "rule": "mean", "threshold": 4}])
+    assert store.record_judge_thresholds([]) == 0
+    assert [row["calib_id"] for row in store.judge_thresholds()] == ["c1"]
