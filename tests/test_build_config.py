@@ -440,8 +440,20 @@ def test_targets_for_an_unknown_profile_raises_rather_than_defaulting():
 # --- HubCfg dataset_* fields ----------------------------------------------
 
 
-def test_hub_dataset_fields_default_none():
-    cfg = load_config(TRAIN_CONFIG, allow_unpinned=True)
+def test_hub_dataset_fields_default_none(tmp_path):
+    # Task 15 fix round 1 (M5) gave the SHIPPED config a real dataset_repo -
+    # the pin handoff push.py -> scripts/pin_dataset.py needs the value set
+    # there. This test is about HubCfg's own default, not that config's
+    # content, so it builds a config that legitimately omits the field
+    # rather than asserting an absence the shipped file no longer has.
+    text = TRAIN_CONFIG.read_text(encoding="utf-8")
+    without_dataset_repo = text.replace(
+        "  dataset_repo: tantan01/tuned-law-v1-data\n", ""
+    )
+    assert without_dataset_repo != text
+    tmp = tmp_path / "c.yaml"
+    tmp.write_text(without_dataset_repo, encoding="utf-8")
+    cfg = load_config(tmp, allow_unpinned=True)
     assert cfg.hub.dataset_repo is None
     assert cfg.hub.dataset_revision is None
     assert cfg.hub.dataset_sha256 is None

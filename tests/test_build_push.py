@@ -150,6 +150,20 @@ def test_the_shipped_config_carries_a_real_push_target():
     assert cfg.push == PushCfg(repo_id="tantan01/tuned-law-v1-data", private=True, card_extra=None)
 
 
+def test_the_train_configs_pin_target_matches_pushs_own_repo():
+    """M5: closes the loop task 15 exists to make real. pin_dataset.py reads
+    hub.dataset_repo from the SAME train config data_law_v1.yaml points at
+    (build.train_config) - it must name the exact repo push.py writes to, or
+    the pin script has nothing real to pin."""
+    from tuned.train.config import load_config
+
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    train_cfg = load_config(
+        Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml", allow_unpinned=True,
+    )
+    assert train_cfg.hub.dataset_repo == cfg.push.repo_id
+
+
 def test_repo_id_is_required_and_named(tmp_path):
     doc = _base_doc()
     doc["push"] = {"private": True}
