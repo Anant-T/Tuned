@@ -833,6 +833,25 @@ def test_a_chunk_of_exactly_the_maximum_counts_as_in_band_not_as_a_bucket_artifa
     assert stats["token_histogram"] == {"1500-1599": 1}
 
 
+def test_the_band_is_inclusive_at_both_edges_and_the_three_tallies_partition():
+    # Both edges, and the property that makes the tallies readable as a
+    # breakdown rather than three overlapping counts: every chunk is in
+    # exactly one of under-min / in-band / oversize.
+    from tuned.data.chunks import _new_stats, _tally_chunks
+
+    stats = _new_stats()
+    _tally_chunks(stats, [
+        Chunk(0, 1, "x", MIN_CHUNK_TOKENS - 1, (), False),
+        Chunk(0, 1, "x", MIN_CHUNK_TOKENS, (), False),
+        Chunk(0, 1, "x", MAX_CHUNK_TOKENS, (), False),
+        Chunk(0, 1, "x", MAX_CHUNK_TOKENS + 1, (), True),
+    ])
+    assert stats["under_min_chunks"] == 1
+    assert stats["in_band_chunks"] == 2
+    assert stats["oversize_chunks"] == 1
+    assert sum(stats["token_histogram"].values()) == 4
+
+
 def test_token_count_is_the_encoding_of_the_chunk_not_the_sum_of_its_segments():
     # L6: the two differ exactly when a segment boundary is not a token
     # boundary. This tokenizer makes that visible on purpose - it counts

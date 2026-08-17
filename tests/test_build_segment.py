@@ -325,15 +325,17 @@ def test_the_earliest_position_of_a_repeated_number_anchors_the_chain():
 def test_a_deeply_indented_number_is_not_a_paragraph_start():
     # _PARA_START allows up to three leading spaces because that is what a
     # wrapped or slightly-inset paragraph carries; a block quotation is
-    # indented further, and its numbering is not this document's.
+    # indented further, and its numbering is not this document's. The
+    # indented number here is one the document's own run does NOT contain,
+    # so widening the allowance changes the accepted SET rather than only
+    # which position a duplicate number resolves to.
     text = (
         "JUDGMENT\n\n1. First.\n\n2. Second.\n\n"
         "        3. Deep inside an indented block quotation.\n\n"
-        "3. The real third paragraph.\n\n"
+        "4. The real next paragraph.\n\n"
     )
-    offsets = [offset for offset, _n in paragraph_starts(text)]
-    assert len(offsets) == 3
-    assert text[offsets[-1] : offsets[-1] + 30].startswith("3. The real third")
+    assert numbers(text) == [1, 2, 4]
+    assert " " * 8 + "3." in text  # the indented line really is in the fixture
 
 
 def test_a_short_document_whose_only_run_is_two_paragraphs_still_segments():
