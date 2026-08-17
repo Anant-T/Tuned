@@ -145,6 +145,15 @@ CREATE TABLE IF NOT EXISTS document (
   sha256 TEXT, extract_version INTEGER, meta_json TEXT, extracted_at TEXT,
   PRIMARY KEY (source_id, object_key));
 CREATE INDEX IF NOT EXISTS document_by_status ON document(source_id, status);
+CREATE TABLE IF NOT EXISTS chunk_manifest (
+  source_id TEXT NOT NULL REFERENCES source(source_id),
+  object_key TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
+  tier TEXT, why TEXT, chunk_count INTEGER NOT NULL DEFAULT 0,
+  seed_ids_json TEXT,
+  sha256 TEXT, extract_version INTEGER,
+  segment_version INTEGER, chunk_version INTEGER,
+  meta_json TEXT, chunked_at TEXT,
+  PRIMARY KEY (source_id, object_key));
 """
 
 _SEED_COLS = (
@@ -178,6 +187,22 @@ _DOCUMENT_COLS = (
 # The five columns the extraction resume decision reads, and no more: the
 # index is loaded whole at the start of every run (see document_index).
 _DOCUMENT_RESUME_COLS = ("object_key", "status", "reason", "text_path", "extract_version")
+_CHUNK_MANIFEST_COLS = (
+    "source_id", "object_key", "status", "reason", "tier", "why",
+    "chunk_count", "seed_ids_json", "sha256", "extract_version",
+    "segment_version", "chunk_version", "meta_json", "chunked_at",
+)
+# The columns chunks.py's resume decision reads: whether this document/seed
+# was chunked before, under which rules, and (seed_ids_json) what to delete
+# before writing its replacement. Unlike _DOCUMENT_RESUME_COLS this DOES
+# carry seed_ids_json - a few hundred bytes per row at most (a document
+# backs a few dozen chunks, not the unbounded per-document blob meta_json
+# is) - because the replace-not-duplicate rule needs it on every resumed run,
+# not only on the runs that actually replace something.
+_CHUNK_MANIFEST_RESUME_COLS = (
+    "object_key", "status", "sha256", "extract_version",
+    "segment_version", "chunk_version", "seed_ids_json",
+)
 
 
 # Errors that mean "this raw record is unusable" rather than "the database is
@@ -378,6 +403,24 @@ class Store:
         row = self._conn.execute("SELECT * FROM seed WHERE seed_id = ?", (seed_id,)).fetchone()
         return dict(row) if row is not None else None
 
+    def seeds_by_source(self, source_id: str) -> list[dict]:
+        """Every seed row under one source, in seed_id order.
+
+        chunks.py's seed-table driver is the reason this exists: seeds.py's
+        InJudgements rows carry whole judgment text with no on-disk manifest
+        of their own (unlike the document table), so finding "which whole
+        rows still need chunking" has nowhere else to read from. seed_id
+        order rather than insertion order, for the same reason document rows
+        are walked in object_key order - a deterministic, machine-independent
+        scan a resumed or `--limit`ed run can repeat.
+        """
+        return [
+            dict(row)
+            for row in self._conn.execute(
+                "SELECT * FROM seed WHERE source_id = ? ORDER BY seed_id", (source_id,)
+            ).fetchall()
+        ]
+
     # --------------------------------------------------------------- artifacts
 
     def record_artifact(
@@ -531,6 +574,89 @@ class Store:
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         return self._conn.execute(sql, tuple(params)).fetchone()[0]
+
+    # ---------------------------------------------------------- chunk manifest
+
+    def record_chunk_manifest(self, source_id: str, object_key: str, row: dict) -> None:
+        """Index one chunked document/seed - chunks.py's resume twin of
+        record_document, over the same (source_id, object_key) identity
+        convention `document` and `artifact` already use. `object_key` is
+        whatever chunks.py's caller says identifies the thing that was
+        chunked: extract.py's object_key for a document-table judgment, or
+        the parent whole-text row's own seed_id for a seed-table one (there
+        is no object_key there, and seed_id is already the stable,
+        content-derived identity seeds.py gives it).
+
+        INSERT OR REPLACE on that pair: re-chunking under new rules moves the
+        row rather than forking it, exactly as record_document's own
+        docstring reasons about `extract_version`. This module's caller must
+        delete the OLD seed_ids_json rows (store.delete_seeds) before writing
+        the replacement manifest row - this method only indexes the newest
+        chunk set, it does not diff against what a previous row named.
+        """
+        packed = dict(row)
+        packed["source_id"] = source_id
+        packed["object_key"] = object_key
+        self._write(
+            _insert_sql("chunk_manifest", _CHUNK_MANIFEST_COLS, "INSERT OR REPLACE"),
+            _pack(_fill(packed, chunked_at=utcnow()), _CHUNK_MANIFEST_COLS),
+        )
+
+    def chunk_manifest(self, source_id: str, object_key: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM chunk_manifest WHERE source_id = ? AND object_key = ?",
+            (source_id, object_key),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def chunk_manifest_index(self, source_id: str) -> dict[str, dict]:
+        """Every indexed chunk-manifest row for one source, keyed by object_key.
+
+        Read ONCE per chunking run, the same reason document_index is: the
+        resume decision is taken once per document/seed in the source and a
+        SELECT apiece would make restarting an interrupted run cost more than
+        the work it skips. Carries seed_ids_json (unlike document_index's
+        deliberate omission of meta_json) because every resumed run needs it
+        the moment a document turns out stale, not only the runs that find one.
+        """
+        cols = ", ".join(_CHUNK_MANIFEST_RESUME_COLS)
+        return {
+            row["object_key"]: dict(row)
+            for row in self._conn.execute(
+                f"SELECT {cols} FROM chunk_manifest WHERE source_id = ?", (source_id,)
+            ).fetchall()
+        }
+
+    def chunk_manifest_count(self, source_id: str | None = None) -> int:
+        if source_id is None:
+            return self._conn.execute("SELECT COUNT(*) FROM chunk_manifest").fetchone()[0]
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM chunk_manifest WHERE source_id = ?", (source_id,)
+        ).fetchone()[0]
+
+    def delete_seeds(self, seed_ids: Iterable[str]) -> int:
+        """Delete seed rows by id; returns how many rows were actually removed.
+
+        The replace half of chunking's resume contract ("their chunks are
+        replaced, never duplicated"): chunks.py calls this with a stale
+        document's previous seed_ids (read off its chunk_manifest row)
+        before writing the new ones, so a rule change that produces fewer or
+        differently-bounded chunks does not leave the old boundaries behind
+        as orphaned rows nothing points at any more.
+
+        FK-enforced against task (foreign_keys=ON): deleting a seed some
+        task row already references raises sqlite3.IntegrityError rather
+        than silently orphaning that task. That is a real signal - chunking
+        re-ran on a document a wave was already planned against - and not a
+        case this method swallows.
+        """
+        ids = list(dict.fromkeys(seed_ids))
+        if not ids:
+            return 0
+        before = self._conn.total_changes
+        with self._write_txn() as conn:
+            conn.executemany("DELETE FROM seed WHERE seed_id = ?", [(i,) for i in ids])
+        return self._conn.total_changes - before
 
     # ------------------------------------------------------------------- tasks
 

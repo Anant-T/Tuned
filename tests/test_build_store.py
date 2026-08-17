@@ -1142,3 +1142,138 @@ def test_documents_reads_back_in_key_order_and_filters_by_status(store):
     quarantined = store.documents("a", status="quarantined")
     assert [row["reason"] for row in quarantined] == ["no_text"]
     assert len(store.documents("a")) == 4
+
+
+# ------------------------------------------------------- 11. chunk manifest
+
+
+def _chunk_manifest_row(**over) -> dict:
+    row = {
+        "status": "ok", "reason": None, "tier": "packing", "why": "fallback",
+        "chunk_count": 2, "seed_ids_json": ["c1", "c2"],
+        "sha256": "ab" * 32, "extract_version": 5,
+        "segment_version": 1, "chunk_version": 1,
+        "meta_json": {"degradation": {"from": "roles", "reason": "roles_backend_none"}},
+    }
+    row.update(over)
+    return row
+
+
+def test_record_chunk_manifest_indexes_one_chunked_document(store):
+    store.upsert_source("a", "Public Domain")
+    store.record_chunk_manifest("a", "k1", _chunk_manifest_row())
+
+    row = store.chunk_manifest("a", "k1")
+    assert row["status"] == "ok"
+    assert row["tier"] == "packing"
+    assert row["chunk_count"] == 2
+    assert json.loads(row["seed_ids_json"]) == ["c1", "c2"]
+    assert row["extract_version"] == 5
+    assert _TS_RE.match(row["chunked_at"])
+    assert store.chunk_manifest("a", "never-chunked") is None
+
+
+def test_chunk_manifest_rows_need_a_registered_source(store):
+    with pytest.raises(sqlite3.IntegrityError):
+        store.record_chunk_manifest("nope", "k", _chunk_manifest_row())
+
+
+def test_chunk_manifest_index_is_per_source_and_carries_the_resume_columns(store):
+    store.upsert_source("a", "Public Domain")
+    store.upsert_source("b", "Public Domain")
+    store.record_chunk_manifest("a", "k1", _chunk_manifest_row())
+    store.record_chunk_manifest("a", "k2", _chunk_manifest_row(status="empty", chunk_count=0,
+                                                                seed_ids_json=[]))
+    store.record_chunk_manifest("b", "k1", _chunk_manifest_row(sha256="cd" * 32))
+
+    index = store.chunk_manifest_index("a")
+    assert sorted(index) == ["k1", "k2"]
+    # The columns the resume decision reads, unabridged - unlike
+    # document_index this DOES carry seed_ids_json (the replace step needs
+    # it on every run, not only the ones that find something stale).
+    assert index["k1"]["sha256"] == "ab" * 32
+    assert index["k1"]["extract_version"] == 5
+    assert index["k1"]["segment_version"] == 1
+    assert index["k1"]["chunk_version"] == 1
+    assert json.loads(index["k1"]["seed_ids_json"]) == ["c1", "c2"]
+    assert index["k2"]["status"] == "empty"
+    assert store.chunk_manifest_index("b")["k1"]["sha256"] == "cd" * 32
+
+
+def test_re_chunking_a_document_replaces_its_manifest_row(store):
+    store.upsert_source("a", "Public Domain")
+    store.record_chunk_manifest("a", "k", _chunk_manifest_row(chunk_count=2, seed_ids_json=["c1", "c2"]))
+    store.record_chunk_manifest(
+        "a", "k", _chunk_manifest_row(chunk_count=3, seed_ids_json=["c3", "c4", "c5"], sha256="ff" * 32)
+    )
+    assert store.chunk_manifest_count("a") == 1
+    row = store.chunk_manifest("a", "k")
+    assert row["chunk_count"] == 3
+    assert json.loads(row["seed_ids_json"]) == ["c3", "c4", "c5"]
+    assert row["sha256"] == "ff" * 32
+
+
+def test_chunk_manifest_count_splits_by_source(store):
+    store.upsert_source("a", "Public Domain")
+    store.upsert_source("b", "Public Domain")
+    store.record_chunk_manifest("a", "k1", _chunk_manifest_row())
+    store.record_chunk_manifest("a", "k2", _chunk_manifest_row())
+    store.record_chunk_manifest("b", "k1", _chunk_manifest_row())
+    assert store.chunk_manifest_count() == 3
+    assert store.chunk_manifest_count("a") == 2
+    assert store.chunk_manifest_count("b") == 1
+
+
+# ------------------------------------------------------- 12. delete_seeds
+
+
+def test_delete_seeds_removes_the_named_rows_and_returns_the_count(store):
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_seeds(_seed_rows(3, source_id="a"))
+    removed = store.delete_seeds(["sd0", "sd2"])
+    assert removed == 2
+    assert store.get_seed("sd0") is None
+    assert store.get_seed("sd1") is not None
+    assert store.get_seed("sd2") is None
+    assert store.seed_count("a") == 1
+
+
+def test_delete_seeds_deduplicates_repeated_ids_and_ignores_unknown_ones(store):
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_seeds(_seed_rows(2, source_id="a"))
+    removed = store.delete_seeds(["sd0", "sd0", "never-existed"])
+    assert removed == 1
+    assert store.get_seed("sd0") is None
+
+
+def test_delete_seeds_of_an_empty_list_does_nothing(store):
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_seeds(_seed_rows(1, source_id="a"))
+    assert store.delete_seeds([]) == 0
+    assert store.seed_count("a") == 1
+
+
+def test_delete_seeds_refuses_to_orphan_a_referencing_task(store):
+    # A seed a task already points at must not vanish silently - that would
+    # leave task.seed_id referencing nothing, and this store runs with
+    # foreign_keys=ON specifically so that cannot happen unnoticed.
+    _populate(store, n=1)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.delete_seeds(["sd0"])
+
+
+# ------------------------------------------------------- 13. seeds_by_source
+
+
+def test_seeds_by_source_reads_back_in_seed_id_order(store):
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_source("b", "CC-BY-4.0")
+    store.upsert_seeds([
+        {"seed_id": "z1", "source_id": "a", "text": "t", "token_count": 1},
+        {"seed_id": "a1", "source_id": "a", "text": "t", "token_count": 1},
+        {"seed_id": "m1", "source_id": "b", "text": "t", "token_count": 1},
+    ])
+    rows = store.seeds_by_source("a")
+    assert [r["seed_id"] for r in rows] == ["a1", "z1"]
+    assert [r["seed_id"] for r in store.seeds_by_source("b")] == ["m1"]
+    assert store.seeds_by_source("nonexistent-source") == []
