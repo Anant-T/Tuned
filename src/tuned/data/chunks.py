@@ -54,7 +54,7 @@ Build:  python -m tuned.data.chunks --config configs/data_law_v1.yaml
 
 import json
 import subprocess
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
