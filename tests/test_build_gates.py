@@ -1304,6 +1304,28 @@ def test_answer_key_a_negation_that_really_governs_is_not_broken_by_a_comma(answ
     assert result.detail["liability_asserted"] == []
 
 
+def test_answer_key_a_distant_negation_does_not_reach_the_assertion():
+    """The NEGATION_WINDOW bound, which nothing else in this file exercised.
+
+    Found by mutation: unbounding the window (scope = everything before the
+    cue) left every other assertion green, because every other fixture puts
+    its negator within a few words of the cue. The sentence below is the case
+    the bound exists for - a "no" that belongs to a different part of the
+    sentence entirely, sixty-odd characters away, with no hard break between
+    to stop it. It denies nothing about the charge, and it must not excuse the
+    assertion that follows it.
+    """
+    ctx = _no_liability_ctx()
+    far = (
+        "There is no dispute that the dates are as stated and that the parties are "
+        "correctly described in the papers now before this court, and the charge lies "
+        "under Section 302 IPC."
+    )
+    result = check_answer_key(far, ctx)
+    assert not result.passed
+    assert result.detail["liability_asserted"] == ["the charge lies under"]
+
+
 def test_answer_key_denial_cues_match_at_word_boundaries():
     """"void" is a substring of "avoid", so an answer that denies nothing
     satisfied the limb that exists to require a denial."""
