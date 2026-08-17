@@ -144,6 +144,71 @@ _IRAC_HEADING_RE = re.compile(
 # answer-key contract.
 _SAVINGS_RE = re.compile(r"\bsaving|§\s{0,2}358\b|\bsection\s{1,4}358\b", re.IGNORECASE)
 
+# THE ANSWER "no charge lies", as something a key can require and this gate can
+# read. A section a court struck down before the conduct is chargeable on no
+# date, so on those cells the correct answer NAMES the section (or it has ruled
+# out nothing) and then says no charge lies under it. Citations alone cannot
+# tell that answer from its opposite - both name the same section - so the key
+# needs these two vocabularies and this gate needs both limbs:
+#
+#   the DENIAL must be present, and
+#   an affirmative attribution of the charge must be absent.
+#
+# The first limb alone already rejects the wrong answer, which asserts the
+# charge and never denies it; the second catches the answer that hedges by
+# saying both. Neither is a style rule - on these cells they are the whole of
+# the difference between the right answer and a false statement of law.
+NO_LIABILITY_CUES = (
+    "no charge",
+    "no offence",
+    "not an offence",
+    "no prosecution",
+    "cannot be charged",
+    "cannot be prosecuted",
+    "no liability",
+    "struck down",
+    "read down",
+    "unconstitutional",
+    "void",
+    "no longer in force",
+    "nothing to preserve",
+    "preserves nothing",
+)
+
+# Affirmative attributions of a charge to a section. Each carries its own
+# subject ("the charge lies under", not "charge lies under") so that the
+# DENIAL - "no charge lies under s.497" - does not contain one as a substring;
+# a negation window catches the rest ("it is not the case that the charge lies
+# under ..."), because a permanent gate that fires on a correct answer
+# awkwardly phrased is the same failure this whole finding is about.
+LIABILITY_CUES = (
+    "the charge lies under",
+    "the charge would lie under",
+    "a charge lies under",
+    "charged under section",
+    "stands charged under",
+    "is chargeable under",
+    "remains chargeable",
+    "is punishable under",
+    "remains punishable",
+    "continues to be punishable",
+    "is liable under",
+    "may be prosecuted under",
+    "liability is preserved",
+    "liability was preserved",
+)
+
+# How far back a negation may sit and still govern the cue, and where it stops
+# governing whatever it is. The clause break is what stops "no charge lies
+# under s.497; the charge lies under s.497" reading as a denial - a hedge that
+# says both things is not a correct answer, and without the break the leading
+# "no" would excuse the clause that contradicts it.
+NEGATION_WINDOW = 48
+_NEGATOR_RE = re.compile(
+    r"\b(?:no|not|never|nor|neither|cannot|without|nothing)\b|n't\b", re.IGNORECASE
+)
+_CLAUSE_BREAK_RE = re.compile(r"[.;:!?]\s")
+
 # Shingle stride for the verbatim scan; see find_verbatim_run.
 SHINGLE_STEP = 10
 DEFAULT_MAX_RUN = 30
@@ -596,6 +661,50 @@ def _mentions_savings(answer: str, refs: list[SectionRef]) -> bool:
     return bool(_SAVINGS_RE.search(answer or ""))
 
 
+def _denies_liability(answer: str) -> list[str]:
+    """Cues by which the answer says no charge lies. Whitespace-normalized, so
+    a phrase broken across a line break still counts."""
+    text = _norm_ws(answer).lower()
+    return [cue for cue in NO_LIABILITY_CUES if cue in text]
+
+
+def _negated_at(text: str, at: int) -> bool:
+    """Does a negation govern the cue starting at `at`?
+
+    The window is the NEGATION_WINDOW characters before the cue, cut back to
+    the last clause break inside it. Both halves matter and each was measured:
+    without the window, "it is not the case that the charge lies under s.497"
+    reads as an assertion and a correctly-reasoned answer is permanently
+    rejected; without the clause break, "no charge lies under s.497; the charge
+    lies under s.497" reads as a denial and an answer that says both things
+    passes.
+    """
+    window = text[max(0, at - NEGATION_WINDOW) : at]
+    breaks = list(_CLAUSE_BREAK_RE.finditer(window))
+    if breaks:
+        window = window[breaks[-1].end() :]
+    return bool(_NEGATOR_RE.search(window))
+
+
+def _asserts_liability(answer: str) -> list[str]:
+    """Cues by which the answer says a charge DOES lie, negated ones excluded.
+
+    Every occurrence of every cue is examined, so one negated use does not
+    excuse a later bare one.
+    """
+    text = _norm_ws(answer)
+    lowered = text.lower()
+    hits: list[str] = []
+    for cue in LIABILITY_CUES:
+        at = lowered.find(cue)
+        while at != -1:
+            if not _negated_at(text, at):
+                hits.append(cue)
+                break
+            at = lowered.find(cue, at + 1)
+    return hits
+
+
 def check_answer_key(
     answer: str, ctx: GateContext, *, think: str | None = ""
 ) -> GateResult:
@@ -617,6 +726,14 @@ def check_answer_key(
     A malformed key still FAILS rather than skipping: that one is an operator
     bug in a hand-authored key, and a key nobody can parse means the row was
     never really checked.
+
+    THE KEY CAN ALSO REQUIRE THAT NO CHARGE LIES. `requires_no_liability_
+    statement` is the one field here that reads the answer's words rather than
+    its citations, and it exists because on a section a court struck down the
+    right answer and the wrong answer cite the SAME section: one says the
+    charge lies under it, the other says nothing does. Citations cannot tell
+    them apart, so before this field the only answer the key could express on
+    those cells was the false one. See NO_LIABILITY_CUES / LIABILITY_CUES.
 
     governing_family is recorded, not enforced: what the answer may cite is
     already pinned by expected/forbidden sections, and demanding a single
@@ -656,6 +773,15 @@ def check_answer_key(
     savings_required = bool(key.get("requires_savings_mention"))
     savings_ok = _mentions_savings(text, refs) if savings_required else True
 
+    # The key may require the answer to be that NO charge lies - see
+    # NO_LIABILITY_CUES. Both limbs, and only where the key asked: on an
+    # ordinary cell "the charge lies under IPC s.302" is the RIGHT answer, so
+    # the affirmative vocabulary must not be consulted there at all.
+    no_liability_required = bool(key.get("requires_no_liability_statement"))
+    denials = _denies_liability(text) if no_liability_required else []
+    assertions = _asserts_liability(text) if no_liability_required else []
+    no_liability_ok = (bool(denials) and not assertions) if no_liability_required else True
+
     both_required = bool(key.get("must_name_both_families"))
     families = sorted(
         {"old" for ref in refs if ref.code in OLD_CODES}
@@ -673,11 +799,22 @@ def check_answer_key(
         "forbidden_present": present_forbidden,
         "savings_required": savings_required,
         "savings_ok": savings_ok,
+        "no_liability_required": no_liability_required,
+        "no_liability_ok": no_liability_ok,
+        "no_liability_cues": denials,
+        "liability_asserted": assertions,
         "both_families_required": both_required,
         "families": families,
         "malformed_key_entries": malformed,
     }
-    passed = not missing and not present_forbidden and savings_ok and both_ok and not malformed
+    passed = (
+        not missing
+        and not present_forbidden
+        and savings_ok
+        and no_liability_ok
+        and both_ok
+        and not malformed
+    )
     return GateResult("answer_key", passed, detail)
 
 

@@ -93,12 +93,16 @@ def test_the_grid_is_the_verified_map_crossed_with_the_postures(grid, mapping):
     assert len(T.POSTURE_CELLS) == (
         len(T.DATE_POSTURES) * len(T.PROCEDURAL_POSTURES) * len(T.QUESTION_FORMS)
     )
-    assert len(families) == len(mapping.verified_rows()) == 154
-    # 154 x 80 minus the cells no gate stack could accept (see the
-    # ungateable test below), which is the whole of the difference.
+    assert len(mapping.verified_rows()) == 154
+    # 153, not 154: IPC 377 is verified and emits nothing at all, because no
+    # posture of it can be keyed with certainty (see the judicial tests below).
+    assert len(families) == 153
+    # 154 x 80 minus the cells that cannot be built - the ones no gate stack
+    # could accept AND the ones whose law this build cannot state - which is
+    # the whole of the difference.
     ungateable = [entry for entry in refused if "cell" in entry]
-    assert len(cells) == len(families) * len(T.POSTURE_CELLS) - len(ungateable)
-    assert len(cells) == 12192
+    assert len(cells) == len(mapping.verified_rows()) * len(T.POSTURE_CELLS) - len(ungateable)
+    assert len(cells) == 12144
 
 
 def test_every_cell_id_is_unique_and_content_keyed(grid):
@@ -145,7 +149,7 @@ def test_the_draw_covers_every_family_and_every_posture_pair(selection, grid):
     per_family: dict[str, int] = {}
     for cell in selection.sample:
         per_family[cell.family.key] = per_family.get(cell.family.key, 0) + 1
-    assert len(per_family) == len({c.family.key for c in cells}) == 154
+    assert len(per_family) == len({c.family.key for c in cells}) == 153
     # A prefix of the coverage order gives every family within one cell of
     # every other - no family is left out of a 1,100-cell draw.
     assert max(per_family.values()) - min(per_family.values()) <= 1
@@ -310,16 +314,38 @@ def test_every_cell_dates_the_proceeding_no_earlier_than_the_conduct(grid):
 
 
 def test_the_date_postures_mean_what_they_are_named(grid):
+    """Each posture, against the boundary IT is anchored to.
+
+    "just_before" means the months before the boundary that decides the
+    family's substantive answer, and for a family a court struck down that
+    boundary is the JUDGMENT, not the appointed day. The proceeding is
+    anchored to the appointed day whatever the family, because which
+    procedural code governs turns on that day alone.
+    """
     cells, _ = grid
     seen = {}
     for cell in cells:
         seen.setdefault(cell.date_posture.name, []).append(cell)
-    for cell in seen["well_before"] + seen["just_before"]:
+
+    def anchor(cell):
+        event = T.JUDICIAL_INVALIDATIONS.get(cell.family.key)
+        if event is not None and cell.date_posture.anchors_to_invalidation:
+            assert cell.date_anchor == T.ANCHOR_INVALIDATION
+            return event.decided_on
+        assert cell.date_anchor == T.ANCHOR_APPOINTED_DAY
+        return APPOINTED_DAY
+
+    for cell in seen["well_before"]:
         assert cell.offence_date < APPOINTED_DAY and cell.proceeding_started < APPOINTED_DAY
+    for cell in seen["just_before"]:
+        assert cell.offence_date < anchor(cell)
+        assert cell.proceeding_started < APPOINTED_DAY
     for cell in seen["on_appointed_day"]:
-        assert cell.offence_date == cell.proceeding_started == APPOINTED_DAY
+        assert cell.offence_date == APPOINTED_DAY
+        assert cell.proceeding_started >= APPOINTED_DAY
     for cell in seen["just_after"]:
-        assert cell.offence_date >= APPOINTED_DAY and cell.proceeding_started > APPOINTED_DAY
+        assert cell.offence_date > anchor(cell)
+        assert cell.proceeding_started > APPOINTED_DAY
     for cell in seen["straddling"]:
         assert cell.offence_date < APPOINTED_DAY <= cell.proceeding_started
 
@@ -371,6 +397,11 @@ def _independent_key(cell: T.Cell, provisions) -> dict:
     mapping row's own two sides, so that a change in transition.py's
     derivation has to be justified against the decision table rather than
     against itself.
+
+    The judicial timeline is re-derived here too, from the two dated constants
+    and the offence date, WITHOUT calling transition.judicial_status: the
+    branch it drives is the one that was wrong, so a test that asked the
+    module the same question twice would agree with itself.
     """
     substantive = governing_family(
         "substantive",
@@ -382,10 +413,25 @@ def _independent_key(cell: T.Cell, provisions) -> dict:
         offence_date=cell.offence_date,
         proceeding_started=cell.proceeding_started,
     )
+    event = T.JUDICIAL_INVALIDATIONS.get(cell.family.key)
+    if event is None:
+        struck = False
+    elif event.scope == T.SCOPE_CONDUCT_SCOPED:
+        struck = None  # never decidable: the papers do not narrate consent
+    else:
+        struck = cell.offence_date > event.decided_on
+        if not struck:
+            struck = None  # conduct at or before the judgment: reach unknown
+
     old_ref, new_ref = cell.family.old_ref, cell.family.new_ref
-    charge = old_ref if substantive == "old" else new_ref
-    counterpart = new_ref if substantive == "old" else old_ref
+    if struck is False:
+        charge = old_ref if substantive == "old" else new_ref
+        counterpart = new_ref if substantive == "old" else old_ref
+    else:
+        charge = counterpart = None
     engage = charge if charge is not None else counterpart
+    if engage is None and struck is not False:
+        engage = old_ref if old_ref is not None else new_ref
 
     expected = [engage] if engage is not None else []
     if "procedural" in cell.question_form.limbs:
@@ -399,7 +445,11 @@ def _independent_key(cell: T.Cell, provisions) -> dict:
     if cell.question_form.forbids_counterpart and charge is not None and counterpart is not None:
         forbidden = [counterpart]
 
-    if charge is not None:
+    if struck is None:
+        consequence = "not_decidable_on_this_build"
+    elif struck:
+        consequence = "no_offence_lies"
+    elif charge is not None:
         consequence = "old_liability_preserved" if substantive == "old" else "new_code_governs_directly"
     elif substantive == "old":
         consequence = "new_offence_cannot_reach_earlier_conduct"
@@ -412,6 +462,7 @@ def _independent_key(cell: T.Cell, provisions) -> dict:
         "forbidden_sections": [{"code": r.code, "number": r.number} for r in forbidden],
         "requires_savings_mention": substantive == "old"
         or cell.question_form.name == "savings_effect",
+        "requires_no_liability_statement": struck is True,
         "must_name_both_families": substantive == "old" and old_ref is not None,
         "savings_consequence": consequence,
         "procedural_family": procedural,
@@ -431,9 +482,11 @@ def test_every_key_is_recomputable_from_the_statute_table_alone(grid, provisions
             c.question_form.name,
         ),
     )
-    # 4 kinds x 80 posture triples, minus the (deleted x post-appointed-day)
-    # combinations build_grid excludes.
-    assert len(strata) == 4 * 80 - 32
+    # 4 kinds x 80 posture triples, minus the (deleted x date posture)
+    # combinations no deleted family can be built on: the two post-appointed-
+    # day postures, and "just_before", which for IPC 497 is anchored to the
+    # judgment and therefore refused while 124A/309 keep it.
+    assert len(strata) == 4 * 80 - 16
     for cell in strata:
         key = T.answer_key_for(cell, provisions)
         want = _independent_key(cell, provisions)
@@ -449,15 +502,26 @@ def test_the_edges_the_plan_named_are_all_in_the_grid(grid):
     kinds = {cell.family.kind for cell in cells}
     assert kinds == {"one_to_one", "changed", "new_offence", "deleted"}
     families = {cell.family.key for cell in cells}
-    # No-counterpart new offences and read-down/deleted sections, named in the
-    # plan. IPC 377 and 497 are `deleted` and keep every pre-repeal posture.
+    # No-counterpart new offences, named in the plan.
     for named in ("BNS 111", "BNS 113", "BNS 103(2)", "BNS 304", "BNS 69"):
         assert named in families
-    for named in ("IPC 377", "IPC 497"):
+    # The two `deleted` families with no judicial event keep every posture
+    # whose conduct predates the repeal.
+    for named in ("IPC 124A", "IPC 309"):
         assert named in families
         assert {
             c.date_posture.name for c in cells if c.family.key == named
         } == {"well_before", "just_before", "straddling"}
+    # IPC 497 keeps the postures whose conduct POST-DATES Joseph Shine, which
+    # is a different set: "just_before" is anchored to the judgment for this
+    # family and lands before it, so it goes; "just_after" is anchored there
+    # too and lands after it, so it arrives.
+    assert {c.date_posture.name for c in cells if c.family.key == "IPC 497"} == {
+        "well_before", "just_after", "straddling"
+    }
+    # IPC 377 is verified, is in no refusal of the FAMILY kind, and still
+    # emits nothing at all.
+    assert "IPC 377" not in families
 
 
 def test_a_new_offence_charged_against_earlier_conduct_names_the_section_it_rules_out(
@@ -484,25 +548,248 @@ def test_a_new_offence_charged_against_earlier_conduct_names_the_section_it_rule
 
 
 def test_a_repealed_section_keeps_its_pre_repeal_postures_and_loses_the_others(grid, provisions):
+    """A section REPEALED by the new code, with no court having touched it.
+
+    The savings clause is the whole answer here: liability incurred before the
+    appointed day survives the repeal, so the charge lies under the repealed
+    section however long afterwards the matter is taken up.
+    """
     cells, refused = grid
-    deleted = [c for c in cells if c.family.kind == "deleted"]
-    assert deleted
+    deleted = [
+        c for c in cells
+        if c.family.kind == "deleted" and c.family.key not in T.JUDICIAL_INVALIDATIONS
+    ]
+    assert {c.family.key for c in deleted} == {"IPC 124A", "IPC 309"}
     for cell in deleted:
         key = T.answer_key_for(cell, provisions)
         assert key["governing_family"] == "old"
+        assert key["judicial_status"] == T.STATUS_IN_FORCE
         assert key["charge"] == {
             "code": cell.family.old_ref.code, "number": cell.family.old_ref.number
         }
         assert key["counterpart"] is None
-        assert key["savings_consequence"] == "old_liability_preserved"
+        assert key["savings_consequence"] == T.SAVINGS_PRESERVED
+        assert key["requires_no_liability_statement"] is False
 
     ungateable = [entry for entry in refused if "cell" in entry]
-    assert len(ungateable) == 128 == 4 * 2 * 16
+    by_basis: dict[str, int] = {}
+    for entry in ungateable:
+        by_basis[entry["basis"]] = by_basis.get(entry["basis"], 0) + 1
+    # The gate-stack half is unchanged in kind and smaller in count: the two
+    # post-appointed-day postures of the three deleted families that build a
+    # cell at all (IPC 377 never reaches this branch - it is refused earlier,
+    # on the law).
+    assert by_basis[T.REFUSAL_GATE_STACK] == 80 == 3 * 2 * 16 - 16
+    assert by_basis[T.REFUSAL_LEGAL_CERTAINTY] == 96 == 80 + 16
+    assert len(ungateable) == 176
     assert {entry["family"] for entry in ungateable} == {
         "IPC 124A", "IPC 309", "IPC 377", "IPC 497"
     }
     for entry in ungateable:
-        assert "no suppression" in entry["reason"]
+        if entry["basis"] == T.REFUSAL_GATE_STACK:
+            assert "no suppression" in entry["reason"]
+        else:
+            assert "Joseph Shine" in entry["reason"] or "Navtej Singh Johar" in entry["reason"]
+
+
+# --------------------------------------------------------------------------
+# The second timeline: a section a court struck down.
+# --------------------------------------------------------------------------
+
+def test_the_invalidation_constants_are_grounded_in_the_audited_map(mapping):
+    """A date this module keys an answer on may not come from recollection.
+
+    The event, the case and the year are the audit sheet's; only the DAY is a
+    constant here, and the constant carries the note saying so. This test is
+    the tie: it reads the mapping row and asserts the constant's own claim
+    about where it comes from is true of the file.
+    """
+    assert set(T.JUDICIAL_INVALIDATIONS) == {"IPC 497", "IPC 377"}
+    for key, event in T.JUDICIAL_INVALIDATIONS.items():
+        row = mapping.row(SectionRef(*key.split(" ", 1)))
+        note = str(row.get("notes") or "")
+        assert event.is_grounded_in(note), (key, note)
+        assert event.case in note and str(event.year) in note
+        assert row["kind"] == "deleted"
+        # The source note says where the day came from and admits what it is.
+        assert "operator-supplied constant" in event.source_note
+        assert "ipc_bns_map.jsonl" in event.source_note
+        assert event.scope in (T.SCOPE_SECTION_VOID, T.SCOPE_CONDUCT_SCOPED)
+    assert T.JUDICIAL_INVALIDATIONS["IPC 497"].decided_on == date(2018, 9, 27)
+    assert T.JUDICIAL_INVALIDATIONS["IPC 377"].decided_on == date(2018, 9, 6)
+    assert T.JUDICIAL_INVALIDATIONS["IPC 497"].scope == T.SCOPE_SECTION_VOID
+    assert T.JUDICIAL_INVALIDATIONS["IPC 377"].scope == T.SCOPE_CONDUCT_SCOPED
+
+
+def test_a_constant_the_audit_sheet_does_not_carry_refuses_its_family(mapping, provisions):
+    """The other direction: break the tie and the family stops emitting.
+
+    Not a style check. The constant is the only thing that says WHEN the
+    section stopped being chargeable, and a constant the sheet cannot
+    corroborate is exactly the unstated recollection this stream must never
+    key an answer on.
+    """
+    rows = copy.deepcopy(mapping.rows)
+    victim = next(row for row in rows if row["old_section"] == "497")
+    victim["notes"] = "Adultery. Repealed and not re-enacted."  # the case name goes
+    cells, refused = T.build_grid(Mapping(rows), provisions=provisions)
+    assert "IPC 497" not in {c.family.key for c in cells}
+    reason = next(
+        entry["reason"] for entry in refused
+        if "cell" not in entry and entry["family"] == "IPC 497"
+    )
+    assert "Joseph Shine" in reason and "cannot be traced to the audit sheet" in reason
+
+
+def test_a_note_recording_a_judgment_with_no_constant_refuses_its_family(mapping, provisions):
+    """The operator writes a new note; the build refuses rather than keys it.
+
+    This is the C1 failure mode generalised: the prompt told the teacher the
+    section had been struck down while the key graded the answer as if it had
+    not. A note nobody has dated cannot be keyed at all.
+    """
+    rows = copy.deepcopy(mapping.rows)
+    victim = next(row for row in rows if row.get("verified_by") and row["kind"] == "one_to_one")
+    key = str(SectionRef(victim["old_code"], victim["old_section"]))
+    before, _ = T.build_grid(Mapping(copy.deepcopy(rows)), provisions=provisions)
+    assert key in {c.family.key for c in before}
+
+    victim["notes"] = (victim.get("notes") or "") + " Struck down in a later case."
+    after, refused = T.build_grid(Mapping(rows), provisions=provisions)
+    assert key not in {c.family.key for c in after}
+    assert len(after) == len(before) - len(T.POSTURE_CELLS)
+    reason = next(
+        entry["reason"] for entry in refused
+        if "cell" not in entry and entry["family"] == key
+    )
+    assert "records a judicial event" in reason and "struck down" in reason.lower()
+
+
+def test_judicial_status_reads_the_timeline_and_not_the_appointed_day():
+    """The three answers, at the boundary and on both sides of it."""
+    shine = T.JUDICIAL_INVALIDATIONS["IPC 497"].decided_on
+    assert T.judicial_status("IPC 302", date(2020, 1, 1)) == (T.STATUS_IN_FORCE, None)
+    assert T.judicial_status("IPC 497", shine + timedelta(days=1))[0] == T.STATUS_VOID
+    # The day itself and everything before it: refused, not guessed.
+    for day in (shine, shine - timedelta(days=1), date(2001, 1, 1)):
+        status, reason = T.judicial_status("IPC 497", day)
+        assert status == T.STATUS_UNDECIDABLE
+        assert "Joseph Shine" in reason and shine.isoformat() in reason
+    # Conduct-scoped: undecidable on EVERY date, because the papers never say
+    # whether the conduct was consensual.
+    for day in (date(2001, 1, 1), date(2018, 9, 6), date(2023, 5, 5)):
+        status, reason = T.judicial_status("IPC 377", day)
+        assert status == T.STATUS_UNDECIDABLE
+        assert "consent" in reason
+
+
+def test_the_struck_down_family_keys_no_charge_lies_and_names_the_section(grid, provisions):
+    """The C1 key, re-derived here from the timeline rather than read off the
+    module: conduct after Joseph Shine, so no charge lies - and the answer
+    must still NAME s.497, or it has ruled nothing out."""
+    cells, _ = grid
+    struck = [c for c in cells if c.family.key == "IPC 497"]
+    assert len(struck) == 48
+    shine = T.JUDICIAL_INVALIDATIONS["IPC 497"].decided_on
+    for cell in struck:
+        assert cell.offence_date > shine, cell.coordinates
+        assert cell.offence_date < APPOINTED_DAY  # every surviving posture
+        key = T.answer_key_for(cell, provisions)
+        assert key["judicial_status"] == T.STATUS_VOID
+        assert key["savings_consequence"] == T.SAVINGS_NO_OFFENCE_LIES
+        assert key["charge"] is None, "nothing is chargeable under a void section"
+        assert key["counterpart"] is None
+        assert key["requires_no_liability_statement"] is True
+        assert {"code": "IPC", "number": "497"} in key["expected_sections"]
+        # ...and s.358 with it: the answer has to say what the savings clause
+        # does here, which is preserve nothing.
+        assert {"code": "BNS", "number": "358"} in key["expected_sections"]
+        assert key["forbidden_sections"] == []
+        assert key["judicial_event"]["case"] == "Joseph Shine"
+        assert key["judicial_event"]["decided_on"] == shine.isoformat()
+
+
+def test_the_postures_around_the_judgment_are_the_ones_the_grid_asks(grid, provisions):
+    """just_before / just_after, anchored to the judgment for this family: one
+    side is the question the grid keeps, the other is the one it refuses."""
+    cells, refused = grid
+    shine = T.JUDICIAL_INVALIDATIONS["IPC 497"].decided_on
+    after = [
+        c for c in cells
+        if c.family.key == "IPC 497" and c.date_posture.name == "just_after"
+    ]
+    assert len(after) == 16
+    for cell in after:
+        assert cell.date_anchor == T.ANCHOR_INVALIDATION
+        assert shine < cell.offence_date <= shine + timedelta(days=45)
+        # The conduct sits days after the judgment and YEARS before the
+        # appointed day, so the substantive limb is IPC-era and the question
+        # is entirely about the judgment.
+        assert cell.offence_date < APPOINTED_DAY
+    refusals = [
+        entry for entry in refused
+        if entry.get("family") == "IPC 497" and "cell" in entry
+        and "just_before" in entry["cell"]
+    ]
+    assert len(refusals) == 16
+    for entry in refusals:
+        assert entry["basis"] == T.REFUSAL_LEGAL_CERTAINTY
+        assert "on or before 2018-09-27" in entry["reason"]
+
+
+def test_the_read_down_family_emits_nothing_and_says_why(grid, mapping, provisions):
+    """IPC 377 is verified, is not refused as a FAMILY, and still builds no
+    cell: after Navtej Singh Johar the section's reach turns on consent, and
+    the fact skeletons deliberately do not narrate it."""
+    cells, refused = grid
+    assert "IPC 377" in {
+        str(SectionRef(row["old_code"], row["old_section"]))
+        for row in mapping.verified_rows()
+        if row["old_code"]
+    }
+    assert "IPC 377" not in {c.family.key for c in cells}
+    assert "IPC 377" not in {e["family"] for e in refused if "cell" not in e}
+    cell_refusals = [e for e in refused if e.get("family") == "IPC 377" and "cell" in e]
+    assert len(cell_refusals) == 80 == len(T.POSTURE_CELLS)
+    for entry in cell_refusals:
+        assert entry["basis"] == T.REFUSAL_LEGAL_CERTAINTY
+        assert "Navtej Singh Johar" in entry["reason"] and "consent" in entry["reason"]
+
+
+def test_the_no_charge_lies_answer_passes_and_its_opposite_is_rejected(cfg, grid, provisions):
+    """The whole of C1, at the gate: the legally correct answer PASSES and the
+    answer the old key demanded - the charge lies under the struck-down
+    section - is the one that fails."""
+    cells, _ = grid
+    cell = next(
+        c for c in cells
+        if c.family.key == "IPC 497" and c.question_form.name == "charge_only"
+    )
+    row = T.seed_row(cell, provisions, held_out=False)
+    _, ctx = _ctx_for(cfg, row)
+
+    correct = (
+        "Conclusion: no charge lies under Section 497 of the Indian Penal Code. It was "
+        "struck down before this conduct, so no liability was ever incurred under it and "
+        "Section 358 BNS - which preserves liability incurred - preserves nothing here."
+    )
+    wrong = (
+        "Conclusion: the charge lies under Section 497 of the Indian Penal Code, preserved "
+        "by Section 358 BNS."
+    )
+    hedged = (
+        "Conclusion: no charge lies under Section 497 IPC; the charge lies under Section "
+        "497 IPC, preserved by Section 358 BNS."
+    )
+    good = gates.check_answer_key(correct, ctx, think="x")
+    assert good.passed, good.detail
+    assert gates.check_temporal(f"<think>x</think>\n{correct}", ctx).passed
+    bad = gates.check_answer_key(wrong, ctx, think="x")
+    assert not bad.passed
+    assert bad.detail["liability_asserted"] == ["the charge lies under"]
+    assert bad.detail["missing"] == [], "it cites everything the key asks for and is still wrong"
+    # An answer that says both things is not a correct answer either.
+    assert not gates.check_answer_key(hedged, ctx, think="x").passed
 
 
 def test_only_charge_only_forbids_the_counterpart(grid, provisions):
@@ -536,6 +823,7 @@ def test_the_key_is_shaped_the_way_check_answer_key_reads_it(selection, provisio
         "expected_sections",
         "forbidden_sections",
         "requires_savings_mention",
+        "requires_no_liability_statement",
         "must_name_both_families",
     }
     assert json.loads(json.dumps(key)) == key  # store.upsert_seeds serialises it
@@ -549,7 +837,12 @@ def _ideal_answer(key: dict) -> str:
     cites = " ".join(
         f"Section {entry['number']} {entry['code']}" for entry in key["expected_sections"]
     )
-    return f"Issue\nRule\nApplication\nConclusion: the position is {cites}."
+    answer = f"Issue\nRule\nApplication\nConclusion: the position is {cites}."
+    if key.get("requires_no_liability_statement"):
+        # The whole of what the key asks for on a struck-down section: name it,
+        # and say that no charge lies under it.
+        answer += " No charge lies: the section was struck down before this conduct."
+    return answer
 
 
 def _ctx_for(cfg, row: dict):
@@ -809,13 +1102,17 @@ def test_the_stream_and_task_type_are_the_ones_the_rest_of_the_pipeline_uses():
 
 def test_build_transition_writes_the_draw_and_reports_the_shape(store, cfg, mapping, provisions):
     manifest = T.build_transition(store, cfg, mapping=mapping, provisions=provisions)
-    assert manifest["grid_cells"] == 12192
-    assert manifest["families_emitting"] == 154
+    assert manifest["grid_cells"] == 12144
+    assert manifest["families_emitting"] == 153
     assert manifest["families_refused"] == 17
-    assert manifest["cells_refused"] == 128
+    assert manifest["cells_refused"] == 176
+    assert manifest["cells_refused_by_basis"] == {"legal-certainty": 96, "gate-stack": 80}
+    # The family that passes every audit gate and still emits nothing is named
+    # rather than left to be inferred from two counts that no longer subtract.
+    assert manifest["families_emitting_nothing"] == ["IPC 377"]
     assert (manifest["sample"], manifest["reserve"]) == (1100, 150)
     assert manifest["written"] == 1250
-    assert manifest["sample_families_covered"] == 154
+    assert manifest["sample_families_covered"] == 153
     assert manifest["sample_posture_pairs"] == manifest["posture_pairs_total"] == 20
     assert store.seed_count(T.TRANSITION_SOURCE_ID) == 1250
     assert [event["kind"] for event in store.events("transition_grid_built")]
@@ -833,7 +1130,7 @@ def test_a_dry_run_measures_and_writes_nothing(store, cfg, mapping, provisions):
         store, cfg, mapping=mapping, provisions=provisions, dry_run=True
     )
     assert manifest["written"] == 0
-    assert manifest["grid_cells"] == 12192
+    assert manifest["grid_cells"] == 12144
     assert store.seed_count() == 0
 
 

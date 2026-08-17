@@ -14,13 +14,24 @@ One cell per
 
     verified mapping row  x  date posture  x  procedural posture  x  question form
 
-and the four factors are owned in four different places on purpose:
+and the four factors are owned in four different places on purpose. There are
+TWO boundaries in the dates, not one - see JUDICIAL_INVALIDATIONS: the
+appointed day decides which ENACTMENT governs, and a judgment date decides
+whether the section named on the old side of it was in force at all. A key
+that answered the first question without asking the second demanded that a
+struck-down section be named as the section the charge lies under, which made
+"no charge lies" - the correct answer - a permanent reject.
+
+The four factors:
 
 * the FAMILIES are resources/ipc_bns_map.jsonl, through Mapping.require_verified
   and nothing else. The 17 rows whose `verified_by` is still null cannot emit a
   single cell, and they are not skipped silently - build_grid records each one
   in the manifest with the refusal statutes.py itself raised. When the operator
-  signs a row off the grid grows and no code changes;
+  signs a row off the grid grows and no code changes. A row whose audited NOTE
+  records a judicial event this module has no dated constant for is refused the
+  same way, for the same reason: the build cannot say whether the section was
+  in force on the day of the conduct, so it does not guess;
 * the DATE POSTURES and PROCEDURAL POSTURES are here, because they are the two
   axes the two savings rules turn on and their intersection is the whole point
   of the stream;
@@ -69,7 +80,8 @@ are exactly the keys it reads. Everything else in the dict
 (`families_by_kind`, `procedural_rule`, `savings_consequence`, the grid
 coordinates) is metadata for the eval and the report, which that gate ignores.
 
-Two things about the teeth are worth stating because both were got wrong first:
+Three things about the teeth are worth stating because all three were got
+wrong first:
 
 1. `forbidden_sections` is populated on ONE question form, `charge_only`, and
    only when a counterpart exists. The other three forms invite the answer to
@@ -86,6 +98,14 @@ Two things about the teeth are worth stating because both were got wrong first:
    mention check_temporal would reject the correct answer. The two gates
    agree because the key makes them agree.
 
+3. `requires_no_liability_statement` is the only field in the key that reads
+   the answer's WORDS rather than its citations, and it is set only where the
+   section was void when the conduct occurred. It has to exist: on those cells
+   the right answer and the wrong answer cite the same section - "no charge
+   lies under IPC s.497" and "the charge lies under IPC s.497" are the same
+   citation set - so a key made of citations alone could express only the
+   false one, and did.
+
 THE RESERVE
 -----------
 `transition.eval_reserve` cells are taken from the FRONT of one deterministic
@@ -101,6 +121,7 @@ Build:  python -m tuned.data.transition --config configs/data_law_v1.yaml
 """
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 from math import gcd
@@ -334,20 +355,31 @@ def savings_block(provisions: dict[str, Provision]) -> str:
 
 @dataclass(frozen=True)
 class DatePosture:
-    """A pair of day-offset spans around the appointed day.
+    """A pair of day-offset spans, one for the conduct and one for the record.
 
-    The spans are disjoint and ordered so that the proceeding can never
-    predate the offence - an impossible record would teach the model to
-    reason about one. Within a span the exact day is derived from the cell's
-    own content key, so two cells in the same posture are not the same paper
-    twice, and the derivation is a hash rather than an RNG so a grid rebuilt
-    next year is the same grid.
+    The spans are ordered so that the proceeding can never predate the offence
+    - an impossible record would teach the model to reason about one. Within a
+    span the exact day is derived from the cell's own content key, so two cells
+    in the same posture are not the same paper twice, and the derivation is a
+    hash rather than an RNG so a grid rebuilt next year is the same grid.
+
+    `anchors_to_invalidation` names WHICH BOUNDARY the offence span is measured
+    from. For every ordinary family that is the appointed day, and the two
+    spans are both offsets from it. For a family a court struck down the
+    operative boundary is the JUDGMENT, years earlier, and "the months
+    immediately before" / "the days immediately after" are only the legally
+    interesting question when they are the months and days around THAT date.
+    The proceeding span stays anchored to the appointed day either way,
+    because which procedural code governs turns on the appointed day for every
+    family alike. A cell records which anchor it was built on
+    (`Cell.date_anchor`) so the eval never has to infer it.
     """
 
     name: str
     offence_span: tuple[int, int]
     proceeding_span: tuple[int, int]
     note: str
+    anchors_to_invalidation: bool = False
 
 
 DATE_POSTURES = (
@@ -357,17 +389,21 @@ DATE_POSTURES = (
     ),
     DatePosture(
         "just_before", (-330, -190), (-180, -8),
-        "conduct and proceeding both in the months immediately before the appointed day",
+        "conduct in the months immediately before the boundary that decides this family's "
+        "substantive answer, proceeding in the months immediately before the appointed day",
+        anchors_to_invalidation=True,
     ),
     DatePosture(
         "on_appointed_day", (0, 0), (0, 0),
-        "conduct and proceeding both ON the appointed day - new on both axes, because "
-        "the codes came into force that day and the procedural saving reaches only what "
-        "was pending IMMEDIATELY BEFORE it",
+        "conduct ON the appointed day, and the record at the earliest its stage allows - "
+        "new on both axes, because the codes came into force that day and the procedural "
+        "saving reaches only what was pending IMMEDIATELY BEFORE it",
     ),
     DatePosture(
         "just_after", (1, 45), (50, 120),
-        "conduct and proceeding both after the appointed day",
+        "conduct in the days immediately after the boundary that decides this family's "
+        "substantive answer, proceeding after the appointed day",
+        anchors_to_invalidation=True,
     ),
     DatePosture(
         "straddling", (-900, -60), (3, 240),
@@ -466,6 +502,166 @@ POSTURE_CELLS = tuple(
 
 
 # --------------------------------------------------------------------------
+# The SECOND timeline: judicial invalidation.
+# --------------------------------------------------------------------------
+#
+# statutes.py owns one boundary, the appointed day, and it decides which
+# ENACTMENT governs. It does not and cannot decide whether the section named on
+# either side of that boundary was in force at all, and for four `deleted`
+# families that is the question the answer turns on. A section a court has
+# struck down is not chargeable on any date after the judgment, so the savings
+# clause has nothing to preserve: BNS s.358 saves liability INCURRED under the
+# repealed Code, and no liability is incurred under a void section.
+#
+# The boundary is therefore the JUDGMENT date, not the appointed day, and it
+# is years earlier. Keying these cells off the appointed day alone produced
+# the error this block exists to remove: an answer key that demanded the
+# struck-down section be named as the section the charge lies under, so that
+# "no charge lies" - the correct answer - was a PERMANENT reject.
+#
+# WHERE THESE FACTS COME FROM, because a date recalled rather than read is the
+# same failure one layer down. The event, the case and the year are recorded in
+# the audited statute table (ipc_bns_map.jsonl `notes`), and every constant
+# below is checked against that note at build time - a constant whose case name
+# and year the audit sheet does not carry refuses its family rather than
+# keying it. The DAY of each judgment is not in that file and is pinned here as
+# a named constant with its source note. No judgment text is reproduced
+# anywhere in this build, and nothing here is inferred from anything else.
+
+# What the judicial event did to the section, as the audited note records it.
+# Two shapes, because the two events in this build are not the same shape of
+# fact and keying them the same way is what would produce a wrong answer.
+SCOPE_SECTION_VOID = "section_void"
+SCOPE_CONDUCT_SCOPED = "conduct_scoped"
+
+# What this build can say about a family on one offence date.
+STATUS_IN_FORCE = "in_force"
+STATUS_VOID = "void"
+STATUS_UNDECIDABLE = "undecidable"
+
+
+@dataclass(frozen=True)
+class JudicialEvent:
+    """One judgment, as a date and a scope this module may key an answer on.
+
+    `case` is the fragment the AUDITED NOTE must carry, not a citation: it is
+    what ties the constant to the operator's sheet, and `is_grounded_in` is
+    where that tie is enforced.
+    """
+
+    family: str
+    case: str
+    decided_on: date
+    scope: str
+    source_note: str
+
+    @property
+    def year(self) -> int:
+        return self.decided_on.year
+
+    def is_grounded_in(self, note: str) -> bool:
+        text = note or ""
+        return self.case.lower() in text.lower() and str(self.year) in text
+
+
+JUDICIAL_INVALIDATIONS: dict[str, JudicialEvent] = {
+    "IPC 497": JudicialEvent(
+        family="IPC 497",
+        case="Joseph Shine",
+        decided_on=date(2018, 9, 27),
+        scope=SCOPE_SECTION_VOID,
+        source_note=(
+            "The event, the case and the year are the audited statute table's own: "
+            "ipc_bns_map.jsonl records this row as 'Adultery. Struck down in Joseph Shine "
+            "v. Union of India (2018) and not re-enacted.' The DAY is not in that file. "
+            "2018-09-27 is the operator-supplied constant for that judgment and is pinned "
+            "here so that no date this module keys an answer on comes from unstated "
+            "recollection; build time checks the case and the year back against the note. "
+            "No text of the judgment is reproduced anywhere in this build. OPERATOR QUEUE: "
+            "carry the status onto the mapping row itself (a judicial_status field) when "
+            "the audit sheet is next signed - a constant in code is the honest place for "
+            "it only until the sheet can hold it."
+        ),
+    ),
+    "IPC 377": JudicialEvent(
+        family="IPC 377",
+        case="Navtej Singh Johar",
+        decided_on=date(2018, 9, 6),
+        scope=SCOPE_CONDUCT_SCOPED,
+        source_note=(
+            "The event, the case and the year are the audited statute table's own: "
+            "ipc_bns_map.jsonl records this row as 'Unnatural offences. Read down for "
+            "consenting adults by Navtej Singh Johar (2018) and carried into no BNS "
+            "section.' The DAY is not in that file. 2018-09-06 is the operator-supplied "
+            "constant, pinned for the same reason as the row above. The SCOPE is what "
+            "matters here and it is why this family keys nothing: the note records that "
+            "the section was read down for a class of conduct defined by CONSENT, and the "
+            "fact skeletons describe the conduct only as 'the conduct described in the "
+            "provisions set out below'. Which answer is correct therefore turns on a fact "
+            "the papers deliberately do not carry. No text of the judgment is reproduced "
+            "anywhere in this build."
+        ),
+    ),
+}
+
+# A note that records a judicial event this module has no constant for. The
+# check is deliberately WIDE and its failure mode is a refusal, not a guess:
+# the C1 error was a family whose own prompt told the teacher the section had
+# been struck down while the key graded the answer as if it had not, so a new
+# note the operator writes must stop the family emitting rather than key it.
+_JUDICIAL_MARKER_RE = re.compile(
+    r"struck\s+down|read\s+down|declared\s+void|unconstitutional|abeyance", re.IGNORECASE
+)
+
+
+def judicial_status(family_key: str, offence_date: date) -> tuple[str, str | None]:
+    """(status, why it cannot be keyed) for one family on one offence date.
+
+    Three answers and no fourth. IN_FORCE is every family the audit sheet
+    records no judicial event for. VOID is a section a court struck down
+    before the conduct: no charge lies, and that is a fact the key states.
+    UNDECIDABLE is everything this build cannot settle from its own sources,
+    and it is a REFUSAL - the cell is not built, the reason is named in the
+    manifest, and no answer key is ever written on a guess.
+
+    Two things land in UNDECIDABLE, both deliberately:
+
+    * conduct-scoped read-downs (IPC 377), on EVERY date. After the judgment
+      the section reaches non-consensual conduct and not consensual conduct,
+      and the papers do not say which this was; before the judgment, whether a
+      prosecution already on foot survives a declaration that the section was
+      always inconsistent with the Constitution is a further question the
+      audited note does not answer. Either way the correct answer depends on
+      something this build does not carry.
+    * conduct that PREDATES a striking down. Whether a prosecution for earlier
+      conduct survives the declaration is a question of the declaration's
+      reach backwards, and the audited note records the striking down and
+      nothing about that. The day of the judgment itself is treated as
+      undecidable for the same reason.
+    """
+    event = JUDICIAL_INVALIDATIONS.get(family_key)
+    if event is None:
+        return STATUS_IN_FORCE, None
+    if event.scope == SCOPE_CONDUCT_SCOPED:
+        return STATUS_UNDECIDABLE, (
+            f"{family_key} was read down in {event.case} ({event.year}) for a class of "
+            f"conduct defined by consent, and the fact skeletons describe the conduct only "
+            f"as the conduct the provisions set out - so whether a charge lies on these "
+            f"papers turns on a fact this build does not narrate. The key would have to "
+            f"guess, and on this stream a guess IS the wrong answer"
+        )
+    if offence_date > event.decided_on:
+        return STATUS_VOID, None
+    return STATUS_UNDECIDABLE, (
+        f"the conduct is dated on or before {event.decided_on.isoformat()}, when "
+        f"{event.case} struck {family_key} down. Whether a prosecution for conduct that "
+        f"early survives the declaration is a question of how far back it reaches, and "
+        f"this build's statute table records the striking down and nothing about that, "
+        f"so the cell is refused rather than keyed either way"
+    )
+
+
+# --------------------------------------------------------------------------
 # Families.
 # --------------------------------------------------------------------------
 
@@ -522,6 +718,37 @@ def families(mapping: Mapping) -> tuple[list[Family], list[dict]]:
         except ValueError as exc:
             refused.append({"family": str(ref), "kind": row.get("kind"), "reason": str(exc)})
             continue
+        note = str(row.get("notes") or "").strip()
+        # THE SECOND GATE, and it is the same shape as the first: a family
+        # whose status this build cannot state does not emit, and the reason is
+        # the manifest's rather than a comment's. Both directions are refusals
+        # because both are the same mistake - a key written on a fact nobody
+        # can point at.
+        event = JUDICIAL_INVALIDATIONS.get(str(ref))
+        if event is not None and not event.is_grounded_in(note):
+            refused.append({
+                "family": str(ref),
+                "kind": row.get("kind"),
+                "reason": (
+                    f"the judicial-invalidation constant for {ref} names {event.case} "
+                    f"({event.year}) and this row's audited note does not, so the date the "
+                    f"key would turn on cannot be traced to the audit sheet: {note!r}"
+                ),
+            })
+            continue
+        marker = None if event is not None else _JUDICIAL_MARKER_RE.search(note)
+        if marker is not None:
+            refused.append({
+                "family": str(ref),
+                "kind": row.get("kind"),
+                "reason": (
+                    f"this row's audited note records a judicial event ({marker.group(0)!r}) "
+                    f"and no invalidation constant gives its date, so the build cannot say "
+                    f"whether {ref} was in force on the day of the conduct. Add the date as a "
+                    f"named constant with its source note, or the family cannot be keyed"
+                ),
+            })
+            continue
         ok.append(
             Family(
                 key=str(ref),
@@ -538,6 +765,10 @@ def families(mapping: Mapping) -> tuple[list[Family], list[dict]]:
 # Cells.
 # --------------------------------------------------------------------------
 
+ANCHOR_APPOINTED_DAY = "appointed_day"
+ANCHOR_INVALIDATION = "invalidation"
+
+
 @dataclass(frozen=True)
 class Cell:
     cell_id: str
@@ -547,6 +778,7 @@ class Cell:
     question_form: QuestionForm
     offence_date: date
     proceeding_started: date
+    date_anchor: str = ANCHOR_APPOINTED_DAY
 
     @property
     def coordinates(self) -> dict:
@@ -556,6 +788,11 @@ class Cell:
             "date_posture": self.date_posture.name,
             "procedural_posture": self.procedural_posture.name,
             "question_form": self.question_form.name,
+            # WHICH boundary this cell's conduct date was measured from. A
+            # posture named "just_before" means one thing around the appointed
+            # day and another around a judgment, and the eval reports the
+            # coordinate: it should not have to re-derive which was meant.
+            "date_anchor": self.date_anchor,
         }
 
 
@@ -576,16 +813,36 @@ def _in_span(key: str, salt: str, span: tuple[int, int]) -> int:
     return lo + _digest(key, salt) % (hi - lo + 1)
 
 
-def cell_dates(key: str, dp: DatePosture, appointed_day: date) -> tuple[date, date]:
+def cell_dates(
+    key: str,
+    dp: DatePosture,
+    appointed_day: date,
+    *,
+    offence_anchor: date | None = None,
+) -> tuple[date, date]:
     """(offence_date, proceeding_started) for one cell.
 
     Content-keyed, never random: the same key gives the same pair on any
     machine under any PYTHONHASHSEED, which is what lets a grid be rebuilt
     and compared with the one before it.
+
+    `offence_anchor` is the boundary the CONDUCT is placed around and defaults
+    to the appointed day. The proceeding is always placed around the appointed
+    day, because which procedural code governs turns on that day and on
+    nothing else - see DatePosture.
     """
-    offence = appointed_day + timedelta(days=_in_span(key, "offence", dp.offence_span))
+    anchor = appointed_day if offence_anchor is None else offence_anchor
+    offence = anchor + timedelta(days=_in_span(key, "offence", dp.offence_span))
     proceeding = appointed_day + timedelta(days=_in_span(key, "proceeding", dp.proceeding_span))
     return offence, proceeding
+
+
+def offence_anchor_for(family: Family, dp: DatePosture, appointed_day: date) -> tuple[date, str]:
+    """(the day this cell's conduct is placed around, the name of that anchor)."""
+    event = JUDICIAL_INVALIDATIONS.get(family.key)
+    if event is not None and dp.anchors_to_invalidation:
+        return event.decided_on, ANCHOR_INVALIDATION
+    return appointed_day, ANCHOR_APPOINTED_DAY
 
 
 def build_grid(
@@ -613,7 +870,8 @@ def build_grid(
     for family in ok:
         for dp, pp, qf in POSTURE_CELLS:
             key = cell_key(family, dp, pp, qf)
-            offence, proceeding = cell_dates(key, dp, appointed_day)
+            anchor, anchor_name = offence_anchor_for(family, dp, appointed_day)
+            offence, proceeding = cell_dates(key, dp, appointed_day, offence_anchor=anchor)
             cell = Cell(
                 cell_id=cell_id_for(key),
                 family=family,
@@ -622,10 +880,25 @@ def build_grid(
                 question_form=qf,
                 offence_date=offence,
                 proceeding_started=proceeding,
+                date_anchor=anchor_name,
             )
-            reason = ungateable_reason(answer_key_for(cell, provisions))
+            answer_key = answer_key_for(cell, provisions)
+            reason = ungateable_reason(answer_key)
             if reason is not None:
-                refused.append({"family": family.key, "cell": key, "reason": reason})
+                refused.append({
+                    "family": family.key,
+                    "cell": key,
+                    "reason": reason,
+                    # WHY the cell could not be built, in two words the manifest
+                    # can count. They are different failures: one is a gate
+                    # stack that cannot accept the ideal answer, the other is a
+                    # law this build cannot state with certainty.
+                    "basis": (
+                        REFUSAL_LEGAL_CERTAINTY
+                        if answer_key.get("undecidable_reason")
+                        else REFUSAL_GATE_STACK
+                    ),
+                })
                 continue
             cells.append(cell)
     return cells, refused
@@ -722,6 +995,18 @@ SAVINGS_PRESERVED = "old_liability_preserved"
 SAVINGS_NO_RETROSPECTIVE_OFFENCE = "new_offence_cannot_reach_earlier_conduct"
 SAVINGS_REPEALED_WITHOUT_SUCCESSOR = "repealed_without_successor"
 SAVINGS_NOT_ENGAGED = "new_code_governs_directly"
+# The section was VOID when the conduct occurred, so no liability was ever
+# incurred under it and s.358 - which preserves liability incurred - has
+# nothing to preserve. This is the one the four `deleted` families were
+# missing, and the one whose absence made "no charge lies" a permanent reject.
+SAVINGS_NO_OFFENCE_LIES = "no_offence_lies"
+# Nothing is asserted: the cell is refused, and this value exists so that a key
+# built for a refused cell cannot be mistaken for a key that decided something.
+SAVINGS_NOT_DECIDABLE = "not_decidable_on_this_build"
+
+# Why a cell could not be built. Counted separately in the manifest.
+REFUSAL_GATE_STACK = "gate-stack"
+REFUSAL_LEGAL_CERTAINTY = "legal-certainty"
 
 
 def _entry(ref: SectionRef) -> dict:
@@ -739,15 +1024,33 @@ def answer_key_for(cell: Cell, provisions: dict[str, Provision]) -> dict:
     by_kind = {kind: governing_family(kind, **dates) for kind in PROVISION_KINDS}
     substantive = by_kind["substantive"]
 
+    # THE SECOND TIMELINE, before the first one is applied to anything. Which
+    # ENACTMENT governs is decided by the appointed day; whether the section
+    # named on the old side of it was in force at all is decided by the
+    # judgment date, and a key that answered the first question without asking
+    # the second is the C1 error.
+    status, undecidable = judicial_status(cell.family.key, cell.offence_date)
+
     old_ref, new_ref = cell.family.old_ref, cell.family.new_ref
-    charge_ref = old_ref if substantive == "old" else new_ref
-    counterpart = new_ref if substantive == "old" else old_ref
+    if status == STATUS_IN_FORCE:
+        charge_ref = old_ref if substantive == "old" else new_ref
+        counterpart = new_ref if substantive == "old" else old_ref
+    else:
+        # Nothing is chargeable under a section that was void when the conduct
+        # occurred, and nothing is chargeable under a section whose reach this
+        # build cannot state. There is no counterpart either: these four
+        # families have a null new side, which is what `deleted` means.
+        charge_ref = None
+        counterpart = None
     # The section the answer must ENGAGE with. Where the governing family has
     # a section it is that one; where it has none - a new offence charged
     # against earlier conduct, a repealed section charged against later
-    # conduct - it is the section the answer has to name in order to rule it
-    # out. Expecting nothing there would leave the cell with no teeth at all.
+    # conduct, a section a court struck down before the conduct - it is the
+    # section the answer has to name in order to rule it out. Expecting
+    # nothing there would leave the cell with no teeth at all.
     engage_ref = charge_ref if charge_ref is not None else counterpart
+    if engage_ref is None and status != STATUS_IN_FORCE:
+        engage_ref = cell.family.identifying_ref
 
     # See the module docstring, and note what MEASUREMENT put here: an answer
     # that merely uses the word "savings" satisfies gates._mentions_savings but
@@ -775,7 +1078,15 @@ def answer_key_for(cell: Cell, provisions: dict[str, Provision]) -> dict:
     if cell.question_form.forbids_counterpart and charge_ref is not None and counterpart is not None:
         forbidden.append(counterpart)
 
-    if charge_ref is not None:
+    if status == STATUS_UNDECIDABLE:
+        consequence = SAVINGS_NOT_DECIDABLE
+    elif status == STATUS_VOID:
+        # s.358 preserves liability INCURRED under the repealed Code. A void
+        # section incurs none, so the savings clause is engaged and preserves
+        # nothing - which is the answer, and why the answer still has to cite
+        # s.358 to give it.
+        consequence = SAVINGS_NO_OFFENCE_LIES
+    elif charge_ref is not None:
         consequence = SAVINGS_PRESERVED if substantive == "old" else SAVINGS_NOT_ENGAGED
     elif substantive == "old":
         consequence = SAVINGS_NO_RETROSPECTIVE_OFFENCE
@@ -805,6 +1116,7 @@ def answer_key_for(cell: Cell, provisions: dict[str, Provision]) -> dict:
         ),
     }
 
+    event = JUDICIAL_INVALIDATIONS.get(cell.family.key)
     return {
         # --- read by gates.check_answer_key ---
         "governing_family": substantive,
@@ -812,11 +1124,28 @@ def answer_key_for(cell: Cell, provisions: dict[str, Provision]) -> dict:
         "forbidden_sections": [_entry(ref) for ref in forbidden],
         "requires_savings_mention": requires_savings,
         "must_name_both_families": both_families,
+        # THE PASSING ANSWER IS "no charge lies". Set exactly where the section
+        # was void when the conduct occurred: the answer must SAY that no
+        # charge lies (it still has to name the section, or it has ruled out
+        # nothing), and an answer that names it as the section the charge lies
+        # under fails. Without this the key could only ask for citations, and
+        # the only answer it could express on these cells was the wrong one.
+        "requires_no_liability_statement": status == STATUS_VOID,
         # --- metadata: the eval and the report read these, the gate does not ---
         "families_by_kind": dict(by_kind),
         "charge": None if charge_ref is None else _entry(charge_ref),
         "counterpart": None if counterpart is None else _entry(counterpart),
         "savings_consequence": consequence,
+        "judicial_status": status,
+        "judicial_event": None if event is None else {
+            "case": event.case,
+            "decided_on": event.decided_on.isoformat(),
+            "scope": event.scope,
+        },
+        # Set only on a cell that must NOT be built. build_grid reads it, and
+        # its presence is what makes the refusal a named legal refusal rather
+        # than a gate-stack one.
+        "undecidable_reason": undecidable,
         "procedural_rule": procedural_rule,
         "evidence_rule": evidence_rule,
         "appointed_day": APPOINTED_DAY.isoformat(),
@@ -825,12 +1154,18 @@ def answer_key_for(cell: Cell, provisions: dict[str, Provision]) -> dict:
 
 
 def ungateable_reason(key: dict) -> str | None:
-    """Why this key's own ideal answer could not survive check_temporal, or None.
+    """Why this cell must not be built, or None. TWO bases, in order.
 
-    A cell is only worth building if an answer that satisfies its key also
-    passes the rest of the gate stack. check_answer_key and check_temporal
-    read the same generation, and one of them demands citations the other can
-    reject:
+    FIRST, the law: a cell whose correct answer this build cannot state with
+    certainty is refused with the reason judicial_status gave, and no key is
+    written on a guess. That check comes first because it is prior - a cell
+    whose answer nobody knows is not worth asking whether the gates could
+    grade it.
+
+    SECOND, the gate stack. A cell is only worth building if an answer that
+    satisfies its key also passes the rest of the gate stack. check_answer_key
+    and check_temporal read the same generation, and one of them demands
+    citations the other can reject:
 
     * a NEW-family section cited where the OLD family governs is suppressed by
       statutes._cites_savings_clause, and every such key expects BNS s.358, so
@@ -847,8 +1182,11 @@ def ungateable_reason(key: dict) -> str | None:
     NAME the repealed section in order to say it was repealed, and naming it
     is what check_temporal flags. Those cells are excluded from the grid and
     counted in the manifest; the same four families keep every posture whose
-    offence predates the repeal, which is where the interesting question is.
+    offence predates the repeal AND whose answer this build can state.
     """
+    undecidable = key.get("undecidable_reason")
+    if undecidable:
+        return str(undecidable)
     savings_mentioned = bool(key.get("requires_savings_mention"))
     by_kind = key.get("families_by_kind") or {}
     for entry in key.get("expected_sections") or []:
@@ -1060,12 +1398,26 @@ def build_transition(
 
     family_refusals = [entry for entry in refused if "cell" not in entry]
     cell_refusals = [entry for entry in refused if "cell" in entry]
+    refusals_by_basis: dict[str, int] = {}
+    for entry in cell_refusals:
+        basis = entry.get("basis", REFUSAL_GATE_STACK)
+        refusals_by_basis[basis] = refusals_by_basis.get(basis, 0) + 1
+    emitting = {cell.family.key for cell in cells}
+    # A family can pass every audit gate and still emit NOTHING - IPC 377 does,
+    # because no posture of it can be keyed with certainty. It is in neither
+    # `families_emitting` nor `families_refused`, so without this line it is
+    # visible only by subtracting two numbers nobody subtracts.
+    silent = sorted(
+        {entry["family"] for entry in cell_refusals if entry["family"] not in emitting}
+    )
     manifest = {
         "grid_cells": len(cells),
-        "families_emitting": len({cell.family.key for cell in cells}),
+        "families_emitting": len(emitting),
         "families_refused": len(family_refusals),
         "refusals": family_refusals,
         "cells_refused": len(cell_refusals),
+        "cells_refused_by_basis": refusals_by_basis,
+        "families_emitting_nothing": silent,
         "cell_refusal_families": sorted({entry["family"] for entry in cell_refusals}),
         "posture_cells": len(POSTURE_CELLS),
         "sample": len(selection.sample),
@@ -1122,8 +1474,14 @@ def main(argv=None) -> int:
         print(f"    {refusal['family']:<12} {str(refusal['kind']):<12} {refusal['reason'][:90]}")
     print(
         f"  refused cells {manifest['cells_refused']} across "
-        f"{manifest['cell_refusal_families']} (no answer both gates can accept)"
+        f"{manifest['cell_refusal_families']} "
+        f"({manifest['cells_refused_by_basis']})"
     )
+    if manifest["families_emitting_nothing"]:
+        print(
+            f"    EMIT NOTHING AT ALL: {manifest['families_emitting_nothing']} "
+            f"(verified, but no posture of them can be keyed with certainty)"
+        )
     print(
         f"  reserve {manifest['reserve']}  sample {manifest['sample']}  "
         f"written {manifest['written']}"

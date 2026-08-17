@@ -978,6 +978,89 @@ def test_answer_key_savings_mention_required_and_absent_fails():
     assert result.detail["savings_ok"] is False
 
 
+def test_answer_key_can_require_that_no_charge_lies():
+    """The key's one word-reading field, both directions.
+
+    On a section a court struck down, the right answer and the wrong answer
+    cite the SAME section - the citations are identical and only the assertion
+    differs - so this is the only field that can tell them apart.
+    """
+    ctx = _transition_ctx(
+        answer_key=_key(requires_no_liability_statement=True, forbidden_sections=[]),
+    )
+    correct = (
+        "No charge lies under Section 302 IPC: it was struck down before this conduct."
+    )
+    result = check_answer_key(correct, ctx)
+    assert result.passed, result.detail
+    assert result.detail["no_liability_required"] is True
+    assert result.detail["no_liability_cues"]
+    assert result.detail["liability_asserted"] == []
+
+    wrong = "The charge lies under Section 302 IPC and the sentence follows from it."
+    failed = check_answer_key(wrong, ctx)
+    assert not failed.passed
+    assert failed.detail["missing"] == []  # it cites everything, and is still wrong
+    assert failed.detail["liability_asserted"] == ["the charge lies under"]
+    assert disposition([failed]) == "reject"
+
+
+def test_answer_key_no_liability_is_not_consulted_unless_the_key_asks():
+    """The affirmative vocabulary must be inert everywhere else: on an
+    ordinary cell "the charge lies under Section 302 IPC" is the RIGHT
+    answer, and a gate that rejected it would be the same error one code
+    change to the left."""
+    ctx = _transition_ctx(answer_key=_key(forbidden_sections=[]))
+    result = check_answer_key("The charge lies under Section 302 IPC.", ctx)
+    assert result.passed
+    assert result.detail["no_liability_required"] is False
+    assert result.detail["no_liability_ok"] is True
+    assert result.detail["liability_asserted"] == []
+
+
+def test_answer_key_no_liability_needs_the_denial_not_merely_the_absence():
+    # Saying nothing either way is not the answer: the key asks the model to
+    # say that no charge lies, and silence would pass on any answer at all.
+    ctx = _transition_ctx(
+        answer_key=_key(requires_no_liability_statement=True, forbidden_sections=[]),
+    )
+    result = check_answer_key("Section 302 IPC is the provision in issue.", ctx)
+    assert not result.passed
+    assert result.detail["no_liability_cues"] == []
+
+
+def test_answer_key_a_negated_assertion_is_not_an_assertion():
+    # A permanent gate that fires on a correct answer awkwardly phrased is the
+    # failure this whole field exists to remove, so the negation window is
+    # tested with the cue INSIDE the negated clause.
+    ctx = _transition_ctx(
+        answer_key=_key(requires_no_liability_statement=True, forbidden_sections=[]),
+    )
+    answer = (
+        "It is not the case that the charge lies under Section 302 IPC - the section was "
+        "struck down, so no offence lies."
+    )
+    result = check_answer_key(answer, ctx)
+    assert result.passed, result.detail
+    assert result.detail["liability_asserted"] == []
+
+
+def test_answer_key_an_answer_that_says_both_things_is_still_rejected():
+    # ...and the clause break is what keeps the negation from reaching across
+    # into the clause that contradicts it.
+    ctx = _transition_ctx(
+        answer_key=_key(requires_no_liability_statement=True, forbidden_sections=[]),
+    )
+    answer = (
+        "No charge lies under Section 302 IPC; the charge lies under Section 302 IPC and "
+        "the sentence follows."
+    )
+    result = check_answer_key(answer, ctx)
+    assert not result.passed
+    assert result.detail["no_liability_cues"]  # it DID deny...
+    assert result.detail["liability_asserted"] == ["the charge lies under"]  # ...and assert
+
+
 def test_answer_key_both_families_required_and_named():
     ctx = _transition_ctx(
         answer_key=_key(must_name_both_families=True, forbidden_sections=[]),
