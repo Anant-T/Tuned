@@ -772,6 +772,18 @@ def test_module_versions_reads_every_reachable_stage(tmp_path):
     }
 
 
+def test_module_versions_reads_stats_version_off_the_report_not_a_constant(tmp_path):
+    """R9 (review mutation harness): `versions['stats']` must come from
+    `report['stats_version']`, not a hardcoded literal. STATS_VERSION
+    happens to be 1 today, which makes a hardcoded-1 mutant tautological
+    against every OTHER fixture in this file (both are 1 either way) - only
+    a report naming a version that is NOT 1 can tell the two apart."""
+    cfg_path, report, paths = green_pipeline(tmp_path)
+    fake_report = dict(report, stats_version=99)
+    versions = module_versions(paths.out_dir, fake_report)
+    assert versions["stats"] == 99
+
+
 def test_dry_run_needs_no_token(tmp_path, monkeypatch):
     monkeypatch.delenv("HF_TOKEN", raising=False)
     cfg_path, _report, _paths = green_pipeline(tmp_path)
