@@ -88,21 +88,65 @@ def test_ordinary_chunks_land_within_the_band_when_enough_material_exists():
         assert MIN_CHUNK_TOKENS <= chunk.token_count <= MAX_CHUNK_TOKENS
 
 
-def test_a_small_trailing_chunk_is_merged_into_its_predecessor_when_it_fits():
-    # First chunk fills toward the band (approx 1400 "tokens" across paras
-    # numbered with 2-token markers), the trailing paragraph alone would be
-    # a tiny final chunk - merged instead of left as a sliver.
+def test_no_two_adjacent_ordinary_chunks_could_still_be_combined_under_the_band():
+    # A mathematical property of the greedy packer, not an active merge
+    # step (there isn't one - see pack_chunks' docstring for the proof that
+    # one would always be a no-op here): whatever chunk immediately follows
+    # a flush was flushed BECAUSE adding the next chunk's own first segment
+    # would already have overflowed max_tokens, so two adjacent ordinary
+    # chunks can never sum to <= max_tokens. Regression protection for that
+    # invariant, not a test of a merge that does not exist.
     text = numbered_paragraphs([350, 350, 350, 350, 50])
     segments = segment_document(text).segments
     chunks = pack_chunks(text, segments, FakeTokenizer())
-    # Whatever the exact split, no chunk after merging is a bare handful of
-    # tokens sitting next to a same-band neighbour it could have joined.
     for i in range(len(chunks) - 1):
         if not chunks[i].oversize and not chunks[i + 1].oversize:
-            assert not (
-                chunks[i + 1].token_count < MIN_CHUNK_TOKENS
-                and chunks[i].token_count + chunks[i + 1].token_count <= MAX_CHUNK_TOKENS
-            )
+            assert chunks[i].token_count + chunks[i + 1].token_count > MAX_CHUNK_TOKENS
+
+
+def _sized_segments(sizes: list[int]) -> tuple[str, list[Segment]]:
+    """Contiguous segments whose FakeTokenizer word count is EXACTLY
+    `sizes[i]` each - precise enough to test the >, >= boundary itself,
+    which prose built from `numbered_paragraphs` cannot promise."""
+    parts, segs, cursor = [], [], 0
+    for i, n in enumerate(sizes):
+        piece = " ".join(f"s{i}w{j}" for j in range(n)) + " "
+        segs.append(Segment(cursor, cursor + len(piece), str(i + 1)))
+        parts.append(piece)
+        cursor += len(piece)
+    return "".join(parts), segs
+
+
+def test_a_segment_exactly_at_max_tokens_is_not_oversize():
+    text, segs = _sized_segments([MAX_CHUNK_TOKENS])
+    chunks = pack_chunks(text, segs, FakeTokenizer())
+    assert len(chunks) == 1
+    assert chunks[0].token_count == MAX_CHUNK_TOKENS
+    assert chunks[0].oversize is False
+
+
+def test_a_segment_one_token_over_max_is_oversize():
+    text, segs = _sized_segments([MAX_CHUNK_TOKENS + 1])
+    chunks = pack_chunks(text, segs, FakeTokenizer())
+    assert len(chunks) == 1
+    assert chunks[0].oversize is True
+
+
+def test_two_segments_summing_to_exactly_max_tokens_share_one_chunk():
+    text, segs = _sized_segments([MAX_CHUNK_TOKENS - 700, 700])
+    chunks = pack_chunks(text, segs, FakeTokenizer())
+    assert len(chunks) == 1
+    assert chunks[0].token_count == MAX_CHUNK_TOKENS
+    assert chunks[0].oversize is False
+
+
+def test_one_token_past_the_max_sum_forces_a_second_chunk():
+    text, segs = _sized_segments([MAX_CHUNK_TOKENS - 700, 701])
+    chunks = pack_chunks(text, segs, FakeTokenizer())
+    assert len(chunks) == 2
+    assert chunks[0].token_count == MAX_CHUNK_TOKENS - 700
+    assert chunks[1].token_count == 701
+    assert not chunks[0].oversize and not chunks[1].oversize
 
 
 def test_chunks_reconstruct_the_source_text_byte_for_byte():
@@ -299,6 +343,48 @@ def test_a_segment_version_bump_forces_rechunking_via_the_manifest():
     assert _doc_chunk_decision(current, doc, force=False) == "skip"
     assert _doc_chunk_decision(None, doc, force=False) == "chunk"
     assert _doc_chunk_decision(current, doc, force=True) == "chunk"
+
+
+def test_sha_changing_alone_forces_rechunk_even_with_extract_version_unchanged():
+    # Independent of the extract_version test above: the source PDF was
+    # re-extracted under the SAME rule version (extract_version unchanged)
+    # but produced different bytes - sha256 alone must be enough to trigger
+    # a re-chunk. Isolated from test_a_changed_sha_replaces_the_chunks (the
+    # end-to-end version), which always changes extract_version alongside
+    # sha and so cannot tell the two branches apart on its own.
+    from tuned.data.chunks import _doc_chunk_decision
+
+    doc = {"extract_version": 5, "sha256": "new-sha"}
+    prior = {
+        "extract_version": 5, "sha256": "old-sha",
+        "segment_version": SEGMENT_VERSION, "chunk_version": CHUNK_VERSION,
+    }
+    assert _doc_chunk_decision(prior, doc, force=False) == "chunk"
+
+
+def test_extract_version_changing_alone_forces_rechunk_even_with_sha_unchanged():
+    # The mirror case: rules changed (extract_version bumped) but this
+    # particular document's bytes happen to be identical either way (a real
+    # possibility - not every rule change moves every document's text).
+    from tuned.data.chunks import _doc_chunk_decision
+
+    doc = {"extract_version": 6, "sha256": "same-sha"}
+    prior = {
+        "extract_version": 5, "sha256": "same-sha",
+        "segment_version": SEGMENT_VERSION, "chunk_version": CHUNK_VERSION,
+    }
+    assert _doc_chunk_decision(prior, doc, force=False) == "chunk"
+
+
+def test_neither_sha_nor_extract_version_changing_skips():
+    from tuned.data.chunks import _doc_chunk_decision
+
+    doc = {"extract_version": 5, "sha256": "same-sha"}
+    prior = {
+        "extract_version": 5, "sha256": "same-sha",
+        "segment_version": SEGMENT_VERSION, "chunk_version": CHUNK_VERSION,
+    }
+    assert _doc_chunk_decision(prior, doc, force=False) == "skip"
 
 
 def test_oversize_paragraphs_are_counted_in_the_run_stats(doc_store):

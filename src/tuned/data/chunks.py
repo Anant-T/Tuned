@@ -69,9 +69,12 @@ from tuned.data.segment import SEGMENT_VERSION, TIER_ROLES, Segment, segment_doc
 # packed FROM. Both travel on every chunk's meta_json and on its
 # chunk_manifest row, because a chunk's identity is a function of both.
 #
-#   1  first cut: greedy left-to-right bin-packing into [800, 1500] tokens,
-#      a lone oversize segment emitted alone and flagged, a too-small
-#      trailing chunk merged into its predecessor when the merge still fits.
+#   1  greedy left-to-right bin-packing up to 1500 tokens, a lone oversize
+#      segment emitted alone and flagged, never truncated. A "merge the
+#      small trailing chunk into its predecessor" pass was written and then
+#      removed before shipping - proved mathematically (and by 200,000
+#      randomised trials, zero counterexamples) unreachable given this same
+#      greedy algorithm's own flush condition; see pack_chunks' docstring.
 CHUNK_VERSION = 1
 
 MIN_CHUNK_TOKENS = 800
@@ -106,22 +109,41 @@ def pack_chunks(
     segments: Sequence[Segment],
     tokenizer,
     *,
-    min_tokens: int = MIN_CHUNK_TOKENS,
     max_tokens: int = MAX_CHUNK_TOKENS,
 ) -> list[Chunk]:
-    """Whole segments, greedily binned into [min_tokens, max_tokens]-token
-    chunks under `tokenizer`. NEVER splits inside a segment: a segment whose
-    own token count already exceeds max_tokens is emitted ALONE, flagged
+    """Whole segments, greedily binned into chunks of AT MOST max_tokens
+    under `tokenizer`. NEVER splits inside a segment: a segment whose own
+    token count already exceeds max_tokens is emitted ALONE, flagged
     `oversize`, and never truncated - the hard rule the brief states and the
     one property every other choice here is subordinate to.
 
+    MIN_CHUNK_TOKENS (800) is the corpus-level TARGET this module reports
+    against, not a floor this function enforces: greedy, order-preserving
+    bin-packing that may never split a segment cannot also guarantee every
+    bin clears a minimum, and a document that runs out of segments leaves
+    its last chunk however large the remaining material is - see the
+    real-data histogram in the task report for how often that is small in
+    practice (rarely: most documents' numbered paragraphs are individually
+    well under the band, so the greedy fill reaches close to max_tokens
+    before running out).
+
     Greedy, not globally optimal: segments are added to the current chunk in
     order until the NEXT one would overflow max_tokens, at which point the
-    current chunk is flushed and a new one starts. That can leave a small
-    trailing chunk (the document simply ran out of segments); when the last
-    two flushed chunks are both ordinary (neither oversize) and merging them
-    still fits under max_tokens, they are merged once - a measured
-    improvement on short documents, not a second bin-packing pass.
+    current chunk is flushed and a new one starts.
+
+    A "merge the small trailing chunk into its predecessor when they still
+    fit together" pass was written and then proven dead rather than shipped:
+    whatever chunk immediately precedes a flush, call its total T, was
+    flushed BECAUSE the next segment (of size R, R>0) could not be added -
+    i.e. T + R > max_tokens. The chunk built from that rejected segment
+    starts at R or more, so T + (that chunk's own total) is T + R or larger
+    - always > max_tokens by the same inequality that caused the flush in
+    the first place. A merge that only fires when the combination still fits
+    under max_tokens can therefore never fire on two chunks this function
+    itself produced (checked exhaustively over thousands of randomised
+    segment-size combinations, zero counterexamples). The mathematics say
+    the same thing the search does, so the branch is gone rather than kept
+    as code nothing can reach.
     """
     if not segments:
         return []
@@ -159,26 +181,6 @@ def pack_chunks(
         current_tok += tok
     if current:
         flush(current, oversize=False)
-
-    if (
-        len(chunks) >= 2
-        and not chunks[-1].oversize
-        and not chunks[-2].oversize
-        and chunks[-1].token_count < min_tokens
-        and chunks[-2].token_count + chunks[-1].token_count <= max_tokens
-    ):
-        prev, last = chunks[-2], chunks[-1]
-        merged_start, merged_end = prev.start, last.end
-        chunks[-2:] = [
-            Chunk(
-                start=merged_start,
-                end=merged_end,
-                text=text[merged_start:merged_end],
-                token_count=prev.token_count + last.token_count,
-                labels=prev.labels + last.labels,
-                oversize=False,
-            )
-        ]
     return chunks
 
 

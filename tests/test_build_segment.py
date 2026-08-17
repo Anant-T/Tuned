@@ -79,6 +79,15 @@ def test_consecutive_numbered_paragraphs_are_all_accepted():
     assert [n for _offset, n in starts] == [1, 2, 3, 4, 5]
 
 
+def test_the_close_paren_marker_form_is_also_recognised():
+    # extract.py's own numbered-paragraph signal accepts both "1." and "1)" -
+    # this module's marker must too, not only the period form every other
+    # fixture in this file happens to use.
+    text = "JUDGMENT\n\n1) First paragraph text here.\n\n2) Second paragraph text here.\n\n"
+    starts = monotonic_paragraph_starts(text)
+    assert [n for _offset, n in starts] == [1, 2]
+
+
 def test_a_quoted_earlier_paragraph_number_is_rejected_not_a_new_boundary():
     # The failure this module's monotonic rule exists for: a quotation from
     # an earlier report carries its OWN "15." that must not fracture the
