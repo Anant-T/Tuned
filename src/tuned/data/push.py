@@ -71,12 +71,17 @@ touching the repo, push.py asks the client for the repo's current
 `build_manifest.json` (`current_manifest`) and compares outputs against the
 manifest it just built locally. An exact match prints the existing revision
 and returns without calling `ensure_repo` or `upload` at all. The comparison
-is over `law_v1_train.jsonl`/`law_v1_eval.jsonl` ONLY - the actual corpus
-bytes - never `README.md` or `stats.json`: both embed the stats report's own
-`at` timestamp, so a stats.py re-run over byte-identical rows would still
-change THEIR bytes on every push, turning "same corpus" into "always
-re-upload" and defeating the instrument. A malformed remote manifest (data
-from outside this machine, not from this run) is a named refusal
+is over `law_v1_train.jsonl`/`law_v1_eval.jsonl`/`README.md` - corpus bytes
+AND the card that describes them - never `stats.json`, which embeds the
+stats report's own `at` timestamp directly (it IS that report), so a
+stats.py re-run over byte-identical rows would still change ITS bytes on
+every push. README carries no such timestamp (the card states the stats
+verdict, never the report's `at` - see THE CARD IS MEASURED below), so it is
+a pure function of corpus + config + code: a stats-only re-run over an
+unchanged corpus is still a no-op, and a genuinely different card (a new
+`push.card_extra`, a card-rendering fix) is NOT silently swallowed - round
+2's own regression, caught and closed (N-1). A malformed remote manifest
+(data from outside this machine, not from this run) is a named refusal
 (`RemoteManifestCorrupt`), never a crash.
 
 Build:  python -m tuned.data.push --config configs/data_law_v1.yaml
@@ -105,12 +110,15 @@ README_FILENAME = "README.md"
 MANIFEST_FILENAME = "build_manifest.json"
 
 # 1  the first version. Uploads the two assembled JSONL sides, a card measured
-#    off stats' report and the decontamination manifest, and a
-#    build_manifest.json carrying every reachable module version and the
-#    sha256 of every uploaded file; refuses on a red or absent stats report,
-#    an incomplete custody chain (independent of require_chain), or bytes
-#    that no longer match what stats.py measured; idempotent against the
-#    repo's own build_manifest.json through an injectable hub-client seam.
+#    off stats' report and the decontamination manifest, stats' own report,
+#    and a build_manifest.json carrying the full custody chain, every
+#    reachable module version and the sha256 of every uploaded file; refuses
+#    on a red or absent stats report, an incomplete custody chain
+#    (independent of require_chain), a decontamination manifest that
+#    disagrees with the chain's own record of it, bytes that no longer match
+#    what stats.py measured, or a malformed remote manifest; idempotent
+#    against the repo's own build_manifest.json (corpus + card bytes, never
+#    stats.json's) through an injectable hub-client seam.
 PUSH_VERSION = 1
 
 
@@ -208,6 +216,54 @@ def bytes_refusal(report: dict, *, train_path: Path, eval_path: Path) -> str | N
                 f"  nothing was uploaded."
             )
     return None
+
+
+def decon_chain_faults(decon: dict | None, chain: dict | None) -> list[str]:
+    """Cross-checks the standalone decontamination.json push.py reads for the
+    card (`decon`) against the SAME record dedupe.py's custody chain already
+    carries forward (`chain["split"]["dedupe"]["decontamination"]`) - four
+    fields dedupe.manifest_of's upstream_summary already carries whole:
+    `at`, `decon_version`, `counts`, and `eval_sets` (narrowed there to
+    `status`/`allowed_missing`/`items` per key, which is why the comparison
+    below narrows `decon`'s copy the same way before comparing).
+
+    A post-hoc edit of decontamination.json AFTER the chain was built - the
+    exact failure mode a disclosed hole silently vanishing needs - changes
+    at least one of these four fields (a hole cleared changes its
+    `eval_sets` entry), so this binds the file's identity the way every
+    other link in this custody chain already is.
+
+    NOT bound: `semantic_scripts` itself. dedupe.py's own summary never
+    carried it forward (that is why build_manifest's own "decontamination"
+    field exists at all - see build_manifest's comment), so there is nothing
+    here to cross-check it against; an edit that touches ONLY
+    `semantic_scripts` and none of the four fields above is a residual gap
+    this check cannot see. Closing that completely needs dedupe.py to carry
+    decontamination.json's own sha256 forward - an upstream change, out of
+    this module's scope (task 15 round 2, N-3).
+    """
+    chain_decon = (((chain or {}).get("split") or {}).get("dedupe") or {}).get("decontamination")
+    if chain_decon is None:
+        # Nothing to cross-check against. Not this function's refusal to
+        # make - an absent/broken chain link is stats_refusal's job (the
+        # chain-completeness gate), which runs before this one ever could.
+        return []
+    decon = decon or {}
+    faults = []
+    if decon.get("at") != chain_decon.get("at"):
+        faults.append("at")
+    if decon.get("decon_version") != chain_decon.get("decon_version"):
+        faults.append("decon_version")
+    if decon.get("counts") != chain_decon.get("counts"):
+        faults.append("counts")
+    narrowed = {
+        key: {"status": v.get("status"), "allowed_missing": v.get("allowed_missing"),
+              "items": v.get("items")}
+        for key, v in (decon.get("eval_sets") or {}).items()
+    }
+    if narrowed != (chain_decon.get("eval_sets") or {}):
+        faults.append("eval_sets")
+    return faults
 
 
 # --------------------------------------------------------------------------
@@ -490,7 +546,13 @@ def render_card(
     lines.append("")
     for name in ("decontaminate", "dedupe", "split", "assemble", "stats", "push"):
         lines.append(f"- {name}: version {versions.get(name)}")
-    lines.append(f"- stats report: {report.get('at')}, verdict {report.get('verdict')}")
+    # N-1 (round 2): NOT report['at'] - a timestamp is not a property of the
+    # corpus, and rendering it here was the whole reason a stats-only re-run
+    # over byte-identical rows changed README's bytes (see IDEMPOTENCE in
+    # the module docstring). The timestamp still travels in
+    # build_manifest.json's stats_report.at and in the uploaded stats.json
+    # itself - dropped here, not lost.
+    lines.append(f"- stats report verdict: {report.get('verdict')}")
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -571,19 +633,26 @@ class RemoteManifestCorrupt(RuntimeError):
     every other input this module reads already refuses on."""
 
 
-# The only outputs idempotence is measured against: the actual corpus bytes.
-# README.md and stats.json both render the stats report's own `at`
-# timestamp into their content, so a stats.py re-run over byte-identical
-# rows still changes THEIR sha256 - comparing them would defeat "unchanged
-# input set -> no-op" on every re-run, not just ones that changed the corpus.
-_CONTENT_OUTPUTS = frozenset({TRAIN_FILENAME, EVAL_FILENAME})
+# The outputs idempotence is measured against: the corpus bytes AND the card
+# that describes them. NOT stats.json - it embeds the stats report's own
+# `at` timestamp directly (the report IS that JSON), so a stats.py re-run
+# over byte-identical rows still changes ITS sha256, and comparing it would
+# defeat "unchanged input set -> no-op" on every re-run, not just ones that
+# changed the corpus. README.md does NOT have that problem any more:
+# render_card no longer prints report['at'] (round 2, N-1) specifically so
+# README is a pure function of corpus + config + code, which is what makes
+# it safe to put back in this set - a genuinely changed card (a new
+# push.card_extra, a card-rendering fix) now uploads instead of silently
+# never reaching an already-pushed repo.
+_CONTENT_OUTPUTS = frozenset({TRAIN_FILENAME, EVAL_FILENAME, README_FILENAME})
 
 
 def same_uploaded_bytes(current: dict | None, manifest: dict) -> bool:
     """True when `current` (the repo's own last build_manifest.json) already
-    carries the same train/eval bytes as `manifest` (the one this run just
-    built). Raises RemoteManifestCorrupt if `current`'s shape cannot be read
-    at all - see the class docstring for why that is a refusal, not a crash.
+    carries the same train/eval/README bytes as `manifest` (the one this run
+    just built) - stats.json is excluded, see _CONTENT_OUTPUTS. Raises
+    RemoteManifestCorrupt if `current`'s shape cannot be read at all - see
+    the class docstring for why that is a refusal, not a crash.
     """
     if current is None:
         return False
@@ -750,6 +819,17 @@ def main(argv: Sequence[str] | None = None, *, hub_client=None) -> int:
             f"push REFUSES TO RUN: the module-version record for {', '.join(version_faults)} "
             f"is unreadable in {paths.out_dir}, even though stats.py reported the custody "
             f"chain complete - an artifact went missing after the green report was written.\n"
+            f"  nothing was uploaded."
+        )
+        return 2
+
+    decon_faults = decon_chain_faults(decon, chain)
+    if decon_faults:
+        print(
+            f"push REFUSES TO RUN: decontamination.json disagrees with the custody chain's "
+            f"own record of it ({', '.join(decon_faults)}) - it was edited after the chain "
+            f"was built.\n"
+            f"  remedy: re-run the pipeline tail so the file and the chain agree again\n"
             f"  nothing was uploaded."
         )
         return 2

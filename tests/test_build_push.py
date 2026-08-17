@@ -34,6 +34,7 @@ from tuned.data.push import (
     build_manifest,
     bytes_refusal,
     chain_faults,
+    decon_chain_faults,
     decon_sections,
     license_rows,
     mix_rows,
@@ -111,12 +112,32 @@ def enrich_decon(paths, *, eval_sets=EVAL_SETS, semantic_scripts=SEMANTIC_SCRIPT
     """Fills in the eval-set/semantic-script detail run_pipeline's minimal
     decontamination.json stub does not carry, WITHOUT touching the
     output/counts/thresholds keys dedupe.py already verified its input
-    against - those stay exactly as run_pipeline wrote them."""
+    against - those stay exactly as run_pipeline wrote them.
+
+    ALSO patches the same eval_sets detail into the custody chain's own
+    embedded copy (assemble.json -> split -> dedupe -> decontamination),
+    narrowed the way dedupe.manifest_of's upstream_summary narrows it
+    (status/allowed_missing/items only). A REAL decontaminate.py run writes
+    eval_sets into decontamination.json before dedupe.py ever reads it, so
+    the two would already agree; this two-step stub-then-enrich shortcut is
+    what's out of step with that, not push.py's N-3 cross-check
+    (decon_chain_faults) - patch the fixture to match reality rather than
+    let every test in this file silently exercise a manifest that could
+    never happen with the real pipeline."""
     decon_path = paths.out_dir / "decontamination.json"
     decon = json.loads(decon_path.read_text(encoding="utf-8"))
     decon["eval_sets"] = eval_sets
     decon["semantic_scripts"] = semantic_scripts
     decon_path.write_text(json.dumps(decon), encoding="utf-8")
+
+    assemble_path = paths.out_dir / "assemble.json"
+    assemble = json.loads(assemble_path.read_text(encoding="utf-8"))
+    assemble["split"]["dedupe"]["decontamination"]["eval_sets"] = {
+        key: {"status": v.get("status"), "allowed_missing": v.get("allowed_missing"),
+              "items": v.get("items")}
+        for key, v in eval_sets.items()
+    }
+    assemble_path.write_text(json.dumps(assemble), encoding="utf-8")
     return decon
 
 
@@ -262,6 +283,71 @@ def test_chain_faults_names_each_kind_of_break():
 
 def test_stats_refusal_none_on_a_green_complete_report():
     assert stats_refusal(_report(), report_path=Path("x"), config_path="c.yaml") is None
+
+
+# --------------------------------------------------------------------------
+# decon_chain_faults - N-3 (round 2): the standalone decontamination.json
+# push.py reads for the card, cross-checked against dedupe.py's own custody
+# summary of it embedded in the chain.
+# --------------------------------------------------------------------------
+
+def _chain_with_decon(decon_summary):
+    return {"split": {"dedupe": {"decontamination": decon_summary}}}
+
+
+def test_decon_chain_faults_is_empty_when_consistent():
+    summary = {"at": "t0", "decon_version": 4, "counts": {"kept": 100},
+               "eval_sets": {"bbl": {"status": "ok", "allowed_missing": False, "items": 500}}}
+    decon = {"at": "t0", "decon_version": 4, "counts": {"kept": 100},
+             # The standalone file carries MORE fields per eval set than the
+             # chain's narrowed summary - that is not a divergence.
+             "eval_sets": {"bbl": {"status": "ok", "allowed_missing": False, "items": 500,
+                                   "repo_id": "org/bbl", "license": "CC-BY-4.0"}}}
+    assert decon_chain_faults(decon, _chain_with_decon(summary)) == []
+
+
+def test_decon_chain_faults_names_each_kind_of_divergence():
+    summary = {"at": "t0", "decon_version": 4, "counts": {"kept": 100},
+               "eval_sets": {"bbl": {"status": "ok", "allowed_missing": False, "items": 500}}}
+    chain = _chain_with_decon(summary)
+
+    edited_at = {"at": "LATER", "decon_version": 4, "counts": {"kept": 100},
+                 "eval_sets": summary["eval_sets"]}
+    assert decon_chain_faults(edited_at, chain) == ["at"]
+
+    edited_version = {"at": "t0", "decon_version": 99, "counts": {"kept": 100},
+                      "eval_sets": summary["eval_sets"]}
+    assert decon_chain_faults(edited_version, chain) == ["decon_version"]
+
+    edited_counts = {"at": "t0", "decon_version": 4, "counts": {"kept": 1},
+                     "eval_sets": summary["eval_sets"]}
+    assert decon_chain_faults(edited_counts, chain) == ["counts"]
+
+    # The exact failure this check exists for: a disclosed hole erased.
+    edited_eval_sets = {"at": "t0", "decon_version": 4, "counts": {"kept": 100},
+                        "eval_sets": {"bbl": {"status": "ok", "allowed_missing": True,
+                                              "items": 500}}}
+    assert decon_chain_faults(edited_eval_sets, chain) == ["eval_sets"]
+
+
+def test_decon_chain_faults_empty_when_the_chain_carries_no_decon_link():
+    """Not this function's refusal to make - an absent/broken chain link is
+    stats_refusal's job (the chain-completeness gate), which runs first."""
+    assert decon_chain_faults({"decon_version": 4}, {}) == []
+    assert decon_chain_faults({"decon_version": 4}, None) == []
+    assert decon_chain_faults(None, _chain_with_decon(None)) == []
+
+
+def test_decon_chain_faults_does_not_cross_check_semantic_scripts():
+    """The documented residual: dedupe's own summary never carried
+    semantic_scripts forward, so an edit that touches ONLY that field is
+    invisible to this check - closing it needs an upstream change (dedupe.py
+    carrying decontamination.json's own sha256), out of task 15's scope."""
+    summary = {"at": "t0", "decon_version": 4, "counts": {}, "eval_sets": {}}
+    chain = _chain_with_decon(summary)
+    decon = {"at": "t0", "decon_version": 4, "counts": {}, "eval_sets": {},
+             "semantic_scripts": {"devanagari": {"screened": True}}}  # edited post-hoc
+    assert decon_chain_faults(decon, chain) == []
 
 
 def test_stats_refusal_on_a_missing_report():
@@ -576,11 +662,16 @@ def test_render_card_appends_card_extra_when_given():
 def test_build_manifest_carries_versions_counts_and_outputs():
     report, decon, _rows, push_cfg, versions = _card_fixture()
     outputs = [{"path": "law_v1_train.jsonl", "rows": 90, "sha256": "a" * 64}]
+    # The innermost link (dedupe.manifest_of's upstream_summary) carries NO
+    # "stage" key at all - measured on a real chain: keys are exactly
+    # {at, counts, decon_version, eval_sets, semantic}. Modelling "stage"
+    # here would describe a shape the real pipeline never produces.
     chain = {"stage": "assemble", "assemble_version": 2,
              "split": {"stage": "split", "split_version": 1,
                        "dedupe": {"stage": "dedupe", "dedupe_version": 4,
-                                  "decontamination": {"stage": "decontaminate",
-                                                       "decon_version": 4}}}}
+                                  "decontamination": {"decon_version": 4, "at": "t0",
+                                                       "counts": {}, "eval_sets": {},
+                                                       "semantic": "ran"}}}}
     manifest = build_manifest(report=report, decon=decon, push_cfg=push_cfg, versions=versions,
                               outputs=outputs, chain=chain)
     assert manifest["push_version"] == PUSH_VERSION
@@ -591,7 +682,7 @@ def test_build_manifest_carries_versions_counts_and_outputs():
     assert manifest["decontamination"]["eval_sets"]["aibe"]["allowed_missing"] is True
     # I1: the whole chain, carried forward byte-for-byte - not a pointer.
     assert manifest["chain"] == chain
-    assert manifest["chain"]["split"]["dedupe"]["decontamination"]["stage"] == "decontaminate"
+    assert manifest["chain"]["split"]["dedupe"]["decontamination"]["decon_version"] == 4
 
 
 def test_same_uploaded_bytes_compares_outputs_only():
@@ -603,25 +694,47 @@ def test_same_uploaded_bytes_compares_outputs_only():
     c = {"outputs": [{"path": TRAIN_FILENAME, "sha256": "DIFFERENT"},
                      {"path": EVAL_FILENAME, "sha256": "2"}]}
     assert same_uploaded_bytes(a, c) is False
+    # N-2 (round 2, mutant N10): TRAIN differing was already pinned above by
+    # `c` - nothing varied EVAL alone, so dropping EVAL_FILENAME from
+    # _CONTENT_OUTPUTS left the whole suite green. An eval-only corpus
+    # change is exactly the half a leak would be planted in (R2's own
+    # lesson, one layer up).
+    d = {"outputs": [{"path": TRAIN_FILENAME, "sha256": "1"},
+                     {"path": EVAL_FILENAME, "sha256": "DIFFERENT"}]}
+    assert same_uploaded_bytes(a, d) is False
     assert same_uploaded_bytes(None, a) is False
 
 
-def test_same_uploaded_bytes_ignores_readme_and_stats_json_bytes():
-    """M2: README.md and stats.json both embed the stats report's own `at`
-    timestamp, so their bytes differ on every re-run even over byte-identical
-    train/eval data - comparing them would turn "same corpus" into "always
-    re-upload" on a stats-only re-run. Only the two data files decide."""
+def test_same_uploaded_bytes_ignores_only_stats_json_bytes():
+    """M2 + N-1 (round 2): stats.json embeds the stats report's own `at`
+    timestamp directly (it IS that report), so its bytes differ on every
+    re-run even over byte-identical train/eval data - excluded, or a
+    stats-only re-run would never be a no-op. README.md does NOT get the
+    same exemption any more: render_card no longer prints report['at'], so a
+    README difference is a REAL card difference (a card_extra change, a
+    rendering fix) that must trigger a re-upload, not be silently dropped
+    (round 2's N-1 - the bug excluding README used to cause)."""
     a = {"outputs": [
         {"path": TRAIN_FILENAME, "sha256": "1"}, {"path": EVAL_FILENAME, "sha256": "2"},
         {"path": README_FILENAME, "sha256": "readme-v1"},
         {"path": REPORT_FILENAME, "sha256": "stats-v1"},
     ]}
+    # stats.json alone differs (a stats-only re-run over the same corpus) ->
+    # still a no-op.
     b = {"outputs": [
         {"path": TRAIN_FILENAME, "sha256": "1"}, {"path": EVAL_FILENAME, "sha256": "2"},
-        {"path": README_FILENAME, "sha256": "readme-v2-different-timestamp"},
+        {"path": README_FILENAME, "sha256": "readme-v1"},
         {"path": REPORT_FILENAME, "sha256": "stats-v2-different-timestamp"},
     ]}
     assert same_uploaded_bytes(a, b) is True
+    # README alone differs (a genuinely different card over the SAME corpus)
+    # -> NOT a no-op; this is the N-1 regression this test now pins shut.
+    c = {"outputs": [
+        {"path": TRAIN_FILENAME, "sha256": "1"}, {"path": EVAL_FILENAME, "sha256": "2"},
+        {"path": README_FILENAME, "sha256": "readme-v2-different-content"},
+        {"path": REPORT_FILENAME, "sha256": "stats-v1"},
+    ]}
+    assert same_uploaded_bytes(a, c) is False
 
 
 def test_same_uploaded_bytes_raises_named_on_a_non_dict_remote_manifest():
@@ -758,6 +871,28 @@ def test_dry_run_refuses_when_decontamination_json_itself_went_missing(tmp_path,
     assert code == 2
     out = capsys.readouterr().out
     assert "decontaminate" in out
+
+
+def test_dry_run_refuses_when_decontamination_json_was_edited_after_the_chain_was_built(
+    tmp_path, capsys,
+):
+    """N-3 (round 2): decontamination.json disagreeing with the custody
+    chain's own record of it (dedupe.py's upstream_summary) is a named
+    refusal - the exact failure mode a disclosed hole silently vanishing
+    needs. Edits ONLY eval_sets (waiving a previously-unwaived hole), which
+    the cross-check's `eval_sets` field catches directly."""
+    from tuned.data.decontaminate import MANIFEST_FILENAME as DECON_MANIFEST
+
+    cfg_path, _report, paths = green_pipeline(tmp_path)
+    decon_path = paths.out_dir / DECON_MANIFEST
+    decon = json.loads(decon_path.read_text(encoding="utf-8"))
+    decon["eval_sets"]["aibe"]["allowed_missing"] = False  # edited post-hoc
+    decon_path.write_text(json.dumps(decon), encoding="utf-8")
+
+    code = push_main(["--config", cfg_path, "--dry-run"])
+    assert code == 2
+    out = capsys.readouterr().out
+    assert "disagrees with the custody chain" in out and "eval_sets" in out
 
 
 def test_module_versions_reads_every_reachable_stage(tmp_path):
@@ -917,11 +1052,14 @@ def test_a_second_push_of_unchanged_bytes_is_a_no_op(tmp_path, monkeypatch, caps
 
 def test_a_stats_only_rerun_over_identical_bytes_is_still_a_no_op(tmp_path, monkeypatch):
     """M2: idempotence must survive a stats.py re-run over byte-identical
-    data. Re-running ONLY stats.py regenerates stats.json (and therefore
-    README.md, which renders the report's own `at`) with a fresh timestamp
-    even though train.jsonl/eval.jsonl are untouched - same_uploaded_bytes
-    must still call that a no-op, derived from the corpus bytes, not the
-    report's clock."""
+    data. Re-running ONLY stats.py regenerates stats.json (which embeds the
+    report's own `at` directly - it IS that report) with a fresh timestamp
+    even though train.jsonl/eval.jsonl are untouched, and stats.json is
+    excluded from the idempotence key for exactly that reason;
+    same_uploaded_bytes must still call this a no-op, derived from the
+    corpus + card bytes, not the report's clock. This is HALF the
+    idempotence contract - see the paired test right below for the other
+    half (a genuinely different card must NOT be swallowed the same way)."""
     monkeypatch.setattr("tuned.data.push.load_dotenv_keys", lambda *a, **kw: 0)
     monkeypatch.setenv("HF_TOKEN", "sk-test-dummy")
     cfg_path, _report, paths = green_pipeline(tmp_path)
@@ -931,6 +1069,7 @@ def test_a_stats_only_rerun_over_identical_bytes_is_still_a_no_op(tmp_path, monk
 
     train_before = (paths.out_dir / TRAIN_FILENAME).read_bytes()
     eval_before = (paths.out_dir / EVAL_FILENAME).read_bytes()
+    readme_before = (paths.out_dir / README_FILENAME).read_bytes()
     stats_before = (paths.out_dir / REPORT_FILENAME).read_text(encoding="utf-8")
 
     assert stats_main(["--config", cfg_path], tokenizer=FakeTokenizer(SCALE)) == 0
@@ -941,7 +1080,48 @@ def test_a_stats_only_rerun_over_identical_bytes_is_still_a_no_op(tmp_path, monk
 
     code = push_main(["--config", cfg_path], hub_client=client)
     assert code == 0
+    # The re-rendered LOCAL card is also unchanged - render_card no longer
+    # prints report['at'], so nothing in it varies with the re-run either.
+    assert (paths.out_dir / README_FILENAME).read_bytes() == readme_before
     assert client.upload_calls == 1  # NOT uploaded again - the corpus never changed
+
+
+def test_a_card_only_change_triggers_an_upload_not_a_stale_no_op(tmp_path, monkeypatch):
+    """N-1 (round 2): the OTHER idempotence direction, paired with the test
+    above. Excluding README from the idempotence key (the original M2 fix)
+    made a card that legitimately changed over an unchanged corpus
+    unreachable on an already-pushed repo, while push claimed "already
+    carries these exact bytes" - false about README, one of the four files
+    that push. A push.card_extra addition over an untouched corpus is the
+    concrete case the round-2 review reproduced; it must upload again."""
+    monkeypatch.setattr("tuned.data.push.load_dotenv_keys", lambda *a, **kw: 0)
+    monkeypatch.setenv("HF_TOKEN", "sk-test-dummy")
+    cfg_path, _report, paths = green_pipeline(tmp_path)
+    client = FakeHubClient()
+    assert push_main(["--config", cfg_path], hub_client=client) == 0
+    assert client.upload_calls == 1
+
+    train_before = (paths.out_dir / TRAIN_FILENAME).read_bytes()
+    eval_before = (paths.out_dir / EVAL_FILENAME).read_bytes()
+
+    extra_path = paths.out_dir / "extra.md"
+    extra_path.write_text("NEW-DISCLOSURE-MARKER", encoding="utf-8")
+    text = Path(cfg_path).read_text(encoding="utf-8")
+    patched = text.replace(
+        "push:\n  repo_id: tantan01/tuned-law-v1-data\n  private: true\n",
+        f"push:\n  repo_id: tantan01/tuned-law-v1-data\n  private: true\n"
+        f"  card_extra: {extra_path.as_posix()}\n",
+    )
+    assert patched != text
+    Path(cfg_path).write_text(patched, encoding="utf-8")
+
+    code = push_main(["--config", cfg_path], hub_client=client)
+    assert code == 0
+    assert (paths.out_dir / TRAIN_FILENAME).read_bytes() == train_before
+    assert (paths.out_dir / EVAL_FILENAME).read_bytes() == eval_before  # corpus untouched
+    assert client.upload_calls == 2  # the card change reached the repo, not swallowed
+    uploaded_readme = client.uploaded_files[README_FILENAME].read_text(encoding="utf-8")
+    assert "NEW-DISCLOSURE-MARKER" in uploaded_readme
 
 
 def test_a_corrupt_remote_manifest_is_a_named_refusal_not_a_crash(tmp_path, monkeypatch, capsys):
