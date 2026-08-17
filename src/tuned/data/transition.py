@@ -357,11 +357,17 @@ def savings_block(provisions: dict[str, Provision]) -> str:
 class DatePosture:
     """A pair of day-offset spans, one for the conduct and one for the record.
 
-    The spans are ordered so that the proceeding can never predate the offence
-    - an impossible record would teach the model to reason about one. Within a
-    span the exact day is derived from the cell's own content key, so two cells
-    in the same posture are not the same paper twice, and the derivation is a
-    hash rather than an RNG so a grid rebuilt next year is the same grid.
+    The spans are ordered so that the proceeding can never predate the offence,
+    and the PROCEDURAL POSTURE then pushes it further out by the shortest time
+    in which the record it narrates could exist (ProceduralPosture.
+    min_lag_days) - an impossible record would teach the model to reason about
+    one. The spans are NOT disjoint and this docstring used to say they were:
+    on_appointed_day puts both dates on the same day, which is a real record at
+    the FIR stage and an impossible one at every other, and it was the claim
+    that was wrong rather than the design. Within a span the exact day is
+    derived from the cell's own content key, so two cells in the same posture
+    are not the same paper twice, and the derivation is a hash rather than an
+    RNG so a grid rebuilt next year is the same grid.
 
     `anchors_to_invalidation` names WHICH BOUNDARY the offence span is measured
     from. For every ordinary family that is the appointed day, and the two
@@ -416,18 +422,48 @@ DATE_POSTURES = (
 
 @dataclass(frozen=True)
 class ProceduralPosture:
-    """A stage, and the limb of the procedural saving it engages."""
+    """A stage, the limb of the procedural saving it engages, and the shortest
+    time in which the record its skeleton narrates could exist.
+
+    `min_lag_days` belongs HERE, next to skeleton_id, because it is a fact
+    about what the skeleton says rather than about the dates: the appeal
+    skeleton narrates a conviction appealed against, and a conviction on the
+    day of the conduct is a record no court file can hold. The two are edited
+    together, and a skeleton edit is already a reviewed act (its sha is
+    pinned).
+
+    The floors are deliberately the FASTEST a real file could move, not the
+    typical: this is a minimum, the drawn date is used whenever it is later,
+    and a generous floor would quietly flatten the date distribution the
+    postures exist to spread.
+    """
 
     name: str
     skeleton_id: str
     limb: str
+    min_lag_days: int
 
 
 PROCEDURAL_POSTURES = (
-    ProceduralPosture("fir", "posture_fir_v1", "investigation"),
-    ProceduralPosture("chargesheet", "posture_chargesheet_v1", "inquiry"),
-    ProceduralPosture("trial", "posture_trial_v1", "trial"),
-    ProceduralPosture("appeal", "posture_appeal_v1", "appeal"),
+    # An information recorded and an investigation opened on the day of the
+    # conduct is the ordinary case, not an impossible one. Zero is a measured
+    # value here, not an unset field.
+    ProceduralPosture("fir", "posture_fir_v1", "investigation", 0),
+    # The papers are a FINAL REPORT already before the court with cognizance
+    # being taken on it. The date the skeleton narrates is the investigation's
+    # start, which is the only lever it gives; three weeks is what keeps the
+    # record from reading as conduct, investigation, report and cognizance all
+    # on one day.
+    ProceduralPosture("chargesheet", "posture_chargesheet_v1", "inquiry", 21),
+    # Investigation, report, cognizance, charge framed, plea taken, part-heard.
+    ProceduralPosture("trial", "posture_trial_v1", "trial", 90),
+    # All of the above, a concluded trial, a conviction, and an appeal filed
+    # against it. Six months is fast for that and it is possible; the same day
+    # is not. It is also the widest floor the postures can carry - just_before
+    # holds conduct and proceeding within 330 days of the appointed day, and a
+    # longer floor would push that posture's record past the boundary it is
+    # named for.
+    ProceduralPosture("appeal", "posture_appeal_v1", "appeal", 180),
 )
 
 
@@ -819,6 +855,7 @@ def cell_dates(
     appointed_day: date,
     *,
     offence_anchor: date | None = None,
+    min_lag_days: int = 0,
 ) -> tuple[date, date]:
     """(offence_date, proceeding_started) for one cell.
 
@@ -830,11 +867,18 @@ def cell_dates(
     to the appointed day. The proceeding is always placed around the appointed
     day, because which procedural code governs turns on that day and on
     nothing else - see DatePosture.
+
+    `min_lag_days` is the procedural posture's floor and it moves the
+    PROCEEDING only, never the conduct. That direction is the whole point on
+    the on_appointed_day posture: the question there is about the OFFENCE date
+    sitting exactly on the boundary, so the conduct stays where it is and the
+    record moves out to where it could exist. The proceeding stays on or after
+    the appointed day either way, so the posture is still new on both axes.
     """
     anchor = appointed_day if offence_anchor is None else offence_anchor
     offence = anchor + timedelta(days=_in_span(key, "offence", dp.offence_span))
     proceeding = appointed_day + timedelta(days=_in_span(key, "proceeding", dp.proceeding_span))
-    return offence, proceeding
+    return offence, max(proceeding, offence + timedelta(days=min_lag_days))
 
 
 def offence_anchor_for(family: Family, dp: DatePosture, appointed_day: date) -> tuple[date, str]:
@@ -871,7 +915,9 @@ def build_grid(
         for dp, pp, qf in POSTURE_CELLS:
             key = cell_key(family, dp, pp, qf)
             anchor, anchor_name = offence_anchor_for(family, dp, appointed_day)
-            offence, proceeding = cell_dates(key, dp, appointed_day, offence_anchor=anchor)
+            offence, proceeding = cell_dates(
+                key, dp, appointed_day, offence_anchor=anchor, min_lag_days=pp.min_lag_days
+            )
             cell = Cell(
                 cell_id=cell_id_for(key),
                 family=family,

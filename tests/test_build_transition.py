@@ -313,6 +313,76 @@ def test_every_cell_dates_the_proceeding_no_earlier_than_the_conduct(grid):
         assert cell.proceeding_started >= cell.offence_date, cell.coordinates
 
 
+def test_no_cell_narrates_a_record_that_could_not_exist_yet(grid):
+    """Ordering is not enough: the record has to be POSSIBLE.
+
+    Measured before the floors landed: 2,400 cells dated the proceeding on the
+    day of the conduct, 1,800 of them at a stage that cannot be reached that
+    day, and one in seven of the drawn cells read "the appeal against the
+    conviction was filed on 1 July 2024" for conduct on 1 July 2024. 1,571 of
+    3,048 appeal cells filed the appeal inside six months.
+    """
+    cells, _ = grid
+    for cell in cells:
+        lag = (cell.proceeding_started - cell.offence_date).days
+        assert lag >= cell.procedural_posture.min_lag_days, (cell.coordinates, lag)
+
+    same_day = [c for c in cells if c.proceeding_started == c.offence_date]
+    # Only the FIR stage, where an information recorded on the day of the
+    # conduct is the ordinary case rather than an impossible record.
+    assert {c.procedural_posture.name for c in same_day} == {"fir"}
+    assert len(same_day) == 600
+    appeals = [c for c in cells if c.procedural_posture.name == "appeal"]
+    assert appeals
+    assert min((c.proceeding_started - c.offence_date).days for c in appeals) == 180
+
+
+def test_the_floors_never_push_a_posture_over_its_own_boundary(grid):
+    """The lag moves the record, and the posture still means what it says.
+
+    A floor wide enough to carry an appeal past the appointed day would turn
+    every just_before cell into a straddling one and flip its procedural limb,
+    which is the failure mode of fixing this the lazy way.
+    """
+    cells, _ = grid
+    for cell in cells:
+        if cell.date_posture.name in ("well_before", "just_before"):
+            assert cell.proceeding_started < APPOINTED_DAY, cell.coordinates
+        else:
+            assert cell.proceeding_started >= APPOINTED_DAY, cell.coordinates
+
+
+def test_the_on_appointed_day_question_is_still_about_the_offence_date(grid, provisions):
+    """The conduct stays exactly on the boundary; only the record moves out."""
+    cells, _ = grid
+    on_day = [c for c in cells if c.date_posture.name == "on_appointed_day"]
+    assert len(on_day) == 2400
+    for cell in on_day:
+        assert cell.offence_date == APPOINTED_DAY
+        assert cell.proceeding_started == APPOINTED_DAY + timedelta(
+            days=cell.procedural_posture.min_lag_days
+        )
+    # ...and the answer is unmoved: new on all three limbs, which is the edge
+    # the posture exists for.
+    for cell in on_day[:40]:
+        assert T.answer_key_for(cell, provisions)["families_by_kind"] == {
+            "substantive": "new", "procedural": "new", "evidence": "new"
+        }
+
+
+def test_the_appeal_scenario_reads_as_a_record_a_court_file_could_hold(grid, provisions):
+    cell = next(
+        c for c in grid[0]
+        if c.date_posture.name == "on_appointed_day" and c.procedural_posture.name == "appeal"
+    )
+    scenario = T.render_cell(cell, provisions)["scenario"]
+    assert T.pretty_date(APPOINTED_DAY) in scenario  # the conduct, on the boundary
+    assert T.pretty_date(cell.proceeding_started) in scenario
+    # The two dates in the prose are different ones - the conviction and the
+    # appeal against it are no longer narrated as the day of the conduct.
+    assert cell.proceeding_started != cell.offence_date
+
+
 def test_the_date_postures_mean_what_they_are_named(grid):
     """Each posture, against the boundary IT is anchored to.
 
