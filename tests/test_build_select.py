@@ -697,11 +697,16 @@ def test_metadata_rows_reads_the_parquet_acquire_recorded(store, tmp_path):
 def test_metadata_rows_survive_the_hive_partition_directory_they_really_live_in(store, tmp_path):
     """The layout acquire ACTUALLY produces, which the fixture above flattens
     away: the file sits under a `year=YYYY/` ancestor AND carries its own
-    embedded `year` column. `pq.read_table` routes through the dataset API,
-    infers Hive partitioning from the path segment, and the inferred `year`
-    collides with the embedded one (ArrowTypeError: incompatible types -
-    found on Kaggle 2026-08-17, reproducible anywhere). The reader must open
-    the one file and infer nothing from where it sits."""
+    embedded `year` column. On the pyarrow Kaggle ships (2026-08-17),
+    `pq.read_table` routed this through the dataset API, inferred Hive
+    partitioning from the path segment, and the inferred `year` collided
+    with the embedded one (ArrowTypeError: incompatible types). MEASURED
+    HONESTLY: local pyarrow 25.0.1 does NOT infer from a single-file path,
+    so on this machine the old reader also passes this test - the crash is
+    version-dependent and this test pins the corrected reader's behavior
+    (embedded cell wins, nothing inferred) rather than reproducing the
+    crash. `ParquetFile` sidesteps the dataset API on every version, which
+    is the point."""
     pq = pytest.importorskip("pyarrow.parquet")
     pa = pytest.importorskip("pyarrow")
 
