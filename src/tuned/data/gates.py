@@ -847,13 +847,18 @@ def _negated_at(text: str, at: int) -> bool:
        disputed that X" means X. No vocabulary of cues can see a negation of a
        negation, and this is the class of evasion cue-matching cannot close.
 
-    Both are double-embedded. Neither is a phrasing the prompt invites, and the
-    first fails safe only in the sense that it burns a seed rather than
+    Both are double-embedded, but the class REACHES ORDINARY LEGAL REGISTER -
+    "It is not disputed that the charge lies under s.497" and "It is not denied
+    that ..." pass clean (measured, review round 3) and are phrasings a
+    one-line declarative answer can produce. The exposure is bounded by the 9
+    affected cells per 1,250 drawn, not by the phrasing being exotic; the
+    first shape fails safe only in the sense that it burns a seed rather than
     teaching a falsehood. Which negator governs when several are in scope - the
     nearest, as here, or the first - is NOT pinned by any test, because no
     phrasing in the suite has two negators in one scope where the choice
-    changes the verdict; a four-sentence probe found one where "first" reads
-    better and none where it reads worse, which is too little to turn a design
+    changes the verdict; across six probe sentences (four here, two more in
+    review round 3) every shape where the choice matters favours "first",
+    3-0, and none favours "nearest" - recorded, still too little to turn a design
     on.
     """
     scope = text[max(0, at - NEGATION_WINDOW) : at]

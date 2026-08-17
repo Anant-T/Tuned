@@ -1304,6 +1304,32 @@ def test_answer_key_a_negation_that_really_governs_is_not_broken_by_a_comma(answ
     assert result.detail["liability_asserted"] == []
 
 
+def test_answer_key_a_distant_concessive_does_not_defeat_a_genuine_denial():
+    """The CONCESSIVE_LOOKBACK bound, which nothing else in this file
+    exercised - the same shape NEGATION_WINDOW was in until mutation found it
+    (review round 3, survivor S7: the unbounded mutant is STRICTER, not
+    looser, so every existing DENIES fixture stayed green under it).
+
+    A concessive opening a long recital - 160 characters of comma-joined
+    procedural narration, no hard break - has spent its force by the time the
+    negator arrives; reading it as governing would over-reject a correct
+    denial. The bound says a concessive only defeats the complement rescue
+    from nearby. The denial must be the PARENTHETICAL shape (a comma between
+    negator and cue) - that comma is what routes the check through the
+    concessive lookback at all; without it the negation governs directly and
+    the bound is never consulted.
+    """
+    answer = (
+        "Although the chargesheet, the committal record, the deposition summaries and "
+        "the exhibits all travelled with the appeal paperbook in their original form, "
+        "it is not, on any view, the case that the charge lies under Section 302 IPC. "
+        "No charge lies."
+    )
+    result = check_answer_key(answer, _no_liability_ctx())
+    assert result.passed, result.detail
+    assert result.detail["liability_asserted"] == []
+
+
 def test_answer_key_a_distant_negation_does_not_reach_the_assertion():
     """The NEGATION_WINDOW bound, which nothing else in this file exercised.
 
