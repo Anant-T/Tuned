@@ -128,6 +128,15 @@ assembly:
     # is the terminal instrument, so a missing link is red rather than a note.
     require_chain: true
 
+# --------------------------------------------------------------------------
+# push.py: the HF dataset repo the training lane pins against (HubCfg.
+# dataset_repo in configs/law_v1_8b_ddp.yaml, via scripts/pin_dataset.py -
+# push.py's own job ends at "repo exists, revision printed").
+# --------------------------------------------------------------------------
+push:
+  repo_id: tantan01/tuned-law-v1-data
+  private: true
+
 providers:
   - name: cerebras
     base_url: https://api.cerebras.ai/v1

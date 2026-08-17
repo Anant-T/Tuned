@@ -161,6 +161,18 @@ def _parse_ref(ref: str) -> ModelRef:
 
 
 @dataclass(frozen=True)
+class PushCfg:
+    """push.py's target: the HF dataset repo, and nothing push.py should ever
+    hardcode. Optional at the top level - a build config that never pushes
+    (every fixture in this test suite, for one) does not need this block, and
+    split.py/assemble.py/stats.py never read it."""
+
+    repo_id: str
+    private: bool = True
+    card_extra: str | None = None
+
+
+@dataclass(frozen=True)
 class BuildConfig:
     build: BuildCfg
     providers: tuple[ProviderCfg, ...]
@@ -180,6 +192,8 @@ class BuildConfig:
     # think tags are: a builder that carried its own 8192 could pass a corpus
     # the trainer then truncates or refuses.
     max_seq_length: int
+    # None when the config carries no `push:` block at all - see PushCfg.
+    push: PushCfg | None = None
 
     def model_for(self, ref: ModelRef) -> tuple[ProviderCfg, ModelCfg]:
         for provider in self.providers:
@@ -458,6 +472,46 @@ def _assembly_of(raw: dict, build: BuildCfg) -> AssemblyCfg:
     )
 
 
+def _push_of(raw: dict) -> PushCfg | None:
+    """The optional `push:` block, or None if this config never pushes.
+
+    Unlike `assembly:`, absence is a legitimate configuration - split.py,
+    assemble.py and stats.py all run to a green report without one, and only
+    push.py itself needs to fail on a missing block (named there, not here,
+    because the message push.py can give ["run stats.py first" vs "this
+    config has no push target"] is more useful than a generic loader error).
+    Once the block IS present, every key in it is checked the same strict way
+    assembly.gates is: no coercion, a named refusal per key.
+    """
+    block = raw.get("push")
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise ValueError(f"`push:` must be a block of keys, got {type(block).__name__}")
+    if "repo_id" not in block:
+        raise ValueError(
+            "push.repo_id is missing, and it is the HuggingFace dataset repo push.py "
+            "writes to. A `push:` block without it is a target nobody named."
+        )
+    repo_id = block["repo_id"]
+    if not isinstance(repo_id, str) or not repo_id.strip():
+        raise ValueError(f"push.repo_id must be a non-empty string, got {repo_id!r}")
+    private = block.get("private", True)
+    # Strict, like assembly.gates' toggles: bool("false") is True, so a quoted
+    # "false" here would make a PRIVATE dataset repo PUBLIC, which is the one
+    # direction this config must never coerce its way into.
+    if not isinstance(private, bool):
+        raise ValueError(
+            f"push.private must be a YAML boolean (true/false), got {private!r}. Not "
+            f'coerced: bool() of any non-empty string is True, so a quoted "false" '
+            f"would make a private dataset repo PUBLIC."
+        )
+    card_extra = block.get("card_extra")
+    if card_extra is not None and not isinstance(card_extra, str):
+        raise ValueError(f"push.card_extra must be a string path, got {card_extra!r}")
+    return PushCfg(repo_id=repo_id, private=private, card_extra=card_extra)
+
+
 def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> BuildConfig:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
@@ -517,6 +571,7 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
         response_part=train_cfg.model.response_part,
         main_dataset_path=train_cfg.train.main.dataset,
         max_seq_length=train_cfg.train.main.max_seq_length,
+        push=_push_of(raw),
     )
     _validate(cfg)
     return cfg
