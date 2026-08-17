@@ -1221,6 +1221,108 @@ def test_answer_key_an_answer_that_says_both_things_is_still_rejected():
     assert result.detail["liability_asserted"] == ["the charge lies under"]  # ...and assert
 
 
+def _no_liability_ctx():
+    return _transition_ctx(
+        answer_key=_key(requires_no_liability_statement=True, forbidden_sections=[]),
+    )
+
+
+# Every one of these ASSERTS a live charge under a section that is not
+# chargeable, and every one carries a denial cue as well - so the denial limb
+# cannot be what fails them. What fails them is the assertion limb, which is
+# the thing under test.
+ASSERTS_THROUGH_A_COMMA = [
+    # The reviewer's measured shape: a concessive clause hands the sentence to
+    # a main clause that asserts, and round 1's rule let the "no" reach across.
+    "Although it is no longer in force, the accused stands charged under Section 302 "
+    "IPC, and the savings clause preserves that liability.",
+    # ...and their second: two views, the second of which asserts.
+    "On one view no offence is made out, on another the charge lies under Section 302 "
+    "IPC and the savings clause would preserve it.",
+    # More concessives, because "although" is not the only one.
+    "Though no offence survives the repeal, the accused stands charged under Section "
+    "302 IPC.",
+    "While no offence survives today, the charge lies under Section 302 IPC.",
+    "Granted that the provision is void, the accused stands charged under Section 302 "
+    "IPC.",
+    # A bare comma with no concessive at all: still a new clause, still an
+    # assertion.
+    "No offence is made out on these dates, the charge lies under Section 302 IPC.",
+    # A concessive AND a complement clause: the complement exception must not
+    # rescue an assertion that a concessive already handed over.
+    "Although it is no longer in force, it is said that the charge lies under Section "
+    "302 IPC.",
+]
+
+# Every one of these DENIES, in a shape where the negation genuinely reaches
+# the cue. A permanent gate that rejected any of them would be doing the harm
+# this field exists to prevent.
+DENIES_THROUGH_A_COMMA = [
+    # The reviewer's measured correct shape: commas around an interrupter.
+    "It is not, on any view, the case that the charge lies under Section 302 IPC.",
+    # Interrupters can nest and can carry their own verb.
+    "It is not, on any view, and never has been, the case that the charge lies under "
+    "Section 302 IPC.",
+    "It cannot be said, on these facts, that the charge lies under Section 302 IPC.",
+    # A negation with no comma at all between it and the cue.
+    "It is not the case that the charge lies under Section 302 IPC.",
+    "The question is not whether the charge lies under Section 302 IPC but whether any "
+    "offence existed at all.",
+]
+
+
+@pytest.mark.parametrize("answer", ASSERTS_THROUGH_A_COMMA)
+def test_answer_key_a_comma_does_not_carry_the_negation_into_the_next_clause(answer):
+    """THE round-1 hole. `_CLAUSE_BREAK_RE` was `[.;:!?]\\s` - no comma - so a
+    concessive clause excused the clause that contradicted it, and
+
+        "Although it is no longer in force, the accused stands charged under
+         s.497, and s.358 preserves that liability"
+
+    passed all ten gates with a clean disposition and entered the dataset. It
+    is the semicolon hedge this module already pinned, repunctuated.
+    """
+    result = check_answer_key(answer, _no_liability_ctx())
+    assert not result.passed, result.detail
+    assert result.detail["liability_asserted"], result.detail
+    # ...and it is the ASSERTION limb failing, not the denial limb: each of
+    # these does carry a denial cue, so a test that passed for want of one
+    # would be testing nothing.
+    assert result.detail["no_liability_cues"], result.detail
+
+
+@pytest.mark.parametrize("answer", DENIES_THROUGH_A_COMMA)
+def test_answer_key_a_negation_that_really_governs_is_not_broken_by_a_comma(answer):
+    """The other direction, and the constraint that makes the fix non-trivial:
+    simply adding "," to the break set fixes the shapes above and starts
+    PERMANENTLY rejecting these, which is the failure the field exists to
+    remove. The complement clause is what tells them apart - "it is not ...
+    the case THAT the charge lies" negates exactly what follows it.
+    """
+    result = check_answer_key(answer + " No charge lies.", _no_liability_ctx())
+    assert result.passed, result.detail
+    assert result.detail["liability_asserted"] == []
+
+
+def test_answer_key_denial_cues_match_at_word_boundaries():
+    """"void" is a substring of "avoid", so an answer that denies nothing
+    satisfied the limb that exists to require a denial."""
+    ctx = _no_liability_ctx()
+    result = check_answer_key(
+        "To avoid doubt, the provision engaged is Section 302 IPC.", ctx
+    )
+    assert not result.passed
+    assert result.detail["no_liability_cues"] == []
+    # The word itself still counts, so the boundary did not cost the cue.
+    kept = check_answer_key(
+        "The section was void when this conduct occurred, so Section 302 IPC reaches "
+        "nothing.",
+        ctx,
+    )
+    assert kept.detail["no_liability_cues"] == ["void"]
+    assert kept.passed
+
+
 def test_answer_key_both_families_required_and_named():
     ctx = _transition_ctx(
         answer_key=_key(must_name_both_families=True, forbidden_sections=[]),

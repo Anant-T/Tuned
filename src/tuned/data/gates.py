@@ -160,6 +160,16 @@ _SAVINGS_RE = re.compile(r"\bsaving|§\s{0,2}358\b|\bsection\s{1,4}358\b", re.IG
 # charge and never denies it; the second catches the answer that hedges by
 # saying both. Neither is a style rule - on these cells they are the whole of
 # the difference between the right answer and a false statement of law.
+#
+# THE COST, stated because a closed vocabulary always has one: an answer that
+# is correct and avoids all fourteen cues - "s.497 ceased to have effect in
+# 2018 and therefore reaches nothing done afterwards; s.358 is engaged and
+# there is nothing for it to save" - fails this limb and is a PERMANENT
+# reject. That is inherent to matching words rather than meaning. It is
+# mitigated by the prompt, which hands the teacher the vocabulary in the
+# provision block ("Struck down in Joseph Shine v. Union of India (2018) and
+# not re-enacted"), and the list is deliberately NOT widened speculatively:
+# every cue added is also a cue an assertion can wear.
 NO_LIABILITY_CUES = (
     "no charge",
     "no offence",
@@ -201,15 +211,49 @@ LIABILITY_CUES = (
 )
 
 # How far back a negation may sit and still govern the cue, and where it stops
-# governing whatever it is. The clause break is what stops "no charge lies
-# under s.497; the charge lies under s.497" reading as a denial - a hedge that
-# says both things is not a correct answer, and without the break the leading
-# "no" would excuse the clause that contradicts it.
+# governing. Three rules, and each one is here because a measured phrasing
+# needed it - see _negated_at, where they are applied.
+#
+#   1. a HARD break ends the negation's reach: "no charge lies under s.497;
+#      the charge lies under s.497" is not a denial, it is an answer that says
+#      both things.
+#   2. a COMMA ends it too - "Although it is no longer in force, the accused
+#      stands charged under s.497" asserts the charge, and the concessive
+#      clause before the comma does not take that back. Round 1 shipped rule 1
+#      without rule 2, and that sentence passed every gate and entered the
+#      dataset: the pinned semicolon hedge with different punctuation.
+#   3. EXCEPT where the cue sits inside the negation's own complement clause -
+#      "it is not, on any view, the case THAT the charge lies under s.497"
+#      negates exactly what follows it, and rejecting that would be a
+#      permanent gate firing on a correct answer, which is the harm this whole
+#      field exists to remove. The complementizer is the signal; a concessive
+#      lead before the negator overrides it, because "although the section is
+#      not in force, it is said that the charge lies" is an assertion wearing
+#      a complement.
 NEGATION_WINDOW = 48
+CONCESSIVE_LOOKBACK = 120
 _NEGATOR_RE = re.compile(
     r"\b(?:no|not|never|nor|neither|cannot|without|nothing)\b|n't\b", re.IGNORECASE
 )
 _CLAUSE_BREAK_RE = re.compile(r"[.;:!?]\s")
+_CONCESSIVE_RE = re.compile(
+    r"\b(?:although|though|even\s{1,4}if|while|whilst|whereas|albeit|"
+    r"granted\s{1,4}that|admittedly|notwithstanding|on\s{1,4}one\s{1,4}view|"
+    r"that\s{1,4}said)\b",
+    re.IGNORECASE,
+)
+_COMPLEMENT_RE = re.compile(r"\bthat\b", re.IGNORECASE)
+
+
+def _cue_pattern(cue: str) -> re.Pattern:
+    """A cue, matched at word boundaries.
+
+    Plain `in` was the first cut and it was wrong in the direction that
+    matters: "void" is a substring of "avoid", so "To avoid doubt, the
+    provision engaged is s.497" satisfied the limb that exists to REQUIRE a
+    denial, on an answer that denies nothing.
+    """
+    return re.compile(r"\b" + re.escape(cue) + r"\b", re.IGNORECASE)
 
 # Shingle stride for the verbatim scan; see find_verbatim_run.
 SHINGLE_STEP = 10
@@ -238,6 +282,16 @@ DEFAULT_MAX_RUN = 30
 # The last is what keeps "Section 302 IPC governs. The informant said 'he
 # struck him'" out of it: that quote is attributed to a witness, not to a
 # section, and the full stop says so.
+# DOUBLE QUOTES ONLY, and it is a measured judgement rather than an oversight.
+# A single-quoted attribution (`s.358 BNS provides: 'the repeal does not
+# affect any liability'`) escapes this gate. Widening the class to `'` closes
+# that and costs a false positive on ordinary possessives, which this domain
+# is full of: measured, `Section 302 IPC is engaged: the accused's plea and
+# the informant's statement are on the record` then reads "s plea and the
+# informant" as a quoted span attributed to s.302 - a clean answer sent back
+# for rewriting. The escape is a teacher choosing an unusual quotation mark;
+# the cost lands on ordinary prose, so the narrow class stays until a
+# possessive-aware form is worth writing.
 ATTRIBUTION_WINDOW = 160
 _QUOTE_RE = re.compile(r"[\"“]([^\"“”]{12,}?)[\"”]")
 _SECTION_SUBJECT_RE = re.compile(
@@ -751,29 +805,58 @@ def _mentions_savings(answer: str, refs: list[SectionRef]) -> bool:
     return bool(_SAVINGS_RE.search(answer or ""))
 
 
+_DENIAL_PATTERNS = tuple((cue, _cue_pattern(cue)) for cue in NO_LIABILITY_CUES)
+_ASSERTION_PATTERNS = tuple((cue, _cue_pattern(cue)) for cue in LIABILITY_CUES)
+
+
 def _denies_liability(answer: str) -> list[str]:
     """Cues by which the answer says no charge lies. Whitespace-normalized, so
-    a phrase broken across a line break still counts."""
-    text = _norm_ws(answer).lower()
-    return [cue for cue in NO_LIABILITY_CUES if cue in text]
+    a phrase broken across a line break still counts, and matched at word
+    boundaries, so "avoid" is not "void"."""
+    text = _norm_ws(answer)
+    return [cue for cue, pattern in _DENIAL_PATTERNS if pattern.search(text)]
 
 
 def _negated_at(text: str, at: int) -> bool:
-    """Does a negation govern the cue starting at `at`?
+    """Does a negation govern the liability cue starting at `at`?
 
-    The window is the NEGATION_WINDOW characters before the cue, cut back to
-    the last clause break inside it. Both halves matter and each was measured:
-    without the window, "it is not the case that the charge lies under s.497"
-    reads as an assertion and a correctly-reasoned answer is permanently
-    rejected; without the clause break, "no charge lies under s.497; the charge
-    lies under s.497" reads as a denial and an answer that says both things
-    passes.
+    Scope: the NEGATION_WINDOW characters before the cue, cut back to the last
+    HARD break in them; the closest negator in what remains is the one that
+    governs. Then the three rules in the constants above, in order:
+
+      no comma between that negator and the cue        -> it governs
+      a concessive lead before that negator            -> it does not
+      a "that"-complement between negator and cue      -> it governs
+      otherwise (a bare comma, i.e. a new clause)      -> it does not
+
+    The order is the whole design. A comma is a handover by default, because
+    the measured failure was a concessive clause handing the sentence to a main
+    clause that asserts the charge; the complement exception is narrower than
+    the handover rule, so a sentence that is BOTH ("although the section is not
+    in force, it is said that the charge lies") is read as the assertion it is.
     """
-    window = text[max(0, at - NEGATION_WINDOW) : at]
-    breaks = list(_CLAUSE_BREAK_RE.finditer(window))
+    scope = text[max(0, at - NEGATION_WINDOW) : at]
+    breaks = list(_CLAUSE_BREAK_RE.finditer(scope))
     if breaks:
-        window = window[breaks[-1].end() :]
-    return bool(_NEGATOR_RE.search(window))
+        scope = scope[breaks[-1].end() :]
+    negators = list(_NEGATOR_RE.finditer(scope))
+    if not negators:
+        return False
+
+    scope_at = at - len(scope)
+    negator = negators[-1]
+    tail = text[scope_at + negator.end() : at]
+    if "," not in tail:
+        return True
+
+    lead_end = scope_at + negator.start()
+    lead = text[max(0, lead_end - CONCESSIVE_LOOKBACK) : lead_end]
+    lead_breaks = list(_CLAUSE_BREAK_RE.finditer(lead))
+    if lead_breaks:
+        lead = lead[lead_breaks[-1].end() :]
+    if _CONCESSIVE_RE.search(lead):
+        return False
+    return bool(_COMPLEMENT_RE.search(tail))
 
 
 def _asserts_liability(answer: str) -> list[str]:
@@ -783,15 +866,12 @@ def _asserts_liability(answer: str) -> list[str]:
     excuse a later bare one.
     """
     text = _norm_ws(answer)
-    lowered = text.lower()
     hits: list[str] = []
-    for cue in LIABILITY_CUES:
-        at = lowered.find(cue)
-        while at != -1:
-            if not _negated_at(text, at):
+    for cue, pattern in _ASSERTION_PATTERNS:
+        for match in pattern.finditer(text):
+            if not _negated_at(text, match.start()):
                 hits.append(cue)
                 break
-            at = lowered.find(cue, at + 1)
     return hits
 
 
