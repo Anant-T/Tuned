@@ -11,6 +11,7 @@ import pytest
 from tuned.data.roles_infer import BACKEND_NONE, BACKEND_SUBPROCESS, RolesBridgeError
 from tuned.data.segment import (
     FOOTNOTES_LABEL,
+    MAX_PARA_STEP,
     MIN_TOC_HEADINGS,
     TIER_PACKING,
     TIER_ROLES,
@@ -20,9 +21,12 @@ from tuned.data.segment import (
     WHY_TOC,
     Segment,
     _normalize_segments,
+    _packing_tier,
     _split_footnote_tail,
+    _subdivide,
     _toc_segments,
-    monotonic_paragraph_starts,
+    paragraph_offsets,
+    paragraph_starts,
     segment_document,
     toc_candidates,
 )
@@ -69,14 +73,27 @@ def test_empty_text_is_packing_tier_with_no_segments_and_recorded_degradation():
 
 
 # --------------------------------------------------------------------------
-# Monotonic paragraph detection - the workhorse's own correctness.
+# Paragraph detection - the workhorse's own correctness.
+#
+# The rule under test is NOT "strictly increasing". That rule shipped once and
+# was wrong in a way its own tests could not see: it assumed a quoted number
+# is never HIGHER than the number the surrounding prose already reached, and
+# on real judgments it routinely is (a quoted paragraph of the judgment under
+# appeal, a quoted statute section, a wrapped "Article 335"). When it is, the
+# strictly-increasing counter spikes and every genuine later paragraph is
+# rejected - splitting the paragraph at the citation AND swallowing the rest
+# of the judgment. The four shapes below are the ones measured on the real
+# staged corpus; every one of them has its own test here.
 # --------------------------------------------------------------------------
+
+
+def numbers(text) -> list[int]:
+    return [n for _offset, n in paragraph_starts(text)]
 
 
 def test_consecutive_numbered_paragraphs_are_all_accepted():
     text = judgment(5)
-    starts = monotonic_paragraph_starts(text)
-    assert [n for _offset, n in starts] == [1, 2, 3, 4, 5]
+    assert numbers(text) == [1, 2, 3, 4, 5]
 
 
 def test_the_close_paren_marker_form_is_also_recognised():
@@ -84,33 +101,130 @@ def test_the_close_paren_marker_form_is_also_recognised():
     # this module's marker must too, not only the period form every other
     # fixture in this file happens to use.
     text = "JUDGMENT\n\n1) First paragraph text here.\n\n2) Second paragraph text here.\n\n"
-    starts = monotonic_paragraph_starts(text)
-    assert [n for _offset, n in starts] == [1, 2]
+    assert numbers(text) == [1, 2]
 
 
-def test_a_quoted_earlier_paragraph_number_is_rejected_not_a_new_boundary():
-    # The failure this module's monotonic rule exists for: a quotation from
-    # an earlier report carries its OWN "15." that must not fracture the
-    # paragraph doing the quoting.
+def test_a_quoted_lower_paragraph_number_is_rejected_not_a_new_boundary():
+    # The direction the old strictly-increasing rule got right, kept as a
+    # test that actually REACHES the rule: the quoted number is line-initial
+    # and unquoted, so _PARA_START's own `^` anchor matches it and only the
+    # accept/reject rule can throw it out. (The version of this test that
+    # shipped put its quoted number mid-line behind a quotation mark, where
+    # the anchor rejected it before any rule was consulted - deleting the
+    # whole filter left that test green.)
     text = (
         "JUDGMENT\n\nRAO, J.\n\n"
         "1. This appeal raises a narrow question.\n\n"
-        '2. In an earlier case this Court observed: "15. The onus lies on '
-        'the prosecution to establish guilt beyond reasonable doubt."\n\n'
-        "3. We are not persuaded by that argument here.\n\n"
+        "2. The parties were heard at some length on the second day.\n\n"
+        "3. In an earlier case this Court observed as follows:\n\n"
+        "1. The onus lies on the prosecution throughout the trial.\n\n"
+        "4. We are not persuaded by that argument here.\n\n"
     )
-    starts = monotonic_paragraph_starts(text)
-    assert [n for _offset, n in starts] == [1, 2, 3]
+    assert numbers(text) == [1, 2, 3, 4]
     result = segment_document(text)
     labels = [s.label for s in result.segments if s.label not in (None, FOOTNOTES_LABEL)]
-    assert labels == ["1", "2", "3"]
+    assert labels == ["1", "2", "3", "4"]
     assert_gapless_partition(text, result.segments)
 
 
-def test_a_number_that_goes_backward_after_the_first_match_is_rejected():
-    text = "JUDGMENT\n\n1. First.\n\n5. Should be accepted (increasing).\n\n2. Should be rejected.\n\n"
-    starts = monotonic_paragraph_starts(text)
-    assert [n for _offset, n in starts] == [1, 5]
+def test_a_quoted_higher_paragraph_number_is_rejected_and_the_rest_survives():
+    # H1, in miniature: a judgment at its own paragraph 3 quoting the court
+    # below's paragraph 47. The old rule accepted 47 (it was "increasing"),
+    # split paragraph 3 at the citation, and then rejected 4, 5 and 6 for
+    # being smaller - which is how a real document lost 86% of itself into a
+    # single chunk.
+    text = (
+        "JUDGMENT\n\nRAO, J.\n\n"
+        "1. This appeal raises a narrow question.\n\n"
+        "2. The parties were heard at some length on the second day.\n\n"
+        "3. The High Court reasoned as follows:\n\n"
+        "47. The society having failed to produce its register, the claim fails.\n\n"
+        "4. We are unable to agree with that reasoning.\n\n"
+        "5. The evidence points the other way on this record.\n\n"
+        "6. The appeal is allowed and the conviction is set aside.\n\n"
+    )
+    assert numbers(text) == [1, 2, 3, 4, 5, 6]
+    result = segment_document(text)
+    labels = [s.label for s in result.segments if s.label not in (None, FOOTNOTES_LABEL)]
+    assert labels == ["1", "2", "3", "4", "5", "6"]
+    assert_gapless_partition(text, result.segments)
+
+
+def test_a_quoted_statute_section_number_does_not_become_a_boundary():
+    # The `2014_11` shape: a judgment at its own paragraph 6 setting out two
+    # consecutive sections of a code (`178.`, `179.`) and then carrying on.
+    # Two consecutive numbers are still a foreign run, not this document's
+    # numbering.
+    text = (
+        "JUDGMENT\n\nRAO, J.\n\n"
+        "1. Leave granted in both the appeals.\n\n"
+        "2. The short question is one of jurisdiction.\n\n"
+        "3. The relevant provisions are set out below.\n\n"
+        "4. The material sections read thus:\n\n"
+        "178. Sittings of the tribunal.- (a) When it is uncertain in which of\n"
+        "several local areas an offence was committed.\n\n"
+        "179. Powers of the appellate authority.- An offence may be tried by\n"
+        "the court within whose local jurisdiction it was committed.\n\n"
+        "5. Applying those provisions to this record, the objection fails.\n\n"
+        "6. The appeals are dismissed with no order as to costs.\n\n"
+    )
+    assert numbers(text) == [1, 2, 3, 4, 5, 6]
+    assert_gapless_partition(text, segment_document(text).segments)
+
+
+def test_a_number_that_is_the_tail_of_a_wrapped_citation_is_not_a_boundary():
+    # The `2010_1` shape, and the subtlest of the four: the number belongs to
+    # "Article 335" on the line above and only LOOKS line-initial because the
+    # line wrapped there. extract.py measured this exact shape on this exact
+    # corpus before segment.py was written.
+    text = (
+        "JUDGMENT\n\nRAO, J.\n\n"
+        "1. Leave granted.\n\n"
+        "2. The appellant relies on the guarantee contained in Article\n"
+        "335. The provision speaks of the claims of all sections in the\n"
+        "making of appointments to services and posts.\n\n"
+        "3. That guarantee does not carry the appellant as far as claimed.\n\n"
+        "4. The appeal is dismissed.\n\n"
+    )
+    assert numbers(text) == [1, 2, 3, 4]
+    assert_gapless_partition(text, segment_document(text).segments)
+
+
+def test_a_long_quoted_numbered_list_does_not_swallow_the_paragraphs_after_it():
+    # The `2010_3` shape: a post-mortem report's injury list, twenty-one
+    # numbered items quoted inside the judgment's own paragraph 6. A run that
+    # long IS this document's numbering for as long as it lasts, so its items
+    # are accepted as boundaries (they are separate lines, and the packer
+    # merges them straight back into one chunk) - what must NOT happen is the
+    # thing the strictly-increasing rule did: leave the counter parked at 21
+    # so that the judgment's own paragraphs 7, 8 and 9 are all rejected and
+    # the rest of the document collapses into a single segment.
+    listed = "".join(f"{i}. Incised wound of the {i}th described dimension.\n\n" for i in range(1, 22))
+    text = (
+        "JUDGMENT\n\nRAO, J.\n\n"
+        "4. The trial court accepted the prosecution case in full.\n\n"
+        "5. The High Court affirmed the conviction on the same reasoning.\n\n"
+        "6. The post-mortem report records the following injuries:\n\n"
+        + listed
+        + "7. The medical evidence is therefore consistent with the charge.\n\n"
+        "8. We see no reason to interfere with the concurrent findings.\n\n"
+        "9. The appeal is dismissed.\n\n"
+    )
+    found = numbers(text)
+    # the judgment's own tail survives - the defect this test exists for
+    assert found[-3:] == [7, 8, 9]
+    assert_gapless_partition(text, segment_document(text).segments)
+
+
+def test_a_far_forward_jump_is_never_a_next_paragraph():
+    # MAX_PARA_STEP, at its own edge and one past it. A real next paragraph
+    # is `last + 1` and occasionally skips one or two (a mis-scanned marker);
+    # `last + 169` is a citation. Both directions, so the constant is pinned
+    # rather than merely present.
+    step_ok = f"JUDGMENT\n\n1. First.\n\n{1 + MAX_PARA_STEP}. Still this document's own numbering.\n\n"
+    step_over = f"JUDGMENT\n\n1. First.\n\n{2 + MAX_PARA_STEP}. A number from somewhere else.\n\n"
+    assert numbers(step_ok) == [1, 1 + MAX_PARA_STEP]
+    assert numbers(step_over) == [1]
 
 
 def test_no_numbered_paragraphs_at_all_still_yields_one_segment():
@@ -122,10 +236,39 @@ def test_no_numbered_paragraphs_at_all_still_yields_one_segment():
     assert_gapless_partition(text, result.segments)
 
 
-def test_a_repeated_paragraph_number_is_rejected_as_not_strictly_greater():
+def test_a_repeated_paragraph_number_is_rejected_as_not_a_new_paragraph():
     text = "JUDGMENT\n\n1. First.\n\n1. Repeated marker, not a new paragraph.\n\n"
-    starts = monotonic_paragraph_starts(text)
-    assert [n for _offset, n in starts] == [1]
+    assert numbers(text) == [1]
+
+
+def test_a_number_that_goes_backward_after_the_first_match_is_rejected():
+    # Still true, and still worth pinning: an isolated smaller number in the
+    # middle of the judgment's own run is a quotation, not paragraph 1 again.
+    text = (
+        "JUDGMENT\n\n1. First.\n\n2. Second.\n\n"
+        "1. A quoted marker, not a new paragraph.\n\n3. Third.\n\n4. Fourth.\n\n"
+    )
+    assert numbers(text) == [1, 2, 3, 4]
+
+
+def test_a_second_opinion_restarting_its_numbering_is_picked_up_not_swallowed():
+    # The genuine restart case the old rule documented as an accepted cost
+    # ("that tail is swallowed into one large trailing segment"): a
+    # concurring opinion numbering itself from 1 again. A restart long enough
+    # to pay for itself is this document's numbering too.
+    first = "".join(f"{i}. The majority's reasoning at step {i}.\n\n" for i in range(1, 9))
+    second = "".join(f"{i}. The concurrence's reasoning at step {i}.\n\n" for i in range(1, 8))
+    text = "JUDGMENT\n\nRAO, J.\n\n" + first + "BANUMATHI, J.\n\n" + second
+    found = numbers(text)
+    assert found == list(range(1, 9)) + list(range(1, 8))
+    assert_gapless_partition(text, segment_document(text).segments)
+
+
+def test_a_short_document_whose_only_run_is_two_paragraphs_still_segments():
+    # The restart cost must never make a SHORT document unsegmentable: two
+    # paragraphs are two paragraphs, not a run too small to believe.
+    text = "ORDER\n\n1. Leave granted.\n\n2. The appeal is dismissed.\n\n"
+    assert numbers(text) == [1, 2]
 
 
 # --------------------------------------------------------------------------
@@ -191,8 +334,57 @@ def test_a_validated_toc_is_used_and_reported_as_such():
     assert result.why == WHY_TOC
     assert result.degradation is None
     labels = [s.label for s in result.segments if s.label]
-    assert labels == ["Factual Matrix", "Issues For Determination", "Analysis"]
+    assert dict.fromkeys(labels) == dict.fromkeys(
+        ["Factual Matrix", "Issues For Determination", "Analysis"]
+    )
     assert_gapless_partition(text, result.segments)
+
+
+def test_toc_sections_are_subdivided_at_this_document_s_own_paragraph_starts():
+    # M2: the ToC tier decides BOUNDARIES, not chunk size. Its sections are
+    # document-scale spans, so they are cut at the packing tier's own
+    # paragraph starts before they leave this module - every heading is
+    # still a boundary and still a label, and every paragraph inside the
+    # section is a segment the packer can bin.
+    text = _toc_judgment()
+    result = segment_document(text)
+    assert result.tier == TIER_TOC
+    boundaries = {seg.start for seg in result.segments}
+    # the packing tier's own offsets, read from the packing tier - NOT from
+    # segment_document, which on this text returns the ToC tier whose labels
+    # are headings, so paragraph_offsets would hand back heading positions
+    # and the assertion below would pass without testing anything.
+    para = paragraph_offsets(_packing_tier(text))
+    assert len(para) == 5
+    for offset in para:
+        assert offset in boundaries
+    for offset, _letter, _heading in toc_candidates(text):
+        assert offset in boundaries
+
+
+def test_no_tier_may_emit_a_segment_the_packing_tier_would_have_split():
+    # The invariant the subdivision buys, stated directly: whichever tier
+    # wins, its segment set is a REFINEMENT of the packing tier's, so it can
+    # never hand chunks.py a span that packing would have broken up - which
+    # is what "tier precedence is about boundaries, never about the band"
+    # means operationally.
+    long_section = "\n\n".join(para(i, words=200) for i in range(1, 10))
+    text = (
+        "JUDGMENT\n\nA. Factual Matrix\n\n"
+        + long_section
+        + "\n\nB. Issues For Determination\n\n"
+        + "\n\n".join(para(i, words=200) for i in range(10, 14))
+        + "\n\nC. Analysis\n\n"
+        + "\n\n".join(para(i, words=200) for i in range(14, 18))
+        + "\n"
+    )
+    toc = segment_document(text)
+    assert toc.tier == TIER_TOC
+    packing_only = _packing_tier(text)
+    toc_bounds = {seg.start for seg in toc.segments} | {seg.end for seg in toc.segments}
+    for seg in _normalize_segments(text, packing_only):
+        assert seg.start in toc_bounds and seg.end in toc_bounds
+    assert_gapless_partition(text, toc.segments)
 
 
 def test_toc_candidates_are_read_in_document_order():
@@ -324,6 +516,41 @@ def test_a_missing_roles_backend_never_makes_the_whole_document_unusable():
     assert_gapless_partition(text, result.segments)
 
 
+def test_a_reversed_role_span_degrades_this_document_instead_of_ending_the_run():
+    # M3: the "never fatally" contract, at the one place it had a hole. A
+    # backend returning end < start used to reach Segment(), whose plain
+    # ValueError is not a RolesBridgeError - so it travelled out of
+    # segment_document, out of chunk_documents, and ended the whole pass
+    # mid-loop after earlier documents had already been rewritten.
+    text = judgment(3)
+    spawn = _fake_spawn({"spans": [[10, 3, "FAC"]]})
+    result = segment_document(text, roles_backend=BACKEND_SUBPROCESS, roles_spawn=spawn)
+    assert result.tier == TIER_PACKING
+    assert result.degradation["from"] == "roles"
+    assert result.degradation["reason"].startswith("bad_output:")
+    assert_gapless_partition(text, result.segments)
+
+
+def test_a_negative_role_span_start_degrades_the_same_way():
+    text = judgment(3)
+    spawn = _fake_spawn({"spans": [[-5, 20, "FAC"]]})
+    result = segment_document(text, roles_backend=BACKEND_SUBPROCESS, roles_spawn=spawn)
+    assert result.tier == TIER_PACKING
+    assert result.degradation["reason"].startswith("bad_output:")
+
+
+def test_a_role_span_running_past_the_document_is_clipped_not_refused():
+    # The other direction, and deliberately different: a model overshooting
+    # the end of the last span is repairable, so it is repaired (clipped by
+    # _normalize_segments) rather than costing the document its tier.
+    text = judgment(3)
+    spawn = _fake_spawn({"spans": [[0, 10_000, "FAC"]]})
+    result = segment_document(text, roles_backend=BACKEND_SUBPROCESS, roles_spawn=spawn)
+    assert result.tier == TIER_ROLES
+    assert result.segments[-1].end == len(text)
+    assert_gapless_partition(text, result.segments)
+
+
 def test_toc_takes_priority_over_a_configured_and_available_roles_backend():
     # Tier priority is toc, then roles, then packing - a validated ToC never
     # even asks the roles bridge.
@@ -391,6 +618,70 @@ def test_normalize_covers_leading_and_trailing_gaps():
     assert_gapless_partition(text, normalized)
     assert normalized[0] == Segment(0, 3, None)
     assert normalized[-1] == Segment(7, 10, None)
+
+
+def test_normalize_clips_a_span_running_past_the_end_of_the_document():
+    # The untrusted-input half of the clip. Without it the segment's own
+    # `end` names bytes the document does not have, and chunks.py turns that
+    # end into the chunk's native_id AND its content-derived seed_id - an id
+    # for a byte range nothing can ever re-read.
+    text = "0123456789"
+    normalized = _normalize_segments(text, [Segment(0, 10_000, "FAC")])
+    assert_gapless_partition(text, normalized)
+    assert normalized == (Segment(0, 10, "FAC"),)
+
+
+def test_normalize_drops_a_span_that_starts_past_the_end_of_the_document():
+    text = "0123456789"
+    normalized = _normalize_segments(text, [Segment(0, 4, "a"), Segment(9000, 9500, "FAC")])
+    assert_gapless_partition(text, normalized)
+    assert [s.label for s in normalized] == ["a", None]
+    assert normalized[-1].end == len(text)
+
+
+# --------------------------------------------------------------------------
+# Subdivision: a tier decides boundaries, never the token band.
+# --------------------------------------------------------------------------
+
+
+def test_subdivide_cuts_only_strictly_inside_a_segment_and_keeps_the_label():
+    segments = (Segment(0, 10, "A"), Segment(10, 20, "B"))
+    out = _subdivide(segments, [0, 4, 7, 10, 15, 20])
+    assert [(s.start, s.end, s.label) for s in out] == [
+        (0, 4, "A"), (4, 7, "A"), (7, 10, "A"),
+        (10, 15, "B"), (15, 20, "B"),
+    ]
+
+
+def test_subdivide_with_no_offsets_inside_returns_the_segments_unchanged():
+    segments = (Segment(0, 10, "A"), Segment(10, 20, "B"))
+    assert _subdivide(segments, [0, 10, 20]) == segments
+    assert _subdivide(segments, []) == segments
+
+
+def test_subdivide_conserves_the_span_it_was_given():
+    segments = (Segment(0, 10, "A"), Segment(10, 25, None))
+    out = _subdivide(segments, [3, 3, 11, 24])
+    assert out[0].start == 0 and out[-1].end == 25
+    cursor = 0
+    for seg in out:
+        assert seg.start == cursor
+        cursor = seg.end
+
+
+def test_roles_spans_are_subdivided_at_paragraph_starts_too():
+    # Not a ToC-only rule: a rhetorical role covers many paragraphs, so the
+    # roles tier gets the same treatment - it says where a role begins, the
+    # packing tier's paragraphs say where a chunk may.
+    text = judgment(6, words=60)
+    spawn = _fake_spawn({"spans": [[0, len(text) // 2, "FAC"], [len(text) // 2, len(text), "ANALYSIS"]]})
+    result = segment_document(text, roles_backend=BACKEND_SUBPROCESS, roles_spawn=spawn)
+    assert result.tier == TIER_ROLES
+    assert_gapless_partition(text, result.segments)
+    boundaries = {seg.start for seg in result.segments}
+    for offset in paragraph_offsets(_packing_tier(text)):
+        assert offset in boundaries
+    assert set(s.label for s in result.segments) <= {"FAC", "ANALYSIS", None}
 
 
 # --------------------------------------------------------------------------

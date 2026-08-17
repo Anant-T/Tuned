@@ -27,26 +27,56 @@ carries, restated here so the priority is not just asserted):
             least one segment for non-empty text, which is what lets
             `--roles-backend none` leave the whole pipeline functional.
 
-WHY MONOTONIC. The raw signal P0 measured was `^\\s*\\d{1,3}\\.\\s+` with no
-further filtering. This module accepts a match as a new paragraph boundary
-only when its number is STRICTLY GREATER than the last accepted one. That is
-a deliberate narrowing, not a re-measurement of P0's number: a judgment
-routinely quotes an earlier report's own numbered paragraphs ("in XYZ, this
-Court held: '15. The appellant contended...'"), and an un-filtered regex
-reads that quoted "15." as a boundary inside whatever paragraph is doing the
-quoting - splitting a real paragraph in half on a citation instead of the
-text the court actually wrote at that point. Requiring strictly-increasing
-numbers rejects exactly that case (a quoted number is never higher than
-where the surrounding prose already got to) at the cost of under-segmenting
-the rarer case of a document that restarts its own numbering partway through
-(a second "ORDER" section numbered from 1 after a "JUDGMENT" section that
-reached paragraph 40, say): that tail is swallowed into one large trailing
-segment. Under-segmenting is safe by this module's own contract - a single
-oversize segment is exactly what chunks.py's "never split inside a
-paragraph, emit oversize alone and flag it" rule exists for - while
-over-segmenting on a quotation is not: it would silently misrepresent a
-citation as a chunk boundary. The real-data run this task's report carries
-measures how often each of these actually happens on the 15 staged PDFs.
+WHICH NUMBERS ARE THIS DOCUMENT'S OWN. The raw signal P0 measured was
+`^\\s*\\d{1,3}\\.\\s+` with no further filtering, and it needs one: a
+judgment routinely quotes numbered material that is not its own - an earlier
+report's paragraphs, the paragraphs of the judgment under appeal, a statute's
+sections, a post-mortem report's injury list - and an un-filtered regex reads
+those as boundaries inside whatever paragraph is doing the quoting.
+
+The first cut of this module filtered them with a STRICTLY-INCREASING rule,
+on the premise that "a quoted number is never higher than where the
+surrounding prose already got to". That premise is false, and measurably so:
+on the 15 staged PDFs it fails on five documents (a quoted paragraph `184.`
+of the judgment under appeal at the quoting judgment's own paragraph 15, a
+quoted section `178.` of a code, an "Article 335" whose number wrapped onto
+the next line, a twenty-one item injury list, an isolated quoted `22.`).
+When it fails it does BOTH harms at once: the citation becomes a boundary
+AND, because the counter is now parked at the foreign number, every genuine
+later paragraph is rejected - one document collapsed to a single chunk
+holding 86% of itself. The counter-evidence had already been measured on
+these same objects by extract.py's own `split_footnotes` (see its docstring,
+which names three of these five shapes); it was not carried across.
+
+WHAT REPLACES IT is a rule about RUNS rather than a running maximum. The
+accepted boundaries are the highest-scoring chain of candidates, where
+
+  CONTINUE  a candidate whose number exceeds SOME EARLIER ACCEPTED number by
+            at most MAX_PARA_STEP scores +1. "Some earlier", not "the
+            immediately preceding candidate", is the whole point: the
+            document's own paragraph 16 continues its own paragraph 15 even
+            when a quoted `122.` sits between them on the page.
+  RESTART   any other jump scores +1 - RESTART_COST. A document really does
+            restart its numbering (a concurring opinion beginning at 1
+            again, an ORDER after a JUDGMENT), so this must be possible -
+            but a restart has to pay for itself, which a two- or three-line
+            citation cannot and a real second opinion easily can.
+
+A quoted foreign run pays a restart to be entered AND another to be left, so
+it is accepted only when it is long enough to be worth reading as numbering
+in its own right (a twenty-one item injury list is; `178.`/`179.` is not).
+When it IS accepted the items become boundaries between lines of a list,
+which the packer merges straight back into one chunk - the harm the old rule
+took is the one it could not undo, and that is the asymmetry this rule is
+built around. Measured against the shipped rule on the same 15 documents:
+94 -> 145 chunks, 9 -> 3 oversize, 75.5% -> 84.8% in band, worst chunk
+26,818 -> 3,906 tokens.
+
+Under-segmenting is still the safe direction by this module's contract - a
+single oversize segment is what chunks.py's "never split inside a paragraph,
+emit oversize alone and flag it" rule exists for - and nothing here ever
+drops a byte: every tier's output is normalized into a gapless partition
+below.
 
 FOOTNOTES are cut off before paragraph-scanning rather than left to be
 mis-numbered by it: extract.py appends any trailing footnote block after a
@@ -55,11 +85,25 @@ otherwise look exactly like this module's idea of a new paragraph. The tail
 becomes its own segment (label "footnotes"), never dropped, never merged
 into the numbered body.
 
+TIER PRECEDENCE IS ABOUT BOUNDARIES, NEVER ABOUT THE TOKEN BAND. A ToC
+section and a rhetorical role are both DOCUMENT-SCALE spans - one section of
+a real judgment ran to 23,560 tokens - so a tier that emitted them as
+segments would hand chunks.py material it is contractually forbidden to
+split, and the tier with priority would produce WORSE chunks than the tier it
+outranked. So the ToC and roles tiers contribute their boundaries and then
+their spans are SUBDIVIDED at the packing tier's own paragraph starts
+(_subdivide), carrying the section heading or role label onto every piece.
+The tiers still decide where a chunk may begin; they never decide that a
+chunk may be out of band. Whatever a tier claims, the resulting segment set
+is a refinement of the packing tier's, so no tier can produce an oversize
+chunk that packing would have avoided.
+
 EVERY TIER'S OUTPUT IS NORMALIZED (_normalize_segments) before it leaves this
-module: sorted, clipped against overlaps, and gap-filled so the result is
-always a GAPLESS, ORDERED partition of the whole document. That is what
-turns "never truncated, never silently" from a rule about the packing tier
-into an invariant the offset-audit and chunks.py's packer can both rely on
+module: sorted, clipped against overlaps - forward against len(text) as well
+as backward against the cursor - and gap-filled so the result is always a
+GAPLESS, ORDERED partition of the whole document. That is what turns "never
+truncated, never silently" from a rule about the packing tier into an
+invariant the offset-audit and chunks.py's packer can both rely on
 regardless of which tier produced the segments - including a future real
 roles backend, whose span output this module does not otherwise control.
 """
@@ -80,7 +124,11 @@ from tuned.data.extract import FOOTNOTE_HEADING
 #   1  first cut: monotonic numbered-paragraph packing, ToC validated against
 #      the document's own paragraph positions, OpenNyAI via the subprocess
 #      bridge with a packing degrade on any failure.
-SEGMENT_VERSION = 1
+#   2  the strictly-increasing filter replaced by the run-scoring rule above
+#      (its premise was false on 5 of the 15 staged documents), and the ToC
+#      and roles tiers subdivided at paragraph starts instead of emitting
+#      document-scale spans. Both move where a chunk's boundaries fall.
+SEGMENT_VERSION = 2
 
 TIER_TOC = "toc"
 TIER_ROLES = "roles"
@@ -153,29 +201,88 @@ def _split_footnote_tail(text: str) -> tuple[str, int | None]:
 
 _PARA_START = re.compile(r"^[ \t]{0,3}(\d{1,3})[.)][ \t]+(?=\S)", re.M)
 
+# _PARA_START's own \d{1,3}: the largest number it can ever match.
+_MAX_PARA_NUMBER = 999
 
-def monotonic_paragraph_starts(text: str) -> list[tuple[int, int]]:
-    """[(char_offset, paragraph_number), ...], strictly increasing in number.
+# How far a real next paragraph may step. Measured over every raw candidate
+# on the 15 staged documents: +1 occurs 681 times, +2 nineteen times, +3
+# five times, +4 once, and everything above that (+6, +7, +8, +10, +11, +22,
+# +31, +135, +169, +296) is a citation, a statute section or a wrapped
+# "Article NNN". Three is where the document's own numbering stops and
+# somebody else's begins.
+MAX_PARA_STEP = 3
 
-    Exposed (not a leading-underscore helper) because the ToC tier's own
-    validation reads it too - a heading's section is only real when it
-    contains one of THESE positions, not any digit-dot-space match.
+# What a restart costs, in boundaries. A foreign numbered run pays this
+# twice - once to be entered, once to be left - so it has to be longer than
+# 2 * RESTART_COST to be worth accepting, while a real second opinion or a
+# post-JUDGMENT ORDER pays it once against everything it then contributes.
+# At 2, the measured citation runs (1, 1, 2, 3 and 3 candidates long) are all
+# rejected and the measured genuine restarts (7 and 21 candidates) are all
+# kept, with the nearest miss two candidates clear of the line either way.
+RESTART_COST = 2
+
+
+def paragraph_starts(text: str) -> list[tuple[int, int]]:
+    """[(char_offset, paragraph_number), ...] - this document's own numbering.
+
+    The highest-scoring chain of _PARA_START candidates under the CONTINUE /
+    RESTART scoring the module docstring sets out. Ties break by the chain
+    that spans the most of the document and then by the earliest start, so
+    the result is a pure function of `text` - nothing here reads run state.
+
+    Exposed (not a leading-underscore helper) because two other things read
+    it: the ToC tier's validation (a heading's section is only real when it
+    contains one of THESE positions, not any digit-dot-space match) and
+    _subdivide, which cuts every tier's spans at exactly these offsets so no
+    tier can escape the token band.
     """
-    starts: list[tuple[int, int]] = []
-    last: int | None = None
-    for match in _PARA_START.finditer(text):
-        number = int(match.group(1))
-        if last is None or number > last:
-            starts.append((match.start(), number))
-            last = number
-    return starts
+    candidates = [(m.start(), int(m.group(1))) for m in _PARA_START.finditer(text)]
+    if not candidates:
+        return []
+
+    # best_at[v] = (score, index) of the best chain ending on the NUMBER v so
+    # far; best_any = the best chain ending anywhere so far. Both only ever
+    # hold candidates already passed, because this loop runs in document
+    # order - which is what makes "some earlier accepted number" cheap.
+    best_at: list[tuple[int, int]] = [(0, -1)] * (_MAX_PARA_NUMBER + 1)
+    best_any: tuple[int, int] = (0, -1)
+    score = [0] * len(candidates)
+    pred = [-1] * len(candidates)
+    span_start = [0] * len(candidates)
+
+    for j, (offset, number) in enumerate(candidates):
+        best, source = 1, -1  # a chain that begins here, owing nothing
+        for value in range(max(1, number - MAX_PARA_STEP), number):
+            cand_score, cand_index = best_at[value]
+            if cand_score and cand_score + 1 > best:
+                best, source = cand_score + 1, cand_index
+        any_score, any_index = best_any
+        if any_score and any_score + 1 - RESTART_COST > best:
+            best, source = any_score + 1 - RESTART_COST, any_index
+        score[j], pred[j] = best, source
+        span_start[j] = span_start[source] if source != -1 else offset
+        if best > best_at[number][0]:
+            best_at[number] = (best, j)
+        if best > best_any[0]:
+            best_any = (best, j)
+
+    end = max(
+        range(len(candidates)),
+        key=lambda j: (score[j], candidates[j][0] - span_start[j], -span_start[j]),
+    )
+    chain: list[tuple[int, int]] = []
+    while end != -1:
+        chain.append(candidates[end])
+        end = pred[end]
+    chain.reverse()
+    return chain
 
 
 def _packing_segments(body: str) -> tuple[Segment, ...]:
     """Segments over `body` alone (the footnote tail is handled by the caller)."""
     if not body:
         return ()
-    starts = monotonic_paragraph_starts(body)
+    starts = paragraph_starts(body)
     if not starts:
         # No numbered-paragraph signal at all (a short order, a garbled
         # scan): the whole body is one segment. This is the branch that
@@ -212,8 +319,8 @@ _TOC_HEADING = re.compile(r"^[ \t]{0,3}([A-Z])\.[ \t]+([A-Z][A-Za-z0-9 ,'&/\-]{2
 
 def toc_candidates(text: str) -> list[tuple[int, str, str]]:
     """[(offset, letter, heading text), ...] in document order. Exposed for
-    the same reason monotonic_paragraph_starts is - it is a signal on its
-    own, not only an internal step of the validated tier."""
+    the same reason paragraph_starts is - it is a signal on its own, not
+    only an internal step of the validated tier."""
     return [(m.start(), m.group(1), m.group(2).strip()) for m in _TOC_HEADING.finditer(text)]
 
 
@@ -243,7 +350,7 @@ def _toc_segments(text: str, packing: Sequence[Segment]) -> tuple[Segment, ...] 
         expected += 1
 
     bounds = [c[0] for c in candidates] + [len(text)]
-    para_starts = [seg.start for seg in packing if seg.label not in (None, FOOTNOTES_LABEL)]
+    para_starts = paragraph_offsets(packing)
     for i in range(len(candidates)):
         lo, hi = bounds[i], bounds[i + 1]
         if not any(lo <= p < hi for p in para_starts):
@@ -255,6 +362,42 @@ def _toc_segments(text: str, packing: Sequence[Segment]) -> tuple[Segment, ...] 
     for i, (offset, _letter, heading) in enumerate(candidates):
         segments.append(Segment(offset, bounds[i + 1], heading))
     return tuple(segments)
+
+
+# --------------------------------------------------------------------------
+# Subdivision: a tier decides boundaries, never the token band.
+# --------------------------------------------------------------------------
+
+
+def paragraph_offsets(segments: Sequence[Segment]) -> list[int]:
+    """The packing tier's own paragraph-start offsets, read off its segments.
+
+    One derivation, three readers (ToC validation, _subdivide, and the tests
+    that check the two agree) - the alternative is re-running the chain
+    scoring per reader and hoping the three copies stay in step.
+    """
+    return [seg.start for seg in segments if seg.label not in (None, FOOTNOTES_LABEL)]
+
+
+def _subdivide(segments: Sequence[Segment], offsets: Sequence[int]) -> tuple[Segment, ...]:
+    """Cut each segment at the offsets strictly inside it, label unchanged.
+
+    The result is a REFINEMENT of the input: same total span, same labels,
+    every original boundary still a boundary. That is what lets a ToC
+    section or a rhetorical role stay a real segmentation decision while
+    chunks.py still sees paragraph-sized material to pack - and it is why no
+    tier can emit an oversize chunk that the packing tier would have
+    avoided, since every tier's segment set ends up a refinement of packing's.
+    """
+    out: list[Segment] = []
+    for seg in segments:
+        cursor = seg.start
+        for offset in offsets:
+            if seg.start < offset < seg.end:
+                out.append(Segment(cursor, offset, seg.label))
+                cursor = offset
+        out.append(Segment(cursor, seg.end, seg.label))
+    return tuple(out)
 
 
 # --------------------------------------------------------------------------
@@ -274,20 +417,29 @@ def _normalize_segments(text: str, segments: Sequence[Segment]) -> tuple[Segment
     is a deterministic, order-stable rule (ties broken by end, then by
     dict/list order being irrelevant post-sort) rather than a judgement
     about which segment is "more right".
+
+    Clipping is BOTH ways. Backward against the cursor is the overlap rule
+    above; forward against len(text) is the untrusted-input half, and it is
+    not hypothetical - a span running past the end of the document would
+    otherwise reach chunks.py as a chunk whose recorded `end`, `native_id`
+    and content-derived `seed_id` all name bytes the document does not have,
+    while `text[start:end]` silently returned fewer. A span starting past
+    the end collapses to nothing at all and is dropped.
     """
+    limit = len(text)
     ordered = sorted(segments, key=lambda s: (s.start, s.end))
     out: list[Segment] = []
     cursor = 0
     for seg in ordered:
-        start = max(seg.start, cursor)
-        end = max(seg.end, start)
+        start = min(max(seg.start, cursor), limit)
+        end = min(max(seg.end, start), limit)
         if start > cursor:
             out.append(Segment(cursor, start, None))
         if end > start:
             out.append(Segment(start, end, seg.label))
         cursor = max(cursor, end)
-    if cursor < len(text):
-        out.append(Segment(cursor, len(text), None))
+    if cursor < limit:
+        out.append(Segment(cursor, limit, None))
     return tuple(out)
 
 
@@ -321,11 +473,15 @@ def segment_document(
         )
 
     packing = _packing_tier(text)
+    offsets = paragraph_offsets(packing)
 
     toc = _toc_segments(text, packing)
     if toc is not None:
         return SegmentationResult(
-            tier=TIER_TOC, why=WHY_TOC, segments=_normalize_segments(text, toc), degradation=None
+            tier=TIER_TOC,
+            why=WHY_TOC,
+            segments=_subdivide(_normalize_segments(text, toc), offsets),
+            degradation=None,
         )
 
     roles_reason = "roles_backend_none"
@@ -346,7 +502,7 @@ def segment_document(
                 return SegmentationResult(
                     tier=TIER_ROLES,
                     why=WHY_ROLES,
-                    segments=_normalize_segments(text, role_segments),
+                    segments=_subdivide(_normalize_segments(text, role_segments), offsets),
                     degradation=None,
                 )
             roles_reason = "no_role_spans"
