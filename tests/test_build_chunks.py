@@ -9,9 +9,11 @@ import hashlib
 import json
 import os
 import random
+import re
 from pathlib import Path
 
 import pytest
+from pipeline_fakes import temp_config
 
 from tuned.data.acquire import SC_SOURCE_ID
 from tuned.data.chunks import (
@@ -36,7 +38,6 @@ from tuned.data.segment import (
     Segment,
     segment_document,
 )
-from pipeline_fakes import temp_config
 from tuned.data.config import load_build_config
 from tuned.data.paths import build_paths
 from tuned.data.store import Store
@@ -1040,6 +1041,40 @@ def test_the_cli_limit_flag_reaches_the_driver(tmp_path, capsys, monkeypatch):
 
 def test_cli_hard_exits_after_success():
     assert "os._exit(" in CHUNKS_SRC.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "module, name, value",
+    [
+        ("segment", "SEGMENT_VERSION", SEGMENT_VERSION),
+        ("chunks", "CHUNK_VERSION", CHUNK_VERSION),
+        ("roles_infer", "ROLES_VERSION", ROLES_VERSION),
+    ],
+)
+def test_every_rule_version_has_a_ledger_line_for_the_value_it_currently_holds(
+    module, name, value
+):
+    # These three constants are compared, never read for their value, so
+    # every assertion about them elsewhere is `meta[x] == THE_CONSTANT` and
+    # stays true however far the constant moves - measured: bumping
+    # SEGMENT_VERSION to 999 left the whole suite green. What the convention
+    # actually asks for is that a bump ARRIVES WITH ITS REASON, in the
+    # numbered ledger comment above the assignment. That is checkable, and
+    # this is where it is checked.
+    source = (CHUNKS_SRC.parent / f"{module}.py").read_text(encoding="utf-8")
+    lines = source.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith(f"{name} = "))
+    block, i = [], at - 1
+    while i >= 0 and lines[i].startswith("#"):
+        block.append(lines[i])
+        i -= 1
+    assert block, f"{name} carries no ledger comment at all"
+    entries = [re.match(r"#\s{2,}(\d+)\s{2,}\S", line) for line in block]
+    numbered = {int(m.group(1)) for m in entries if m}
+    assert value in numbered, (
+        f"{module}.{name} is {value} but its ledger names only {sorted(numbered)} - "
+        "a version bump has to arrive with the reason it moved"
+    )
 
 
 def test_all_sql_stays_in_store_py():

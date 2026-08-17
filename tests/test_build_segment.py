@@ -13,6 +13,7 @@ from tuned.data.segment import (
     FOOTNOTES_LABEL,
     MAX_PARA_STEP,
     MIN_TOC_HEADINGS,
+    RESTART_COST,
     TIER_PACKING,
     TIER_ROLES,
     TIER_TOC,
@@ -116,8 +117,8 @@ def test_a_quoted_lower_paragraph_number_is_rejected_not_a_new_boundary():
         "JUDGMENT\n\nRAO, J.\n\n"
         "1. This appeal raises a narrow question.\n\n"
         "2. The parties were heard at some length on the second day.\n\n"
-        "3. In an earlier case this Court observed as follows:\n\n"
-        "1. The onus lies on the prosecution throughout the trial.\n\n"
+        "3. The report the appellant leans upon opens in these words:\n\n"
+        "1. The onus rests where it always has, on the prosecution.\n\n"
         "4. We are not persuaded by that argument here.\n\n"
     )
     assert numbers(text) == [1, 2, 3, 4]
@@ -139,15 +140,61 @@ def test_a_quoted_higher_paragraph_number_is_rejected_and_the_rest_survives():
         "2. The parties were heard at some length on the second day.\n\n"
         "3. The High Court reasoned as follows:\n\n"
         "47. The society having failed to produce its register, the claim fails.\n\n"
-        "4. We are unable to agree with that reasoning.\n\n"
-        "5. The evidence points the other way on this record.\n\n"
-        "6. The appeal is allowed and the conviction is set aside.\n\n"
+        "4. That reasoning does not survive scrutiny on this record.\n\n"
+        "5. The material points the other way on every disputed head.\n\n"
+        "6. The challenge is allowed and the order below is set aside.\n\n"
     )
     assert numbers(text) == [1, 2, 3, 4, 5, 6]
     result = segment_document(text)
     labels = [s.label for s in result.segments if s.label not in (None, FOOTNOTES_LABEL)]
     assert labels == ["1", "2", "3", "4", "5", "6"]
     assert_gapless_partition(text, result.segments)
+
+
+def test_three_consecutive_quoted_paragraphs_are_still_a_foreign_run():
+    # The `2025_10` shape at full size: the quoted block is not one stray
+    # number but THREE consecutive ones (122, 123, 124 on the real
+    # document), which reads as numbering in its own right until you count
+    # what entering and leaving it costs. Written with literals rather than
+    # against RESTART_COST, so the constant cannot satisfy the test by
+    # moving.
+    text = (
+        "JUDGMENT\n\nRAO, J.\n\n"
+        "1. Notice was issued and the matter came to be admitted.\n\n"
+        "2. The decree under challenge dealt with the claim under three heads:\n\n"
+        "122. The first head was refused for want of any proof at all.\n\n"
+        "123. The second head was allowed to the extent of one third.\n\n"
+        "124. Interest was declined on both of those heads.\n\n"
+        "3. We take up the correctness of that division first.\n\n"
+        "4. The challenge succeeds on the second head alone.\n\n"
+    )
+    assert numbers(text) == [1, 2, 3, 4]
+
+
+def test_a_paragraph_number_that_skips_two_is_still_this_document_s_own():
+    # The other edge, in literals: real numbering skips (a mis-scanned
+    # marker, a paragraph that never got one), and the measured distribution
+    # over the staged corpus puts +2 nineteen times and +3 five times before
+    # anything above that turns out to be a citation. A rule tight enough to
+    # reject +3 would drop real paragraphs.
+    text = (
+        "JUDGMENT\n\n1. First.\n\n2. Second.\n\n4. Fourth, three never got a marker.\n\n"
+        "7. Seventh, after two more the scan lost.\n\n8. Eighth.\n\n"
+    )
+    assert numbers(text) == [1, 2, 4, 7, 8]
+
+
+def test_the_two_measured_constants_hold_their_measured_values():
+    # Both are set from a measurement, not chosen, and every OTHER test here
+    # reads them from the module - which makes those tests tautological
+    # under a mutation that moves them. This is the one place their values
+    # are pinned, so moving either forces a re-measurement rather than a
+    # green suite. MAX_PARA_STEP: raw-candidate increments over the 15
+    # staged documents are +1 x681, +2 x19, +3 x5, +4 x1, then citations.
+    # RESTART_COST: the measured citation runs are 1, 1, 2, 3 and 3
+    # candidates long and the measured genuine restarts are 7 and 21, and a
+    # run must beat 2 * RESTART_COST to be accepted.
+    assert (MAX_PARA_STEP, RESTART_COST) == (3, 2)
 
 
 def test_a_quoted_statute_section_number_does_not_become_a_boundary():
@@ -157,16 +204,16 @@ def test_a_quoted_statute_section_number_does_not_become_a_boundary():
     # numbering.
     text = (
         "JUDGMENT\n\nRAO, J.\n\n"
-        "1. Leave granted in both the appeals.\n\n"
-        "2. The short question is one of jurisdiction.\n\n"
-        "3. The relevant provisions are set out below.\n\n"
-        "4. The material sections read thus:\n\n"
-        "178. Sittings of the tribunal.- (a) When it is uncertain in which of\n"
-        "several local areas an offence was committed.\n\n"
-        "179. Powers of the appellate authority.- An offence may be tried by\n"
-        "the court within whose local jurisdiction it was committed.\n\n"
-        "5. Applying those provisions to this record, the objection fails.\n\n"
-        "6. The appeals are dismissed with no order as to costs.\n\n"
+        "1. Notice was issued and both matters were admitted.\n\n"
+        "2. The narrow point is which forum could entertain the claim.\n\n"
+        "3. The material provisions are extracted next.\n\n"
+        "4. They read thus:\n\n"
+        "178. Constitution of the appellate tribunal.- The tribunal shall sit\n"
+        "in benches of two members nominated by its chairperson.\n\n"
+        "179. Sittings and quorum.- A bench so constituted may take up any\n"
+        "reference made to it under the preceding provision.\n\n"
+        "5. Read together, those provisions answer the objection.\n\n"
+        "6. Both matters are disposed of without any order on costs.\n\n"
     )
     assert numbers(text) == [1, 2, 3, 4, 5, 6]
     assert_gapless_partition(text, segment_document(text).segments)
@@ -179,12 +226,12 @@ def test_a_number_that_is_the_tail_of_a_wrapped_citation_is_not_a_boundary():
     # corpus before segment.py was written.
     text = (
         "JUDGMENT\n\nRAO, J.\n\n"
-        "1. Leave granted.\n\n"
+        "1. Notice was issued and the matter came to be admitted.\n\n"
         "2. The appellant relies on the guarantee contained in Article\n"
         "335. The provision speaks of the claims of all sections in the\n"
         "making of appointments to services and posts.\n\n"
         "3. That guarantee does not carry the appellant as far as claimed.\n\n"
-        "4. The appeal is dismissed.\n\n"
+        "4. The matter is disposed of.\n\n"
     )
     assert numbers(text) == [1, 2, 3, 4]
     assert_gapless_partition(text, segment_document(text).segments)
@@ -202,13 +249,13 @@ def test_a_long_quoted_numbered_list_does_not_swallow_the_paragraphs_after_it():
     listed = "".join(f"{i}. Incised wound of the {i}th described dimension.\n\n" for i in range(1, 22))
     text = (
         "JUDGMENT\n\nRAO, J.\n\n"
-        "4. The trial court accepted the prosecution case in full.\n\n"
-        "5. The High Court affirmed the conviction on the same reasoning.\n\n"
+        "4. The court of first instance acted on the case as presented.\n\n"
+        "5. That view was carried forward on the same footing in appeal.\n\n"
         "6. The post-mortem report records the following injuries:\n\n"
         + listed
         + "7. The medical evidence is therefore consistent with the charge.\n\n"
-        "8. We see no reason to interfere with the concurrent findings.\n\n"
-        "9. The appeal is dismissed.\n\n"
+        "8. Those concurrent findings therefore stand undisturbed.\n\n"
+        "9. The matter is disposed of.\n\n"
     )
     found = numbers(text)
     # the judgment's own tail survives - the defect this test exists for
@@ -264,10 +311,35 @@ def test_a_second_opinion_restarting_its_numbering_is_picked_up_not_swallowed():
     assert_gapless_partition(text, segment_document(text).segments)
 
 
+def test_the_earliest_position_of_a_repeated_number_anchors_the_chain():
+    # Determinism has to name WHICH occurrence wins, not only that one
+    # does: a page-header artifact can repeat a paragraph number hundreds of
+    # characters away, and the chain that continues from the LATER one moves
+    # every boundary after it. Earliest-wins, asserted on offsets because
+    # the numbers are identical either way.
+    text = "JUDGMENT\n\n1. First.\n\n2. Second.\n\n2. A repeat of the marker.\n\n3. Third.\n\n"
+    offsets = [offset for offset, _n in paragraph_starts(text)]
+    assert offsets == [text.index("1. "), text.index("2. "), text.index("3. ")]
+
+
+def test_a_deeply_indented_number_is_not_a_paragraph_start():
+    # _PARA_START allows up to three leading spaces because that is what a
+    # wrapped or slightly-inset paragraph carries; a block quotation is
+    # indented further, and its numbering is not this document's.
+    text = (
+        "JUDGMENT\n\n1. First.\n\n2. Second.\n\n"
+        "        3. Deep inside an indented block quotation.\n\n"
+        "3. The real third paragraph.\n\n"
+    )
+    offsets = [offset for offset, _n in paragraph_starts(text)]
+    assert len(offsets) == 3
+    assert text[offsets[-1] : offsets[-1] + 30].startswith("3. The real third")
+
+
 def test_a_short_document_whose_only_run_is_two_paragraphs_still_segments():
     # The restart cost must never make a SHORT document unsegmentable: two
     # paragraphs are two paragraphs, not a run too small to believe.
-    text = "ORDER\n\n1. Leave granted.\n\n2. The appeal is dismissed.\n\n"
+    text = "ORDER\n\n1. Notice was issued.\n\n2. The matter is disposed of.\n\n"
     assert numbers(text) == [1, 2]
 
 
@@ -427,6 +499,22 @@ def test_a_hollow_section_with_no_paragraph_in_it_rejects_the_whole_toc():
     # to: the hollow B section must be why, not some other candidate defect.
     assert _toc_segments(text, packing_segments.segments) is None
     assert packing_segments.tier == TIER_PACKING
+
+
+def test_a_heading_needs_words_not_just_a_letter_and_a_capital():
+    # The length floor in _TOC_HEADING is what separates a real heading from
+    # extract.py's own margin letter, and it is the only thing that does: at
+    # zero it matches "A. B", which is the shape of a garbled OCR margin
+    # column, and three of those in a row would claim the whole document for
+    # the ToC tier.
+    text = (
+        "JUDGMENT\n\n"
+        "A. B\n\n1. Something happened at trial.\n\n"
+        "B. C\n\n2. The High Court affirmed it.\n\n"
+        "C. D\n\n3. We take a different view.\n\n"
+    )
+    assert toc_candidates(text) == []
+    assert segment_document(text).tier == TIER_PACKING
 
 
 def test_repeated_letter_is_rejected():
