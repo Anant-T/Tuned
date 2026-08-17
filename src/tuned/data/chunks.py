@@ -435,6 +435,18 @@ def chunk_seed_rows(
     once a parent is replaced its id no longer appears in `seed` at all, so
     a second run naturally has nothing left to reconsider for that document
     unless SEGMENT_VERSION/CHUNK_VERSION moved or --force was passed.
+
+    THE ONE CASE THAT DOES REACH A "skip" HERE: seeds.py's own upsert is
+    content-derived and idempotent, so a LATER normalization run over the
+    same raw HF row can legitimately recreate a whole-text row under the
+    SAME seed_id this driver already chunked and deleted once. That
+    resurrected parent is still deleted below even on the skip path - only
+    the CHUNKING work is skipped (nothing about the rules or the bytes
+    moved, so redoing it would waste work and, being content-derived,
+    reproduce the identical chunk ids) - because leaving the resurrected
+    parent in `seed` would let the wave planner see both the whole judgment
+    and its own already-existing chunks, which is exactly the prompt-budget
+    duplication chunking exists to prevent.
     """
     manifest_index = store.chunk_manifest_index(source_id)
     stats = _new_stats()
@@ -457,6 +469,7 @@ def chunk_seed_rows(
             and prior.get("segment_version") == SEGMENT_VERSION
             and prior.get("chunk_version") == CHUNK_VERSION
         ):
+            store.delete_seeds([parent_id])
             stats["skipped"] += 1
             continue
 

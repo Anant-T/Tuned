@@ -522,6 +522,34 @@ def test_chunk_seed_rows_force_rechunks_and_replaces(seed_store):
     assert {r["seed_id"] for r in seed_store.seeds_by_source(INJUDGEMENTS_SOURCE_ID)} == old_ids
 
 
+def test_a_resurrected_whole_row_at_the_current_rules_is_skipped_but_still_deleted(seed_store):
+    # The one scenario that DOES reach the "prior manifest matches current
+    # rules" skip branch inside chunk_seed_rows: seeds.py's own upsert is
+    # content-derived and idempotent, so a later normalization run over the
+    # same raw HF row can legitimately recreate a whole-text seed under the
+    # SAME seed_id this driver already chunked and deleted once. The
+    # CHUNKING work is skipped (nothing moved, and it would reproduce the
+    # identical ids anyway) - but the resurrected parent row must not be
+    # left sitting next to its own already-existing chunks, which would let
+    # the wave planner see both the whole judgment and its chunks at once.
+    text = numbered_paragraphs([250] * 6)
+    _whole_seed(seed_store, "whole1", text)
+    chunk_seed_rows(seed_store, tokenizer=FakeTokenizer())
+    manifest_before = seed_store.chunk_manifest(INJUDGEMENTS_SOURCE_ID, "whole1")
+    ids_before = set(json.loads(manifest_before["seed_ids_json"]))
+
+    _whole_seed(seed_store, "whole1", text)  # seeds.py re-normalizing the same raw row
+    assert seed_store.get_seed("whole1") is not None  # really resurrected
+    stats = chunk_seed_rows(seed_store, tokenizer=FakeTokenizer())
+    assert stats["considered"] == 1
+    assert stats["chunked"] == 0
+    assert stats["skipped"] == 1
+    assert seed_store.get_seed("whole1") is None  # resurrected parent removed again
+    manifest_after = seed_store.chunk_manifest(INJUDGEMENTS_SOURCE_ID, "whole1")
+    assert set(json.loads(manifest_after["seed_ids_json"])) == ids_before
+    assert {r["seed_id"] for r in seed_store.seeds_by_source(INJUDGEMENTS_SOURCE_ID)} == ids_before
+
+
 def test_predex_and_tathyanyaya_rows_are_never_touched_by_the_seed_driver(seed_store):
     # Only INJUDGEMENTS_SOURCE_ID rows are whole-text-unchunked per seeds.py's
     # own docstring; this driver must not reach into another source's rows
