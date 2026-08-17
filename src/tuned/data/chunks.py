@@ -124,12 +124,12 @@ def pack_chunks(
     bin-packing that may never split a segment cannot also guarantee every
     bin clears a minimum, and a document that runs out of segments leaves
     its last chunk however large the remaining material is. Measured on the
-    15 staged documents it is missed 30 times in 145 chunks, and 15 of those
-    are INTERIOR chunks rather than trailing ones - a chunk landing under
-    the minimum next to an oversize segment it could not absorb. Both counts
-    are reported by the drivers below (`under_min_chunks`,
-    `token_histogram`), because the brief's band-adherence criterion is not
-    checkable from a run that only counts chunks written.
+    15 staged documents it is missed 19 times in 145 chunks, and 11 of those
+    19 are INTERIOR chunks rather than trailing ones - a chunk that ran into
+    an oversize segment it could not absorb and was flushed early. Both
+    counts are reported by the drivers below (`under_min_chunks`,
+    `in_band_chunks`, `token_histogram`), because the brief's band-adherence
+    criterion is not checkable from a run that only counts chunks written.
 
     Greedy, not globally optimal: segments are added to the current chunk in
     order until the NEXT one would overflow max_tokens, at which point the
