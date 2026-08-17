@@ -151,10 +151,18 @@ CREATE TABLE IF NOT EXISTS chunk_manifest (
   tier TEXT, why TEXT, chunk_count INTEGER NOT NULL DEFAULT 0,
   seed_ids_json TEXT,
   sha256 TEXT, extract_version INTEGER,
-  segment_version INTEGER, chunk_version INTEGER,
+  segment_version INTEGER, chunk_version INTEGER, roles_version INTEGER,
   meta_json TEXT, chunked_at TEXT,
   PRIMARY KEY (source_id, object_key));
 """
+
+# Columns added to an existing table after its first shipped shape. CREATE
+# TABLE IF NOT EXISTS is a no-op against a database that already has the
+# table, so a column added to SCHEMA above would never reach one - and the
+# next INSERT would fail on a database that is otherwise perfectly good.
+# Kept as an explicit, idempotent list rather than a migration framework
+# because there is exactly one entry and each is one ALTER.
+_ADDED_COLUMNS = (("chunk_manifest", "roles_version", "INTEGER"),)
 
 _SEED_COLS = (
     "seed_id", "source_id", "native_id", "cnr", "neutral_citation",
@@ -190,7 +198,7 @@ _DOCUMENT_RESUME_COLS = ("object_key", "status", "reason", "text_path", "extract
 _CHUNK_MANIFEST_COLS = (
     "source_id", "object_key", "status", "reason", "tier", "why",
     "chunk_count", "seed_ids_json", "sha256", "extract_version",
-    "segment_version", "chunk_version", "meta_json", "chunked_at",
+    "segment_version", "chunk_version", "roles_version", "meta_json", "chunked_at",
 )
 # The columns chunks.py's resume decision reads: whether this document/seed
 # was chunked before, under which rules, and (seed_ids_json) what to delete
@@ -201,7 +209,7 @@ _CHUNK_MANIFEST_COLS = (
 # not only on the runs that actually replace something.
 _CHUNK_MANIFEST_RESUME_COLS = (
     "object_key", "status", "sha256", "extract_version",
-    "segment_version", "chunk_version", "seed_ids_json",
+    "segment_version", "chunk_version", "roles_version", "seed_ids_json",
 )
 
 
@@ -322,6 +330,12 @@ class Store:
         # while another thread holds an open transaction on this handle.
         with self._lock:
             self._conn.executescript(SCHEMA)
+            for table, column, decl in _ADDED_COLUMNS:
+                present = {
+                    row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")
+                }
+                if column not in present:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         self._conn.close()
@@ -403,16 +417,52 @@ class Store:
         row = self._conn.execute("SELECT * FROM seed WHERE seed_id = ?", (seed_id,)).fetchone()
         return dict(row) if row is not None else None
 
+    # How many seed rows iter_seeds_by_source holds at once. Whole
+    # InJudgements judgments are the largest text in this store, and
+    # DEFAULT_LIMITS puts 4,000 of them under one source_id.
+    SEED_PAGE = 200
+
+    def iter_seeds_by_source(self, source_id: str) -> Iterator[dict]:
+        """seeds_by_source, one page at a time - same rows, same order.
+
+        The streaming half of the same query, and the one chunks.py's seed
+        driver uses: that driver reads WHOLE judgment text and the eager
+        version holds every row of it in memory for the length of the pass.
+
+        Paged by KEYSET (`seed_id > last seen`), not LIMIT/OFFSET, because
+        the caller mutates the table as it walks it - chunk_seed_rows
+        deletes each parent row after replacing it, and under OFFSET every
+        such delete would silently skip the next unread row. Rows the caller
+        INSERTS ahead of the cursor (a document's own chunks) are visited
+        and recognised by their meta, exactly as they are today.
+        """
+        last = ""
+        while True:
+            page = self._conn.execute(
+                "SELECT * FROM seed WHERE source_id = ? AND seed_id > ? "
+                "ORDER BY seed_id LIMIT ?",
+                (source_id, last, self.SEED_PAGE),
+            ).fetchall()
+            if not page:
+                return
+            for row in page:
+                yield dict(row)
+            last = page[-1]["seed_id"]
+
     def seeds_by_source(self, source_id: str) -> list[dict]:
         """Every seed row under one source, in seed_id order.
 
-        chunks.py's seed-table driver is the reason this exists: seeds.py's
-        InJudgements rows carry whole judgment text with no on-disk manifest
-        of their own (unlike the document table), so finding "which whole
-        rows still need chunking" has nowhere else to read from. seed_id
-        order rather than insertion order, for the same reason document rows
-        are walked in object_key order - a deterministic, machine-independent
-        scan a resumed or `--limit`ed run can repeat.
+        seeds.py's InJudgements rows carry whole judgment text with no
+        on-disk manifest of their own (unlike the document table), so
+        finding "which whole rows still need chunking" has nowhere else to
+        read from. seed_id order rather than insertion order, for the same
+        reason document rows are walked in object_key order - a
+        deterministic, machine-independent scan a resumed or `--limit`ed run
+        can repeat.
+
+        Materializes. Callers walking the whole source under memory
+        pressure want iter_seeds_by_source above; this stays for the callers
+        that genuinely want the list (tests, counts, ad-hoc inspection).
         """
         return [
             dict(row)
@@ -650,16 +700,18 @@ class Store:
         re-ran on a document a wave was already planned against - and not a
         case this method swallows.
 
-        `dict.fromkeys` dedupes the input before it reaches SQL. Documented
-        as a DEFENSIVE measure rather than a correctness one, because it
-        is not one: DELETE on an id already removed by an earlier statement
-        in the same call matches zero rows, so `total_changes` - and
-        therefore the count this method returns - is identical either way.
-        Removing the dedup is a mutation this repository's own harness
-        cannot kill on that axis; it survives on purpose, and the axis it
-        WOULD matter on (repeated ids costing an extra no-op round trip to
-        SQLite on a caller that built its list carelessly) is not one any
-        test here measures.
+        `dict.fromkeys` dedupes the input BEFORE IT REACHES SQL, and that
+        sentence is the whole of what it buys: DELETE on an id an earlier
+        statement in the same call already removed matches zero rows, so
+        `total_changes` - and therefore the count this method returns - is
+        identical either way. An earlier version of this docstring went on
+        to call the dedup "a mutation this repository's own harness cannot
+        kill". That was wrong, and wrong on the axis the sentence above
+        names: what reaches the driver is observable through
+        sqlite3.Connection.set_trace_callback, a public API, and removing
+        the dedup takes a two-id call from 2 executed DELETEs to 4 with the
+        return value unchanged. The test that asserts it counts statements
+        rather than rows for exactly that reason.
         """
         ids = list(dict.fromkeys(seed_ids))
         if not ids:

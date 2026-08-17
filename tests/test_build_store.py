@@ -1152,7 +1152,7 @@ def _chunk_manifest_row(**over) -> dict:
         "status": "ok", "reason": None, "tier": "packing", "why": "fallback",
         "chunk_count": 2, "seed_ids_json": ["c1", "c2"],
         "sha256": "ab" * 32, "extract_version": 5,
-        "segment_version": 1, "chunk_version": 1,
+        "segment_version": 1, "chunk_version": 1, "roles_version": 1,
         "meta_json": {"degradation": {"from": "roles", "reason": "roles_backend_none"}},
     }
     row.update(over)
@@ -1171,6 +1171,38 @@ def test_record_chunk_manifest_indexes_one_chunked_document(store):
     assert row["extract_version"] == 5
     assert _TS_RE.match(row["chunked_at"])
     assert store.chunk_manifest("a", "never-chunked") is None
+
+
+def test_a_chunk_manifest_written_before_roles_version_existed_gains_the_column(tmp_path):
+    # CREATE TABLE IF NOT EXISTS is a no-op against a database that already
+    # has the table, so a column added to SCHEMA after the first shipped
+    # shape never reaches an existing store - and the next record_ call
+    # fails on a database that is otherwise perfectly good. Reproduced here
+    # by creating the OLD table shape by hand and then opening the Store.
+    db = tmp_path / "old.sqlite3"
+    old = sqlite3.connect(db)
+    old.executescript("""
+      CREATE TABLE source (source_id TEXT PRIMARY KEY, license TEXT, url TEXT,
+                           version TEXT, retrieved_at TEXT);
+      CREATE TABLE chunk_manifest (
+        source_id TEXT NOT NULL REFERENCES source(source_id),
+        object_key TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
+        tier TEXT, why TEXT, chunk_count INTEGER NOT NULL DEFAULT 0,
+        seed_ids_json TEXT, sha256 TEXT, extract_version INTEGER,
+        segment_version INTEGER, chunk_version INTEGER,
+        meta_json TEXT, chunked_at TEXT,
+        PRIMARY KEY (source_id, object_key));
+    """)
+    old.commit()
+    old.close()
+
+    with Store.open(db) as store:
+        columns = {r["name"] for r in store.conn.execute("PRAGMA table_info(chunk_manifest)")}
+        assert "roles_version" in columns
+        store.upsert_source("a", "Public Domain")
+        store.record_chunk_manifest("a", "k1", _chunk_manifest_row())
+        assert store.chunk_manifest("a", "k1")["roles_version"] == 1
+        store.ensure_schema()  # and re-running it must not try to add it twice
 
 
 def test_chunk_manifest_rows_need_a_registered_source(store):
@@ -1195,6 +1227,7 @@ def test_chunk_manifest_index_is_per_source_and_carries_the_resume_columns(store
     assert index["k1"]["extract_version"] == 5
     assert index["k1"]["segment_version"] == 1
     assert index["k1"]["chunk_version"] == 1
+    assert index["k1"]["roles_version"] == 1
     assert json.loads(index["k1"]["seed_ids_json"]) == ["c1", "c2"]
     assert index["k2"]["status"] == "empty"
     assert store.chunk_manifest_index("b")["k1"]["sha256"] == "cd" * 32
@@ -1238,12 +1271,43 @@ def test_delete_seeds_removes_the_named_rows_and_returns_the_count(store):
     assert store.seed_count("a") == 1
 
 
-def test_delete_seeds_deduplicates_repeated_ids_and_ignores_unknown_ones(store):
+def test_delete_seeds_ignores_unknown_ids_and_counts_only_rows_it_removed(store):
     store.upsert_source("a", "CC-BY-4.0")
     store.upsert_seeds(_seed_rows(2, source_id="a"))
     removed = store.delete_seeds(["sd0", "sd0", "never-existed"])
     assert removed == 1
     assert store.get_seed("sd0") is None
+
+
+def test_delete_seeds_dedupes_before_the_statements_reach_sqlite(store):
+    # The dedup's own docstring says it happens "before it reaches SQL", and
+    # that sentence - not the return value - is what is observable. The
+    # return value cannot see it: DELETE on an already-removed id matches
+    # zero rows, so `removed` is 1 either way, which is why the test that
+    # used to be named for deduplication could not have caught its removal.
+    # set_trace_callback is a public sqlite3 API and counts the statements
+    # the driver actually executed.
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_seeds(_seed_rows(3, source_id="a"))
+    statements = []
+    store.conn.set_trace_callback(statements.append)
+    try:
+        removed = store.delete_seeds(["sd0", "sd0", "sd1", "sd1", "sd0"])
+    finally:
+        store.conn.set_trace_callback(None)
+    deletes = [s for s in statements if s.strip().upper().startswith("DELETE FROM SEED")]
+    assert len(deletes) == 2  # two distinct ids, five ids in
+    assert removed == 2
+    assert store.get_seed("sd2") is not None
+
+
+def test_delete_seeds_consumes_a_generator_exactly_once(store):
+    # The same `list(dict.fromkeys(...))` also materializes the input, which
+    # is what lets the count-before/count-after work at all: a generator
+    # walked twice would be empty the second time.
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_seeds(_seed_rows(2, source_id="a"))
+    assert store.delete_seeds(sid for sid in ["sd0", "sd1"]) == 2
 
 
 def test_delete_seeds_of_an_empty_list_does_nothing(store):
@@ -1277,3 +1341,30 @@ def test_seeds_by_source_reads_back_in_seed_id_order(store):
     assert [r["seed_id"] for r in rows] == ["a1", "z1"]
     assert [r["seed_id"] for r in store.seeds_by_source("b")] == ["m1"]
     assert store.seeds_by_source("nonexistent-source") == []
+
+
+def test_iter_seeds_by_source_yields_the_same_rows_in_the_same_order(store):
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_seeds(_seed_rows(7, source_id="a"))
+    assert [r["seed_id"] for r in store.iter_seeds_by_source("a")] == [
+        r["seed_id"] for r in store.seeds_by_source("a")
+    ]
+    assert list(store.iter_seeds_by_source("nonexistent-source")) == []
+
+
+def test_iter_seeds_by_source_pages_and_survives_the_caller_deleting_as_it_walks(
+    store, monkeypatch
+):
+    # chunks.py's seed driver deletes each parent row after replacing it, so
+    # this walk must be robust to rows vanishing behind the cursor. Keyset
+    # paging is; LIMIT/OFFSET would skip one unread row per delete, which is
+    # why the page size is forced small enough here to cross a page boundary.
+    store.upsert_source("a", "CC-BY-4.0")
+    store.upsert_seeds(_seed_rows(9, source_id="a"))
+    monkeypatch.setattr(type(store), "SEED_PAGE", 2)
+    seen = []
+    for row in store.iter_seeds_by_source("a"):
+        seen.append(row["seed_id"])
+        store.delete_seeds([row["seed_id"]])
+    assert seen == [f"sd{i}" for i in range(9)]
+    assert store.seed_count("a") == 0

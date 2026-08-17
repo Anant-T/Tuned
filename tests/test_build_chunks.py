@@ -7,6 +7,7 @@ this suite.
 
 import hashlib
 import json
+import os
 import random
 from pathlib import Path
 
@@ -24,8 +25,20 @@ from tuned.data.chunks import (
     chunk_seed_rows,
     pack_chunks,
 )
+from tuned.data.roles_infer import BACKEND_SUBPROCESS, ROLES_VERSION
 from tuned.data.seeds import INJUDGEMENTS_SOURCE_ID
-from tuned.data.segment import SEGMENT_VERSION, Segment, segment_document
+from tuned.data.segment import (
+    MAX_PARA_STEP,
+    SEGMENT_VERSION,
+    TIER_PACKING,
+    TIER_ROLES,
+    TIER_TOC,
+    Segment,
+    segment_document,
+)
+from pipeline_fakes import temp_config
+from tuned.data.config import load_build_config
+from tuned.data.paths import build_paths
 from tuned.data.store import Store
 
 CHUNKS_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "chunks.py"
@@ -330,19 +343,68 @@ def test_force_rechunks_even_when_nothing_changed(doc_store):
     assert stats["replaced"] == 1
 
 
-def test_a_segment_version_bump_forces_rechunking_via_the_manifest():
-    # Simulated without actually bumping the module constant: writes a
-    # manifest row claiming an OLDER segment_version, then checks the real
-    # resume decision function reads it correctly.
+def _prior(**over) -> dict:
+    """A manifest row at exactly today's rules; `over` moves one field."""
+    row = {
+        "extract_version": 5,
+        "sha256": "aa",
+        "segment_version": SEGMENT_VERSION,
+        "chunk_version": CHUNK_VERSION,
+        "roles_version": ROLES_VERSION,
+    }
+    row.update(over)
+    return row
+
+
+@pytest.mark.parametrize("field", ["segment_version", "chunk_version", "roles_version"])
+def test_each_rule_version_on_its_own_forces_rechunking_via_the_manifest(field):
+    # Simulated without actually bumping the module constants: writes a
+    # manifest row claiming an OLDER version of ONE rule and checks the real
+    # resume decision reads it. Parametrized because the first cut tested
+    # only the segment_version half - deleting the chunk_version half of the
+    # decision's `or` left the whole suite green, and roles_version was
+    # compared nowhere at all.
     from tuned.data.chunks import _doc_chunk_decision
 
     doc = {"extract_version": 5, "sha256": "aa"}
-    stale = {"extract_version": 5, "sha256": "aa", "segment_version": 0, "chunk_version": CHUNK_VERSION}
-    current = {"extract_version": 5, "sha256": "aa", "segment_version": SEGMENT_VERSION, "chunk_version": CHUNK_VERSION}
-    assert _doc_chunk_decision(stale, doc, force=False) == "chunk"
-    assert _doc_chunk_decision(current, doc, force=False) == "skip"
+    assert _doc_chunk_decision(_prior(**{field: -1}), doc, force=False) == "chunk"
+    assert _doc_chunk_decision(_prior(), doc, force=False) == "skip"
     assert _doc_chunk_decision(None, doc, force=False) == "chunk"
-    assert _doc_chunk_decision(current, doc, force=True) == "chunk"
+    assert _doc_chunk_decision(_prior(), doc, force=True) == "chunk"
+
+
+@pytest.mark.parametrize("field", ["segment_version", "chunk_version", "roles_version"])
+def test_each_rule_version_is_recorded_on_the_manifest_row_it_will_be_compared_to(doc_store, field):
+    # The other half: comparing a version the writer never records is a
+    # comparison against None that happens to be right by accident.
+    store, tmp_path = doc_store
+    _write_doc(store, tmp_path, "k1", numbered_paragraphs([200] * 5))
+    chunk_documents(store, tokenizer=FakeTokenizer())
+    manifest = store.chunk_manifest(SC_SOURCE_ID, "k1")
+    current = {
+        "segment_version": SEGMENT_VERSION,
+        "chunk_version": CHUNK_VERSION,
+        "roles_version": ROLES_VERSION,
+    }
+    assert manifest[field] == current[field]
+    row = store.seeds_by_source(SC_SOURCE_ID)[0]
+    assert json.loads(row["meta_json"])[field] == current[field]
+
+
+def test_a_roles_version_bump_rechunks_a_document_end_to_end(doc_store, monkeypatch):
+    # Through the real driver rather than the decision function alone: the
+    # manifest carries the version the run was made under, so moving the
+    # constant must make the next run redo the work.
+    store, tmp_path = doc_store
+    _write_doc(store, tmp_path, "k1", numbered_paragraphs([200] * 5))
+    chunk_documents(store, tokenizer=FakeTokenizer())
+    assert chunk_documents(store, tokenizer=FakeTokenizer())["chunked"] == 0
+
+    monkeypatch.setattr("tuned.data.chunks.ROLES_VERSION", ROLES_VERSION + 1)
+    stats = chunk_documents(store, tokenizer=FakeTokenizer())
+    assert stats["chunked"] == 1
+    assert stats["replaced"] == 1
+    assert store.chunk_manifest(SC_SOURCE_ID, "k1")["roles_version"] == ROLES_VERSION + 1
 
 
 def test_sha_changing_alone_forces_rechunk_even_with_extract_version_unchanged():
@@ -355,11 +417,7 @@ def test_sha_changing_alone_forces_rechunk_even_with_extract_version_unchanged()
     from tuned.data.chunks import _doc_chunk_decision
 
     doc = {"extract_version": 5, "sha256": "new-sha"}
-    prior = {
-        "extract_version": 5, "sha256": "old-sha",
-        "segment_version": SEGMENT_VERSION, "chunk_version": CHUNK_VERSION,
-    }
-    assert _doc_chunk_decision(prior, doc, force=False) == "chunk"
+    assert _doc_chunk_decision(_prior(sha256="old-sha"), doc, force=False) == "chunk"
 
 
 def test_extract_version_changing_alone_forces_rechunk_even_with_sha_unchanged():
@@ -369,22 +427,14 @@ def test_extract_version_changing_alone_forces_rechunk_even_with_sha_unchanged()
     from tuned.data.chunks import _doc_chunk_decision
 
     doc = {"extract_version": 6, "sha256": "same-sha"}
-    prior = {
-        "extract_version": 5, "sha256": "same-sha",
-        "segment_version": SEGMENT_VERSION, "chunk_version": CHUNK_VERSION,
-    }
-    assert _doc_chunk_decision(prior, doc, force=False) == "chunk"
+    assert _doc_chunk_decision(_prior(sha256="same-sha"), doc, force=False) == "chunk"
 
 
 def test_neither_sha_nor_extract_version_changing_skips():
     from tuned.data.chunks import _doc_chunk_decision
 
     doc = {"extract_version": 5, "sha256": "same-sha"}
-    prior = {
-        "extract_version": 5, "sha256": "same-sha",
-        "segment_version": SEGMENT_VERSION, "chunk_version": CHUNK_VERSION,
-    }
-    assert _doc_chunk_decision(prior, doc, force=False) == "skip"
+    assert _doc_chunk_decision(_prior(sha256="same-sha"), doc, force=False) == "skip"
 
 
 def test_oversize_paragraphs_are_counted_in_the_run_stats(doc_store):
@@ -438,24 +488,42 @@ def test_chunking_two_documents_in_either_order_gives_identical_ids_and_bounds(t
     assert results[("a", "b")] == results[("b", "a")]
 
 
-def test_shuffled_seed_row_processing_order_gives_the_same_chunk_ids(tmp_path):
+def test_shuffled_document_processing_order_gives_the_same_chunk_ids():
+    # Shuffles the CHUNKING ITSELF, not the insertion order. Driving
+    # chunk_documents with a shuffled store cannot fail: store.documents()
+    # returns rows in object_key order, so the driver processes them in the
+    # same order however the caller inserted them, and a shuffle test around
+    # it passes for a reason that has nothing to do with the property. The
+    # property being claimed is that a chunk's id and bounds are a pure
+    # function of its own document - so it is the per-document calls that
+    # have to be shuffled.
     random.seed(0)
     texts = {f"doc{i}": numbered_paragraphs([150 + i * 10] * 4) for i in range(4)}
+    tok = FakeTokenizer()
 
     def run(order):
-        with Store.open(tmp_path / f"shuffle-{'-'.join(order)}.sqlite3") as store:
-            store.upsert_source(SC_SOURCE_ID, "Public Domain")
-            for key in order:
-                _write_doc(store, tmp_path / f"shuffle-{'-'.join(order)}-files", key, texts[key])
-            chunk_documents(store, tokenizer=FakeTokenizer())
-            return {r["seed_id"] for r in store.seeds_by_source(SC_SOURCE_ID)}
+        out = {}
+        for key in order:
+            chunks = pack_chunks(texts[key], segment_document(texts[key]).segments, tok)
+            out[key] = [(chunk_id_for(SC_SOURCE_ID, key, c), c.start, c.end) for c in chunks]
+        return out
 
     keys = list(texts)
-    first = run(keys)
     shuffled = keys[:]
     random.shuffle(shuffled)
-    second = run(shuffled)
-    assert first == second
+    assert shuffled != keys  # the shuffle really moved something
+    assert run(keys) == run(shuffled)
+
+
+def test_chunk_documents_walks_its_documents_in_object_key_order_whatever_the_insert_order(tmp_path):
+    # The reason the shuffle above had to move: this is the real property
+    # the end-to-end version was measuring, stated as itself.
+    keys = ["doc3", "doc1", "doc2"]
+    with Store.open(tmp_path / "order.sqlite3") as store:
+        store.upsert_source(SC_SOURCE_ID, "Public Domain")
+        for key in keys:
+            _write_doc(store, tmp_path / "order-files", key, numbered_paragraphs([180] * 4))
+        assert [d["object_key"] for d in store.documents(SC_SOURCE_ID, status="ok")] == sorted(keys)
 
 
 # --------------------------------------------------------------------------
@@ -584,6 +652,385 @@ def test_the_real_pinned_tokenizer_counts_tokens_the_same_way_the_fake_claims():
     assert chunks
     for chunk in chunks:
         assert chunk.token_count == len(tok.encode(chunk.text, add_special_tokens=False))
+
+
+# --------------------------------------------------------------------------
+# What the OTHER two tiers actually yield. Neither was ever driven through
+# pack_chunks: both were tested for whether they fire, never for the chunk
+# shapes they produce - which is how a tier with priority over packing came
+# to produce chunks packing would never have made.
+# --------------------------------------------------------------------------
+
+
+def _toc_document(section_words: int = 400, per_section: int = 4) -> str:
+    """A validated ToC whose sections are far larger than the token band."""
+    parts, number = ["JUDGMENT\n"], 1
+    for letter, heading in (("A", "Factual Matrix"), ("B", "Issues"), ("C", "Analysis")):
+        parts.append(f"\n{letter}. {heading}\n\n")
+        for _ in range(per_section):
+            parts.append(f"{number}. {words(section_words)}.\n\n")
+            number += 1
+    return "".join(parts)
+
+
+def test_a_toc_tier_document_is_packed_into_the_band_like_any_other(doc_store):
+    store, tmp_path = doc_store
+    text = _toc_document()
+    _write_doc(store, tmp_path, "k1", text)
+    result = segment_document(text)
+    assert result.tier == TIER_TOC  # the tier really is the one under test
+    stats = chunk_documents(store, tokenizer=FakeTokenizer())
+    assert stats["tiers"] == {"toc": 1}
+    assert stats["oversize_chunks"] == 0
+    assert stats["chunks_written"] > 3  # more chunks than there are sections
+    for row in store.seeds_by_source(SC_SOURCE_ID):
+        assert row["token_count"] <= MAX_CHUNK_TOKENS
+
+
+def test_a_toc_tier_chunk_carries_its_section_heading_once_not_once_per_paragraph(doc_store):
+    store, tmp_path = doc_store
+    _write_doc(store, tmp_path, "k1", _toc_document(section_words=120))
+    chunk_documents(store, tokenizer=FakeTokenizer())
+    seen = set()
+    for row in store.seeds_by_source(SC_SOURCE_ID):
+        labels = json.loads(row["meta_json"])["labels"]
+        assert labels == list(dict.fromkeys(labels))  # deduplicated
+        seen.update(labels)
+    assert seen == {"Factual Matrix", "Issues", "Analysis"}
+
+
+def test_no_tier_produces_an_oversize_chunk_that_packing_would_have_avoided(doc_store):
+    # The rule stated as a comparison, on the one document where the tiers
+    # actually disagree: whichever tier wins, its chunk set is at least as
+    # in-band as the packing tier's, because its segments are a refinement.
+    store, tmp_path = doc_store
+    text = _toc_document()
+    tok = FakeTokenizer()
+    toc_chunks = pack_chunks(text, segment_document(text).segments, tok)
+    from tuned.data.segment import _normalize_segments, _packing_tier
+
+    packing_chunks = pack_chunks(text, _normalize_segments(text, _packing_tier(text)), tok)
+    assert sum(c.oversize for c in toc_chunks) <= sum(c.oversize for c in packing_chunks)
+    assert max(c.token_count for c in toc_chunks) <= max(c.token_count for c in packing_chunks)
+    assert "".join(c.text for c in toc_chunks) == text
+
+
+def test_a_roles_tier_document_is_packed_into_the_band_like_any_other(doc_store):
+    store, tmp_path = doc_store
+    text = numbered_paragraphs([400] * 8)
+    _write_doc(store, tmp_path, "k1", text)
+    half = len(text) // 2
+    spawn = _fake_spawn({"spans": [[0, half, "FAC"], [half, len(text), "ANALYSIS"]]})
+    stats = chunk_documents(
+        store, tokenizer=FakeTokenizer(), roles_backend=BACKEND_SUBPROCESS, roles_spawn=spawn
+    )
+    assert stats["tiers"] == {"roles": 1}
+    assert stats["oversize_chunks"] == 0
+    rows = store.seeds_by_source(SC_SOURCE_ID)
+    assert len(rows) > 2  # not one chunk per role span
+    for row in rows:
+        assert row["token_count"] <= MAX_CHUNK_TOKENS
+        assert json.loads(row["roles_json"])  # the tier's labels travel
+
+
+def _fake_spawn(reply):
+    def run(args, *, input, capture_output, text, timeout):
+        class R:
+            returncode = 0
+            stdout = json.dumps(reply)
+            stderr = ""
+
+        return R()
+
+    return run
+
+
+# --------------------------------------------------------------------------
+# Band accounting: the acceptance criterion, observable from the run itself.
+# --------------------------------------------------------------------------
+
+
+def test_the_run_reports_the_band_it_was_asked_to_hit(doc_store):
+    store, tmp_path = doc_store
+    _write_doc(store, tmp_path, "k1", numbered_paragraphs([300] * 12))
+    _write_doc(store, tmp_path, "k2", numbered_paragraphs([40]))  # one tiny chunk
+    _write_doc(store, tmp_path, "k3", numbered_paragraphs([2000]))  # one oversize
+    stats = chunk_documents(store, tokenizer=FakeTokenizer())
+
+    assert sum(stats["token_histogram"].values()) == stats["chunks_written"]
+    assert stats["oversize_chunks"] == 1
+    assert stats["under_min_chunks"] >= 1
+    assert stats["in_band_chunks"] + stats["under_min_chunks"] + stats["oversize_chunks"] == (
+        stats["chunks_written"]
+    )
+    assert "0-99" in stats["token_histogram"]  # the 41-token document
+
+
+def test_a_chunk_of_exactly_the_maximum_counts_as_in_band_not_as_a_bucket_artifact():
+    # MAX_CHUNK_TOKENS is inclusive and sits on a histogram bucket edge, so
+    # the in-band count is tallied exactly rather than read off the buckets.
+    from tuned.data.chunks import _new_stats, _tally_chunks
+
+    stats = _new_stats()
+    _tally_chunks(stats, [Chunk(0, 1, "x", MAX_CHUNK_TOKENS, (), False)])
+    assert stats["in_band_chunks"] == 1
+    assert stats["under_min_chunks"] == 0
+    assert stats["token_histogram"] == {"1500-1599": 1}
+
+
+def test_token_count_is_the_encoding_of_the_chunk_not_the_sum_of_its_segments():
+    # L6: the two differ exactly when a segment boundary is not a token
+    # boundary. This tokenizer makes that visible on purpose - it counts
+    # RUNS of a letter, so joining two segments that both touch the same run
+    # yields fewer tokens than the parts do separately, and a chunk sized by
+    # the sum would claim a number its own text does not have.
+    class RunTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            out, prev = [], None
+            for ch in text:
+                if ch != prev:
+                    out.append(ch)
+                prev = ch
+            return out
+
+    text = "aaaa" + "aaaa" + "bbbb"
+    segments = [Segment(0, 4, "1"), Segment(4, 8, "2"), Segment(8, 12, "3")]
+    chunks = pack_chunks(text, segments, RunTokenizer(), max_tokens=10)
+    assert len(chunks) == 1
+    tok = RunTokenizer()
+    assert chunks[0].token_count == len(tok.encode(chunks[0].text))
+    assert chunks[0].token_count == 2  # not 3, which the per-segment sum gives
+
+
+# --------------------------------------------------------------------------
+# Per-document failure containment: one bad document costs one document.
+# --------------------------------------------------------------------------
+
+
+def test_a_missing_text_file_fails_that_document_and_the_pass_continues(doc_store):
+    store, tmp_path = doc_store
+    _write_doc(store, tmp_path, "k1", numbered_paragraphs([200] * 4))
+    _write_doc(store, tmp_path, "k2", numbered_paragraphs([200] * 4))
+    _write_doc(store, tmp_path, "k3", numbered_paragraphs([200] * 4))
+    Path(store.document(SC_SOURCE_ID, "k2")["text_path"]).unlink()
+
+    stats = chunk_documents(store, tokenizer=FakeTokenizer())
+    assert stats["chunked"] == 2
+    assert stats["failed"] == 1
+    assert [f["object_key"] for f in stats["failures"]] == ["k2"]
+    assert "FileNotFoundError" in stats["failures"][0]["reason"]
+    # no manifest row for the failure: the next run must try it again
+    assert store.chunk_manifest(SC_SOURCE_ID, "k2") is None
+    assert store.chunk_manifest(SC_SOURCE_ID, "k3") is not None
+
+
+def test_a_document_that_failed_once_is_retried_by_the_next_pass(doc_store):
+    store, tmp_path = doc_store
+    text = numbered_paragraphs([200] * 4)
+    _write_doc(store, tmp_path, "k1", text)
+    path = Path(store.document(SC_SOURCE_ID, "k1")["text_path"])
+    path.unlink()
+    assert chunk_documents(store, tokenizer=FakeTokenizer())["failed"] == 1
+    path.write_text(text, encoding="utf-8")
+    stats = chunk_documents(store, tokenizer=FakeTokenizer())
+    assert stats["chunked"] == 1 and stats["failed"] == 0
+
+
+def test_a_foreign_key_error_from_delete_seeds_fails_that_document_only(doc_store):
+    # The measured case: chunking interleaves with wave planning over a
+    # weeks-long run, so a routine extract_version bump on a document a wave
+    # was already planned against hits the task foreign key. That is a real
+    # signal about ONE document, not a reason to end the pass after earlier
+    # documents were already rewritten.
+    store, tmp_path = doc_store
+    for key in ("k1", "k2"):
+        _write_doc(store, tmp_path, key, numbered_paragraphs([200] * 4))
+    chunk_documents(store, tokenizer=FakeTokenizer())
+
+    planned = json.loads(store.chunk_manifest(SC_SOURCE_ID, "k1")["seed_ids_json"])[0]
+    store.create_tasks([{
+        "task_id": "t1", "seed_id": planned, "stream": "s", "task_type": "irac_analysis",
+        "prompt_id": "p", "prompt_sha": "x", "sample_ix": 0,
+    }])
+    for key in ("k1", "k2"):
+        _write_doc(store, tmp_path, key, numbered_paragraphs([250] * 5), extract_version=6)
+
+    stats = chunk_documents(store, tokenizer=FakeTokenizer())
+    assert stats["failed"] == 1
+    assert stats["failures"][0]["object_key"] == "k1"
+    assert "IntegrityError" in stats["failures"][0]["reason"]
+    assert stats["chunked"] == 1  # k2 got through
+    assert store.get_seed(planned) is not None  # k1's rows are intact
+
+
+def test_the_seed_driver_contains_a_per_row_failure_too(seed_store):
+    text = numbered_paragraphs([250] * 6)
+    _whole_seed(seed_store, "whole1", text)
+    _whole_seed(seed_store, "whole2", text)
+    chunk_seed_rows(seed_store, tokenizer=FakeTokenizer())
+    child = seed_store.seeds_by_source(INJUDGEMENTS_SOURCE_ID)[0]["seed_id"]
+    seed_store.create_tasks([{
+        "task_id": "t1", "seed_id": child, "stream": "s", "task_type": "irac_analysis",
+        "prompt_id": "p", "prompt_sha": "x", "sample_ix": 0,
+    }])
+    _whole_seed(seed_store, "whole1", text)  # resurrected parent, skip path
+    _whole_seed(seed_store, "whole2", text)
+
+    stats = chunk_seed_rows(seed_store, tokenizer=FakeTokenizer(), force=True)
+    assert stats["failed"] + stats["chunked"] == 2
+    assert stats["failed"] == 1
+    assert "IntegrityError" in stats["failures"][0]["reason"]
+
+
+# --------------------------------------------------------------------------
+# The behaviours nothing constrained: --limit, the CLI, the durability
+# ordering, and chunk_seed_rows' own version guard.
+# --------------------------------------------------------------------------
+
+
+def test_limit_caps_documents_chunked_not_documents_considered(doc_store):
+    store, tmp_path = doc_store
+    for key in ("k1", "k2", "k3"):
+        _write_doc(store, tmp_path, key, numbered_paragraphs([200] * 4))
+    stats = chunk_documents(store, tokenizer=FakeTokenizer(), limit=2)
+    assert stats["chunked"] == 2
+    assert stats["considered"] == 2
+    assert store.chunk_manifest_count(SC_SOURCE_ID) == 2
+
+
+def test_limit_spends_its_cap_on_new_work_not_on_re_confirming_skips(doc_store):
+    # The docstring's specific claim, and the reason `limit` gates on
+    # `chunked` rather than `considered`: a resumed run must advance.
+    store, tmp_path = doc_store
+    for key in ("k1", "k2", "k3"):
+        _write_doc(store, tmp_path, key, numbered_paragraphs([200] * 4))
+    chunk_documents(store, tokenizer=FakeTokenizer(), limit=1)
+    stats = chunk_documents(store, tokenizer=FakeTokenizer(), limit=1)
+    assert stats["skipped"] == 1
+    assert stats["chunked"] == 1
+    assert store.chunk_manifest_count(SC_SOURCE_ID) == 2
+
+
+def test_limit_zero_chunks_nothing(doc_store):
+    store, tmp_path = doc_store
+    _write_doc(store, tmp_path, "k1", numbered_paragraphs([200] * 4))
+    stats = chunk_documents(store, tokenizer=FakeTokenizer(), limit=0)
+    assert stats == {**stats, "chunked": 0, "considered": 0}
+    assert store.seed_count(SC_SOURCE_ID) == 0
+
+
+def test_limit_caps_the_seed_driver_too(seed_store):
+    for key in ("w1", "w2", "w3"):
+        _whole_seed(seed_store, key, numbered_paragraphs([250] * 6))
+    stats = chunk_seed_rows(seed_store, tokenizer=FakeTokenizer(), limit=2)
+    assert stats["chunked"] == 2
+    assert seed_store.get_seed("w3") is not None  # untouched, still whole
+
+
+def test_the_parent_row_is_removed_only_after_its_chunks_are_written(seed_store):
+    # The durability ordering the module comments at length about, with the
+    # consequence made observable: under the other order a crash between the
+    # two destroys the whole judgment with nothing written to replace it.
+    order = []
+    real_upsert, real_delete = seed_store.upsert_seeds, seed_store.delete_seeds
+
+    def spy_upsert(rows):
+        rows = list(rows)
+        order.append(("upsert", tuple(r["seed_id"] for r in rows)))
+        return real_upsert(rows)
+
+    def spy_delete(ids):
+        ids = list(ids)
+        order.append(("delete", tuple(ids)))
+        return real_delete(ids)
+
+    seed_store.upsert_seeds, seed_store.delete_seeds = spy_upsert, spy_delete
+    try:
+        _whole_seed(seed_store, "whole1", numbered_paragraphs([250] * 6))
+        order.clear()
+        chunk_seed_rows(seed_store, tokenizer=FakeTokenizer())
+    finally:
+        seed_store.upsert_seeds, seed_store.delete_seeds = real_upsert, real_delete
+
+    parent_delete = next(i for i, (op, ids) in enumerate(order) if op == "delete" and "whole1" in ids)
+    children_upsert = next(i for i, (op, _ids) in enumerate(order) if op == "upsert")
+    assert children_upsert < parent_delete
+
+
+@pytest.mark.parametrize("field", ["segment_version", "chunk_version", "roles_version"])
+def test_the_seed_driver_rechunks_when_one_rule_version_moved(seed_store, monkeypatch, field):
+    # chunk_seed_rows' own four-line version guard, which no test reached:
+    # with no manifest ever differing from current, the whole `if` collapsed
+    # to "skip whenever a prior row exists" with nothing failing.
+    text = numbered_paragraphs([250] * 6)
+    _whole_seed(seed_store, "whole1", text)
+    chunk_seed_rows(seed_store, tokenizer=FakeTokenizer())
+    old_ids = {r["seed_id"] for r in seed_store.seeds_by_source(INJUDGEMENTS_SOURCE_ID)}
+    _whole_seed(seed_store, "whole1", text)  # seeds.py recreating the parent
+
+    constant = {
+        "segment_version": "SEGMENT_VERSION",
+        "chunk_version": "CHUNK_VERSION",
+        "roles_version": "ROLES_VERSION",
+    }[field]
+    monkeypatch.setattr(f"tuned.data.chunks.{constant}", 99)
+    stats = chunk_seed_rows(seed_store, tokenizer=FakeTokenizer())
+    assert stats["chunked"] == 1
+    assert stats["skipped"] == 0
+    assert seed_store.get_seed("whole1") is None
+    assert seed_store.chunk_manifest(INJUDGEMENTS_SOURCE_ID, "whole1")[field] == 99
+    assert {r["seed_id"] for r in seed_store.seeds_by_source(INJUDGEMENTS_SOURCE_ID)} == old_ids
+
+
+def test_the_seed_driver_skips_when_every_rule_version_matches(seed_store):
+    text = numbered_paragraphs([250] * 6)
+    _whole_seed(seed_store, "whole1", text)
+    chunk_seed_rows(seed_store, tokenizer=FakeTokenizer())
+    _whole_seed(seed_store, "whole1", text)
+    stats = chunk_seed_rows(seed_store, tokenizer=FakeTokenizer())
+    assert stats["skipped"] == 1 and stats["chunked"] == 0
+
+
+def test_the_cli_chunks_a_real_store_and_reports_the_band(tmp_path, capsys, monkeypatch):
+    # There were no chunks.main tests at all. os._exit is stubbed for the
+    # same reason assemble.py's own CLI tests stub it - the module hard-exits
+    # by design, and that is itself worth asserting.
+    import tuned.data.chunks as chunks_mod
+
+    config = temp_config(tmp_path)
+    paths = build_paths(load_build_config(config).build.workdir).ensure()
+    with Store.open(paths.state_db) as store:
+        store.upsert_source(SC_SOURCE_ID, "Public Domain")
+        _write_doc(store, tmp_path / "texts", "k1", numbered_paragraphs([300] * 6))
+
+    exits = []
+    monkeypatch.setattr(os, "_exit", lambda code: exits.append(code))
+    chunks_mod.main(["--config", config, "--skip-seed-rows"], tokenizer=FakeTokenizer())
+    out = capsys.readouterr().out
+    assert exits == [0]
+    assert "documents  considered 1  chunked 1" in out
+    assert f"band[{MIN_CHUNK_TOKENS}-{MAX_CHUNK_TOKENS}]" in out
+    with Store.open(paths.state_db) as store:
+        assert store.seed_count(SC_SOURCE_ID) > 0
+
+
+def test_the_cli_limit_flag_reaches_the_driver(tmp_path, capsys, monkeypatch):
+    import tuned.data.chunks as chunks_mod
+
+    config = temp_config(tmp_path)
+    paths = build_paths(load_build_config(config).build.workdir).ensure()
+    with Store.open(paths.state_db) as store:
+        store.upsert_source(SC_SOURCE_ID, "Public Domain")
+        for key in ("k1", "k2", "k3"):
+            _write_doc(store, tmp_path / "texts", key, numbered_paragraphs([300] * 4))
+
+    monkeypatch.setattr(os, "_exit", lambda code: None)
+    chunks_mod.main(
+        ["--config", config, "--limit", "1", "--skip-seed-rows"], tokenizer=FakeTokenizer()
+    )
+    assert "chunked 1" in capsys.readouterr().out
+    with Store.open(paths.state_db) as store:
+        assert store.chunk_manifest_count(SC_SOURCE_ID) == 1
 
 
 # --------------------------------------------------------------------------
