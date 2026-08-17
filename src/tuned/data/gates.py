@@ -834,6 +834,27 @@ def _negated_at(text: str, at: int) -> bool:
     clause that asserts the charge; the complement exception is narrower than
     the handover rule, so a sentence that is BOTH ("although the section is not
     in force, it is said that the charge lies") is read as the assertion it is.
+
+    THE RESIDUAL, measured rather than guessed, because a rule about English
+    written in regular expressions has one and it should be written down:
+
+      "Nothing said here is a concession that, no matter the view taken, the
+       charge lies under s.497"        -> read as an ASSERTION. It denies. The
+       nearest negator ("no matter") is an intensifier inside the complement,
+       and its own tail carries no second complement to save it.
+      "It is not disputed, and no one has suggested otherwise, that the charge
+       lies under s.497"               -> read as a DENIAL. It asserts: "not
+       disputed that X" means X. No vocabulary of cues can see a negation of a
+       negation, and this is the class of evasion cue-matching cannot close.
+
+    Both are double-embedded. Neither is a phrasing the prompt invites, and the
+    first fails safe only in the sense that it burns a seed rather than
+    teaching a falsehood. Which negator governs when several are in scope - the
+    nearest, as here, or the first - is NOT pinned by any test, because no
+    phrasing in the suite has two negators in one scope where the choice
+    changes the verdict; a four-sentence probe found one where "first" reads
+    better and none where it reads worse, which is too little to turn a design
+    on.
     """
     scope = text[max(0, at - NEGATION_WINDOW) : at]
     breaks = list(_CLAUSE_BREAK_RE.finditer(scope))
