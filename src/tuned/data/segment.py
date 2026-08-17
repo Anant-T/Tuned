@@ -388,6 +388,12 @@ def _subdivide(segments: Sequence[Segment], offsets: Sequence[int]) -> tuple[Seg
     chunks.py still sees paragraph-sized material to pack - and it is why no
     tier can emit an oversize chunk that the packing tier would have
     avoided, since every tier's segment set ends up a refinement of packing's.
+
+    `offsets` must be ascending and `segments` must already be an ordered
+    partition - both are, because the only caller passes _normalize_segments'
+    output and paragraph_offsets read off it. Stated rather than defended,
+    so a future caller knows what it owes rather than finding out from a
+    non-monotonic segment list.
     """
     out: list[Segment] = []
     for seg in segments:
