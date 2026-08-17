@@ -649,6 +649,17 @@ class Store:
         than silently orphaning that task. That is a real signal - chunking
         re-ran on a document a wave was already planned against - and not a
         case this method swallows.
+
+        `dict.fromkeys` dedupes the input before it reaches SQL. Documented
+        as a DEFENSIVE measure rather than a correctness one, because it
+        is not one: DELETE on an id already removed by an earlier statement
+        in the same call matches zero rows, so `total_changes` - and
+        therefore the count this method returns - is identical either way.
+        Removing the dedup is a mutation this repository's own harness
+        cannot kill on that axis; it survives on purpose, and the axis it
+        WOULD matter on (repeated ids costing an extra no-op round trip to
+        SQLite on a caller that built its list carelessly) is not one any
+        test here measures.
         """
         ids = list(dict.fromkeys(seed_ids))
         if not ids:

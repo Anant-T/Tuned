@@ -360,6 +360,20 @@ def test_normalize_clips_an_overlap_first_segment_wins():
     assert [(s.start, s.end, s.label) for s in normalized] == [(0, 6, "a"), (6, 10, "b")]
 
 
+def test_normalize_sorts_by_start_not_by_end_a_nested_overlap_the_two_disagree_on():
+    # A segment fully CONTAINED in another sorts differently depending on
+    # which end of (start, end) is primary: by start, the containing
+    # segment ("a", 0-10) comes first and swallows "b" (2-5) entirely; by
+    # end, "b" (ending at 5) would sort BEFORE "a" (ending at 10) and
+    # survive as its own segment instead - a real behavioural difference a
+    # gapless-reconstruction check alone cannot see, only the LABELS can.
+    text = "0123456789"
+    segments = [Segment(0, 10, "a"), Segment(2, 5, "b")]
+    normalized = _normalize_segments(text, segments)
+    assert_gapless_partition(text, normalized)
+    assert [(s.start, s.end, s.label) for s in normalized] == [(0, 10, "a")]
+
+
 def test_normalize_handles_unsorted_input():
     text = "0123456789"
     segments = [Segment(6, 10, "b"), Segment(0, 3, "a")]
