@@ -10,6 +10,7 @@ from pipeline_fakes import (
     StealsTheLease,
     build_cfg,
     cfg_with_fourth_judge_family,
+    cfg_with_two_generator_families,
     cfg_without_the_paid_judges,
     chat_response,
     judge_reply,
@@ -752,7 +753,11 @@ def test_slot_b_can_be_unroutable_after_slot_a_has_been_paid_for(tmp_path, cfg, 
     back empty must bank judge A and park recoverably, and that has to keep
     working for any pool that runs out. It is also the live behaviour for an
     operator who has not funded OPENAI_API_KEY."""
-    holed = cfg_without_the_paid_judges(cfg)
+    # The row under test is LONG, and a long row only reaches a judge if a
+    # generator can hold it. mistral was demoted to judge-only on 2026-08-18,
+    # so the second generator family is supplied explicitly - otherwise this
+    # parks at the generator and never exercises the judge path at all.
+    holed = cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
     store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
     plan_wave(store, holed, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
     with store:
@@ -787,7 +792,11 @@ def test_a_reopened_row_never_re_pays_the_judge_it_already_bought(tmp_path, cfg,
     On the backstop-less pool, for the same reason as the test above - the
     shipped pool parks nothing here, and what is under test is the recovery,
     which has to work for any pool that ran out."""
-    holed = cfg_without_the_paid_judges(cfg)
+    # The row under test is LONG, and a long row only reaches a judge if a
+    # generator can hold it. mistral was demoted to judge-only on 2026-08-18,
+    # so the second generator family is supplied explicitly - otherwise this
+    # parks at the generator and never exercises the judge path at all.
+    holed = cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
     store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
     plan_wave(store, holed, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
     with store:
@@ -1483,7 +1492,11 @@ def test_the_judge_sizes_the_call_it_is_about_to_buy_the_way_the_preflight_does(
     judge_slot to `sum(len(m["content"]) for m in messages) // 4 + max_tokens`
     left the suite green. On a Devanagari row - which is what this corpus is -
     the two disagree by enough to change the routing decision."""
-    widened = cfg_with_fourth_judge_family(cfg)
+    # The row under test is LONG, and a long row only reaches a judge if a
+    # generator can hold it. mistral was demoted to judge-only on 2026-08-18,
+    # so the second generator family is supplied explicitly - otherwise this
+    # parks at the generator and never exercises the judge path at all.
+    widened = cfg_with_fourth_judge_family(cfg_with_two_generator_families(cfg))
     devanagari = "अभियुक्त को भारतीय दंड संहिता की धारा तीन सौ दो के अंतर्गत दोषी ठहराया गया। " * 140
     with open_store(tmp_path, n_seeds=1, text=devanagari) as store:
         plan_wave(store, widened, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
@@ -1570,12 +1583,21 @@ def test_the_judge_cli_refuses_the_pool_hole_before_claiming(tmp_path, cfg, monk
     realistic case (the paid backstop is the last key an operator funds) and
     the only way to get one from the shipped config now. It has to be
     withheld EXPLICITLY: a machine that happens to export it would turn this
-    into a test of nothing, since the refusal it asserts would not happen."""
+    into a test of nothing, since the refusal it asserts would not happen.
+
+    TWO GENERATOR FAMILIES, and it is load-bearing rather than incidental: the
+    hole is reachable only from a MISTRAL generation, because that is what
+    removes mistral from the judge pool and leaves slot B empty. mistral was
+    demoted to judge-only on 2026-08-18, and with one generator family the
+    shipped config has no hole at all - the CLI stops refusing, proceeds past
+    the preflight and starts a real run, which with keys in the environment
+    means live network calls out of a unit test. The suite HUNG on exactly
+    that before this argument existed."""
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr("tuned.data.providers.load_dotenv_keys", lambda path=None: 0)
-    config_path = temp_config(tmp_path)
+    config_path = temp_config(tmp_path, two_generator_families=True)
     with pytest.raises(SystemExit) as excinfo:
         judge_main(["--config", config_path, "--max-batches", "1"])
     assert excinfo.value.code == 2

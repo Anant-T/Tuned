@@ -458,6 +458,50 @@ def cfg_with_split_pools(cfg: BuildConfig, *, judge_context: int, tiebreak_conte
     )
 
 
+def cfg_with_two_generator_families(cfg: BuildConfig) -> BuildConfig:
+    """The shipped config with a SECOND generator family put back.
+
+    The build shipped two generator families until 2026-08-18, when
+    mistral-small-latest was demoted to judge-only: it produced zero
+    gate-passing rows in 56 re-pilot calls and failed irac_placement on 89% of
+    them by writing a numbered IRAC outline inside its trace, and the API
+    offers only `reasoning_effort` of 'none' or 'high', so there is no setting
+    between outlining and no trace at all.
+
+    A large body of pool/preflight tests is ABOUT the algorithm that walks
+    generator families - each family checked at its own window, a gap reported
+    per family, the router's key filter applied per family - and those
+    properties are only observable when more than one family exists. They took
+    their second family from the shipped config by coincidence, not by design.
+    This fixture supplies it explicitly so the demotion cannot silently reduce
+    those tests to a single-family walk that asserts almost nothing.
+
+    Tests that are genuinely ABOUT THE SHIPPED POOL keep using `cfg` and now
+    describe the one-generator reality.
+    """
+    from dataclasses import replace
+
+    ref = "mistral/mistral-small-latest"
+
+    def patch(model):
+        if model.id != "mistral-small-latest":
+            return model
+        return replace(
+            model,
+            roles=("generator",) + tuple(model.roles),
+            role_params={**model.role_params,
+                         "generator": {"temperature": 0.7, "top_p": 0.95}},
+        )
+
+    return replace(
+        cfg,
+        providers=tuple(
+            replace(p, models=tuple(patch(m) for m in p.models)) for p in cfg.providers
+        ),
+        routing=replace(cfg.routing, generator=tuple(cfg.routing.generator) + (ref,)),
+    )
+
+
 def cfg_with_context(cfg: BuildConfig, *, family: str, role: str, max_context: int):
     """The shipped config with one (family, role)'s context window rewritten."""
     from dataclasses import replace
@@ -475,15 +519,42 @@ def cfg_with_context(cfg: BuildConfig, *, family: str, role: str, max_context: i
     )
 
 
-def temp_config(tmp_path) -> str:
+def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
     """The real build config with its workdir redirected into tmp_path.
 
     For the CLI tests: `main()` resolves its own paths from the config, and
     the shipped one points at the operator's live data/build.
+
+    `two_generator_families` is the file-level twin of
+    cfg_with_two_generator_families, and one CLI test genuinely needs it. The
+    judge pool's only remaining hole is reachable ONLY from a mistral
+    generation - that is what removes mistral from the judge pool and empties
+    slot B - and mistral stopped being a generator on 2026-08-18. Without this
+    the CLI under test stops refusing and proceeds into a real run, which on a
+    machine with keys set means live network calls from a unit test.
     """
     raw = DATA_CONFIG.read_text(encoding="utf-8")
     redirected = raw.replace("workdir: data/build", f"workdir: {(tmp_path / 'build').as_posix()}")
     assert redirected != raw
+    if two_generator_families:
+        for old, new in (
+            # Anchored on the id line: two blocks in this config say
+            # `roles: [judge]` and only the mistral one is being promoted.
+            ("      - id: mistral-small-latest\n"
+             "        family: mistral\n"
+             "        roles: [judge]\n",
+             "      - id: mistral-small-latest\n"
+             "        family: mistral\n"
+             "        roles: [generator, judge]\n"),
+            ("        role_params:\n          judge: {temperature: 0.2}",
+             "        role_params:\n"
+             "          generator: {temperature: 0.7, top_p: 0.95}\n"
+             "          judge: {temperature: 0.2}"),
+            ("  generator: [cerebras/gpt-oss-120b]",
+             "  generator: [cerebras/gpt-oss-120b, mistral/mistral-small-latest]"),
+        ):
+            assert redirected.count(old) == 1, old
+            redirected = redirected.replace(old, new)
     path = tmp_path / "cfg.yaml"
     path.write_text(redirected, encoding="utf-8")
     return str(path)

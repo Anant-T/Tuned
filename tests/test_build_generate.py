@@ -16,6 +16,7 @@ from pipeline_fakes import (
     build_cfg,
     cfg_with_fourth_judge_family,
     cfg_with_context,
+    cfg_with_two_generator_families,
     cfg_with_split_pools,
     chat_response,
     open_store,
@@ -1009,14 +1010,43 @@ def test_streams_are_claimed_separately(tmp_path, cfg, paths):
 # Context routing for the GENERATOR (an 8k model is first in the list).
 # --------------------------------------------------------------------------
 
-def test_a_long_prompt_is_routed_past_the_8k_generator(tmp_path, cfg, paths):
+def test_a_long_prompt_now_parks_because_there_is_no_second_generator(
+    tmp_path, cfg, paths
+):
+    """WHAT THE 2026-08-18 DEMOTION COSTS, asserted rather than assumed.
+
+    This used to divert to mistral. mistral is judge-only now - over 56
+    re-pilot generations it produced zero gate-passing rows and failed
+    irac_placement on 89% of them by outlining IRAC inside its trace - so a
+    prompt the 8k cerebras model cannot hold has nowhere to go.
+
+    The row PARKS and spends NOTHING: no call, recoverable via --reopen. That
+    is the trade the demotion made, and it is the cheap side of it - the
+    alternative was three billed attempts at an 89% failure rate. Measured on
+    the re-pilot, 3 of 100 prompts are this long.
+    """
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
         router = FakeRouter(cfg)
         run(store, cfg, router, paths)
+        # The attempt is recorded, but `ref is None` - the context filter
+        # emptied the pool before any provider was reached, so nothing was
+        # spent.
+        (attempt,) = router.calls_for("generator")
+        assert attempt["est_tokens"] > 8192
+        assert attempt["exclude_families"] == frozenset({"gpt-oss"})
+        assert attempt["ref"] is None
+        task = only_task(store)
+        assert task["state"] == GEN_UNROUTABLE_STATE
+        assert task["disposition"] == "unroutable:generator"
+
+    # ...and with a second generator family present it still diverts, so the
+    # routing itself is intact and only the pool changed.
+    two = cfg_with_two_generator_families(cfg)
+    with make_store(tmp_path / "two", text=LONG_SEED_TEXT) as store:
+        router = FakeRouter(two)
+        run(store, two, router, paths)
         call = router.calls_for("generator")[0]
         assert call["est_tokens"] > 8192
-        # cerebras/gpt-oss-120b is 8k and first in the preference list; an
-        # over-long prompt there is a 400, and a 400 does NOT fail over.
         assert "gpt-oss" in call["exclude_families"]
         assert call["ref"] == ModelRef("mistral", "mistral-small-latest")
         assert only_task(store)["state"] == "judging"
@@ -1052,10 +1082,16 @@ def test_the_generator_opts_mistral_into_reasoning_and_leaves_gpt_oss_alone(
     raises through WITHOUT failing over, turning every failover into a dead
     task. The long-prompt route below is exactly that failover.
     """
+    # mistral is judge-only in the shipped config since 2026-08-18, so the
+    # generator half of this contract is exercised against the two-family
+    # fixture. The CODE is deliberately kept - it is family-keyed, harmless
+    # while the family serves no generator role, and it records the finding
+    # that Small 4's reasoning channel is opt-in.
+    two = cfg_with_two_generator_families(cfg)
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
-        router = FakeRouter(cfg)
+        router = FakeRouter(two)
         task = only_task(store)
-        asyncio.run(generate_once(store, cfg, router, task, paths=paths, attempt=2))
+        asyncio.run(generate_once(store, two, router, task, paths=paths, attempt=2))
         call = router.calls_for("generator")[0]
         assert call["ref"].provider == "mistral"
         assert call["params"] == {"reasoning_effort": "high"}
@@ -1096,7 +1132,8 @@ def test_a_row_no_generator_can_hold_parks_recoverably(tmp_path, cfg, paths):
         assert only_task(store)["claimed_by"] is None
         event = json.loads(store.events("generation_error")[0]["detail_json"])
         assert event["unroutable"] is True
-        assert set(event["excluded_families"]) == {"gpt-oss", "mistral"}
+        # One generator family since the 2026-08-18 demotion.
+        assert set(event["excluded_families"]) == {"gpt-oss"}
 
 
 def test_a_stale_worker_cannot_park_a_task_it_no_longer_holds(tmp_path, cfg, paths):
@@ -1290,10 +1327,19 @@ def test_the_context_estimate_routes_devanagari_past_the_8k_generator(tmp_path, 
 
     with make_store(tmp_path / "indic", text=devanagari) as store:
         router = FakeRouter(cfg)
-        asyncio.run(generate_once(store, cfg, router, only_task(store), paths=paths))
-        call = router.calls_for("generator")[0]
-        assert "gpt-oss" in call["exclude_families"]
-        assert call["ref"] == ModelRef("mistral", "mistral-small-latest")
+        result = asyncio.run(
+            generate_once(store, cfg, router, only_task(store), paths=paths)
+        )
+        # The script-aware estimate still excludes the 8k family - that is the
+        # property under test - but since the 2026-08-18 demotion there is no
+        # second generator to receive the row, so it parks unspent instead of
+        # diverting. See test_a_long_prompt_now_parks_because_there_is_no_
+        # second_generator.
+        (attempt,) = router.calls_for("generator")
+        assert attempt["ref"] is None
+        assert result.unroutable is True
+        event = json.loads(store.events("generation_error")[0]["detail_json"])
+        assert "gpt-oss" in event["excluded_families"]
 
 
 def test_the_gate_estimate_is_not_moved_by_the_routing_estimate(tmp_path, cfg):
@@ -1447,6 +1493,10 @@ def test_the_fleet_refuses_to_start_without_a_key_for_a_routed_role(tmp_path, cf
 
 
 def test_the_fleet_refuses_to_start_with_a_judge_slot_it_cannot_fill(cfg, monkeypatch):
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     refusals, warnings = preflight_messages(cfg, ("generator",))
@@ -1487,6 +1537,10 @@ def test_the_preflight_refuses_a_16k_fourth_family_judge(cfg, monkeypatch):
     print, so this config STARTED: a Devanagari row then passed the length
     gate, paid for judge A and parked in judge_unroutable at needed=14042.
     Many free-tier candidates for the pending operator decision are 16k."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     sixteen_k = cfg_with_fourth_judge_family(cfg, max_context=16384)
@@ -1504,6 +1558,10 @@ def test_allow_pool_gaps_cannot_override_a_gap_no_row_size_escapes(cfg, monkeypa
     has no slot B whatever its length. This is also the LIKELY first launch,
     because the shipped config's own gap already tells the operator to pass
     the flag; starting that way means every row pays for judge A and parks."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
@@ -1527,6 +1585,10 @@ def test_the_shipped_configs_own_gap_is_still_overridable(cfg, monkeypatch):
     """The other half of R4-C1: the fourth-family judge is a MODEL the
     operator is sourcing, not a key, and short rows really do route. Refusing
     that one as well would leave no way to run the pilot at all."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     refusals, warnings = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
@@ -1545,6 +1607,10 @@ def test_the_preflight_advises_one_model_that_closes_every_gap_it_reports(cfg, m
     opened a tiebreak warning. Driven through preflight_messages, which is the
     production call - the old pinning test called pool_gaps WITHOUT
     tiebreak_needed_tokens and could not see it."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     refusals, warnings = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
@@ -1571,6 +1637,10 @@ def test_the_preflight_checks_each_generator_family_at_its_own_window(cfg, monke
     context), so a 20k judge no longer clears it and this test would be
     asserting the absence of a refusal for the wrong reason.
     """
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     patched = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)

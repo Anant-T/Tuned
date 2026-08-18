@@ -18,6 +18,7 @@ httpx = pytest.importorskip("httpx")
 
 from pipeline_fakes import (  # noqa: E402
     cfg_with_context,
+    cfg_with_two_generator_families,
     cfg_with_split_pools,
     cfg_without_the_paid_judges,
 )
@@ -805,9 +806,10 @@ def test_pick_excludes_families_at_call_time(cfg, keys):
     assert router.pick("tiebreak", exclude_families=frozenset({"gpt-oss"})).ref == ModelRef(
         "cerebras", "gemma-4-31b"
     )
-    assert router.pick("generator", exclude_families=frozenset({"gpt-oss"})).ref == ModelRef(
-        "mistral", "mistral-small-latest"
-    )
+    # ...and since the 2026-08-18 demotion there IS no second generator family,
+    # so excluding gpt-oss leaves the generator role with nothing to pick. That
+    # is the routing half of "a long prompt now parks instead of diverting".
+    assert router.pick("generator", exclude_families=frozenset({"gpt-oss"})) is None
 
 
 def test_pick_skips_missing_key(cfg, keys, monkeypatch):
@@ -1250,9 +1252,14 @@ def test_router_on_attempt_carries_the_ref_across_a_failover(cfg, keys):
 
 
 def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys):
-    """reasoning_effort is a gpt-oss parameter. Sent to magistral it is an
-    unknown field, i.e. a 400, which Router.complete raises straight through
-    instead of failing over - so per-call params must be chosen per REF."""
+    """A per-call param must be chosen for the ref that ANSWERS, not the one
+    the Router would have tried first: an unknown field is a 400, which
+    Router.complete raises straight through instead of failing over, so a
+    param picked for the first ref turns every failover into a dead call.
+
+    Needs two generator families to have something to fail over to; the
+    shipped config has carried one since the 2026-08-18 mistral demotion."""
+    cfg = cfg_with_two_generator_families(cfg)
     clock = FakeClock()
     sleeper = FakeSleeper(clock)
     payloads: list[dict] = []
@@ -1350,10 +1357,12 @@ def test_undersized_families_over_the_real_pool(cfg):
     # The 8k judge drops out first, then the 32k one.
     assert undersized_families(cfg, "judge", 20000) == frozenset({"glm"})
     assert undersized_families(cfg, "judge", 40000) == frozenset({"glm", "mistral"})
-    # The generator pool: cerebras/gpt-oss-120b is 8k, magistral is 40k.
+    # The generator pool is ONE family since 2026-08-18: cerebras/gpt-oss-120b
+    # at 8k. Past that window there is no other family to fall back to, which
+    # is why an over-long row now parks instead of diverting.
     assert undersized_families(cfg, "generator", 4000) == frozenset()
     assert undersized_families(cfg, "generator", 20000) == frozenset({"gpt-oss"})
-    assert undersized_families(cfg, "generator", 60000) == frozenset({"gpt-oss", "mistral"})
+    assert undersized_families(cfg, "generator", 60000) == frozenset({"gpt-oss"})
 
 
 def test_undersized_families_keeps_a_mixed_family_with_one_large_model(cfg):
@@ -1669,10 +1678,15 @@ def test_unkeyed_roles_names_the_role_and_the_env_vars(cfg, monkeypatch):
     _unset(monkeypatch, "MISTRAL_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY")
     gaps = unkeyed_roles(cfg, ("generator", "judge"))
     assert set(gaps) == {"generator", "judge"}
-    assert "CEREBRAS_API_KEY" in gaps["generator"]
-    assert "MISTRAL_API_KEY" in gaps["generator"]
+    # The generator role routes to ONE provider since the 2026-08-18 demotion,
+    # so its key list is exactly cerebras - and that key is now load-bearing
+    # rather than merely preferred.
+    assert gaps["generator"] == ("CEREBRAS_API_KEY",)
+    assert "MISTRAL_API_KEY" in gaps["judge"]
     # One key is enough to make a role usable: the rest is failover.
     monkeypatch.setenv("MISTRAL_API_KEY", "sk-test")
+    assert set(unkeyed_roles(cfg, ("generator", "judge"))) == {"generator"}
+    monkeypatch.setenv("CEREBRAS_API_KEY", "sk-test")
     assert unkeyed_roles(cfg, ("generator", "judge")) == {}
     # ...and a role whose every provider is still unkeyed keeps reporting.
     assert unkeyed_roles(cfg, ("probe",))["probe"] == ("GROQ_API_KEY",)
@@ -1687,6 +1701,10 @@ def test_the_shipped_config_has_no_fatal_judge_hole_left(cfg, keys):
     Pinned as "no fatal gap", not as "no gap": the tiebreak holes are still
     there and still only warn, which is what makes this a closure rather than
     a config that stopped being checked."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     gaps = pool_gaps(cfg, needed_tokens=worst_case_judge_tokens(cfg))
     assert [g for g in gaps if g.role == "judge"] == []
     assert [g for g in gaps if g.fatal] == []
@@ -1849,6 +1867,10 @@ def test_a_16k_fourth_family_judge_is_a_fatal_pool_gap(cfg, keys):
     openai judges in the list the slot is filled whatever the 16k model does,
     so the fixture would guarantee the null result and prove nothing about
     size."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     size = 16384
     patched = _with_fourth_judge(cfg_without_the_paid_judges(cfg), max_context=size)
     needed = worst_case_judge_tokens(patched)
@@ -1878,6 +1900,10 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
     while a key is pending is a real choice". That is true of a CONTEXT gap
     and false of this one: eligible_refs skips an unkeyed family at EVERY
     size, so there is no subset of rows the override lets through safely."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     _unset(monkeypatch, "GROQ_API_KEY", "OPENAI_API_KEY")
@@ -1923,6 +1949,10 @@ def test_a_context_shaped_judge_gap_has_row_sizes_the_pool_still_serves(cfg, key
     Without the paid backstop, for the same reason as the 16k test above: a
     400k judge in the list fills slot B at every size, so there would be no
     context-shaped gap to have sizes on either side of."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     sixteen_k = _with_fourth_judge(cfg_without_the_paid_judges(cfg), max_context=16384)
     assert [g for g in pool_gaps(sixteen_k, needed_tokens=2000) if g.fatal] == []
     assert [g for g in pool_gaps(sixteen_k, needed_tokens=8000) if g.fatal] == []
@@ -1937,6 +1967,10 @@ def test_the_advice_the_preflight_prints_is_the_threshold_it_enforces(cfg, keys)
     number is judge-only if the tiebreak is sized apart from it, so a model of
     exactly the advised size closed the judge gap and opened a tiebreak
     warning."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     gaps = pool_gaps(
         cfg,
         needed_tokens=worst_case_judge_tokens(cfg),
@@ -1981,6 +2015,10 @@ def test_the_advice_never_falls_below_the_flat_worst_case(cfg, monkeypatch):
     starts; the key lands, the 40k generator becomes eligible, and the same
     config now wants 29,661 and refuses. Being told to buy a bigger model
     costs nothing; being sent shopping twice costs a purchase."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     flat = required_context(worst_case_judge_tokens(cfg))
 
     def advice_with(*set_envs):
@@ -2012,6 +2050,10 @@ def test_unservable_is_asked_at_the_smallest_call_this_build_can_make(cfg, keys)
     template and asks for a reply, and a judged row carries at least
     think_min + answer_min on top, so a judge under that floor serves no row
     at any length while reading here as the slot the short rows would use."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     floor = min_judge_tokens(cfg)
     tiny = 3000
     assert tiny < required_context(floor), "the fixture has to be under the real floor"
@@ -2152,6 +2194,10 @@ def test_pool_gaps_walks_the_generator_role_through_the_routers_own_filter(cfg, 
     contribute is a FATAL one and the rule is tested where it costs: with the
     400k judges in the list every judge slot fills for every family, and the
     only thing an unkeyed generator could add is another tiebreak warning."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     patched = _with_extra_generator(
         cfg_without_the_paid_judges(cfg), family="qwen", api_key_env="FOURTHPARTY_API_KEY"
     )
@@ -2177,6 +2223,10 @@ def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg
     judge slots at that length invents a gap. Sized at what its own window
     permits the same pool serves it, while the 40k generator, which really can
     produce that row, still has the gap the config TODO is about."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     # 26k, not 20k: correcting the reply conversion (2026-08-18, review round
     # 2 / I6) raised the 8k-window check from 15,104 to 19,104 tokens, i.e.
     # 23,880 of required context, so a 20k judge no longer demonstrates the
@@ -2208,6 +2258,10 @@ def test_the_family_window_bound_never_sizes_above_the_flat_worst_case(cfg, keys
     """`min` with the flat number is load-bearing: the hook can only ever make
     a check smaller, so a caller that passes a wrong one cannot widen what the
     preflight checks behind the operator's back."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     huge = judge_tokens_for_generator_window(cfg, 10**9)
     assert huge == worst_case_judge_tokens(cfg)
     # A window too small to hold the reply allowance contributes NO material -
@@ -2240,6 +2294,10 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     prompts are not the same prompt. The difference is four tokens on this
     config, so the only way to pin the plumbing is a model that sits between
     them: it must clear the judge's requirement and fail the tiebreak's."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     judge_needed = worst_case_judge_tokens(cfg)
     tiebreak_needed = worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
     assert required_context(judge_needed) < required_context(tiebreak_needed)
@@ -2381,6 +2439,10 @@ def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_che
     raised the 8k-window check from 15,104 to 19,104 tokens. The FLAT
     worst case is unchanged at 23,729 (29,661 of context), because that end
     is bounded by the length band, whose chars//4 definition really is 4.0."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     small = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)
     sizer, flat = judge_sizer(small), worst_case_judge_tokens(small)
 
@@ -2407,6 +2469,10 @@ def test_pool_gaps_applies_the_routers_own_key_filter(cfg, monkeypatch):
     ONE ref is keyed, which is the right question for "can this role call at
     all" and the wrong one for "can slot B be filled". Keys arrive piecemeal,
     so a partially-keyed start is the likely first real launch."""
+    # Two generator families: this property is about the ALGORITHM that walks
+    # them, and the shipped config has carried only one since the 2026-08-18
+    # mistral demotion. See cfg_with_two_generator_families.
+    cfg = cfg_with_two_generator_families(cfg)
     _unset(monkeypatch, "GROQ_API_KEY")
     for env in ("MISTRAL_API_KEY", "CEREBRAS_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
@@ -2481,17 +2547,29 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
     advised = {int(line.split("max_context >= ")[1].split()[0]) for line in warnings}
     assert len(advised) == 1, "one number: the operator buys one model"
     required = advised.pop()
-    assert required == required_context(
-        worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
-    )
+
+    # THE ADVISED NUMBER DROPPED 29,666 -> 29,661 ON 2026-08-18, and it is the
+    # documented behaviour rather than drift. `advice` is
+    # max(required_context(needed_tokens), each gap's own requirement), and the
+    # gap that used to carry the larger tiebreak-prompt number was a MISTRAL
+    # generation. With mistral demoted to judge-only that row cannot be
+    # produced, so the flat judge floor is what remains - which is exactly the
+    # "never falls below required_context(needed_tokens)" rule the advice was
+    # given so the operator is not quoted a different number on Tuesday than on
+    # Wednesday.
+    judge_required = required_context(worst_case_judge_tokens(cfg))
+    assert required == judge_required
     assert f"max_context >= {required}" in text
     assert f"{required:,}" in text
-    # ...and the judge threshold the closed gap was measured against, which is
-    # the SMALLER of the two and is quoted in its own right.
-    judge_required = required_context(worst_case_judge_tokens(cfg))
-    assert judge_required < required
-    assert f"max_context >= {judge_required}" in text
-    assert f"{judge_required:,}" in text
+    # The tiebreak threshold is no longer ADVISED, but the block still has to
+    # quote it: it is the bar a tiebreak replacement must clear, and it is the
+    # larger of the two because the tiebreak prompt is longer than the judge's.
+    tiebreak_required = required_context(
+        worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
+    )
+    assert tiebreak_required > judge_required
+    assert f"max_context >= {tiebreak_required}" in text
+    assert f"{tiebreak_required:,}" in text
     # ...and the two thresholds the block explains the (now closed) gap with.
     from tuned.data.generate import max_output_tokens
 
@@ -2615,14 +2693,24 @@ def test_role_params_send_generator_sampling_to_generator_calls_only(cfg, keys):
     After  judge             temperature 0.2,  top_p absent
 
     which is exactly what the two deleted blocks carried.
+
+    SPLIT IN TWO ON 2026-08-18: the shipped config demoted this model to
+    judge-only, so the generator half is now asserted against the two-family
+    fixture. Keeping it is the point - the mechanism is what stops a judge
+    inheriting generator sampling if the model is ever re-promoted, and a test
+    that only ever saw one role would not notice it rotting.
     """
-    assert _params_for_role(cfg, MISTRAL_JUDGE, "generator") == {
-        "temperature": 0.7,
-        "top_p": 0.95,
-    }
+    # Shipped reality: one role, and it is the judge's temperature.
     assert _params_for_role(cfg, MISTRAL_JUDGE, "judge") == {"temperature": 0.2}
     # No role layer at all -> the model's own defaults, which are empty here.
     assert _params_for_role(cfg, MISTRAL_JUDGE, None) == {}
+
+    promoted = cfg_with_two_generator_families(cfg)
+    assert _params_for_role(promoted, MISTRAL_JUDGE, "generator") == {
+        "temperature": 0.7,
+        "top_p": 0.95,
+    }
+    assert _params_for_role(promoted, MISTRAL_JUDGE, "judge") == {"temperature": 0.2}
 
 
 def test_role_params_do_not_leak_between_models(cfg, keys):

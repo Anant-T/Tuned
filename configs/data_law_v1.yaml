@@ -262,28 +262,41 @@ providers:
       # family stays `mistral` for both roles, which is what keeps
       # family_separation from letting this model judge its own generations.
       #
-      # SAMPLING IS PER ROLE, and it has to be: the two deleted blocks carried
-      # different sampling (generator 0.7/0.95, judge 0.2) and merging them
-      # into one `params` would have shipped the generator's temperature on
-      # every judge call. Nothing downstream would have caught it - judge.py
-      # sends no per-call params at all - so a judge would have been scoring at
-      # 0.7 with top_p 0.95 and only the score variance would have shown it.
-      # `params` is therefore left empty and both roles are stated explicitly;
-      # config.py refuses a role_params key the model does not serve.
+      # JUDGE ONLY since 2026-08-18. This model was promoted to generator when
+      # the magistral line was retired, and the re-pilot measured the result:
+      # over 56 generations it produced ZERO rows that passed the gates, and
+      # 50 of the 56 (89%) failed irac_placement because it writes a NUMBERED
+      # IRAC OUTLINE inside its reasoning and then fills it in -
       #
-      # NO reasoning_effort HERE ON PURPOSE. Small 4's reasoning channel is
-      # opt-in and the parameter belongs to the GENERATOR call only - see
-      # generate.GENERATOR_REASONING_PARAMS. Declaring it under role_params.
-      # generator would work too, but the value is coupled to the harness's own
-      # park-on-no-trace behaviour rather than to a sampling preference, so it
-      # stays with the code that depends on it.
+      #     '1. **Issue**: The core issue seems to be whether a partnership...'
+      #     '2. **Rule**: The relevant legal provisions include:'
+      #
+      # - which is precisely the MSLR scripted-trace pathology this dataset is
+      # built to avoid, and which cost -33.8% quality in the evidence that
+      # bought the gate. The same run put cerebras/gpt-oss-120b at 9% on that
+      # gate, so this is the model and not the prompts.
+      #
+      # THE EFFORT KNOB CANNOT FIX IT, probed live 2026-08-18: the API accepts
+      # ONLY `reasoning_effort` of 'none' or 'high' (400 on 'medium'/'low',
+      # error naming the enum ReasoningEffort.none | ReasoningEffort.high). So
+      # the whole menu is outlining-at-high or traceless-at-none, and neither
+      # serves a reasoning stream. Demoted rather than tuned.
+      #
+      # WHAT DEMOTION COSTS, measured rather than assumed: prompts too long for
+      # the 8k cerebras window now have no generator at all and park
+      # gen_unroutable, spending nothing. That was 3 of 100 pilot prompts. The
+      # alternative was 3 billed attempts each at an 89% failure rate.
+      #
+      # SAMPLING IS STILL PER ROLE. The generator entry is gone with the role -
+      # config.py refuses a role_params key naming a role the model does not
+      # serve - but the mechanism stays and matters: it is what keeps a judge
+      # from inheriting generator sampling if this model is ever re-promoted.
       - id: mistral-small-latest
         family: mistral
-        roles: [generator, judge]
+        roles: [judge]
         limits: {rpm: 50, tpm: 50000, tpd: 33000000, max_context: 32000, max_output: 8192}
         params: {}
         role_params:
-          generator: {temperature: 0.7, top_p: 0.95}
           judge: {temperature: 0.2}
   - name: openai
     base_url: https://api.openai.com/v1
@@ -428,7 +441,11 @@ providers:
 # NOT an option: letting a judge share the generator's family when the pool
 # runs out. Family separation is a data-quality invariant, not a preference.
 routing:
-  generator: [cerebras/gpt-oss-120b, mistral/mistral-small-latest]
+  # ONE generator since 2026-08-18 - see the mistral block for the measurement
+  # that removed the second. A prompt too long for this model's 8k window has
+  # nowhere to go and parks gen_unroutable without spending: 3% of pilot
+  # prompts, against a fallback that produced 0 usable rows in 56 calls.
+  generator: [cerebras/gpt-oss-120b]
   judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b, cerebras/zai-glm-4.7,
           openai/gpt-5-mini, openai/gpt-5-nano]
   tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b, cerebras/zai-glm-4.7,
