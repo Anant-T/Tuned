@@ -35,6 +35,7 @@ from tuned.data.generate import (  # noqa: E402
     judge_needed_tokens,
     judge_sizer,
     judge_tokens_for_generator_window,
+    REPLY_BUDGET_CHARS_PER_TOKEN,
     max_output_tokens,
     min_judge_tokens,
     preflight_messages,
@@ -2166,7 +2167,12 @@ def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg
     judge slots at that length invents a gap. Sized at what its own window
     permits the same pool serves it, while the 40k generator, which really can
     produce that row, still has the gap the config TODO is about."""
-    patched = cfg_with_context(cfg, family="qwen", role="judge", max_context=20000)
+    # 26k, not 20k: correcting the reply conversion (2026-08-18, review round
+    # 2 / I6) raised the 8k-window check from 15,104 to 19,104 tokens, i.e.
+    # 23,880 of required context, so a 20k judge no longer demonstrates the
+    # narrowing - it is simply too small either way. The flat worst case is
+    # untouched at 29,661.
+    patched = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)
     flat = worst_case_judge_tokens(patched)
     sizer = judge_sizer(patched)
     assert sizer(8192, "judge") < flat == sizer(None, "judge")
@@ -2197,7 +2203,13 @@ def test_the_family_window_bound_never_sizes_above_the_flat_worst_case(cfg, keys
     # A window too small to hold the reply allowance contributes NO material -
     # the term clamps at zero rather than going negative and quietly buying
     # back some of the candidate's budget.
-    reply_chars = max_output_tokens(cfg) * CHARS_PER_TOKEN_LATIN
+    # REPLY_BUDGET_CHARS_PER_TOKEN, not CHARS_PER_TOKEN_LATIN (2026-08-18,
+    # review round 2 / I6): this mirrors the conversion inside
+    # judge_tokens_for_generator_window, which was under-counting the reply
+    # at 4.0 while reply_over_budget had already been corrected to the
+    # measured 5.5. The two have to use one constant or the sizing budgets
+    # for a smaller candidate than enforcement permits.
+    reply_chars = max_output_tokens(cfg) * REPLY_BUDGET_CHARS_PER_TOKEN
     reply_only = judge_needed_tokens(judge_messages(WORST_CASE_CHAR * int(reply_chars), "", ""))
     assert judge_tokens_for_generator_window(cfg, max_output_tokens(cfg)) == reply_only
     # ...and a hook that answers nonsense narrows nothing: the gap set is the
@@ -2349,10 +2361,17 @@ def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_che
     spent. The operator adds a 128k variant beside the 8k one in an existing
     generator family; the family can now produce the longest row the band
     permits, so its judges must be checked at that length. Sized at the
-    SMALLEST model instead, the check runs at 15,104 (required 18,880), a 20k
+    SMALLEST model instead, the check runs at 19,104 (required 23,880), a 26k
     judge clears, and the long row routes to the 128k generator and parks at
-    slot B having already paid for judge A."""
-    small = cfg_with_context(cfg, family="qwen", role="judge", max_context=20000)
+    slot B having already paid for judge A.
+
+    The probe window moved 20k -> 26k on 2026-08-18 (review round 2, I6):
+    the reply half of this sizing was being converted at 4.0 chars/token on a
+    premise the pilot measured false, and correcting it to the measured 5.5
+    raised the 8k-window check from 15,104 to 19,104 tokens. The FLAT
+    worst case is unchanged at 23,729 (29,661 of context), because that end
+    is bounded by the length band, whose chars//4 definition really is 4.0."""
+    small = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)
     sizer, flat = judge_sizer(small), worst_case_judge_tokens(small)
 
     def fatal(config):
@@ -2363,8 +2382,8 @@ def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_che
         }
 
     # As shipped, the gpt-oss family really is 8k-only and the narrowing is
-    # right: at 15,104 the 20k judge holds every row it can produce.
-    assert required_context(sizer(8192, "judge")) < 20000 < required_context(flat)
+    # right: at 19,104 the 26k judge holds every row it can produce.
+    assert required_context(sizer(8192, "judge")) < 26000 < required_context(flat)
     assert ("gpt-oss", "b") not in fatal(small)
     # Add the big sibling and the same pool no longer serves that family.
     mixed = _with_generator_models(small, caps=(131072,), family="gpt-oss")

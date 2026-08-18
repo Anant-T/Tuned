@@ -98,6 +98,14 @@ REJECTED_STATE = "rejected"
 # `rejected` and the planner then read the wave as complete.
 GEN_UNROUTABLE_STATE = "gen_unroutable"
 
+# The task was planned against a template that has since been edited, so its
+# recorded prompt_sha no longer describes what a teacher would be shown. Parked
+# rather than re-stamped or rejected: nothing is wrong with the SEED, and
+# nothing is wrong with the LAW - only the plan is out of date. Re-openable
+# (tasks.REOPEN_STATES) because restoring a template makes the row valid again,
+# and cheap to re-park because the guard fires before any render or spend.
+STALE_PROMPT_STATE = "stale_prompt"
+
 # Skip reasons that are facts about the ROW rather than about the moment or
 # the configuration. "family-excluded" here always means the context filter:
 # generate.py excludes exactly the families too small to hold this prompt, so
@@ -334,6 +342,9 @@ class GenResult:
     # (think_format, length_band, self_verification) and the real cause is
     # legible only by joining gate_result to generation.model.
     no_reasoning_channel: bool = False
+    # (planned_sha, live_sha) when the task was planned against a template that
+    # has since been edited. Nothing was rendered and nothing was spent.
+    stale_prompt: tuple[str, str] | None = None
 
 
 @dataclass
@@ -346,6 +357,13 @@ class BatchStats:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     dispositions: dict = field(default_factory=dict)
+    # "provider/model" -> rows that model PARKED rather than answered. Kept
+    # apart from `dispositions` because a park is not a gate verdict and
+    # because the provider is the whole diagnosis - see absorb.
+    parked: dict = field(default_factory=dict)
+    # Rows refused before any render or call, because the template moved under
+    # the plan. Not attributable to a provider: nothing was asked of one.
+    stale: int = 0
 
     @property
     def tokens(self) -> int:
@@ -360,16 +378,35 @@ class BatchStats:
         lease still spent the tokens (so those are always counted) but the
         disposition it computed belongs to nobody: reporting it makes a batch
         that lost every lease read as a batch of clean generations.
+
+        A PARK IS COUNTED AS A PARK, AND AGAINST THE MODEL THAT CAUSED IT.
+        This used to key everything on `result.disposition`, which is the GATE
+        verdict - so a row parked for having no reasoning channel was reported
+        as an ordinary `regenerate`, and nothing anywhere aggregated by
+        provider. A generator that answers every call with no trace therefore
+        made the batch line look BETTER (its rows never reach `rejected`), and
+        the operator's only route to the truth was joining gate_result to
+        generation.model by hand. Measured on the pilot: 43 such rows, ~20% of
+        spend, invisible.
         """
         self.prompt_tokens += result.prompt_tokens
         self.completion_tokens += result.completion_tokens
         if not landed:
             self.lost_leases += 1
             return
+        if result.stale_prompt is not None:
+            # No call was made; this is a planning fact, not a generation.
+            self.stale += 1
+            return
         if result.error is not None or result.skipped is not None:
             self.errors += 1
             return
         self.gen_ok += 1
+        if result.no_reasoning_channel:
+            ref = result.ref
+            label = f"{ref.provider}/{ref.model}" if ref is not None else "unknown"
+            self.parked[label] = self.parked.get(label, 0) + 1
+            return
         if result.disposition is not None:
             self.gated_out += 1
             self.dispositions[result.disposition] = (
@@ -473,12 +510,24 @@ def judge_tokens_for_generator_window(
       point the number below is no narrowing at all.
 
     Converting the reply back into characters is the one step that is not a
-    rearrangement of numbers the code already enforces: it charges every reply
-    token at CHARS_PER_TOKEN_LATIN, the most characters this module's own
-    model ever gives a token, so re-estimating those characters in Devanagari
-    over-counts rather than under-counts. That direction matters - under-
-    counting here would clear a judge that then cannot hold the row, which is
-    R3-C2 with extra steps.
+    rearrangement of numbers the code already enforces, and it must charge
+    every reply token at the LOOSEST chars-per-token the fleet has been
+    measured to produce - because under-counting here clears a judge that then
+    cannot hold the row, which is R3-C2 with extra steps.
+
+    IT USED TO CHARGE CHARS_PER_TOKEN_LATIN (4.0), on that constant's stated
+    premise of being "the most characters this module's own model ever gives a
+    token". The pilot measured 4.24-5.13, so the premise was false and this
+    sizing was under-counting in exactly the direction it exists to avoid.
+    Worse, the two halves had drifted apart: reply_over_budget was corrected to
+    5.5 and now PERMITS a 22,000-character reply, while this sizing was still
+    budgeting a judge for 16,000. It uses the same constant as the enforcement
+    it is supposed to mirror.
+
+    band_chars below is untouched and stays on 4.0 deliberately: total_max is
+    a LENGTH-BAND number, and the band is defined in the gates' chars//4
+    currency, so multiplying it by 4 is the exact inverse of its own
+    definition rather than an estimate of anything.
     """
     band_chars = int(cfg.build.length_band.total_max * CHARS_PER_TOKEN_LATIN)
     if window is None:
@@ -486,7 +535,7 @@ def judge_tokens_for_generator_window(
     else:
         reply = max_output_tokens(cfg)
         material = max(0.0, window / CONTEXT_SAFETY_MARGIN - reply) * CHARS_PER_TOKEN_INDIC
-        chars = min(band_chars, int(material) + int(reply * CHARS_PER_TOKEN_LATIN))
+        chars = min(band_chars, int(material) + int(reply * REPLY_BUDGET_CHARS_PER_TOKEN))
     return judge_needed_tokens(
         judge_messages(WORST_CASE_CHAR * chars, "", "", prompt_id=prompt_id),
         reply_tokens=reply_tokens,
@@ -1185,6 +1234,40 @@ async def generate_once(
     attempt = next_attempt(store, task) if attempt is None else attempt
     result = GenResult(task_id=task["task_id"], attempt=attempt)
 
+    # THE PROMPT THIS TASK WAS PLANNED AGAINST MUST STILL BE THE PROMPT ON
+    # DISK, and this is checked BEFORE anything is rendered or spent.
+    #
+    # task.prompt_sha is stamped at plan time (tasks.plan_rows) and copied
+    # verbatim into every raw envelope and generation row, where it is the only
+    # record of what the teacher was actually shown. Nothing compared it to the
+    # live registry, so editing a template silently decoupled the two: the call
+    # would go out under the NEW bytes and be filed under the OLD sha, and
+    # every metric keyed on prompt_sha - the paraphrase A/B above all - would
+    # be pooling two different prompts under one label. Measured on 2026-08-18:
+    # all 419 non-terminal pilot tasks, including both 100-row A/B arms, were
+    # carrying superseded shas after the first fix round.
+    #
+    # LOUD AND TASK-LEVEL, never a silent re-stamp. Re-stamping would make the
+    # provenance agree with itself by destroying the only evidence that it had
+    # ever disagreed; the row is parked instead, with the mismatch written into
+    # the disposition. Costs nothing - no seed read, no render, no call - so
+    # re-opening a parked row is free and the loop cannot burn budget.
+    planned_sha = task.get("prompt_sha")
+    live_sha = prompt_registry.load(task["prompt_id"]).sha
+    if planned_sha and planned_sha != live_sha:
+        result.stale_prompt = (str(planned_sha), str(live_sha))
+        store.log_event(
+            "prompt_sha_mismatch",
+            {
+                "task_id": task["task_id"],
+                "prompt_id": task["prompt_id"],
+                "planned_sha": planned_sha,
+                "live_sha": live_sha,
+                "attempt": attempt,
+            },
+        )
+        return result
+
     seed = store.get_seed(task["seed_id"])
     if seed is None:
         result.skipped = "missing-seed"
@@ -1408,6 +1491,9 @@ async def generate_once(
 def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id: str) -> str:
     """Move the task on from what the gates said. Returns the new state.
 
+    * stale prompt     -> stale_prompt at once, before anything else is
+                          considered: the template moved under the plan, so
+                          the row was never rendered and never spent.
     * clean            -> judging (judge.py's queue)
     * regenerate       -> pending while attempts remain, else rejected. The
                           next claim re-rolls the IDENTICAL request: the
@@ -1442,7 +1528,16 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
     attempts = int(task.get("attempts") or 0)
     exhausted = attempts >= MAX_ATTEMPTS
 
-    if not result.ok:
+    if result.stale_prompt is not None:
+        # Checked before `result.ok`, and before the attempt accounting below,
+        # because nothing was rendered and nothing was spent: this row never
+        # reached a provider. See the guard in generate_once.
+        planned, live = result.stale_prompt
+        state, disposition = (
+            STALE_PROMPT_STATE,
+            f"stale-prompt:{task['prompt_id']}:{planned}!={live}",
+        )
+    elif not result.ok:
         if result.skipped is not None:
             # A missing seed or an unrenderable slot set is permanent: the
             # next attempt would hit the identical wall, unspent.
@@ -1539,10 +1634,19 @@ def budget_lines(store, cfg, day: str | None = None) -> list[str]:
 
 def format_batch_line(batch_ix: int, stats: BatchStats, budget: Sequence[str]) -> str:
     dispositions = " ".join(f"{k}={v}" for k, v in sorted(stats.dispositions.items()))
+    # Parks and stale rows are printed only when they happen, so the ordinary
+    # line does not grow - but when a provider IS parking rows, the line names
+    # it. A silent park is what let a dead generator read as a healthy batch.
+    parked = (
+        " parked{" + " ".join(f"{k}:{v}" for k, v in sorted(stats.parked.items())) + "}"
+        if stats.parked
+        else ""
+    )
+    stale = f" stale={stats.stale}" if stats.stale else ""
     return (
         f"batch {batch_ix}: claimed={stats.claimed} gen-ok={stats.gen_ok} "
         f"gated-out={stats.gated_out} err={stats.errors} "
-        f"lost-lease={stats.lost_leases} "
+        f"lost-lease={stats.lost_leases}{parked}{stale} "
         f"tokens={stats.tokens} [{dispositions}] | " + " | ".join(budget)
     )
 
@@ -1629,8 +1733,11 @@ async def run_workers(
         totals.lost_leases += stats.lost_leases
         totals.prompt_tokens += stats.prompt_tokens
         totals.completion_tokens += stats.completion_tokens
+        totals.stale += stats.stale
         for key, count in stats.dispositions.items():
             totals.dispositions[key] = totals.dispositions.get(key, 0) + count
+        for key, count in stats.parked.items():
+            totals.parked[key] = totals.parked.get(key, 0) + count
         # An idle --forever worker polls every few seconds for hours; printing
         # each empty tick buries the batches that did something. Say "idle"
         # once, then stay quiet until the queue produces work again.
@@ -1652,6 +1759,10 @@ async def run_workers(
         "prompt_tokens": totals.prompt_tokens,
         "completion_tokens": totals.completion_tokens,
         "dispositions": dict(totals.dispositions),
+        # Per-provider parks and plan-level staleness, so a caller reading the
+        # totals sees a dead generator without joining tables by hand.
+        "parked": dict(totals.parked),
+        "stale": totals.stale,
         "worker_id": worker_id,
     }
 
@@ -1714,6 +1825,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"gen-ok={totals['gen_ok']} gated-out={totals['gated_out']} "
         f"errors={totals['errors']} tokens={totals['prompt_tokens'] + totals['completion_tokens']}"
     )
+    # Named per provider, and only when non-empty. A generator that parks every
+    # row it is given is the failure this line exists to make unmissable.
+    if totals.get("parked"):
+        print(
+            "PARKED (generator returned no reasoning channel): "
+            + ", ".join(f"{k}={v}" for k, v in sorted(totals["parked"].items()))
+        )
+    if totals.get("stale"):
+        print(
+            f"STALE (planned against an edited template, never sent): "
+            f"{totals['stale']} - re-plan, or `tasks.py --reopen stale_prompt` "
+            f"if the template was restored"
+        )
     print("task states: " + ", ".join(f"{k}={v}" for k, v in sorted(store.task_counts().items())))
     store.close()
 

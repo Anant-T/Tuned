@@ -112,7 +112,20 @@ REOPEN_STATES = {
     "gen_unroutable": "pending",
     "judge_unroutable": "judging",
     "judge_error": "judging",
+    # Planned against a template that was edited afterwards. Re-openable
+    # because restoring the template makes the row valid again, and free to
+    # re-park if it was not: generate.py's guard fires before any render or
+    # provider call.
+    "stale_prompt": "pending",
 }
+
+# Parked dispositions that ALREADY COST A LIVE CALL. A re-open must not hand
+# these rows a fresh attempt budget: the generation was made, billed and
+# stored, and the park is about what came back rather than about the pool
+# never having been reached. Without this, `--reopen gen_unroutable` on a
+# provider with no reasoning channel buys one more call per cycle, forever.
+# See reopen_tasks.
+BILLED_PARK_DISPOSITIONS = frozenset({"unroutable:no-reasoning-channel"})
 
 
 def task_id_for(seed_id: str, task_type: str, prompt_id: str, sample_ix: int) -> str:
@@ -438,16 +451,27 @@ def reopen_tasks(
     pass produces a new gen_id and both slots are bought again. That is
     correct - they would be scoring a different answer - but it is not free.
 
-    THE ATTEMPT BUDGET COMES BACK WITH THE ROW. The park this exists for
-    happens AT the cap: a wave that could not route at all burnt three claims
-    finding that out, and every one of them was spent on a fact about the
-    fleet rather than on the answer. Restoring the state alone hands the row
-    back exhausted, so the first ordinary failure afterwards - a 429, or a
-    reply with no reasoning channel - is terminal, lands in `rejected`
-    (which is deliberately not re-openable) and is then counted as a
-    legal-quality reject. Zeroing `attempts` is the honest reading of
-    "return it to the queue"; the per-seed cap and the operator-initiated
-    nature of this command are what bound it.
+    THE ATTEMPT BUDGET COMES BACK WITH THE ROW, UNLESS THE PARK ALREADY COST
+    A CALL. The park this exists for happens AT the cap: a wave that could not
+    route at all burnt three claims finding that out, and every one of them was
+    spent on a fact about the fleet rather than on the answer. Restoring the
+    state alone hands the row back exhausted, so the first ordinary failure
+    afterwards - a 429 - is terminal, lands in `rejected` (which is
+    deliberately not re-openable) and is then counted as a legal-quality
+    reject. Zeroing `attempts` is the honest reading of "return it to the
+    queue" for those.
+
+    IT IS NOT THE HONEST READING FOR A BILLED PARK, and that distinction is
+    new (2026-08-18, review round 2). `unroutable:no-reasoning-channel` is
+    reached by making the call, paying for it, storing the generation and
+    finding no trace in the reply. Zeroing attempts there made every reopen
+    cycle buy one more call with NOTHING bounding the loop, and overwriting the
+    disposition with `reopened:from-gen_unroutable` erased the only thing that
+    distinguished an expensive park from a free one - so a fleet burning a call
+    per cycle read exactly like one that had never been reached. Those rows now
+    keep their attempts and their disposition, which bounds the loop at
+    MAX_ATTEMPTS calls and leaves the cost legible. See
+    BILLED_PARK_DISPOSITIONS.
 
     `rejected` is deliberately not re-openable. It is a decision - the gates
     or the judges said this example is wrong - and re-opening decisions is
@@ -459,6 +483,8 @@ def reopen_tasks(
             f"cannot re-open {unknown}: re-openable states are "
             f"{sorted(REOPEN_STATES)} (a rejected row is a decision, not a park)"
         )
+    from tuned.data.generate import MAX_ATTEMPTS
+
     counts: dict[str, int] = {}
     for state in states:
         target = REOPEN_STATES[state]
@@ -468,14 +494,41 @@ def reopen_tasks(
             clauses.append("stream = ?")
             params.append(stream)
         rows = store.conn.execute(
-            f"SELECT task_id FROM task WHERE {' AND '.join(clauses)} ORDER BY rowid", params
+            f"SELECT task_id, disposition, attempts FROM task "
+            f"WHERE {' AND '.join(clauses)} ORDER BY rowid",
+            params,
         ).fetchall()
         moved = 0
-        for (task_id,) in rows:
+        for task_id, disposition, attempts in rows:
+            # A PARK THAT ALREADY COST A CALL DOES NOT GET ITS BUDGET BACK.
+            #
+            # The blanket reset below is right for the park it was written for
+            # - a wave that could not route at all burnt three claims finding
+            # that out, none of them spent on an answer. It is wrong for a park
+            # that happened AFTER a billed generation: `unroutable:no-reasoning
+            # -channel` is reached by making the call, reading the reply and
+            # finding no trace in it, so resetting attempts made every reopen
+            # cycle buy one more call with nothing bounding the loop. Keeping
+            # the attempts is what bounds it: MAX_ATTEMPTS cycles and the row
+            # stops being offered.
+            # The `reopened:` prefix is stripped before the test so that
+            # re-opening a row twice without a claim in between cannot launder
+            # a billed park into a free one and hand back the budget.
+            settled = (disposition or "").removeprefix("reopened:")
+            billed = settled in BILLED_PARK_DISPOSITIONS
+            if billed and int(attempts or 0) >= MAX_ATTEMPTS:
+                continue
+            # THE DISPOSITION IS PRESERVED on a billed park. Overwriting it
+            # with `reopened:from-<state>` erased the only thing that told a
+            # free park from an expensive one, so a fleet burning a call per
+            # cycle looked exactly like one that had never been reached.
+            new_disposition = (
+                f"reopened:{settled}" if billed else f"reopened:from-{state}"
+            )
             # No fence: a parked row holds no lease (set_task_state released
             # it when it parked), so there is no live holder to lose to.
             if store.set_task_state(
-                task_id, target, f"reopened:from-{state}", reset_attempts=True
+                task_id, target, new_disposition, reset_attempts=not billed
             ):
                 moved += 1
         if moved:

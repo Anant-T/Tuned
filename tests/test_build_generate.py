@@ -4,6 +4,7 @@ import json
 import pytest
 from pipeline_fakes import (
     CLEAN_ANSWER,
+    DATA_CONFIG,
     CLEAN_THINK,
     FABRICATED_ANSWER,
     FABRICATED_SUSPECT,
@@ -24,13 +25,14 @@ from pipeline_fakes import (
 )
 
 from tuned.data import gates
-from tuned.data.config import ModelRef
+from tuned.data.config import ModelRef, load_build_config
 from tuned.data.generate import (
     GEN_UNROUTABLE_STATE,
     GENERATOR_PREFLIGHT_ROLES,
     MAX_ATTEMPTS,
     QUESTION_BY_TASK_TYPE,
     REPLY_BUDGET_GATE,
+    STALE_PROMPT_STATE,
     BatchStats,
     GenResult,
     SlotError,
@@ -39,8 +41,10 @@ from tuned.data.generate import (
     assemble_content,
     budget_ok_for,
     build_prompt,
+    ANSWER_TOKEN_ALLOWANCE,
     build_slots,
     effort_params_for_ref,
+    format_batch_line,
     gate_context,
     generate_once,
     grounding_text,
@@ -435,6 +439,36 @@ def test_the_generation_budget_covers_the_largest_gate_legal_reply(cfg):
     assert max_output_tokens(cfg) <= 4096
 
 
+def test_the_generation_budget_does_not_move_when_the_band_moves(tmp_path):
+    """THE DECOUPLING, TESTED WHERE IT CAN ACTUALLY FAIL (review round 2, I1).
+
+    The assertions above pass against the OLD derivation too, because the
+    shipped config makes think_max + ANSWER_TOKEN_ALLOWANCE == 3000 + 1000 ==
+    4000 == GENERATION_OUTPUT_TOKENS. A mutation that restores
+    `band.think_max + ANSWER_TOKEN_ALLOWANCE` survives every one of them - the
+    reviewer's M4, and it survived.
+
+    So the coincidence has to be broken: move think_max in a real config and
+    assert the CALL budget does not follow it. Under the old derivation this
+    reads 2500; under the new one it stays 4000.
+    """
+    raw = DATA_CONFIG.read_text(encoding="utf-8")
+    moved = raw.replace("think_min: 500, think_max: 3000", "think_min: 500, think_max: 1500")
+    assert moved != raw, "the length_band line moved; update this fixture"
+    path = tmp_path / "band_moved.yaml"
+    path.write_text(moved, encoding="utf-8")
+    shifted = load_build_config(str(path), allow_unpinned=True)
+
+    assert shifted.build.length_band.think_max == 1500
+    # The old derivation would give 1500 + 1000 = 2500.
+    assert shifted.build.length_band.think_max + ANSWER_TOKEN_ALLOWANCE == 2500
+    assert max_output_tokens(shifted) == 4000
+    # ...and the inequality that replaced the identity now BINDS: a band this
+    # small is comfortably covered, and the test above is what fails if the
+    # band is ever raised past what the budget can carry.
+    assert max_output_tokens(shifted) >= legal_reply_chars(shifted) / 4.24
+
+
 def test_the_reply_budget_is_the_max_tokens_the_call_actually_sent(cfg):
     """A bound on a physical fact about the call, not a taste judgement: the
     worker sends max_tokens=max_output_tokens(cfg), and
@@ -487,7 +521,10 @@ def test_a_reply_the_gates_pass_can_still_break_the_judge_sizing_premise(tmp_pat
         # 4.0 to the measured 5.5 raised the budget 16,000 -> 22,000 against an
         # unchanged band ceiling of total_max * 4 = 32,768 characters, so the
         # window in which a gates-passing row can still breach the premise went
-        # from ~2x the budget to ~1.5x. It is a window, not a gap: the shape
+        # from ~1.79x the budget to ~1.30x on this fixture (28,627 reply
+        # characters against 16,000 then and 22,000 now - the earlier "~1.5x"
+        # here was written from the band ratio rather than measured, M-5). It
+        # is a window, not a gap: the shape
         # this test exists for is still reachable, which is why the test still
         # has something to catch.
         assert cfg.build.length_band.total_max * 4 > reply_budget_chars(cfg)
@@ -556,11 +593,156 @@ def test_a_missing_trace_parks_as_a_provider_fact_not_a_content_failure(
         assert store.gates_for(gen["gen_id"])["think_format"] is False
 
         # Parked, not burned: the documented re-open path returns it to the
-        # generator queue with its attempt budget restored.
+        # generator queue. It does NOT get its attempt budget back - the call
+        # was made and billed, so the cycle has to be bounded. See
+        # test_reopening_a_billed_park_is_bounded.
         assert reopen_tasks(store, [GEN_UNROUTABLE_STATE]) == {GEN_UNROUTABLE_STATE: 1}
         reopened = only_task(store)
         assert reopened["state"] == "pending"
-        assert reopened["attempts"] == 0
+        assert reopened["attempts"] == 1
+        assert reopened["disposition"] == "reopened:unroutable:no-reasoning-channel"
+
+
+def test_a_dead_generator_is_counted_as_parked_and_named(tmp_path, cfg, paths):
+    """A PROVIDER THAT PARKS EVERY ROW MUST NOT MAKE THE BATCH LOOK HEALTHIER.
+
+    REVIEW ROUND 2, I2. BatchStats.absorb keyed everything on the GATE
+    disposition, so six rows parked for having no reasoning channel were
+    reported as six ordinary `regenerate`s and nothing anywhere aggregated by
+    provider. Since a parked row never reaches `rejected`, a generator that
+    answered every call with no trace actually IMPROVED the visible numbers -
+    the operator's only route to the truth was joining gate_result to
+    generation.model by hand, which is how 43 pilot rows and ~20% of spend
+    stayed invisible for a whole run.
+    """
+    with make_store(tmp_path, n_seeds=6, n_tasks=6) as store:
+        traceless = chat_response(CLEAN_ANSWER, None)
+        router = FakeRouter(cfg, {"generator": [traceless]})
+        totals = run(store, cfg, router, paths, n_workers=6)
+
+        assert totals["parked"] == {"cerebras/gpt-oss-120b": 6}
+        # Not laundered through the gate counters.
+        assert totals["gated_out"] == 0
+        assert totals["dispositions"] == {}
+        assert totals["gen_ok"] == 6
+
+        stats = BatchStats()
+        for _ in range(6):
+            stats.absorb(
+                GenResult(
+                    task_id="t", attempt=1, ok=True,
+                    ref=ModelRef(provider="mistral", model="mistral-small-latest"),
+                    no_reasoning_channel=True,
+                )
+            )
+        line = format_batch_line(1, stats, [])
+        assert "parked{mistral/mistral-small-latest:6}" in line
+
+
+def test_a_task_planned_against_an_edited_template_is_refused(tmp_path, cfg, paths):
+    """THE PROVENANCE GUARD (review round 2, C1).
+
+    task.prompt_sha is stamped at plan time and copied into every raw envelope
+    and generation row, where it is the only record of which bytes the teacher
+    saw. Nothing compared it to the live registry, so a template edit silently
+    decoupled the two: the call went out under the NEW template and was filed
+    under the OLD sha, pooling two different prompts under one label - which is
+    fatal to any paraphrase A/B, and all 419 non-terminal pilot tasks were in
+    exactly that state after the first fix round.
+
+    The row is REFUSED, not re-stamped. Re-stamping would make the provenance
+    agree with itself by destroying the evidence that it had disagreed.
+    """
+    with make_store(tmp_path) as store:
+        task = only_task(store)
+        planned_sha = task["prompt_sha"]
+        # The template moves under the plan.
+        store.conn.execute(
+            "UPDATE task SET prompt_sha = ? WHERE task_id = ?",
+            ("deadbeef0000", task["task_id"]),
+        )
+        store.conn.commit()
+
+        router = FakeRouter(cfg)
+        run(store, cfg, router, paths)
+
+        moved = only_task(store)
+        assert moved["state"] == STALE_PROMPT_STATE
+        assert moved["disposition"] == (
+            f"stale-prompt:{task['prompt_id']}:deadbeef0000!={planned_sha}"
+        )
+        # NOTHING WAS SPENT: no provider call, no generation row.
+        assert router.calls_for("generator") == []
+        assert store.latest_generation(task["task_id"]) is None
+
+        event = json.loads(store.events("prompt_sha_mismatch")[0]["detail_json"])
+        assert event["planned_sha"] == "deadbeef0000"
+        assert event["live_sha"] == planned_sha
+
+        # Restoring the template makes the row valid again, and the re-open
+        # path is what brings it back.
+        store.conn.execute(
+            "UPDATE task SET prompt_sha = ? WHERE task_id = ?",
+            (planned_sha, task["task_id"]),
+        )
+        store.conn.commit()
+        assert reopen_tasks(store, [STALE_PROMPT_STATE]) == {STALE_PROMPT_STATE: 1}
+        run(store, cfg, router, paths)
+        assert only_task(store)["state"] == "judging"
+
+
+def test_reopening_a_billed_park_is_bounded(tmp_path, cfg, paths):
+    """A park that cost a call must not buy another one every cycle.
+
+    REVIEW ROUND 2, I3. reopen_tasks reset `attempts` unconditionally and
+    overwrote the disposition with `reopened:from-gen_unroutable`. For a
+    no-reasoning-channel park - which is reached by MAKING the call, paying for
+    it and finding no trace in the reply - that made the loop unbounded: every
+    `--reopen gen_unroutable` bought one more live generation, and the
+    overwritten disposition meant an expensive park was indistinguishable from
+    a pool that was never reached.
+
+    The loop now terminates: attempts survive the re-open, so MAX_ATTEMPTS
+    cycles exhaust the row and the re-open stops offering it.
+    """
+    with make_store(tmp_path) as store:
+        traceless = chat_response(CLEAN_ANSWER, None)
+        router = FakeRouter(cfg, {"generator": [traceless]})
+
+        calls = 0
+        for _ in range(MAX_ATTEMPTS + 3):
+            run(store, cfg, router, paths)
+            calls = len(router.calls_for("generator"))
+            if only_task(store)["state"] != GEN_UNROUTABLE_STATE:
+                break
+            if not reopen_tasks(store, [GEN_UNROUTABLE_STATE])[GEN_UNROUTABLE_STATE]:
+                break
+
+        assert calls == MAX_ATTEMPTS, (
+            f"the reopen cycle bought {calls} live calls; it must stop at "
+            f"{MAX_ATTEMPTS}"
+        )
+        task = only_task(store)
+        assert task["attempts"] == MAX_ATTEMPTS
+        # ...and the row is still parked, still saying what parked it.
+        assert task["state"] == GEN_UNROUTABLE_STATE
+        assert task["disposition"] == "unroutable:no-reasoning-channel"
+        # A further re-open is refused rather than silently looping.
+        assert reopen_tasks(store, [GEN_UNROUTABLE_STATE]) == {GEN_UNROUTABLE_STATE: 0}
+
+
+def test_reopening_a_free_park_still_restores_the_budget(tmp_path, cfg, paths):
+    """The blanket reset was right for the park it was written for, and I3 must
+    not take that away: a keyless wave burns claims without ever reaching a
+    provider, so those attempts were never spent on an answer."""
+    with make_store(tmp_path) as store:
+        _park_keyless(store, cfg, paths)
+        assert only_task(store)["attempts"] > 0
+        assert reopen_tasks(store, [GEN_UNROUTABLE_STATE]) == {GEN_UNROUTABLE_STATE: 1}
+        task = only_task(store)
+        assert task["state"] == "pending"
+        assert task["attempts"] == 0
+        assert task["disposition"] == f"reopened:from-{GEN_UNROUTABLE_STATE}"
 
 
 def test_a_retry_sends_the_identical_request_and_logs_no_effort_bump(
@@ -1369,10 +1551,17 @@ def test_the_preflight_advises_one_model_that_closes_every_gap_it_reports(cfg, m
 def test_the_preflight_checks_each_generator_family_at_its_own_window(cfg, monkeypatch):
     """The 8k generator is diverted long before the length band's longest row,
     so a judge gap reported for it at that length is a refusal about a
-    combination that cannot occur. The 40k generator's gap is real and stays."""
+    combination that cannot occur. The 40k generator's gap is real and stays.
+
+    The probe judge is 26k, not 20k, since 2026-08-18 (review round 2, I6):
+    correcting the reply conversion from 4.0 to the measured 5.5 chars/token
+    raised the 8k-window check from 15,104 to 19,104 tokens (23,880 of required
+    context), so a 20k judge no longer clears it and this test would be
+    asserting the absence of a refusal for the wrong reason.
+    """
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
-    patched = cfg_with_context(cfg, family="qwen", role="judge", max_context=20000)
+    patched = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)
     refusals, _ = preflight_messages(patched, GENERATOR_PREFLIGHT_ROLES)
     assert any("a mistral generation" in line for line in refusals)
     assert not any("a gpt-oss generation" in line for line in refusals)
