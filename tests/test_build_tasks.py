@@ -5,6 +5,7 @@ from pipeline_fakes import SOURCE_ID, build_cfg, open_store, paths_for, seed_row
 
 from tuned.data import prompt_registry
 from tuned.data.tasks import main as tasks_main
+from tuned.data.generate import MAX_ATTEMPTS
 from tuned.data.tasks import (
     CURATED_C2_MIX,
     PER_SEED_CAP,
@@ -563,3 +564,122 @@ def test_rows_carry_pending_state_after_creation(store, cfg):
     assert row["state"] == "pending"
     assert row["attempts"] == 0
     assert row["stream"] == "synthesis"
+
+
+# --------------------------------------------------------------------------
+# Terminally-dead states, queue capacity, and the re-open budget.
+# --------------------------------------------------------------------------
+
+def test_cancelled_rows_do_not_occupy_queue_capacity(tmp_path, cfg):
+    """N4. A stale-prompt cancellation must not make the queue look full.
+
+    _existing_in_queue counted every state except `rejected`, so the 419 rows
+    the 2026-08-18 purge moved to `stale_prompt` still held their slots even
+    though no worker can ever claim one. `n` is a TARGET, so the next plan
+    topped up to the difference instead of the number asked for: measured on
+    the live store, `plan_wave(..., 500)` produced 281 - exactly 500 - 219
+    already-counted rows in the unarmed queue - and an A/B arm of 100 against
+    100 cancelled rows would have produced ZERO.
+
+    This is a QUEUE-COUNTING bug, not a seed-supply one. The store had 60,103
+    seeds with no task at all; seeds were never the binding constraint.
+    """
+    with open_store(tmp_path, n_seeds=40) as store:
+        assert plan_wave(store, cfg, "synthesis", 10) == 10
+        store.conn.execute("UPDATE task SET state = 'stale_prompt'")
+        store.conn.commit()
+
+        # The full ask, not the difference.
+        assert plan_wave(store, cfg, "synthesis", 10) == 10
+        live = store.conn.execute(
+            "SELECT COUNT(*) FROM task WHERE state = 'pending'"
+        ).fetchone()[0]
+        assert live == 10
+
+
+def test_rejected_and_stale_are_both_terminally_dead(tmp_path, cfg):
+    """The two dead states behave identically for queue capacity, and the
+    recoverable parks still hold their slots - a parked row keeps whatever it
+    has already paid for, so planning a replacement would double the wave."""
+    with open_store(tmp_path, n_seeds=40) as store:
+        assert plan_wave(store, cfg, "synthesis", 6) == 6
+        ids = [r[0] for r in store.conn.execute("SELECT task_id FROM task ORDER BY rowid")]
+        store.set_task_state(ids[0], "rejected", "reject:citations")
+        store.set_task_state(ids[1], "stale_prompt", "stale-prompt:x:a!=b")
+        store.set_task_state(ids[2], "gen_unroutable", "unroutable:generator")
+
+        # Two dead slots are refilled; the parked one is not.
+        assert plan_wave(store, cfg, "synthesis", 6) == 2
+
+
+def test_reopen_does_not_refund_attempts_a_cancellation_swept_up(tmp_path, cfg):
+    """N6. The purge folded 6 genuinely-exhausted rows into `stale_prompt`.
+
+    Those rows had spent three real, billed generations each; `stale_prompt` is
+    a parking state, and under a blanket reset `--reopen stale_prompt` would
+    have handed all three attempts back to every one of them. The rule is now
+    the other way round: attempts are PRESERVED unless the disposition says the
+    park cost nothing, and a row already at the cap is not re-opened at all.
+    """
+    with open_store(tmp_path, n_seeds=40) as store:
+        assert plan_wave(store, cfg, "synthesis", 8) == 8
+        ids = [r[0] for r in store.conn.execute("SELECT task_id FROM task ORDER BY rowid")]
+        # Six exhausted rows swept into the cancellation...
+        for task_id in ids[:6]:
+            store.conn.execute(
+                "UPDATE task SET attempts = ? WHERE task_id = ?", (MAX_ATTEMPTS, task_id)
+            )
+            store.set_task_state(task_id, "stale_prompt", "stale-prompt:p:a!=b")
+        # ...and two that never got that far.
+        for task_id in ids[6:]:
+            store.conn.execute(
+                "UPDATE task SET attempts = 1 WHERE task_id = ?", (task_id,)
+            )
+            store.set_task_state(task_id, "stale_prompt", "stale-prompt:p:a!=b")
+        store.conn.commit()
+
+        skipped: dict[str, int] = {}
+        counts = reopen_tasks(store, ["stale_prompt"], skipped=skipped)
+
+        assert counts == {"stale_prompt": 2}
+        assert skipped == {"stale_prompt": 6}
+        rows = {
+            r["task_id"]: r
+            for r in store.conn.execute("SELECT task_id, state, attempts FROM task")
+        }
+        # The exhausted six stay put, with their spend intact.
+        for task_id in ids[:6]:
+            assert (rows[task_id]["state"], rows[task_id]["attempts"]) == (
+                "stale_prompt",
+                MAX_ATTEMPTS,
+            )
+        # The two with budget left come back, and keep what they had spent.
+        for task_id in ids[6:]:
+            assert (rows[task_id]["state"], rows[task_id]["attempts"]) == ("pending", 1)
+
+
+def test_reopen_reports_a_budget_skip_distinctly_from_an_empty_filter(tmp_path, cfg):
+    """N5. A bare 0 cannot mean two different things.
+
+    "the filter matched nothing" wants a different filter; "every match was out
+    of budget" wants a re-plan. Both used to print the same line.
+    """
+    with open_store(tmp_path, n_seeds=40) as store:
+        assert plan_wave(store, cfg, "synthesis", 1) == 1
+        task_id = store.conn.execute("SELECT task_id FROM task").fetchone()[0]
+        store.conn.execute("UPDATE task SET attempts = ?", (MAX_ATTEMPTS,))
+        store.set_task_state(task_id, "gen_unroutable", "unroutable:no-reasoning-channel")
+        store.conn.commit()
+
+        exhausted_skip: dict[str, int] = {}
+        assert reopen_tasks(store, ["gen_unroutable"], skipped=exhausted_skip) == {
+            "gen_unroutable": 0
+        }
+        assert exhausted_skip == {"gen_unroutable": 1}
+
+        # Same zero, nothing matched: the skip map stays empty.
+        empty_skip: dict[str, int] = {}
+        assert reopen_tasks(store, ["judge_error"], skipped=empty_skip) == {
+            "judge_error": 0
+        }
+        assert empty_skip == {}

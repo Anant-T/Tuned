@@ -36,9 +36,10 @@ identity: an armed wave and an unarmed wave are counted separately, so
 planning 300 unarmed tasks and then 100 "scripted" ones does not make the
 unarmed wave look finished.
 
-REJECTED ROWS DO NOT COUNT toward the target; parked ones do. See
-_existing_in_queue - the difference is whether the row can still become a
-dataset row, and the bound on replacing rejected ones is the per-seed cap.
+TERMINALLY DEAD ROWS DO NOT COUNT toward the target; recoverable parks do.
+See _existing_in_queue and TERMINALLY_DEAD - the difference is whether the
+row can still become a dataset row, and the bound on replacing dead ones is
+the per-seed cap.
 This module also owns the RE-OPEN path (reopen_tasks / --reopen): the
 workers park a row whenever the failure is about the pool rather than the
 answer, and parking is only survivable if something can un-park it.
@@ -119,13 +120,40 @@ REOPEN_STATES = {
     "stale_prompt": "pending",
 }
 
-# Parked dispositions that ALREADY COST A LIVE CALL. A re-open must not hand
-# these rows a fresh attempt budget: the generation was made, billed and
-# stored, and the park is about what came back rather than about the pool
-# never having been reached. Without this, `--reopen gen_unroutable` on a
-# provider with no reasoning channel buys one more call per cycle, forever.
-# See reopen_tasks.
-BILLED_PARK_DISPOSITIONS = frozenset({"unroutable:no-reasoning-channel"})
+# States a row can never leave under its own power, so they do NOT occupy
+# queue capacity - see _existing_in_queue.
+#
+#   rejected      a decision: the gates or the judges said this is wrong.
+#   stale_prompt  planned against template bytes that no longer exist; only a
+#                 re-plan can produce a usable row for that seed.
+TERMINALLY_DEAD = frozenset({"rejected", "stale_prompt"})
+
+# Parked dispositions whose ATTEMPTS WERE NEVER SPENT ON AN ANSWER, and which
+# therefore get their budget back on re-open. Everything else keeps whatever it
+# has already spent.
+#
+# THE DEFAULT IS TO PRESERVE, and that inversion is deliberate (2026-08-18,
+# review round 3). Resetting by default is only right for the park this command
+# was written for - a wave that could not route at all, or had no key, burnt
+# its claims discovering a fact about the FLEET. Every other way a row can
+# arrive here has a real billed generation behind it, and the fix round proved
+# the cost: the stale-prompt cancellation swept up 6 rows that had genuinely
+# exhausted three paid attempts, and under a blanket reset a `--reopen
+# stale_prompt` would have handed all three back.
+#
+# THE JUDGE-SIDE PARKS ARE FREE, and for a reason worth writing down rather
+# than inferring from the prefix: `attempts` counts GENERATION claims, and a
+# judge park happens after a good generation already exists. The row goes back
+# to `judging`, not to the generator, so the attempts it holds were spent
+# producing the answer that is now waiting to be scored - not on discovering
+# the judge pool was short. That is the original R3-C1 case and it still resets.
+FREE_PARK_DISPOSITIONS = frozenset({"unroutable:generator", "exhausted:provider-fault"})
+FREE_PARK_PREFIXES = (
+    "exhausted:unroutable:",
+    "reopened:from-",
+    "judge-",
+    "tiebreak:",
+)
 
 
 def task_id_for(seed_id: str, task_type: str, prompt_id: str, sample_ix: int) -> str:
@@ -180,25 +208,34 @@ def _existing_in_queue(store, stream: str, arm: str | None) -> int:
     are separate queues, so planning the A/B cells does not make the main
     wave look complete.
 
-    `rejected` rows are NOT counted, and that is the whole of the rule. A
-    wave asks for n candidate rows; a rejected one produced nothing and never
-    will, so counting it leaves the wave permanently short of what the
-    operator asked for - and when a routing bug marked a whole wave rejected,
-    re-running the plan reported "already at target" and did nothing at all.
-    The wave could not replace rows it had lost.
+    A row counts only if it can still BECOME a dataset row. TERMINALLY_DEAD
+    holds the states that cannot: a wave asks for n candidate rows, and one
+    that produced nothing and never will leaves the wave permanently short of
+    what the operator asked for. When a routing bug marked a whole wave
+    rejected, re-running the plan reported "already at target" and did nothing
+    at all - the wave could not replace rows it had lost.
 
-    Everything else counts, INCLUDING the parking states. A parked row is
-    recoverable (`--reopen`) and it keeps whatever judgements it already paid
-    for, so planning a replacement as well would quietly double the wave
-    every time the pool had a bad afternoon.
+    `stale_prompt` JOINED THAT SET on 2026-08-18 and it is not a cosmetic
+    addition. The fix round cancelled 419 rows there, and while they still
+    counted as live the queue was full of tasks no worker can ever claim:
+    `plan_wave(..., 500)` topped up to 281 (500 - 219 already in the unarmed
+    queue), and planning either 100-row A/B arm would have topped up to ZERO,
+    because 100 stale rows already filled it. The seed pool was never the
+    binding constraint - this count was.
+
+    Everything else counts, INCLUDING the recoverable parking states. A parked
+    row is re-openable and keeps whatever judgements it already paid for, so
+    planning a replacement as well would quietly double the wave every time the
+    pool had a bad afternoon.
 
     The bound on replacement is the per-seed cap, not this count:
     _candidate_seeds counts a seed's tasks regardless of state, so a seed
     whose PER_SEED_CAP tasks were all rejected is never offered again. A
     genuinely bad seed therefore costs at most PER_SEED_CAP tasks, once.
     """
-    clauses = ["stream = ?", "state != 'rejected'"]
-    params: list = [stream]
+    placeholders = ", ".join("?" * len(TERMINALLY_DEAD))
+    clauses = ["stream = ?", f"state NOT IN ({placeholders})"]
+    params: list = [stream, *sorted(TERMINALLY_DEAD)]
     if arm is None:
         clauses.append("arm IS NULL")
     else:
@@ -427,9 +464,19 @@ def plan_wave(
 
 
 def reopen_tasks(
-    store, states: Sequence[str], *, stream: str | None = None
+    store,
+    states: Sequence[str],
+    *,
+    stream: str | None = None,
+    skipped: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Return parked tasks to the queue that owns them. Counts per state.
+
+    `skipped` is an optional out-parameter, filled with state -> how many
+    rows were left behind because they had no attempt budget left. The
+    same idiom as providers.eligible_refs(skipped=...), and it exists
+    because a bare 0 is ambiguous: "the filter matched nothing" and "every
+    match was out of budget" call for completely different next moves.
 
     `stream=None` means every stream, which is what the recovery command in
     the config's TODO block actually needs: a pool gap parks whatever was in
@@ -485,6 +532,8 @@ def reopen_tasks(
         )
     from tuned.data.generate import MAX_ATTEMPTS
 
+    if skipped is None:
+        skipped = {}
     counts: dict[str, int] = {}
     for state in states:
         target = REOPEN_STATES[state]
@@ -499,38 +548,44 @@ def reopen_tasks(
             params,
         ).fetchall()
         moved = 0
+        exhausted = 0
         for task_id, disposition, attempts in rows:
-            # A PARK THAT ALREADY COST A CALL DOES NOT GET ITS BUDGET BACK.
+            # WHOSE FAULT WERE THE ATTEMPTS? That is the whole question, and
+            # the answer decides whether the budget comes back.
             #
-            # The blanket reset below is right for the park it was written for
-            # - a wave that could not route at all burnt three claims finding
-            # that out, none of them spent on an answer. It is wrong for a park
-            # that happened AFTER a billed generation: `unroutable:no-reasoning
-            # -channel` is reached by making the call, reading the reply and
-            # finding no trace in it, so resetting attempts made every reopen
-            # cycle buy one more call with nothing bounding the loop. Keeping
-            # the attempts is what bounds it: MAX_ATTEMPTS cycles and the row
-            # stops being offered.
-            # The `reopened:` prefix is stripped before the test so that
-            # re-opening a row twice without a claim in between cannot launder
-            # a billed park into a free one and hand back the budget.
+            # The `reopened:` prefix is stripped first so that re-opening a row
+            # twice without a claim in between cannot launder a spent park into
+            # a free one and hand back the budget.
             settled = (disposition or "").removeprefix("reopened:")
-            billed = settled in BILLED_PARK_DISPOSITIONS
-            if billed and int(attempts or 0) >= MAX_ATTEMPTS:
+            free = settled in FREE_PARK_DISPOSITIONS or settled.startswith(
+                FREE_PARK_PREFIXES
+            )
+            # A row that has already spent its budget on real calls is not
+            # re-openable: the next claim would buy attempt four. This is what
+            # bounds the no-reasoning-channel cycle at MAX_ATTEMPTS calls, and
+            # it is also what protects the genuinely-exhausted rows that a
+            # bulk cancellation can sweep into a parking state.
+            if not free and int(attempts or 0) >= MAX_ATTEMPTS:
+                exhausted += 1
                 continue
-            # THE DISPOSITION IS PRESERVED on a billed park. Overwriting it
-            # with `reopened:from-<state>` erased the only thing that told a
-            # free park from an expensive one, so a fleet burning a call per
-            # cycle looked exactly like one that had never been reached.
+            # THE DISPOSITION IS PRESERVED on anything that cost a call.
+            # Overwriting it with `reopened:from-<state>` erased the only thing
+            # that told a free park from an expensive one, so a fleet burning a
+            # call per cycle looked exactly like one never reached.
             new_disposition = (
-                f"reopened:{settled}" if billed else f"reopened:from-{state}"
+                f"reopened:from-{state}" if free else f"reopened:{settled}"
             )
             # No fence: a parked row holds no lease (set_task_state released
             # it when it parked), so there is no live holder to lose to.
             if store.set_task_state(
-                task_id, target, new_disposition, reset_attempts=not billed
+                task_id, target, new_disposition, reset_attempts=free
             ):
                 moved += 1
+        # N5: a zero that means "all of them were out of budget" must not read
+        # the same as a zero that means "the filter matched nothing". The
+        # operator's next move differs entirely.
+        if exhausted:
+            skipped[state] = exhausted
         if moved:
             store.log_event(
                 "tasks_reopened",
@@ -652,7 +707,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             # the residue this command deliberately left parked, which is
             # otherwise invisible until the wave comes up short.
             touched = parked_by_stream(store, states, stream=args.reopen_stream)
-            counts = reopen_tasks(store, states, stream=args.reopen_stream)
+            out_of_budget: dict[str, int] = {}
+            counts = reopen_tasks(
+                store, states, stream=args.reopen_stream, skipped=out_of_budget
+            )
             # Only a FILTER can leave a residue - an unfiltered re-open moves
             # every row in those states - so only a filtered run looks for
             # one. NOT a bug fix, and it is not claimed as one: with
@@ -666,7 +724,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(f"re-opened {sum(counts.values())}")
             for state in states:
-                print(f"  {state} -> {REOPEN_STATES[state]:<12}{counts[state]:>6}")
+                # A zero next to a non-zero skip count is a different message
+                # from a bare zero: the rows were THERE and had nothing left to
+                # spend, so re-running this command will never move them and
+                # the operator wants a re-plan, not another --reopen.
+                left = out_of_budget.get(state, 0)
+                note = f"   ({left} out of attempt budget, not re-opened)" if left else ""
+                print(f"  {state} -> {REOPEN_STATES[state]:<12}{counts[state]:>6}{note}")
             for name, count in sorted(touched.items()):
                 print(f"  stream {name:<14}{count:>6}")
             if residue:

@@ -54,7 +54,7 @@ from tuned.data.gates import BANNED_META, VERIFICATION_CUES, _norm_ws
 # old shas describes these prompts.
 EXPECTED_SHAS = {
     'gen_drafting_v1': '48534e3010f5',
-    'gen_drafting_v2': '9beafc3b8b0c',
+    'gen_drafting_v2': '618b240ab03e',
     'gen_irac_analysis_v1': '97185cd2068e',
     'gen_irac_analysis_v2': 'b43d2e4afa38',
     'gen_irac_analysis_v3': '09e8c6ffaf80',
