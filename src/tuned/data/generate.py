@@ -130,18 +130,87 @@ WORST_CASE_CHAR = "द"
 # with no key drains nothing at all.
 GENERATOR_PREFLIGHT_ROLES = ("generator", "judge", "tiebreak")
 
-# Reasoning-effort ladder for retries. A regeneration that failed on format,
-# an empty trace or a missing self-check is usually a model that did not
-# think hard enough, so the next attempt asks for more. Only sent to models
-# whose config actually declares reasoning_effort - an unknown parameter is a
-# 400 at some providers, and providers.py treats 400 as "our payload is
-# broken everywhere", aborting the call instead of failing over.
-EFFORT_LADDER = ("low", "medium", "high")
-DEFAULT_EFFORT = "medium"
+# THE RETRY EFFORT LADDER, RETIRED 2026-08-18 - kept as a named constant so
+# the decision is legible, and no longer sent to anyone.
+#
+# It used to bump reasoning_effort one rung per attempt on the theory that a
+# regeneration which failed on format, an empty trace or a missing self-check
+# is a model that did not think hard enough. Measured over the pilot's 221
+# gated generations, the bump is UNIFORMLY NEGATIVE on this corpus and is the
+# single largest contributor to a 0-clean-rows run. On gpt-oss-120b, mean
+# trace length went 2,411 -> 12,353 -> 12,536 chars across attempts 1/2/3
+# (5.2x), and with it:
+#
+#   verbatim_overlap    35/60 -> 58/59 -> 58/58   (a longer trace collides more)
+#   banned_meta         11/60 -> 51/59 -> 53/58   (more room to narrate the rules)
+#   irac_placement       6/60 -> 39/59 -> 45/58   (drafts the answer in the trace)
+#   length_band         21/60 -> 29/59 -> 32/58   (blows think_max 3000)
+#   finish_reason=length    0 ->    18 ->    16   (answer truncated away)
+#
+# The only gate it helped was self_verification (51/60 -> 22/59), and it helped
+# by accident: a 5x longer trace is likelier to contain one of the twelve
+# literal cues by chance. That is now fixed where it belongs, in the prompt,
+# which hands the cue vocabulary over explicitly.
+#
+# So a retry now re-rolls the SAME request. Effort is whatever the model's
+# config declares (params.reasoning_effort in configs/data_law_v1.yaml) on
+# every attempt, which is the attempt-1 condition every measurement above was
+# taken under.
+EFFORT_LADDER_RETIRED = "2026-08-18: measured uniformly negative, see pilot"
 
-# Answer-side token allowance on top of the band's think ceiling. The band is
-# an estimate in the same chars/4 currency the gates use.
+# Answer-side token allowance, in the gates' chars/4 estimate currency. Used to
+# size GENERATION_OUTPUT_TOKENS below; not itself a call parameter.
 ANSWER_TOKEN_ALLOWANCE = 1000
+
+# WHAT ONE GENERATION CALL MAY EMIT, in REAL provider tokens.
+#
+# DECOUPLED 2026-08-18 from `band.think_max + ANSWER_TOKEN_ALLOWANCE`, which
+# was wrong in kind rather than in size. That identity added a GATE THRESHOLD
+# to an answer allowance and sent the sum to a provider as `max_tokens`, mixing
+# two currencies: the band counts chars//4 estimates, `max_tokens` counts real
+# tokens, and on this corpus the two differ by ~17% (measured 4.24-5.13
+# chars/token over 155 gpt-oss generations, against the 4.0 the estimate
+# assumes). It also meant that raising a gate ceiling silently re-priced every
+# generation call AND the judge-pool sizing that reads this number.
+#
+# PROVENANCE OF THE VALUE, which is deliberately UNCHANGED at 4000:
+#   * the largest GATE-LEGAL reply is think_max + ANSWER_TOKEN_ALLOWANCE
+#     = 4,000 estimate-tokens = 16,000 characters;
+#   * at the measured MINIMUM 4.24 chars/token - the worst case, since fewer
+#     chars per token means more tokens - that is 3,774 real tokens;
+#   * 4,000 covers it with 226 tokens of margin, and is under the primary
+#     generator's declared max_output (cerebras/gpt-oss-120b, 4096), above
+#     which _cerebras_request_hook would clamp us anyway.
+#
+# No gate-legal row was ever truncated at this budget: all 34 pilot
+# `finish_reason=length` rows carried traces of 15,255-19,558 chars, i.e.
+# 3,814-4,890 estimate-tokens, already far past think_max 3,000 and rejected by
+# check_length_band regardless. So the evidence supports changing the
+# DERIVATION and does not support changing the NUMBER - and this round does not
+# move numbers it cannot measure. test_generation_budget_covers_a_legal_reply
+# pins the inequality, so raising think_max now FAILS a test instead of quietly
+# re-pricing the fleet.
+GENERATION_OUTPUT_TOKENS = 4000
+
+# Chars-per-token for the REPLY BUDGET only - see reply_budget_chars.
+#
+# providers.CHARS_PER_TOKEN_LATIN is 4.0 and is used for context estimation and
+# judge-pool sizing, where under-stating characters is the safe direction. In
+# reply_budget_chars the safe direction is the OPPOSITE - the budget is an
+# upper bound on how many characters a well-behaved provider can return, so
+# under-stating chars/token makes the bound too tight and the check fires on
+# compliant calls. It did: 53 reply_over_budget events in the pilot, of which
+# all 34 `length` ones reported completion_tokens EXACTLY 4000 = the max_tokens
+# sent, i.e. the provider was billing correctly at the moment the check said it
+# was not. Measured chars/completion_token: median 4.66-4.70, max 5.13
+# (gpt-oss-120b n=155, magistral n=29). 5.5 is that maximum with margin.
+#
+# Still catches what the check exists for: an unbilled reasoning channel
+# returning a full trace ON TOP of a full answer is ~28,000 chars against this
+# 22,000-char bound. Deliberately NOT applied to providers.CHARS_PER_TOKEN_LATIN
+# - that constant feeds context_estimate and the 29,661/29,666 judge preflight
+# numbers, which are a separate re-audit (ledgered 2026-08-18).
+REPLY_BUDGET_CHARS_PER_TOKEN = 5.5
 
 # The slots that are MATERIAL - what the teacher may cite, and therefore what
 # the gates and the judge must be shown. Fixed order so the same task always
@@ -259,6 +328,12 @@ class GenResult:
     # class (a 400 with no context marker) is deliberately NOT this: that one
     # is our bug and hiding it in a parking state hides it entirely.
     provider_fault: bool = False
+    # The model answered, in full, with NO separable reasoning channel - see
+    # generate_once. A fact about the PROVIDER, not about the answer, so it
+    # parks like one; without it the row reads as three content-gate failures
+    # (think_format, length_band, self_verification) and the real cause is
+    # legible only by joining gate_result to generation.model.
+    no_reasoning_channel: bool = False
 
 
 @dataclass
@@ -913,8 +988,26 @@ def assemble_content(cfg, response) -> tuple[str, str | None, str]:
 
 
 def max_output_tokens(cfg) -> int:
+    """`max_tokens` for one generation call, in real provider tokens.
+
+    Independent of the length band since 2026-08-18 - see
+    GENERATION_OUTPUT_TOKENS for why the old `think_max + allowance` identity
+    was a currency error and why the value did not move with the derivation.
+    `cfg` is still taken: callers pass it, and the budget being config-shaped
+    is what lets a future build make it per-profile without touching them.
+    """
+    return int(GENERATION_OUTPUT_TOKENS)
+
+
+def legal_reply_chars(cfg) -> int:
+    """Characters in the largest reply the GATES would still pass.
+
+    think_max and the answer allowance are both chars//4 estimates, so this is
+    the honest character size of a maximally-legal generation - the quantity
+    GENERATION_OUTPUT_TOKENS has to be able to carry.
+    """
     band = cfg.build.length_band
-    return int(band.think_max + ANSWER_TOKEN_ALLOWANCE)
+    return int((band.think_max + ANSWER_TOKEN_ALLOWANCE) * 4)
 
 
 # The name the reply-budget breach travels under in a disposition string. It
@@ -929,12 +1022,19 @@ def reply_budget_chars(cfg) -> int:
     """The most characters one generation call can physically return.
 
     `generate_once` sends `max_tokens=max_output_tokens(cfg)`, which bounds
-    the reply in TOKENS, and CHARS_PER_TOKEN_LATIN is the loosest
-    chars-per-token this module models - no tokenizer here gives a token more
-    characters than that. So a well-behaved provider cannot produce a reply
-    longer than this, and the bound over-states rather than under-states.
+    the reply in TOKENS, and REPLY_BUDGET_CHARS_PER_TOKEN is the loosest
+    chars-per-token MEASURED on this corpus. So a well-behaved provider cannot
+    produce a reply longer than this, and the bound over-states rather than
+    under-states.
+
+    IT USED TO UNDER-STATE, which is the failure this constant fixes: the
+    premise was CHARS_PER_TOKEN_LATIN = 4.0 and "no tokenizer here gives a
+    token more characters than that", and the pilot measured 4.24-5.13. The
+    check therefore fired on 53 calls that were inside their token budget -
+    including 34 that reported completion_tokens exactly equal to the
+    max_tokens sent. See REPLY_BUDGET_CHARS_PER_TOKEN.
     """
-    return int(max_output_tokens(cfg) * CHARS_PER_TOKEN_LATIN)
+    return int(max_output_tokens(cfg) * REPLY_BUDGET_CHARS_PER_TOKEN)
 
 
 def reply_over_budget(cfg, think: str | None, answer: str | None) -> int:
@@ -967,36 +1067,27 @@ def reply_over_budget(cfg, think: str | None, answer: str | None) -> int:
     return max(0, len(think or "") + len(answer or "") - reply_budget_chars(cfg))
 
 
-def effort_for_attempt(attempt: int, base: str = DEFAULT_EFFORT) -> str:
-    """One rung up the ladder per retry, saturating at the top."""
-    try:
-        start = EFFORT_LADDER.index(base)
-    except ValueError:
-        start = EFFORT_LADDER.index(DEFAULT_EFFORT)
-    return EFFORT_LADDER[min(start + max(0, attempt - 1), len(EFFORT_LADDER) - 1)]
-
-
 def effort_params_for_ref(attempt: int):
     """Build the Router's per-ref params hook for this attempt.
 
-    Attempt 1 sends nothing and every model's configured defaults stand. A
-    retry asks for more reasoning effort - but the parameter is chosen for
-    the ref the Router is ABOUT TO CALL, not for the one it would have
-    picked first. That distinction is the whole point: reasoning_effort is a
-    gpt-oss parameter, magistral does not declare it, and an unknown field
-    earns a 400 - which providers.py classifies as our payload being broken
-    everywhere and raises straight through WITHOUT failing over. Choosing the
-    params before the failover decision would therefore turn every
-    second-attempt failover into a dead task.
+    EVERY attempt now sends nothing, so every model's configured defaults
+    stand and a retry re-rolls the SAME request. See EFFORT_LADDER_RETIRED for
+    the measurement that closed the ladder: bumping reasoning_effort made five
+    gates worse and one gate better by accident, and produced a 0-clean-rows
+    pilot.
+
+    The signature keeps `attempt` rather than being deleted outright. The
+    Router's contract is a per-ref hook - the params are chosen for the ref it
+    is ABOUT TO CALL, not the one it would have picked first, because
+    reasoning_effort is a gpt-oss parameter that magistral does not declare and
+    an unknown field earns a 400, which providers.py treats as our payload
+    being broken everywhere and raises through WITHOUT failing over. That hook
+    shape is what keeps a failover survivable, and it should still be the thing
+    a future per-attempt parameter is threaded through, so it stays.
     """
 
     def params_for_ref(ref: ModelRef, model_cfg) -> dict:
-        if attempt <= 1:
-            return {}
-        declared = dict(getattr(model_cfg, "params", None) or {})
-        if "reasoning_effort" not in declared:
-            return {}
-        return {"reasoning_effort": effort_for_attempt(attempt, str(declared["reasoning_effort"]))}
+        return {}
 
     return params_for_ref
 
@@ -1246,6 +1337,44 @@ async def generate_once(
     result.disposition = gates.disposition(gate_results)
     result.failed_gates = tuple(g.gate for g in gate_results if not g.passed)
 
+    # THE GENERATOR RETURNED NO REASONING CHANNEL, recorded as the provider
+    # fact it is. `think is None` after assemble_content means the model
+    # neither filled a reasoning field nor inlined a tag pair, so on a stream
+    # that expects a trace there is nothing to gate - and the row would
+    # otherwise be filed as three CONTENT failures (think_format not-exactly-
+    # one-pair, length_band think<think_min, self_verification no-cue) that say
+    # nothing about the model's legal reasoning at all.
+    #
+    # Measured 2026-08-18: 43/43 mistral/magistral-small-latest generations,
+    # 0/176 cerebras/gpt-oss-120b. A single live probe settled why - the
+    # message carries keys ['content','role','tool_calls'] with content a plain
+    # string and no [THINK]/<think> markers, and `prompt_mode: "reasoning"`
+    # answers 400 "Reasoning prompt mode is not enabled for this model"
+    # (code 3051). So there is no channel to extract and no request-side switch
+    # to turn one on: this generator cannot serve a reasoning stream as
+    # configured, which is a fact about the POOL and belongs in the parking
+    # state that says so.
+    #
+    # The gates still ran and their rows are still stored - run_all never
+    # short-circuits, and verify.py re-reads those bytes - so this suppresses
+    # no instrumentation. It only stops the row being counted as a content
+    # rejection.
+    if think is None and ctx.expect_reasoning:
+        result.no_reasoning_channel = True
+        store.log_event(
+            "no_reasoning_channel",
+            {
+                "task_id": task["task_id"],
+                "attempt": attempt,
+                "gen_id": gen_id,
+                "ref": f"{ref.provider}/{ref.model}",
+                "family": model_cfg.family,
+                "finish_reason": response.finish_reason,
+                "answer_chars": len(answer or ""),
+                "gates_that_fired": list(result.failed_gates),
+            },
+        )
+
     # The premise the judge-pool sizing rests on, made true by construction.
     # See reply_over_budget: `max_tokens` was sent, so a well-behaved provider
     # cannot breach this, and the one shape that can (a reasoning channel not
@@ -1281,8 +1410,10 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
 
     * clean            -> judging (judge.py's queue)
     * regenerate       -> pending while attempts remain, else rejected. The
-                          next claim bumps reasoning_effort
-                          (effort_params_for_ref).
+                          next claim re-rolls the IDENTICAL request: the
+                          reasoning-effort ladder that used to escalate here
+                          was retired 2026-08-18 as measurably harmful, see
+                          EFFORT_LADDER_RETIRED.
     * reject           -> rejected. A permanent gate means the example is
                           wrong about the law; the seed is burned, never
                           retried.
@@ -1293,6 +1424,11 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
     * unroutable       -> gen_unroutable at once: no model in the pool can
                           hold this row, so the next two claims would meet
                           the identical wall.
+    * no reasoning     -> gen_unroutable at once, for the same reason: the
+      channel             model answered but has no reasoning channel to give,
+                          which no retry changes. Checked BEFORE the gate
+                          disposition so the row is not filed as the three
+                          content failures its absent trace produces.
 
     NOTHING here closes a task because the Router said "not retryable". A
     missing key is not retryable either, and a keyless fleet must leave its
@@ -1345,6 +1481,15 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
             state, disposition = REJECTED_STATE, "exhausted:error"
         else:
             state, disposition = PENDING_STATE, None
+    elif result.no_reasoning_channel:
+        # The provider answered but has no reasoning channel to give, so the
+        # next two claims meet the identical wall - the same argument
+        # `unroutable` already makes, and the same parking state, which
+        # tasks.REOPEN_STATES returns to `pending` once routing or the pool
+        # changes. NOT `rejected`: nothing here says the example is wrong about
+        # the law, and reject-rate statistics that swallowed 43 of these would
+        # be measuring the fleet.
+        state, disposition = GEN_UNROUTABLE_STATE, "unroutable:no-reasoning-channel"
     elif result.disposition is None:
         state, disposition = JUDGING_STATE, None
     elif result.disposition == "regenerate":

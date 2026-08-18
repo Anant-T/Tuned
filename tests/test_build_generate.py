@@ -40,17 +40,22 @@ from tuned.data.generate import (
     budget_ok_for,
     build_prompt,
     build_slots,
-    effort_for_attempt,
+    effort_params_for_ref,
     gate_context,
     generate_once,
     grounding_text,
     judge_sizer,
+    legal_reply_chars,
     max_output_tokens,
     next_attempt,
     preflight_messages,
     reply_budget_chars,
     reply_over_budget,
     run_workers,
+)
+from tuned.data.generate import (
+    GENERATION_OUTPUT_TOKENS,
+    REPLY_BUDGET_CHARS_PER_TOKEN,
 )
 from tuned.data.generate import main as generate_main
 from tuned.data.jsonl import read_at
@@ -183,11 +188,29 @@ def test_assemble_content_never_fabricates_a_trace(cfg):
     assert cfg.think_open not in content
 
 
-def test_effort_ladder():
-    assert effort_for_attempt(1, "medium") == "medium"
-    assert effort_for_attempt(2, "medium") == "high"
-    assert effort_for_attempt(3, "medium") == "high"
-    assert effort_for_attempt(2, "low") == "medium"
+@pytest.mark.parametrize("attempt", [1, 2, 3, 4])
+def test_a_retry_re_rolls_the_same_request_and_never_bumps_effort(cfg, attempt):
+    """RETIRED LADDER (2026-08-18). This used to assert the opposite -
+    effort_for_attempt(2, "medium") == "high" - and the ladder it pinned is the
+    single largest contributor to the pilot's 0-clean-generations run.
+
+    Measured on cerebras/gpt-oss-120b across 176 generations, attempts 1/2/3:
+    mean trace 2,411 -> 12,353 -> 12,536 chars, and with it verbatim_overlap
+    35/60 -> 58/59 -> 58/58, banned_meta 11/60 -> 51/59 -> 53/58,
+    irac_placement 6/60 -> 39/59 -> 45/58, finish_reason=length 0 -> 18 -> 16.
+    The one gate it improved (self_verification 51/60 -> 22/59) it improved by
+    accident, a longer trace being likelier to contain one of twelve literal
+    cues; that is now handled in the prompt, which hands the cues over.
+
+    So no attempt may send reasoning_effort at all: the model's configured
+    default stands on every one, which is the attempt-1 condition all of the
+    above was measured under.
+    """
+    params_for_ref = effort_params_for_ref(attempt)
+    for provider in cfg.providers:
+        for model in provider.models:
+            ref = ModelRef(provider=provider.name, model=model.id)
+            assert params_for_ref(ref, model) == {}
 
 
 # --------------------------------------------------------------------------
@@ -368,14 +391,66 @@ OVERSIZE_ANSWER = CLEAN_ANSWER + " " + (
     "The gap in the chain is the point to press, and it is the point on which this turns. " * 190
 )
 
+# A trace that trips exactly one REGENERATE gate: it clears think_min, carries
+# no banned phrase, no line-initial IRAC heading and no citation, and simply
+# never doubts itself - so check_self_verification fails and nothing else does.
+#
+# It exists because a traceless response used to be the convenient way to make
+# a test produce a regeneration, and since 2026-08-18 that shape parks as a
+# provider fact instead (see
+# test_a_missing_trace_parks_as_a_provider_fact_not_a_content_failure). Tests
+# that want a CONTENT regeneration have to ask for one.
+NO_CUE_THINK = (
+    "The right pleaded rests on the section both parties invoke, and the "
+    "question is whether the facts as recorded bring the case within it. "
+) * 20
+
+
+def test_the_generation_budget_covers_the_largest_gate_legal_reply(cfg):
+    """The inequality that replaced an identity (2026-08-18).
+
+    max_output_tokens used to BE `think_max + ANSWER_TOKEN_ALLOWANCE`, which
+    added a gate threshold counted in chars//4 to an allowance counted in
+    chars//4 and sent the sum to a provider as `max_tokens`, counted in real
+    tokens. The two currencies differ by ~17% on this corpus (measured
+    4.24-5.13 chars/token over 155 gpt-oss generations against the 4.0 the
+    estimate assumes), and the coupling meant raising a gate ceiling silently
+    re-priced every generation call and the judge-pool sizing that reads it.
+
+    What actually has to hold is this: the budget must carry the largest reply
+    the GATES would pass, converted at the measured WORST-CASE chars/token -
+    worst case being the SMALLEST ratio, since fewer chars per token means more
+    tokens for the same text. Raising think_max now fails here instead of
+    quietly re-pricing the fleet.
+    """
+    # Measured minimum over the pilot; see GENERATION_OUTPUT_TOKENS.
+    measured_min_chars_per_token = 4.24
+    worst_case_tokens = legal_reply_chars(cfg) / measured_min_chars_per_token
+    assert max_output_tokens(cfg) >= worst_case_tokens
+    # ...and it is not derived from the band any more, so moving the band does
+    # not move it.
+    assert max_output_tokens(cfg) == GENERATION_OUTPUT_TOKENS
+    # The primary generator's declared ceiling, above which the cerebras
+    # request hook would clamp us without saying so.
+    assert max_output_tokens(cfg) <= 4096
+
 
 def test_the_reply_budget_is_the_max_tokens_the_call_actually_sent(cfg):
     """A bound on a physical fact about the call, not a taste judgement: the
-    worker sends max_tokens=max_output_tokens(cfg), and CHARS_PER_TOKEN_LATIN
-    is the loosest chars-per-token this module models, so a well-behaved
-    provider cannot exceed it."""
+    worker sends max_tokens=max_output_tokens(cfg), and
+    REPLY_BUDGET_CHARS_PER_TOKEN is the loosest chars-per-token MEASURED, so a
+    well-behaved provider cannot exceed it.
+
+    The constant used to be providers.CHARS_PER_TOKEN_LATIN (4.0) on the stated
+    premise that "no tokenizer here gives a token more characters than that".
+    The pilot measured 4.24-5.13, so the bound was too tight and the check
+    fired on 53 compliant calls - 34 of which reported completion_tokens
+    exactly equal to the max_tokens sent, i.e. the provider was billing
+    correctly at the moment the check said it was not.
+    """
     budget = reply_budget_chars(cfg)
-    assert budget == max_output_tokens(cfg) * 4
+    assert budget == int(max_output_tokens(cfg) * REPLY_BUDGET_CHARS_PER_TOKEN)
+    assert REPLY_BUDGET_CHARS_PER_TOKEN > 5.13, "must clear the measured maximum"
     assert reply_over_budget(cfg, "a" * budget, "") == 0
     assert reply_over_budget(cfg, "a" * (budget - 1), "b") == 0
     assert reply_over_budget(cfg, "a" * budget, "b") == 1
@@ -406,8 +481,16 @@ def test_a_reply_the_gates_pass_can_still_break_the_judge_sizing_premise(tmp_pat
         # budget is a fraction of it, so any row with a short prompt has room
         # to spare.
         reply_chars = len(gen["think"]) + len(gen["answer"])
-        assert reply_chars > 1.5 * reply_budget_chars(cfg)
-        assert cfg.build.length_band.total_max * 4 > 2 * reply_budget_chars(cfg)
+        assert reply_chars > reply_budget_chars(cfg)
+        # The headroom NARROWED on 2026-08-18 and the assertions say so rather
+        # than being loosened quietly: correcting the chars/token premise from
+        # 4.0 to the measured 5.5 raised the budget 16,000 -> 22,000 against an
+        # unchanged band ceiling of total_max * 4 = 32,768 characters, so the
+        # window in which a gates-passing row can still breach the premise went
+        # from ~2x the budget to ~1.5x. It is a window, not a gap: the shape
+        # this test exists for is still reachable, which is why the test still
+        # has something to catch.
+        assert cfg.build.length_band.total_max * 4 > reply_budget_chars(cfg)
         over = reply_over_budget(cfg, gen["think"], gen["answer"])
 
         assert task["state"] == "pending"
@@ -432,39 +515,82 @@ def test_a_permanent_gate_still_decides_an_over_budget_reply(tmp_path, cfg, path
         assert REPLY_BUDGET_GATE in task["disposition"]
 
 
-def test_a_missing_trace_is_a_regeneration_not_a_reject(tmp_path, cfg, paths):
+def test_a_missing_trace_parks_as_a_provider_fact_not_a_content_failure(
+    tmp_path, cfg, paths
+):
+    """A generator with no reasoning channel is a fact about the POOL.
+
+    CHANGED 2026-08-18. This used to assert `pending` + `regenerate:...`, i.e.
+    a content problem worth two more attempts. Measured over the pilot: 43/43
+    mistral/magistral-small-latest generations came back with no trace and
+    0/176 cerebras/gpt-oss-120b did, so the row was never going to improve by
+    being asked again - every retry bought the identical wall and the run
+    filed ~20% of its spend as three content-gate failures (think_format,
+    length_band, self_verification) that describe the harness, not the answer.
+
+    A single live probe settled that there is nothing to extract: the message
+    carries keys ['content','role','tool_calls'], content is a plain string
+    with no [THINK]/<think> markers, and `prompt_mode: "reasoning"` is refused
+    with 400 "Reasoning prompt mode is not enabled for this model" (code 3051).
+    So the harness reports the provider fact and parks the row where
+    tasks.REOPEN_STATES can bring it back, rather than spending the seed's
+    attempts proving the same thing three times.
+
+    The gates still ran and their rows are still stored - this suppresses no
+    instrumentation, it only stops the row being counted as a rejection.
+    """
     with make_store(tmp_path) as store:
         router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, None)]})
         run(store, cfg, router, paths)
         task = only_task(store)
-        assert task["state"] == "pending"
-        assert task["disposition"].startswith("regenerate:")
-        assert "think_format" in task["disposition"]
-        assert task["attempts"] == 1
+        assert task["state"] == GEN_UNROUTABLE_STATE
+        assert task["disposition"] == "unroutable:no-reasoning-channel"
+
+        # The provider-level fact is recorded, and names the ref responsible.
+        event = json.loads(store.events("no_reasoning_channel")[0]["detail_json"])
+        assert event["ref"] == "cerebras/gpt-oss-120b"
+        assert "think_format" in event["gates_that_fired"]
+
+        # ...and the gate rows are still there to be read.
+        gen = store.latest_generation(task["task_id"])
+        assert store.gates_for(gen["gen_id"])["think_format"] is False
+
+        # Parked, not burned: the documented re-open path returns it to the
+        # generator queue with its attempt budget restored.
+        assert reopen_tasks(store, [GEN_UNROUTABLE_STATE]) == {GEN_UNROUTABLE_STATE: 1}
+        reopened = only_task(store)
+        assert reopened["state"] == "pending"
+        assert reopened["attempts"] == 0
 
 
-def test_the_retry_bumps_reasoning_effort_and_says_so(tmp_path, cfg, paths):
+def test_a_retry_sends_the_identical_request_and_logs_no_effort_bump(
+    tmp_path, cfg, paths
+):
+    """INVERTED 2026-08-18 - this used to pin `calls[1]["params"] ==
+    {"reasoning_effort": "high"}` and one effort_bump event per retry. The
+    ladder is retired; see
+    test_a_retry_re_rolls_the_same_request_and_never_bumps_effort for the
+    measurement, and generate.EFFORT_LADDER_RETIRED for the numbers."""
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, None)]})
+        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, NO_CUE_THINK)]})
         run(store, cfg, router, paths)
         run(store, cfg, router, paths)
         calls = router.calls_for("generator")
         assert calls[0]["params"] == {}
-        assert calls[1]["params"] == {"reasoning_effort": "high"}
-        events = store.events("effort_bump")
-        assert len(events) == 1
-        assert json.loads(events[0]["detail_json"])["attempt"] == 2
+        assert calls[1]["params"] == {}
+        assert store.events("effort_bump") == []
 
 
 def test_regeneration_is_exhausted_at_the_attempt_cap(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, None)]})
+        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, NO_CUE_THINK)]})
         for _ in range(MAX_ATTEMPTS):
             run(store, cfg, router, paths)
         task = only_task(store)
         assert task["attempts"] == MAX_ATTEMPTS
         assert task["state"] == "rejected"
         assert task["disposition"].startswith("exhausted:regenerate:")
+        assert "self_verification" in task["disposition"]
 
 
 def test_gates_run_without_an_index_and_say_so(tmp_path, cfg, paths):
@@ -540,9 +666,12 @@ def test_the_generation_attempt_cap_is_three_and_there_is_no_fourth_claim(tmp_pa
     claim that does not happen."""
     assert MAX_ATTEMPTS == 3
     with make_store(tmp_path) as store:
-        # No reasoning channel and no inline tags: the trace gate fails the
+        # A trace that never doubts itself: check_self_verification fails the
         # row into a regeneration every time, which is the path that spends.
-        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, None)]})
+        # (A traceless reply used to be the stimulus here; since 2026-08-18 it
+        # parks as a provider fact and spends nothing, which is the point of
+        # that change and would make this test vacuous.)
+        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, NO_CUE_THINK)]})
         for _ in range(MAX_ATTEMPTS + 2):
             run(store, cfg, router, paths)
 
@@ -713,10 +842,22 @@ def test_a_short_prompt_excludes_no_generator(tmp_path, cfg, paths):
         assert call["ref"] == ModelRef("cerebras", "gpt-oss-120b")
 
 
-def test_the_effort_bump_is_chosen_for_the_ref_that_answers(tmp_path, cfg, paths):
-    """reasoning_effort is a gpt-oss parameter. On a long prompt the call
-    lands on magistral, which does not declare it - and an unknown parameter
-    is a 400 that never fails over."""
+def test_no_attempt_sends_reasoning_effort_on_either_generator(tmp_path, cfg, paths):
+    """The per-ref params hook survives the retired ladder, and sends nothing.
+
+    CHANGED 2026-08-18. The second half used to assert
+    `{"reasoning_effort": "high"}` on the cerebras route; both routes now send
+    `{}` on every attempt, so the model's configured default stands.
+
+    The hook SHAPE is still worth pinning even with nothing to put in it, and
+    that is why this test did not simply go away. reasoning_effort is a gpt-oss
+    parameter that magistral does not declare, and an unknown field earns a 400
+    that providers.py treats as our payload being broken everywhere - raising
+    through WITHOUT failing over. Any future per-attempt parameter has to be
+    chosen for the ref the Router is about to call, not the one it would have
+    picked first, or a failover becomes a dead task. The long-prompt route
+    below is exactly that failover.
+    """
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
         router = FakeRouter(cfg)
         task = only_task(store)
@@ -732,10 +873,8 @@ def test_the_effort_bump_is_chosen_for_the_ref_that_answers(tmp_path, cfg, paths
         asyncio.run(generate_once(store, cfg, router, task, paths=paths, attempt=2))
         call = router.calls_for("generator")[0]
         assert call["ref"].provider == "cerebras"
-        assert call["params"] == {"reasoning_effort": "high"}
-        assert json.loads(store.events("effort_bump")[0]["detail_json"])["ref"] == (
-            "cerebras/gpt-oss-120b"
-        )
+        assert call["params"] == {}
+        assert store.events("effort_bump") == []
 
 
 def test_a_row_no_generator_can_hold_parks_recoverably(tmp_path, cfg, paths):
@@ -881,21 +1020,25 @@ def test_a_reopened_row_survives_the_first_failure_after_recovery(tmp_path, cfg,
 
 
 def test_a_reopened_row_still_buys_the_regenerations_it_never_used(tmp_path, cfg, paths):
-    """The worse half of R3-C1: a reply with no reasoning channel is the most
-    common free-tier outcome (it is why the effort ladder exists), and post-
-    reopen it cost a PAID generation and then rejected with zero
-    regenerations - as `exhausted:regenerate:...`, i.e. counted as a legal-
-    quality reject."""
+    """The worse half of R3-C1: a reply the gates send back is the ordinary
+    free-tier outcome, and post-reopen it cost a PAID generation and then
+    rejected with zero regenerations - as `exhausted:regenerate:...`, i.e.
+    counted as a legal-quality reject.
+
+    The stimulus changed on 2026-08-18 from a traceless reply to one that
+    fails check_self_verification. A traceless reply is no longer a content
+    regeneration at all - it parks as a provider fact and spends nothing - so
+    it can no longer demonstrate the attempt accounting this test is about."""
     with make_store(tmp_path) as store:
         _park_keyless(store, cfg, paths)
         reopen_tasks(store, [GEN_UNROUTABLE_STATE])
 
-        traceless = chat_response(CLEAN_ANSWER, reasoning=None)
-        run(store, cfg, FakeRouter(cfg, {"generator": [traceless]}), paths)
+        sent_back = chat_response(CLEAN_ANSWER, reasoning=NO_CUE_THINK)
+        run(store, cfg, FakeRouter(cfg, {"generator": [sent_back]}), paths)
         task = only_task(store)
         assert task["state"] == "pending"
         assert task["disposition"].startswith("regenerate:")
-        assert "think_format" in task["disposition"]
+        assert "self_verification" in task["disposition"]
 
 
 # --------------------------------------------------------------------------
