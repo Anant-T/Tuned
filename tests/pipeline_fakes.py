@@ -458,6 +458,46 @@ def cfg_with_split_pools(cfg: BuildConfig, *, judge_context: int, tiebreak_conte
     )
 
 
+def cfg_with_extra_judge(
+    cfg: BuildConfig, *, provider: str, family: str, model_id: str, max_context: int
+) -> BuildConfig:
+    """The shipped config plus one judge, in a family and behind a key of the
+    caller's choosing.
+
+    THE SHAPE THIS SUPPLIES used to be in the config: cerebras/zai-glm-4.7, a
+    keyed 8k judge in a third family. It was retired on 2026-08-18 (archived
+    upstream, 404 on every call), and two properties here are only expressible
+    with one in the pool -
+
+      * "this gap is CONTEXT-shaped and that one is KEY-shaped" needs a family
+        that serves the short rows and not the long ones;
+      * a slot B that can be filled AT ALL needs a second KEYED judge family,
+        because slot B excludes slot A's.
+
+    Without one, every gap in a partially-keyed pool classifies unservable and
+    the distinction the rules are about disappears - which reads as the tests
+    passing while measuring one case instead of two.
+    """
+    from dataclasses import replace
+
+    extra = ModelCfg(
+        id=model_id,
+        family=family,
+        roles=("judge",),
+        limits={"rpm": 30, "tpm": 8000, "max_context": max_context, "max_output": 4096},
+        params={"temperature": 0.2},
+    )
+    providers = tuple(
+        replace(p, models=p.models + (extra,)) if p.name == provider else p for p in cfg.providers
+    )
+    assert any(model_id in (m.id for m in p.models) for p in providers), provider
+    return replace(
+        cfg,
+        providers=providers,
+        routing=replace(cfg.routing, judge=cfg.routing.judge + (f"{provider}/{model_id}",)),
+    )
+
+
 def cfg_with_two_generator_families(cfg: BuildConfig) -> BuildConfig:
     """The shipped config with a SECOND generator family put back.
 

@@ -14,19 +14,21 @@ model twice".
 
 CONTEXT LENGTH IS A ROUTING INPUT (contract 2). The judge prompt is the
 longest in the pipeline: the same materials the generator saw PLUS the
-candidate's trace and answer. Two judge-pool models are 8k-context. A
-candidate that does not fit must be routed to a 32k+ judge, because a
-silently truncated judge prompt produces a score for an answer nobody read -
-which is worse than not judging it at all. Router.pick exposes no context
-filter, so the length check is turned into a family exclusion
+candidate's trace and answer. The smallest JUDGE in the pool is 32k since
+2026-08-18, when the 8k one was removed as archived upstream; the smallest
+TIEBREAK is still 8k. A candidate that does not fit must be routed past it,
+because a silently truncated judge prompt produces a score for an answer
+nobody read - which is worse than not judging it at all. Router.pick exposes
+no context filter, so the length check is turned into a family exclusion
 (providers.undersized_families), which degrades safely: a family is excluded
 only when EVERY one of its models in that role is too small.
 
 WHEN THE POOL RUNS OUT, IT RUNS OUT LOUDLY AND ONCE. Family separation and
 context length together can empty a role for a given row - the shipped
-tiebreak pool is gpt-oss + two 8k models, so a long candidate from the
-gpt-oss generator has no eligible tiebreak at all. Three rules keep that
-from becoming a paid loop:
+tiebreak pool is gpt-oss + one 8k model (gemma; the second, glm, left the
+config archived on 2026-08-18), so a long candidate from the gpt-oss
+generator has no eligible tiebreak at all. Three rules keep that from
+becoming a paid loop:
 
   * a NON-RETRYABLE routing failure parks the task in 'judge_unroutable'
     immediately instead of re-queueing it - nothing about tomorrow's claim
@@ -65,6 +67,22 @@ parser accepts the axis aliases the rubric uses (grounding_faithfulness /
 reasoning_validity / issue_coverage as well as the short names), finds JSON
 anywhere in the reply, and treats an unparsable answer as ONE retried judge
 slot - never as a crash, and never as a score.
+
+DEFENSIVE IS NOT CREDULOUS: A THINK BLOCK IS NOT A VERDICT. Some judges
+inline their reasoning as <think>...</think> before answering, and inside
+that block they restate the schema, argue with it, and try scores on. Those
+objects are the model THINKING ABOUT the rubric, not applying it, so
+split_reply_think puts the scorable region strictly after the closed block
+and nothing inside it can be scored. Reading one would be the failure this
+codebase keeps finding in its own instruments - the machinery reporting
+HEALTHY in exactly the case it exists to catch - and it would be worse here
+than elsewhere, because the number goes into the judgement table that P5
+calibration and gold labelling read as a verdict somebody gave.
+
+A block that never CLOSES is a parse error, loudly, and that is the shape
+the qwen judge actually failed in (2026-08-18: 7 replies, 7 truncations, all
+1,024 completion tokens spent inside <think>). Guessing a verdict out of
+half a thought would turn a truncated reply into a score.
 
 EMPTY-THINK ROWS ARE NEVER JUDGED (contract 4). The empty-think slice is
 copied, not generated, so it never reaches this queue; if one ever does -
@@ -148,11 +166,30 @@ TIEBREAK_PROMPT = TIEBREAK_PROMPT_ID
 JUDGE_SLOTS = ("a", "b")
 TIEBREAK_SLOT = "tiebreak"
 
-# Enough for three integers and an 80-word rationale, with headroom for a
-# judge that emits reasoning tokens on its way there. providers.py keeps a
+# Enough for three integers and an 80-word rationale. providers.py keeps a
 # copy (DEFAULT_JUDGE_REPLY_TOKENS) so the startup preflight can size the
 # judge pool without importing this module; they must agree, and a test pins
 # that they do.
+#
+# IT IS NOT "with headroom for a judge that emits reasoning tokens on its way
+# there", which is what this comment used to claim and what 2026-08-18
+# measured false. A reasoning judge does not overshoot this budget a little;
+# it never reaches the verdict at all - groq/qwen/qwen3.6-27b spent EXACTLY
+# 1,024 completion tokens on each of 7 calls and every reply was cut mid-word
+# still inside <think>. The fix is per-model and in the config
+# (role_params.judge.reasoning_effort = none), because the number here cannot
+# be the answer:
+#
+#   * it is FLEET-WIDE. judge_needed_tokens adds it to every judge prompt and
+#     undersized_families turns the sum into a family exclusion, so raising it
+#     raises the pool's context bar. The worst-case judge call is 23,729
+#     routing tokens and CONTEXT_SAFETY_MARGIN makes that 29,661 of required
+#     window against slot A's 32,000; +2,048 of reply budget takes the
+#     requirement to 32,221 and retires mistral from every long row - the fix
+#     would break the judge that works;
+#   * it is not per-model, and the model that needs a bigger reply is the one
+#     whose tpm (6,000) is already under one call at this size (measured judge
+#     prompts 4,914-5,661 routing tokens).
 JUDGE_MAX_TOKENS = DEFAULT_JUDGE_REPLY_TOKENS
 
 # Provisional thresholds until P5 calibration writes judge_threshold rows.
@@ -180,6 +217,14 @@ _AXIS_ALIASES = {
     "validity": ("validity", "reasoning_validity"),
     "coverage": ("coverage", "issue_coverage"),
 }
+
+# The delimiters a PROVIDER wraps inlined reasoning in. Deliberately NOT
+# cfg.think_open/think_close, which are the TRAINER's tags for the dataset:
+# they are the same two strings today, and binding them would make a future
+# re-tag of the corpus silently change how judge replies parse. A judge reply
+# is never trained on; these are wire format, not dataset format.
+REPLY_THINK_OPEN = "<think>"
+REPLY_THINK_CLOSE = "</think>"
 
 
 class JudgeParseError(ValueError):
@@ -278,6 +323,45 @@ class JudgeStats:
 # Parsing (contract 3).
 # --------------------------------------------------------------------------
 
+def split_reply_think(text: str) -> tuple[str | None, str]:
+    """(think, scorable) for a judge reply; raises on a block that never closes.
+
+    Mirrors generate.assemble_content's second shape - the model that inlines
+    <think>...</think> in the text rather than returning a reasoning channel -
+    but answers a narrower question, because a judge reply is scored rather
+    than stored: WHERE IS A VERDICT ALLOWED TO BE.
+
+    Everything after the LAST close tag, and nothing before it. Not
+    gates.split_think's prefix+suffix, and the difference is the whole point:
+    that one keeps the prefix so no answer-side gate is handed a blank, while
+    here a "prefix" is text the model wrote before it had finished thinking,
+    and scoring an object out of it credits a draft as a decision.
+
+    Truncation is ONE test, not two, and it covers both ways a reply can end
+    mid-thought: the scorable region may not contain an OPEN tag. A reply that
+    opened and never closed leaves the whole text scorable-region and trips it;
+    so does a reply that closed one block, answered, and opened another it
+    never finished. Either way the reply stops inside a thought, and a verdict
+    read out of it would be a verdict the model had not arrived at.
+
+    A reply with no tags at all is returned whole (think=None) - that is the
+    mistral shape, which is most of the judgements this build has.
+    """
+    body = text or ""
+    close_at = body.rfind(REPLY_THINK_CLOSE)
+    if close_at < 0:
+        think, scorable = None, body
+    else:
+        cut = close_at + len(REPLY_THINK_CLOSE)
+        think, scorable = body[:cut], body[cut:]
+    if REPLY_THINK_OPEN in scorable:
+        raise JudgeParseError(
+            f"judge reply ends inside an unclosed {REPLY_THINK_OPEN} block - it was "
+            f"truncated before any verdict: {' '.join(body.split())[:200]!r}"
+        )
+    return think, scorable
+
+
 def _json_objects(text: str):
     """Every balanced {...} span in `text`, parsed, in order of appearance.
 
@@ -345,13 +429,16 @@ def _score(value) -> int:
 def parse_judge_reply(text: str) -> JudgeScores:
     """The three axes and the rationale out of whatever the judge said.
 
-    The LAST complete object wins. A model that restates the contract's
-    example object before answering (they do) would otherwise be scored on
-    the example.
+    The LAST complete object wins, out of the region a verdict is allowed to
+    be in (split_reply_think). A model that restates the contract's example
+    object before answering (they do) would otherwise be scored on the
+    example - and a model that reasons about the schema inside a think block
+    would be scored on the reasoning.
     """
+    think, scorable = split_reply_think(text)
     best: JudgeScores | None = None
     last_error: str | None = None
-    for obj in _json_objects(text):
+    for obj in _json_objects(scorable):
         lowered = {str(k).strip().lower(): v for k, v in obj.items()}
         values = {}
         try:
@@ -366,8 +453,14 @@ def parse_judge_reply(text: str) -> JudgeScores:
         rationale = lowered.get("rationale") or lowered.get("reason") or ""
         best = JudgeScores(**values, rationale=str(rationale)[:2000])
     if best is None:
+        # Which REGION was searched is named when it was narrowed. A reply that
+        # visibly contains a well-formed object and is reported as having none
+        # reads as a parser bug, and the operator goes looking for one instead
+        # of at the model that put its verdict inside its own reasoning.
+        where = "" if think is None else " after the reasoning block"
         raise JudgeParseError(
-            f"no scorable JSON object in judge reply ({last_error or 'no object found'}): "
+            f"no scorable JSON object in judge reply{where} "
+            f"({last_error or 'no object found'}): "
             f"{' '.join((text or '').split())[:200]!r}"
         )
     return best

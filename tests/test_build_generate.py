@@ -16,6 +16,7 @@ from pipeline_fakes import (
     build_cfg,
     cfg_with_fourth_judge_family,
     cfg_with_context,
+    cfg_with_extra_judge,
     cfg_with_two_generator_families,
     cfg_with_split_pools,
     chat_response,
@@ -1515,15 +1516,23 @@ def test_the_fleet_refuses_to_start_with_a_judge_slot_it_cannot_fill(cfg, monkey
     cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
+    # Withheld EXPLICITLY: the paid backstop is what fills slot B here, so a
+    # machine that happens to export it would turn this into a test of nothing.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     refusals, warnings = preflight_messages(cfg, ("generator",))
     assert any("routing.judge slot b" in line for line in refusals)
     # The tiebreak gap has a defined fallback, so it warns rather than refuses.
     assert any("routing.tiebreak" in line for line in warnings)
     assert not any("routing.tiebreak" in line for line in refusals)
-    # An operator who knows the gap can still run short rows.
-    allowed, allowed_warnings = preflight_messages(cfg, ("generator",), allow_pool_gaps=True)
-    assert allowed == []
-    assert any("routing.judge slot b" in line for line in allowed_warnings)
+    # The judge gap SURVIVES the override, and that is the 2026-08-18 change
+    # rather than a regression: the slot-B candidate a short mistral row used
+    # to have here was cerebras/zai-glm-4.7, and it was retired as archived.
+    # With it gone the slot is empty at every row size, and a flag whose whole
+    # justification is "the short rows still run" has no short rows to run.
+    # test_the_shipped_configs_own_gap_is_a_key_the_override_cannot_cover
+    # takes that apart; here it is enough that the refusal does not move.
+    allowed, _ = preflight_messages(cfg, ("generator",), allow_pool_gaps=True)
+    assert any("routing.judge slot b" in line for line in allowed)
 
 
 def test_a_widened_pool_starts_clean(cfg, monkeypatch):
@@ -1580,8 +1589,17 @@ def test_allow_pool_gaps_cannot_override_a_gap_no_row_size_escapes(cfg, monkeypa
     cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
-    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    for env in ("GROQ_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
     widened = cfg_with_fourth_judge_family(cfg)  # the new judge is a groq model
+    # ...plus the KEYED 8k judge the shipped pool carried until 2026-08-18. It
+    # is what makes the contrast this test is about expressible at all: with
+    # one keyed judge family, slot B is empty at every size for BOTH generator
+    # families, every gap classifies unservable, and "the gap the override IS
+    # for" has no instance left. See cfg_with_extra_judge.
+    widened = cfg_with_extra_judge(
+        widened, provider="cerebras", family="small", model_id="small-judge", max_context=8192
+    )
 
     forced, warnings = preflight_messages(
         widened, GENERATOR_PREFLIGHT_ROLES, allow_pool_gaps=True
@@ -1597,23 +1615,34 @@ def test_allow_pool_gaps_cannot_override_a_gap_no_row_size_escapes(cfg, monkeypa
     assert preflight_messages(widened, GENERATOR_PREFLIGHT_ROLES) == ([], [])
 
 
-def test_the_shipped_configs_own_gap_is_still_overridable(cfg, monkeypatch):
-    """The other half of R4-C1: the fourth-family judge is a MODEL the
-    operator is sourcing, not a key, and short rows really do route. Refusing
-    that one as well would leave no way to run the pilot at all."""
+def test_the_shipped_configs_own_gap_is_a_key_the_override_cannot_cover(cfg, monkeypatch):
+    """The other half of R4-C1, INVERTED on 2026-08-18 - and kept inverted
+    rather than deleted, because the inversion is what the operator has to
+    know before a launch.
+
+    It used to read: the shipped gap is a MODEL the operator is sourcing, not a
+    key, so short rows really do route and `--allow-pool-gaps` opens a pilot.
+    What made those short rows route was cerebras/zai-glm-4.7 - a keyed 8k
+    judge that could take slot B on a short row from the mistral generator -
+    and it was retired as archived. With it gone the slot is empty at EVERY row
+    size for an operator who has not funded OPENAI_API_KEY, so the override
+    cannot open the pilot any more. The key can."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
     cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
-    refusals, warnings = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    refusals, _ = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
     assert any("routing.judge slot b" in line for line in refusals)
-    forced, forced_warnings = preflight_messages(
-        cfg, GENERATOR_PREFLIGHT_ROLES, allow_pool_gaps=True
-    )
-    assert forced == []
-    assert any("shorter rows still route" in line for line in forced_warnings)
+    forced, _ = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES, allow_pool_gaps=True)
+    assert any("no row size is servable" in line for line in forced)
+    assert any("OPENAI_API_KEY" in line for line in forced)
+    # ...and the key really is the fix, so the refusal is about the pool and
+    # not about the flag.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    assert preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)[0] == []
 
 
 def test_the_preflight_advises_one_model_that_closes_every_gap_it_reports(cfg, monkeypatch):

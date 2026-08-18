@@ -41,6 +41,7 @@ from tuned.data.judge import (
     judge_task,
     parse_judge_reply,
     run_judges,
+    split_reply_think,
     thresholds_active,
     undersized_families,
 )
@@ -164,6 +165,99 @@ def test_parser_rejects_unscorable_replies(text):
         parse_judge_reply(text)
 
 
+# --------------------------------------------------------------------------
+# The parser, on a judge that thinks out loud (contract 3, 2026-08-18).
+# --------------------------------------------------------------------------
+# groq/qwen/qwen3.6-27b inlines <think>...</think> and reasons about the rubric
+# inside it before answering. Three shapes have to come apart, and the middle
+# one is the whole reason this exists.
+
+THINK_PREAMBLE = (
+    "<think>\nHere's a thinking process:\n\n1. **Analyze User Input:**\n"
+    "   - **Role:** Strict evaluator of legal reasoning. Score 1-5 on three axes.\n"
+    "   - The schema wants something like "
+    '{"grounding": 1, "validity": 1, "coverage": 1, "rationale": "..."} '
+    "which I should not fill in yet.\n"
+    "2. Weigh the trace. The chain has a gap at its centre.\n"
+)
+
+
+def test_parser_scores_the_object_after_a_closed_think_block():
+    """The shipped qwen shape once it finishes: reason, close, then answer."""
+    parsed = parse_judge_reply(
+        THINK_PREAMBLE + "</think>\n\n"
+        '{"grounding": 4, "validity": 3, "coverage": 5, "rationale": "gap at the centre"}'
+    )
+    assert (parsed.grounding, parsed.validity, parsed.coverage) == (4, 3, 5)
+    assert parsed.rationale == "gap at the centre"
+
+
+def test_parser_refuses_an_object_that_never_leaves_the_think_block():
+    """THE ONE THIS EXISTS FOR. The preamble above carries a complete, valid,
+    all-1s object - the model quoting the schema at itself - and the reply then
+    closes with no verdict at all.
+
+    Scoring it would be a judgement nobody made, written into the judgement
+    table at min_axis 1 and read later by P5 calibration and gold labelling as
+    a real verdict. It is also the exact failure this codebase keeps finding in
+    its own instruments: the machinery reporting a result in the case it exists
+    to catch. The fixture has to be able to EXPRESS the misreading, so the
+    object inside the block is well-formed and would parse on its own - which
+    the assertion below checks, so this test cannot pass by accident."""
+    inside_only = THINK_PREAMBLE + "</think>\n\nI will stop here."
+    with pytest.raises(JudgeParseError) as excinfo:
+        parse_judge_reply(inside_only)
+    assert "after the reasoning block" in str(excinfo.value)
+    # The object really is scorable when it is not sealed inside the block.
+    assert parse_judge_reply(
+        '{"grounding": 1, "validity": 1, "coverage": 1, "rationale": "..."}'
+    ).min_axis == 1
+
+
+def test_parser_refuses_a_think_block_that_never_closes():
+    """The shape 7 of 7 slot-B replies actually had on 2026-08-18: the model
+    spent its whole 1,024-token budget inside <think> and was cut mid-word. A
+    verdict guessed out of half a thought is not a verdict, so this is a parse
+    error - which costs one retried slot and never a score."""
+    with pytest.raises(JudgeParseError) as excinfo:
+        parse_judge_reply(THINK_PREAMBLE + "3. The delay is unexplained on these pap")
+    assert "unclosed <think>" in str(excinfo.value)
+
+
+def test_parser_refuses_a_reply_that_reopens_a_block_it_never_closes():
+    """Truncation after a verdict is still truncation. One test covers both
+    ways a reply can stop mid-thought, so a reply that answered and then
+    started thinking again cannot be scored on the answer it had abandoned."""
+    with pytest.raises(JudgeParseError):
+        parse_judge_reply(
+            "<think>done</think>\n"
+            '{"grounding": 4, "validity": 4, "coverage": 4}\n'
+            "<think>actually, on reflection"
+        )
+
+
+def test_parser_still_takes_a_plain_reply_with_no_think_at_all():
+    """Slot A must not regress. mistral-small-latest returns a fenced object
+    and no tags whatever, and it is the model that produced every judgement in
+    the store; a think-aware parser that needed a think block would have taken
+    the working half of the pool down with the broken one."""
+    parsed = parse_judge_reply(
+        '```json\n{\n  "grounding": 5,\n  "validity": 3,\n  "coverage": 4,\n'
+        '  "rationale": "compresses the step from the error to the restoration."\n}\n```'
+    )
+    assert (parsed.grounding, parsed.validity, parsed.coverage) == (5, 3, 4)
+    assert parsed.verdict == BORDERLINE
+
+
+def test_split_reply_think_returns_none_when_there_is_no_block():
+    """think=None is what tells parse_judge_reply not to blame a reasoning
+    block for a reply that never had one."""
+    assert split_reply_think('{"grounding": 4}') == (None, '{"grounding": 4}')
+    think, scorable = split_reply_think("<think>weighing</think> verdict follows")
+    assert think == "<think>weighing</think>"
+    assert scorable == " verdict follows"
+
+
 def test_verdict_bands():
     assert scores(4, 4, 4).verdict == PASS
     assert scores(5, 5, 3).verdict == BORDERLINE
@@ -214,11 +308,16 @@ def test_failing_rationale_takes_the_harshest_judge():
 # Routing (contracts 2 and 5).
 # --------------------------------------------------------------------------
 
-def test_undersized_families_excludes_the_8k_judges(cfg):
+def test_undersized_families_excludes_the_judges_too_small_for_the_row(cfg):
+    """The judge pool has no 8k tier since 2026-08-18: zai-glm-4.7 was the only
+    one and it left the config archived. The EMPTY set at 20,000 is the
+    assertion, not a placeholder - it says the first family this filter can
+    remove is now the 32k one, which is what a re-added small judge would
+    change and what the routing tests below are written against."""
     assert undersized_families(cfg, "judge", 4000) == frozenset()
-    assert undersized_families(cfg, "judge", 20000) == frozenset({"glm"})
-    # Past 32k only the 131k judge survives.
-    assert undersized_families(cfg, "judge", 40000) == frozenset({"glm", "mistral"})
+    assert undersized_families(cfg, "judge", 20000) == frozenset()
+    # Past 32k only the 131k judge and the two 400k backstops survive.
+    assert undersized_families(cfg, "judge", 40000) == frozenset({"mistral"})
 
 
 def test_generation_family_falls_back_to_the_config(cfg):
@@ -243,7 +342,19 @@ def test_judges_exclude_the_generator_family_and_each_other(tmp_path, cfg, paths
         assert calls[1]["ref"].model == "qwen/qwen3.6-27b"
 
 
-def test_a_long_candidate_is_routed_past_the_8k_judges(tmp_path, cfg, paths):
+def test_a_long_candidate_past_8k_still_fills_both_slots(tmp_path, cfg, paths):
+    """What retiring the 8k judge cost at this row size: nothing.
+
+    A row past 8,192 routing tokens used to have zai-glm-4.7 struck out of the
+    pool on context length before either slot was picked. The model is gone
+    (archived upstream, 2026-08-18) and NO family is excluded on length here
+    any more - the next window up is mistral's 32k - so both slots fill from
+    the same two models a short row uses.
+
+    The misreading it rejects is that dropping a model from a pool must make
+    some row harder to route. It does not here, because the model dropped could
+    never serve this row either: it was excluded on length exactly when it was
+    needed, and all it did in the meantime was spend an attempt per route."""
     with judged_store(tmp_path, paths, cfg) as store:
         gen = store.latest_generation(only_task(store)["task_id"])
         store.conn.execute(
@@ -254,9 +365,10 @@ def test_a_long_candidate_is_routed_past_the_8k_judges(tmp_path, cfg, paths):
         run_judge(store, cfg, router, paths)
         calls = router.calls_for("judge")
         assert calls[0]["est_tokens"] > 8192
-        assert "glm" in calls[0]["exclude_families"]
-        assert {"glm", "gpt-oss"} <= calls[1]["exclude_families"]
-        assert all(call["ref"].model != "zai-glm-4.7" for call in calls)
+        assert calls[0]["exclude_families"] == frozenset({"gpt-oss"})
+        assert calls[0]["ref"].provider == "mistral"
+        assert calls[1]["exclude_families"] == frozenset({"gpt-oss", "mistral"})
+        assert calls[1]["ref"].model == "qwen/qwen3.6-27b"
 
 
 def test_a_candidate_past_every_small_judge_lands_on_the_131k_model(tmp_path, cfg, paths):
@@ -269,7 +381,7 @@ def test_a_candidate_past_every_small_judge_lands_on_the_131k_model(tmp_path, cf
         router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
         run_judge(store, cfg, router, paths)
         calls = router.calls_for("judge")
-        assert {"glm", "mistral"} <= calls[0]["exclude_families"]
+        assert {"gpt-oss", "mistral"} <= calls[0]["exclude_families"]
         assert calls[0]["ref"].model == "qwen/qwen3.6-27b"
 
 
@@ -655,7 +767,7 @@ def test_an_unroutable_judge_parks_instead_of_re_queueing(tmp_path, cfg, paths):
         assert router.calls_for("judge")[0]["ref"] is None
         event = json.loads(store.events("judge_route_error")[0]["detail_json"])
         assert event["unroutable"] is True
-        assert {"glm", "mistral", "qwen"} <= set(event["excluded"])
+        assert {"gpt-oss", "mistral", "qwen"} <= set(event["excluded"])
         # And it stays parked: a second sweep does not re-claim it.
         assert run_judge(store, cfg, router, paths)["claimed"] == 0
 
@@ -1496,7 +1608,15 @@ def test_the_judge_sizes_the_call_it_is_about_to_buy_the_way_the_preflight_does(
     # generator can hold it. mistral was demoted to judge-only on 2026-08-18,
     # so the second generator family is supplied explicitly - otherwise this
     # parks at the generator and never exercises the judge path at all.
-    widened = cfg_with_fourth_judge_family(cfg_with_two_generator_families(cfg))
+    # The 8k judge this row has to be too big for is SUPPLIED rather than
+    # borrowed from the pool. zai-glm-4.7 carried that window until 2026-08-18,
+    # when it was retired as archived, and every judge left is 32k or larger -
+    # so no shipped model now sits between what the two sizings ask for on this
+    # row (11,247 tokens of declared window in the routing currency, 6,777 in
+    # chars/4), and the disagreement would be unobservable.
+    widened = cfg_with_fourth_judge_family(
+        cfg_with_two_generator_families(cfg), max_context=8192
+    )
     devanagari = "अभियुक्त को भारतीय दंड संहिता की धारा तीन सौ दो के अंतर्गत दोषी ठहराया गया। " * 140
     with open_store(tmp_path, n_seeds=1, text=devanagari) as store:
         plan_wave(store, widened, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
@@ -1518,9 +1638,9 @@ def test_the_judge_sizes_the_call_it_is_about_to_buy_the_way_the_preflight_does(
         assert call["est_tokens"] == judge_needed_tokens(messages, reply_tokens=JUDGE_MAX_TOKENS)
         # ...and the number is load-bearing: it is what takes the 8k judge out
         # of the pool for this row. The chars/4 sizing leaves it in.
-        assert "glm" in call["exclude_families"]
+        assert "fourth" in call["exclude_families"]
         chars_over_four = sum(len(m["content"]) for m in messages) // 4 + JUDGE_MAX_TOKENS
-        assert "glm" not in undersized_families(widened, "judge", chars_over_four)
+        assert "fourth" not in undersized_families(widened, "judge", chars_over_four)
 
 
 def test_a_reopened_judge_row_gets_its_attempt_budget_back(tmp_path, cfg, paths):

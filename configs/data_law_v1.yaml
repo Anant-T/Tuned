@@ -207,11 +207,19 @@ providers:
         roles: [generator]
         limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 8192, max_output: 4096}
         params: {temperature: 0.7, top_p: 0.95, reasoning_effort: medium}
-      - id: zai-glm-4.7
-        family: glm
-        roles: [judge, tiebreak]
-        limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 8192, max_output: 4096}
-        params: {temperature: 0.2}
+      # zai-glm-4.7 (family glm, judge + tiebreak) IS GONE, and this comment is
+      # the fence against re-adding it: the model is ARCHIVED upstream and every
+      # call to it 404s -
+      #
+      #     {"type": "model_archived_error", "code": "model_archived",
+      #      "message": "Model zai-glm-4.7 is archived and unavailable for the ..."}
+      #
+      # - measured 2026-08-18 on 4 slot-B routes, each of which spent one
+      # eligible-model attempt on it before failing over (run_event
+      # judge_route_error, status 404). A dead ref in a routing list is not
+      # free: it is an attempt per route, on every route, forever. Anyone
+      # putting a glm model back must first check it answers `python -m
+      # tuned.data.providers --check --ref cerebras/<id>` with a 200.
       - id: gemma-4-31b
         family: gemma
         roles: [tiebreak]
@@ -222,11 +230,56 @@ providers:
     api_key_env: GROQ_API_KEY
     quirks: [groq]
     models:
+      # REASONING OFF FOR THE JUDGE ROLE since 2026-08-18, because with it on
+      # this model cannot return a verdict at all inside its reply budget.
+      #
+      # Measured: 7 slot-B calls, 7 parse failures, 7,168 completion tokens =
+      # EXACTLY 1,024 each (judge.JUDGE_MAX_TOKENS), every reply cut mid-word
+      # still inside an unclosed `<think>` that opened "Here's a thinking
+      # process: 1. **Analyze User Input:** ...". Zero judgements, and the
+      # tokens were billed. The trace is not a little too long for the budget;
+      # it does not finish within it.
+      #
+      # `none` is Groq's documented value for this family (console.groq.com
+      # /docs/reasoning and the /docs/api-reference entry for reasoning_effort:
+      # "qwen3 models ... Set to 'none' to disable reasoning. Set to 'default'
+      # or null to let Qwen reason."), live-probed 2026-08-18: HTTP 200, no
+      # think tags anywhere in the reply, and the JSON verdict alone.
+      #
+      # WHY NOT KEEP THE REASONING AND RAISE THE CAP. Two independent reasons,
+      # both arithmetic:
+      #   * role_params CANNOT express a bigger cap. providers.build_payload
+      #     merges params < role_params < per-call params and only THEN assigns
+      #     `payload["max_tokens"] = req.max_tokens`, so judge.py's own cap
+      #     overwrites anything named here.
+      #   * tpm 6000 is below the call. The measured judge prompts on this row
+      #     size were 4,914-5,661 routing tokens; with a 1,024 reply that is
+      #     already 5,938-6,685 against a 6,000/minute bucket, which
+      #     TokenBucket._need_tokens can only serve by clamping and waiting for
+      #     a full bucket. A reply budget large enough to hold this model's
+      #     trace would put slot B under one call per minute and still overrun.
+      # `reasoning_format: hidden` and `parsed` (also documented for this
+      # family) are no help either: they change where the trace is REPORTED,
+      # not whether it is generated and billed against max_tokens.
+      #
+      # WHAT IT COSTS: a judge that does not deliberate before scoring. That is
+      # the condition slot A already runs under - mistral-small-latest's
+      # reasoning channel is opt-in and the judge role deliberately does not
+      # opt in - and its verdicts on this wave were 237-411 characters, i.e.
+      # ~59-103 tokens against the 1,024 cap. The rubric asks for three
+      # integers and one sentence, not an essay.
+      #
+      # ROLE-SCOPED ON PURPOSE, even though `judge` is the only role this model
+      # serves today. In `params` the same key would follow the model into a
+      # generator promotion and silently produce a traceless generator, which
+      # is exactly the pilot failure the mistral block above records.
       - id: qwen/qwen3.6-27b
         family: qwen
         roles: [judge]
         limits: {rpm: 30, tpm: 6000, tpd: 200000, rpd: 1000, max_context: 131072, max_output: 16384}
         params: {temperature: 0.2}
+        role_params:
+          judge: {reasoning_effort: 'none'}
       # Also the difficulty probe since 2026-08-17: Groq retired its llama chat
       # lineup (llama-3.1-8b-instant 404s; live models endpoint carries only
       # allam-2-7b, the gpt-oss pair and qwen3.6-27b). Calibration adapts its
@@ -398,8 +451,9 @@ providers:
 # What the fatal gap WAS, kept because any future edit to routing.judge can
 # re-open it. A long prompt is routed past the 8k cerebras generator to
 # mistral/mistral-small-latest (32k). Family separation then removes mistral
-# from the judge pool; the 8k zai-glm-4.7 is removed on context length; slot A
-# takes groq/qwen; and slot B had NOTHING LEFT. The row parked in
+# from the judge pool; the 8k zai-glm-4.7 was removed on context length (that
+# model has since been retired outright - archived upstream, see the cerebras
+# block); slot A takes groq/qwen; and slot B had NOTHING LEFT. The row parked in
 # judge_unroutable having ALREADY PAID for judge A. The arithmetic made this
 # the rule and not an edge case: the generator diverts to mistral at 2,555
 # routing tokens of prompt, and slot B died at 5,531 routing tokens of judge
@@ -426,14 +480,15 @@ providers:
 # family at its first fatal judge gap, so the mistral case was never reached
 # before. For a gpt-oss generation, separation removes every gpt-oss tiebreak
 # - the groq 20b and both openai models, which are lumped into that family on
-# purpose - and the context check removes gemma and glm. For a mistral
+# purpose - and the context check removes gemma, which since the glm
+# retirement is the only tiebreak family separation had left. For a mistral
 # generation, the two judge slots take qwen and gpt-oss, which leaves the
 # tiebreak with no family it has not already spent. In both cases judge.py
 # decides on the two judges it has and rejects the unresolved disagreement
 # (run_event tiebreak_unroutable_two_judge_decision - the metric to watch).
 #
 # Closing THAT would take one more tiebreak in a family that is none of
-# gpt-oss/mistral/qwen/gemma/glm, with max_context >= 29666. The five over
+# gpt-oss/mistral/qwen/gemma, with max_context >= 29666. The five over
 # the judge threshold are real and not a typo: the tiebreak prompt is a
 # little longer than the judge prompt and the preflight sizes the two
 # separately, so 29,661 buys a judge and 29,666 buys a tiebreak.
@@ -446,9 +501,9 @@ routing:
   # nowhere to go and parks gen_unroutable without spending: 3% of pilot
   # prompts, against a fallback that produced 0 usable rows in 56 calls.
   generator: [cerebras/gpt-oss-120b]
-  judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b, cerebras/zai-glm-4.7,
+  judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b,
           openai/gpt-5-mini, openai/gpt-5-nano]
-  tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b, cerebras/zai-glm-4.7,
+  tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b,
              openai/gpt-5-mini, openai/gpt-5-nano]
   probe: [groq/openai/gpt-oss-20b]
   family_separation: true
