@@ -1529,8 +1529,8 @@ def test_the_fleet_refuses_to_start_with_a_judge_slot_it_cannot_fill(cfg, monkey
     # to have here was cerebras/zai-glm-4.7, and it was retired as archived.
     # With it gone the slot is empty at every row size, and a flag whose whole
     # justification is "the short rows still run" has no short rows to run.
-    # test_the_shipped_configs_own_gap_is_a_key_the_override_cannot_cover
-    # takes that apart; here it is enough that the refusal does not move.
+    # test_a_two_generator_judge_gap_is_a_key_the_override_cannot_cover takes
+    # that apart; here it is enough that the refusal does not move.
     allowed, _ = preflight_messages(cfg, ("generator",), allow_pool_gaps=True)
     assert any("routing.judge slot b" in line for line in allowed)
 
@@ -1579,10 +1579,17 @@ def test_the_preflight_refuses_a_16k_fourth_family_judge(cfg, monkeypatch):
 def test_allow_pool_gaps_cannot_override_a_gap_no_row_size_escapes(cfg, monkeypatch):
     """R4-C1. The flag's justification - "running short rows while a key is
     pending is a real choice" - is true of a CONTEXT gap and false of this
-    one: an unkeyed judge family is skipped at every size, so a magistral row
-    has no slot B whatever its length. This is also the LIKELY first launch,
-    because the shipped config's own gap already tells the operator to pass
-    the flag; starting that way means every row pays for judge A and parks."""
+    one: an unkeyed judge family is skipped at every size, so a mistral row
+    has no slot B whatever its length.
+
+    IT IS NO LONGER "the likely first launch", and that clause was retired on
+    2026-08-18 rather than reworded: it rested on the shipped config printing a
+    gap that told the operator to reach for the flag. Measured on the shipped
+    config with the three free keys and no OPENAI_API_KEY, the preflight now
+    returns 0 refusals and 1 tiebreak warning - there is nothing there to
+    reach for the flag about. What this test measures is the fixture pool
+    below, and the honest reason to keep measuring it is that the flag's
+    contract has to hold for the pool an operator assembles next."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
@@ -1615,21 +1622,29 @@ def test_allow_pool_gaps_cannot_override_a_gap_no_row_size_escapes(cfg, monkeypa
     assert preflight_messages(widened, GENERATOR_PREFLIGHT_ROLES) == ([], [])
 
 
-def test_the_shipped_configs_own_gap_is_a_key_the_override_cannot_cover(cfg, monkeypatch):
+def test_a_two_generator_judge_gap_is_a_key_the_override_cannot_cover(cfg, monkeypatch):
     """The other half of R4-C1, INVERTED on 2026-08-18 - and kept inverted
-    rather than deleted, because the inversion is what the operator has to
-    know before a launch.
+    rather than deleted, because the inversion is what an operator assembling
+    this pool has to know.
 
-    It used to read: the shipped gap is a MODEL the operator is sourcing, not a
-    key, so short rows really do route and `--allow-pool-gaps` opens a pilot.
-    What made those short rows route was cerebras/zai-glm-4.7 - a keyed 8k
-    judge that could take slot B on a short row from the mistral generator -
-    and it was retired as archived. With it gone the slot is empty at EVERY row
-    size for an operator who has not funded OPENAI_API_KEY, so the override
-    cannot open the pilot any more. The key can."""
-    # Two generator families: this property is about the ALGORITHM that walks
-    # them, and the shipped config has carried only one since the 2026-08-18
-    # mistral demotion. See cfg_with_two_generator_families.
+    It used to read: this gap is a MODEL the operator is sourcing, not a key,
+    so short rows really do route and `--allow-pool-gaps` opens a pilot. What
+    made those short rows route was cerebras/zai-glm-4.7 - a keyed 8k judge
+    that could take slot B on a short row from the mistral generator - and it
+    was retired as archived. With it gone the slot is empty at EVERY row size
+    for an operator who has not funded OPENAI_API_KEY, so the override cannot
+    open a pilot on this pool any more. The key can.
+
+    NOT THE SHIPPED CONFIG'S GAP, and the name used to say it was. Measured
+    2026-08-18: the shipped one-generator config with CEREBRAS/MISTRAL/GROQ
+    keyed and OPENAI_API_KEY unset returns 0 refusals and 1 tiebreak warning.
+    The gap below is reachable only from a MISTRAL generation, which is what
+    removes mistral from the judge pool and empties slot B, and mistral has
+    been judge-only since that day - so the second generator family is
+    supplied by the fixture and the gap belongs to the fixture, not to what
+    ships."""
+    # See cfg_with_two_generator_families: this property is about the ALGORITHM
+    # that walks generator families, and one family cannot exercise it.
     cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")

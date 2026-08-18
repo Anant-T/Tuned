@@ -249,6 +249,73 @@ def test_parser_still_takes_a_plain_reply_with_no_think_at_all():
     assert parsed.verdict == BORDERLINE
 
 
+def test_parser_refuses_a_draft_object_sealed_in_an_UPPERCASE_think_block():
+    """The reviewer's measured escape, and the reason this parser matches the
+    tags case-insensitively while gates._tag_positions does not.
+
+    An unrecognised close tag makes the whole reply scorable, the draft schema
+    object inside the block becomes the last complete object in it, and the
+    truncation guard misses the unrecognised OPEN tag on the way past. This
+    exact input returned grounding/validity/coverage 1/1/1 before the fix - a
+    verdict nobody voted for, written to the judgement table, reused by every
+    later pass through judge_slot_reused, and read by P5 calibration as real.
+
+    gates fails the other way on a cased tag (the whole content flows to the
+    answer-side gates, which reject rather than admit), which is why the
+    asymmetry is kept rather than harmonized."""
+    sealed = (
+        "<THINK>\nThe schema wants something like "
+        '{"grounding": 1, "validity": 1, "coverage": 1, "rationale": "..."} '
+        "which I should fill in once I have weighed the trace.\n</THINK>\nno verdict."
+    )
+    with pytest.raises(JudgeParseError):
+        parse_judge_reply(sealed)
+
+
+def test_parser_reads_a_verdict_after_a_mixed_case_close_tag():
+    """Case-insensitivity may not cost the reply that DOES answer: a model
+    whose tags are cased is still entitled to be scored on what follows
+    them."""
+    parsed = parse_judge_reply(
+        "<Think>weighing the trace, and the chain has a gap</Think>\n"
+        '{"grounding": 4, "validity": 4, "coverage": 5, "rationale": "gap"}'
+    )
+    assert (parsed.grounding, parsed.validity, parsed.coverage) == (4, 4, 5)
+
+
+def test_parser_takes_the_verdict_after_the_LAST_close_not_the_first():
+    """LAST, not first, and this is the only fixture that can tell them apart.
+
+    Every other reply in this suite carries exactly one </think>, so
+    `rfind -> find` survives all of them. Here a model thinks, says something,
+    thinks again with a DECOY object in the second block, and only then
+    answers. Reading from the first close hands the whole second thought back
+    as scorable text - which trips the unclosed-block guard on the reopened
+    tag, so the mutant fails loudly rather than scoring the decoy. Either way
+    the real verdict is not what comes out, which is what this pins."""
+    parsed = parse_judge_reply(
+        "<think>first pass</think>\n"
+        "Let me reconsider.\n"
+        '<think>on reflection, the schema example is '
+        '{"grounding": 1, "validity": 1, "coverage": 1, "rationale": "decoy"}'
+        "</think>\n"
+        '{"grounding": 5, "validity": 4, "coverage": 4, "rationale": "settled"}'
+    )
+    assert (parsed.grounding, parsed.validity, parsed.coverage) == (5, 4, 4)
+    assert parsed.rationale == "settled"
+
+
+def test_the_reasoning_block_diagnostic_needs_an_opened_block_not_a_stray_tag():
+    """A rationale that quotes "</think>" inside a JSON string leaves a
+    non-empty `think` prefix with no block ever opened in it. Naming a
+    reasoning block there sends the operator after model behaviour that did
+    not happen; the message has to key on the OPEN tag."""
+    stray = '{"grounding": 4, "validity": 4, "note": "the model wrote </think> here"}'
+    with pytest.raises(JudgeParseError) as excinfo:
+        parse_judge_reply(stray)
+    assert "after the reasoning block" not in str(excinfo.value)
+
+
 def test_split_reply_think_returns_none_when_there_is_no_block():
     """think=None is what tells parse_judge_reply not to blame a reasoning
     block for a reply that never had one."""

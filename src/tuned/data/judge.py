@@ -109,6 +109,7 @@ Run:  python -m tuned.data.judge --config configs/data_law_v1.yaml
 import asyncio
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -226,6 +227,17 @@ _AXIS_ALIASES = {
 REPLY_THINK_OPEN = "<think>"
 REPLY_THINK_CLOSE = "</think>"
 
+# Matched case-INSENSITIVELY - see split_reply_think for why the judge parser
+# and gates._tag_positions differ on this deliberately.
+#
+# Compiled patterns over the ORIGINAL string rather than a `body.lower()`
+# search whose offsets are reused: str.lower() is not length-preserving for
+# every codepoint (U+0130 lowercases to two characters), so on a reply
+# carrying one the offsets would slide and the split would land mid-token.
+# The tags are ASCII, the corpus is not.
+_REPLY_THINK_OPEN_RE = re.compile(re.escape(REPLY_THINK_OPEN), re.IGNORECASE)
+_REPLY_THINK_CLOSE_RE = re.compile(re.escape(REPLY_THINK_CLOSE), re.IGNORECASE)
+
 
 class JudgeParseError(ValueError):
     """The reply carried no scorable JSON object."""
@@ -337,6 +349,11 @@ def split_reply_think(text: str) -> tuple[str | None, str]:
     here a "prefix" is text the model wrote before it had finished thinking,
     and scoring an object out of it credits a draft as a decision.
 
+    The LAST, not the first, and that is load-bearing rather than tidy: a reply
+    that thinks, answers, thinks again and answers again has its verdict after
+    the final close, and taking the first one would hand the whole second
+    thought back as scorable text.
+
     Truncation is ONE test, not two, and it covers both ways a reply can end
     mid-thought: the scorable region may not contain an OPEN tag. A reply that
     opened and never closed leaves the whole text scorable-region and trips it;
@@ -344,17 +361,27 @@ def split_reply_think(text: str) -> tuple[str | None, str]:
     never finished. Either way the reply stops inside a thought, and a verdict
     read out of it would be a verdict the model had not arrived at.
 
+    CASE-INSENSITIVE, and gates._tag_positions is not. That asymmetry is a
+    decision, not an oversight, and must not be "harmonized" away: the two
+    fail in opposite directions on a cased tag. gates fails SAFE - an
+    unrecognised <THINK> leaves the whole content flowing to the answer-side
+    gates, which then judge more text than they should and reject rather than
+    admit. This parser fails SILENT - an unrecognised close tag makes the
+    model's own draft schema object scorable, and a 1/1/1 nobody voted for is
+    written to the judgement table, reused by every later pass through
+    judge_slot_reused, and read by P5 calibration as a verdict. Measured, not
+    imagined: <THINK>...draft object...</THINK> with no verdict after it
+    scored 1/1/1 before this.
+
     A reply with no tags at all is returned whole (think=None) - that is the
     mistral shape, which is most of the judgements this build has.
     """
     body = text or ""
-    close_at = body.rfind(REPLY_THINK_CLOSE)
-    if close_at < 0:
-        think, scorable = None, body
-    else:
-        cut = close_at + len(REPLY_THINK_CLOSE)
-        think, scorable = body[:cut], body[cut:]
-    if REPLY_THINK_OPEN in scorable:
+    closes = list(_REPLY_THINK_CLOSE_RE.finditer(body))
+    cut = closes[-1].end() if closes else 0
+    think = body[:cut] if closes else None
+    scorable = body[cut:]
+    if _REPLY_THINK_OPEN_RE.search(scorable):
         raise JudgeParseError(
             f"judge reply ends inside an unclosed {REPLY_THINK_OPEN} block - it was "
             f"truncated before any verdict: {' '.join(body.split())[:200]!r}"
@@ -457,7 +484,16 @@ def parse_judge_reply(text: str) -> JudgeScores:
         # visibly contains a well-formed object and is reported as having none
         # reads as a parser bug, and the operator goes looking for one instead
         # of at the model that put its verdict inside its own reasoning.
-        where = "" if think is None else " after the reasoning block"
+        #
+        # Keyed on the OPEN tag, not on `think is not None`: a stray "</think>"
+        # inside a rationale string makes `think` a non-empty prefix with no
+        # reasoning block in it at all, and blaming a block that was never
+        # opened sends the operator after the wrong model behaviour.
+        where = (
+            " after the reasoning block"
+            if _REPLY_THINK_OPEN_RE.search(think or "")
+            else ""
+        )
         raise JudgeParseError(
             f"no scorable JSON object in judge reply{where} "
             f"({last_error or 'no object found'}): "

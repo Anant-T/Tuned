@@ -63,12 +63,16 @@ and each one silently corrupts a different downstream number if it is missed:
 
   2. THE JUDGE PROMPT IS THE LONGEST PROMPT IN THE PIPELINE. It carries the
      same materials the generator saw PLUS the candidate's trace and answer,
-     so it can be twice the generator's prompt. Two judge-pool models are
-     8k-context (cerebras/zai-glm-4.7, cerebras/gemma-4-31b); the judge
-     worker must budget-check materials+candidate before dispatch and route
-     anything that does not fit to a 32k+ judge (groq/qwen/qwen3.6-27b,
-     mistral/mistral-small-latest). Silently truncating a judge prompt scores
-     a partially-read answer, which is worse than not judging it.
+     so it can be twice the generator's prompt. Since 2026-08-18 the smallest
+     model in routing.judge is 32k (mistral/mistral-small-latest; the 8k
+     zai-glm-4.7 was removed as archived upstream) and the smallest in
+     routing.tiebreak is 8k (cerebras/gemma-4-31b, which serves the TIEBREAK
+     role only and never judged). The judge worker must still budget-check
+     materials+candidate before dispatch and route anything that does not fit
+     past the model that cannot hold it - the pool having grown out of its 8k
+     judge tier is a fact about today's config, not a property the routing may
+     assume. Silently truncating a judge prompt scores a partially-read
+     answer, which is worse than not judging it.
 
   3. THE TRANSITION SLOT SPLIT IS SEMANTIC. {source} is the papers (facts,
      parties, what has happened); {scenario} is the posture and the DATES -

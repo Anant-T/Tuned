@@ -6,8 +6,13 @@ four worker test modules from the tests directory itself.
 Nothing here dials out, sleeps, or touches httpx: FakeRouter implements the
 two methods the workers actually use - pick() and complete() - over the REAL
 build config, so routing preference order, model families and context limits
-are the shipped ones and a test that asserts "the glm judge was excluded" is
-asserting something true about the real pool.
+are the shipped ones and a test that asserts "the mistral judge was excluded
+on context length" is asserting something true about the real pool.
+
+That is also why the fixtures below ADD models rather than assume them: the
+pool changes (glm was retired archived on 2026-08-18), and a rule that needs
+a shape the config no longer carries has to supply it or it stops measuring
+anything. See cfg_with_extra_judge.
 """
 
 from dataclasses import dataclass
@@ -543,20 +548,33 @@ def cfg_with_two_generator_families(cfg: BuildConfig) -> BuildConfig:
 
 
 def cfg_with_context(cfg: BuildConfig, *, family: str, role: str, max_context: int):
-    """The shipped config with one (family, role)'s context window rewritten."""
+    """The shipped config with one (family, role)'s context window rewritten.
+
+    Refuses a (family, role) it did not find, which is the same discipline the
+    bound on _divert_point exists for: silently returning the config unchanged
+    made the caller assert against a window it believed it had narrowed, and a
+    fixture that no-ops when the pool moves under it hands back a green that
+    measured the shipped config instead of the one the test described.
+    """
     from dataclasses import replace
 
+    matched = 0
+
     def patch(model):
+        nonlocal matched
         if model.family != family or role not in model.roles:
             return model
+        matched += 1
         return replace(model, limits={**model.limits, "max_context": max_context})
 
-    return replace(
+    patched = replace(
         cfg,
         providers=tuple(
             replace(p, models=tuple(patch(m) for m in p.models)) for p in cfg.providers
         ),
     )
+    assert matched, f"no model in family {family!r} serves role {role!r} - nothing was narrowed"
+    return patched
 
 
 def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
@@ -600,10 +618,13 @@ def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
     return str(path)
 
 
-# Long enough that prompt + max_tokens passes 8k (so the cerebras generator
-# and the glm judge cannot hold it) while the prompt + trace + answer still
-# fit the 8192-token length band - the routing has to move without the
-# length gate firing and masking the result.
+# Long enough that prompt + max_tokens passes 8k - so the cerebras generator
+# cannot hold it, and the routing has to move - while the prompt + trace +
+# answer still fit the 8192-token length band, so the move happens without the
+# length gate firing and masking the result. It named the glm judge as the
+# other model it defeats until 2026-08-18; that model is gone, and every judge
+# left holds 8k comfortably, so the generator window is the whole of what this
+# length is chosen against now.
 LONG_SEED_TEXT = (SEED_TEXT + " ") * 60
 
 # Everything a transition seed must carry: the four template slots AND the
