@@ -158,6 +158,12 @@ class HfSource:
 # An edit to one of them is a decision, not a typo-fix.
 HF_IDS_VERIFIED_AT = "2026-08-14"
 
+# When IL-TUR's file layout (the exact object names below) was last walked
+# against the Hub. An edit to the allow_patterns list on "iltur" is a decision
+# about which files ARE the eval surface, not a typo-fix - see the comment
+# there for the arithmetic and the coverage gap it accepts.
+ILTUR_LAYOUT_VERIFIED_AT = "2026-08-18"
+
 # Snapshotted because the corpus phase reads them more than once and they
 # are small. The bulk replay sources (WildChat-4.8M, OpenThoughts-114k,
 # smoltalk2, Nemotron-v2) are deliberately NOT here: replay.py streams them
@@ -197,9 +203,49 @@ HF_SOURCES = {
     "bbl": HfSource(
         key="bbl", repo_id="bharatgenai/BhashaBench-Legal", license="CC-BY-4.0", gated=True
     ),
+    # allow_patterns RESTRICTS THE DOWNLOAD TO decontaminate.py's OWN EVAL
+    # SURFACE (EVAL_SETS["iltur"].include_splits=("test", "expert"), excluding
+    # train/fold/dev/val/validation) rather than the whole repo. A snapshot
+    # with no allow_patterns pulls all 8 configs, ~488,000 rows, ~1.5 GiB -
+    # decontaminate.py's own docstring says that is tens of GB of INDEX and
+    # does not fit, so downloading it here would just move the same OOM one
+    # step earlier. The 236 MiB below (10 files) is what decontaminate.py
+    # actually reads once acquired.
+    #
+    # The list is the exact object names, not a glob, because the layout is
+    # eight heterogeneous configs with no shared naming convention - a glob
+    # loose enough to catch all of "test_all", "test_specific", "test",
+    # "test_candidates"/"test_queries" would also catch a future "latest" or
+    # "attest_*" file, which is the exact bug select_split_files' NAME-PART
+    # (not substring) matching exists to avoid on the READ side; naming every
+    # file here gives the DOWNLOAD side the same guarantee. Walked against the
+    # Hub on ILTUR_LAYOUT_VERIFIED_AT via list_repo_files - re-walk before
+    # trusting this list after that date.
+    #
+    # TWO OF THE EIGHT CONFIGS CONTRIBUTE NOTHING to this list, and that is a
+    # real coverage gap, not an oversight in the walk: `lmt` ships no file
+    # naming "test" or "expert" (acts/cci_faq/ip only), and `lner` ships only
+    # 3-fold cross-validation shards (fold_1/2/3), which exclude_splits always
+    # drops and which have no held-out test split to select instead. So LMT
+    # and LNER are NOT decontamination-screened under this policy. Widening
+    # the filter to reach them would mean reading train/fold data for those
+    # two configs only - a policy change for EVAL_SETS["iltur"], not an
+    # acquire-time fix, and is flagged here rather than made silently.
     "iltur": HfSource(
         key="iltur", repo_id="Exploration-Lab/IL-TUR",
         license="non-commercial (EVAL/DECONTAMINATION ONLY)", gated=True,
+        allow_patterns=(
+            "bail/test_all-00000-of-00001.parquet",
+            "bail/test_specific-00000-of-00001.parquet",
+            "cjpe/expert-00000-of-00001.parquet",
+            "cjpe/test-00000-of-00001.parquet",
+            "lsi/test-00000-of-00001.parquet",
+            "pcr/test_candidates-00000-of-00001.parquet",
+            "pcr/test_queries-00000-of-00001.parquet",
+            "rr/CL_test-00000-of-00001.parquet",
+            "rr/IT_test-00000-of-00001.parquet",
+            "summ/test-00000-of-00001.parquet",
+        ),
     ),
     # One file, `data/train-00000-of-00001-*.parquet`: there is NO test split
     # here, which is why the split preference must fall back to the whole set
