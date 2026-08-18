@@ -11,12 +11,14 @@ accident. Each property here was paid for by evidence recorded in the plan:
 scripted/structured think traces cost -33.8% quality AND increase fabrication
 (MSLR), so no template may hand the teacher a think-block outline; a trace
 that reasons about "the provided text" teaches the student to hallucinate a
-passage it will never be given at inference, so every template must enumerate
-the banned meta-phrases gates.check_banned_meta rejects; a trace that never
+passage it will never be given at inference, so every template must forbid
+that register WITHOUT naming the strings gates.check_banned_meta matches (see
+test_generator_never_enumerates_the_banned_meta_phrases - the enumeration was
+measured to CAUSE the failure it was meant to prevent); a trace that never
 doubts itself teaches confident hallucination, so every template must ask for
-a self-verification move in words that gates.VERIFICATION_CUES can see; and
-IRAC belongs to the answer, never to the trace, which is what
-gates.check_irac_placement enforces from the other side.
+a self-verification move AND hand over the vocabulary gates.VERIFICATION_CUES
+actually recognises; and IRAC belongs to the answer, never to the trace, which
+is what gates.check_irac_placement enforces from the other side.
 
 The golden-sha test makes a prompt edit deliberate rather than incidental:
 every generation ever made carries its prompt_sha (store.task.prompt_sha), so
@@ -43,21 +45,28 @@ from tuned.data.gates import BANNED_META, VERIFICATION_CUES
 #
 #   .venv/Scripts/python.exe -c "from tuned.data.prompt_registry import all_ids, load; [print(f'    {i!r}: {load(i).sha!r},') for i in all_ids()]"
 # --------------------------------------------------------------------------
+#
+# RE-PINNED 2026-08-18 (pilot gate-rejection fix round). Every gen_* template
+# changed: the banned-meta enumeration was replaced by a descriptive rule, the
+# self-verification cue vocabulary was handed over explicitly, the trace-length
+# floor was raised off think_min, and the IRAC prohibition was sharpened to the
+# line-initial shape the gate actually matches. No metric computed under the
+# old shas describes these prompts.
 EXPECTED_SHAS = {
-    'gen_drafting_v1': '8a854db2da39',
-    'gen_drafting_v2': 'f6bdff5f1951',
-    'gen_irac_analysis_v1': '5551447f22a7',
-    'gen_irac_analysis_v2': '903494d4d4bd',
-    'gen_irac_analysis_v3': 'e05ffaeb7b3a',
-    'gen_irac_analysis_v4': '3fa2a003355e',
-    'gen_statute_qa_v1': '086eefeda2ba',
-    'gen_statute_qa_v2': 'c40d7d7aa866',
-    'gen_statute_qa_v3': '8acefa9f0292',
-    'gen_statute_qa_v4': '461412164297',
-    'gen_summarization_v1': '11ed9c4b52f8',
-    'gen_summarization_v2': '4449b2b828ff',
-    'gen_transition_v1': '912a9c16fc2d',
-    'gen_transition_v2': '2970de78c07c',
+    'gen_drafting_v1': '1ba2ae4cfba6',
+    'gen_drafting_v2': 'c357363bc003',
+    'gen_irac_analysis_v1': '5126394a5593',
+    'gen_irac_analysis_v2': 'f5acd7eddb3b',
+    'gen_irac_analysis_v3': '51dec850da64',
+    'gen_irac_analysis_v4': '2e545b6c5944',
+    'gen_statute_qa_v1': 'b9fadf6b61e9',
+    'gen_statute_qa_v2': '1e19258d719c',
+    'gen_statute_qa_v3': '037388f49014',
+    'gen_statute_qa_v4': '36ff13c7e9e6',
+    'gen_summarization_v1': '4014f5fa7697',
+    'gen_summarization_v2': '9819ebfe2717',
+    'gen_transition_v1': '314c659728b3',
+    'gen_transition_v2': '9fa8be907587',
     'judge_pointwise_v1': '591d080c5b77',
     'judge_tiebreak_v1': 'a34456f4918b',
     'probe_answer_v1': '8370e47920ee',
@@ -113,6 +122,13 @@ GROUNDING_SENTENCE = (
 # be asserted rather than eyeballed.
 IRAC_PLACEMENT_CLAUSE = "never inside your reasoning"
 
+# The SHAPE half of the same clause, added 2026-08-18. Naming the channel was
+# not enough: 38 pilot rows carried all four headings in the answer AND in the
+# trace, so gates.check_irac_placement rejected a correct answer for what the
+# reasoning looked like. gates._IRAC_HEADING_RE matches a LINE-INITIAL heading
+# word, so that is the shape the template now prohibits by name.
+IRAC_LINE_START_CLAUSE = "never opens a line with one of those four words"
+
 ANSWER_LENGTH_CLAUSE = "250 to 450 words"
 
 # The soft floor on the trace. gates.check_length_band enforces think_min=500
@@ -120,7 +136,17 @@ ANSWER_LENGTH_CLAUSE = "250 to 450 words"
 # answers a short seed in three crisp sentences fails the band and burns a
 # regeneration. Behavioural, never structural: it says think properly, not
 # think in N parts.
-REASONING_FLOOR_CLAUSE = "a few hundred words of deliberation is normal"
+#
+# RAISED 2026-08-18 off "a few hundred words". The band is in chars//4, so
+# think_min=500 is 2,000 characters; "a few hundred words" is ~300 words ~1,900
+# chars ~475 est tokens - the instruction targeted a trace BELOW the floor it
+# had to clear. Measured: every one of the 20 attempt-1 gpt-oss length_band
+# violations was `think<think_min`, on a measured attempt-1 mean of 2,411 chars
+# (603 est tok) sitting barely over it. 450-700 words is ~2,900-4,500 chars,
+# ~725-1,125 est tokens: clear of think_min 500 and clear of think_max 3,000.
+# The band VALUES are untouched - this moves the instruction onto the band, not
+# the band onto the instruction.
+REASONING_FLOOR_CLAUSE = "450 to 700 words of deliberation is normal"
 
 # A "defuser" is the clause that stops an instruction from reading as a
 # script. Two families, defending different failure modes, and both are
@@ -277,10 +303,33 @@ def test_generator_adopts_a_role_and_puts_the_materials_before_the_ask(prompt_id
 
 
 @pytest.mark.parametrize("prompt_id", GEN_IDS)
-def test_generator_enumerates_the_banned_meta_phrases(prompt_id):
+def test_generator_never_enumerates_the_banned_meta_phrases(prompt_id):
+    """A template may NOT name the strings gates.check_banned_meta matches.
+
+    INVERTED 2026-08-18, and the inversion is the whole finding. This test used
+    to REQUIRE >=6 of BANNED_META in every template, on the theory that naming
+    what is forbidden forbids it best. Measured over the pilot's 221 gated
+    generations it does the opposite: the teacher restates the rule in its
+    private trace ("We must not use the phrase \"the source says\"") and
+    check_banned_meta - which matches those literals against the trace - fires
+    on a row that is OBEYING the instruction. 115/221 failures, and the hit
+    histogram tracks the templates' own list order ('the source says' 89,
+    'the provided text' 58, 'the excerpt' 23, ... 'in the given text' 9), which
+    is the tell that these are echoes and not native harness leakage. Attempt-1
+    rate 11/60; attempts 2-3, where the trace is 5x longer and has more room
+    for compliance narration, 51/59 and 53/58.
+
+    The register is still forbidden - test_generator_uses_harness_verbs_only_
+    inside_a_prohibition and the "in your own words" test both still bind - but
+    it is now forbidden by description. BANNED_META stays what it always should
+    have been: a private checklist the teacher never reads.
+    """
     lowered = _rendered(prompt_id).lower()
     present = [phrase for phrase in BANNED_META if phrase in lowered]
-    assert len(present) >= 6, f"{prompt_id} enumerates only {present}"
+    assert not present, (
+        f"{prompt_id} names {present} verbatim - the teacher will echo them "
+        f"into its trace and check_banned_meta will reject a compliant row"
+    )
 
 
 @pytest.mark.parametrize("prompt_id", GEN_IDS)
@@ -311,11 +360,33 @@ def test_generator_states_the_grounding_constraint(prompt_id):
 
 @pytest.mark.parametrize("prompt_id", GEN_IDS)
 def test_generator_self_check_is_behavioural_and_gate_visible(prompt_id):
+    """The template must hand over the cue VOCABULARY, not just ask for the move.
+
+    STRENGTHENED 2026-08-18 from ">=1 cue" to ">=4". gates.VERIFICATION_CUES is
+    a closed twelve-phrase list and check_self_verification passes only on a
+    literal match, but the templates described the behaviour ("double-check the
+    part that carries the weight") and never said which words buy the pass.
+    Measured attempt-1 failure rate 51/60 = 85%, the worst single-attempt gate
+    in the pilot; of the rows that DID pass, the cue was 'double-check' 39
+    times - i.e. the gate was passing on templates' own word rather than on any
+    verification the teacher chose. Traces that failed were verifying
+    themselves in words the list does not carry ("that judgment is not binding
+    on Supreme Court").
+
+    THE ASYMMETRY WITH test_generator_never_enumerates_the_banned_meta_phrases
+    IS DELIBERATE and is why one test now forbids naming gate strings while
+    this one requires it. check_banned_meta fires on PRESENCE, so a teacher
+    that quotes the rule back fails it; check_self_verification fires on
+    ABSENCE, so a teacher that quotes these back SATISFIES it. Echoing is fatal
+    in one direction and harmless in the other. The ritual defuser (asserted
+    separately) is what keeps the offered vocabulary from becoming a set-piece.
+    """
     lowered = _rendered(prompt_id).lower()
     cues = [cue for cue in VERIFICATION_CUES if cue in lowered]
-    assert cues, (
-        f"{prompt_id} asks for no self-verification move in words "
-        f"gates.check_self_verification can recognise"
+    assert len(cues) >= 4, (
+        f"{prompt_id} offers only {cues} of gates.VERIFICATION_CUES - the "
+        f"teacher is being asked to self-verify without being told which "
+        f"words check_self_verification can see"
     )
 
 
@@ -326,6 +397,8 @@ def test_generator_states_the_irac_answer_contract(prompt_id):
         assert heading in rendered, heading
     # IRAC in the answer only - the other half of gates.check_irac_placement.
     assert IRAC_PLACEMENT_CLAUSE in rendered
+    # ...and in the line-initial shape the gate's regex actually matches.
+    assert IRAC_LINE_START_CLAUSE in rendered
     assert ANSWER_LENGTH_CLAUSE in rendered
     assert REASONING_FLOOR_CLAUSE in rendered
 
@@ -395,8 +468,16 @@ def test_generator_user_block_is_the_intended_size(prompt_id):
     # 8k on Cerebras and the chunk has to fit beside it). The target is the
     # brief's ~250-450; the ceiling carries a small tolerance so that adding
     # one clause to the longest template is not a forced rewrite.
+    #
+    # 470 -> 500 on 2026-08-18: the fix round added four clauses to every
+    # template at once (the cue vocabulary being the expensive one), which the
+    # old tolerance was never sized for, and the two longest templates sat 2
+    # and 5 words under it. The context rationale is unaffected at this size -
+    # measured pilot prompt_est ran 1,445-2,799 est tokens and the net change
+    # is +22 words (~30 tokens), against an 8k window that generate.py already
+    # routes away from when a seed does not fit.
     words = _word_count(reg.load(prompt_id).user)
-    assert 250 <= words <= 470, f"{prompt_id} user block is {words} words"
+    assert 250 <= words <= 500, f"{prompt_id} user block is {words} words"
 
 
 @pytest.mark.parametrize("task_type", sorted(EXPECTED_VARIANT_COUNTS))
