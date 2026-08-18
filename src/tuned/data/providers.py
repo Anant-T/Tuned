@@ -208,6 +208,11 @@ class ChatRequest:
     ref: ModelRef
     params: dict = field(default_factory=dict)
     max_tokens: int | None = None
+    # Which ROLE this call is being made in. Carried so build_payload can
+    # apply ModelCfg.role_params - one model may serve two roles that want
+    # different sampling, and the role is known only to the caller. None means
+    # "no role-specific layer", which is what a direct client call gets.
+    role: str | None = None
 
 
 @dataclass
@@ -634,11 +639,27 @@ class ChatClient:
         )
 
     def build_payload(self, req: ChatRequest) -> dict:
-        """Merge model defaults with per-request params (request wins) + quirks."""
+        """Merge model defaults, the ROLE's overrides, then per-request params.
+
+        Three layers, lowest first:
+
+            model.params              what this model wants generally
+            model.role_params[role]   what it wants when called IN this role
+            req.params                what this call wants
+
+        The middle layer exists because one model can serve two roles that want
+        different sampling. mistral-small-latest both generates and judges: the
+        generator wants temperature 0.7 / top_p 0.95 and the judge wants 0.2.
+        While those were two config blocks the distinction was free; merging
+        them (Mistral Small 4, 2026-08-18) would have shipped the generator's
+        sampling on every judge call, since nothing downstream pins a judge
+        temperature - judge.py sends no per-call params at all.
+        """
         payload: dict = {
             "model": self.model.id,
             "messages": [dict(m) for m in req.messages],
             **dict(self.model.params or {}),
+            **dict((self.model.role_params or {}).get(req.role or "", {})),
             **dict(req.params or {}),
         }
         if req.max_tokens is not None:
@@ -1595,6 +1616,9 @@ class Router:
                 ref=routed.ref,
                 params=per_ref,
                 max_tokens=max_tokens,
+                # So build_payload can apply this model's role_params. The
+                # Router is the only layer that knows which role is calling.
+                role=role,
             )
             attempt_hook = (
                 None

@@ -262,15 +262,29 @@ providers:
       # family stays `mistral` for both roles, which is what keeps
       # family_separation from letting this model judge its own generations.
       #
+      # SAMPLING IS PER ROLE, and it has to be: the two deleted blocks carried
+      # different sampling (generator 0.7/0.95, judge 0.2) and merging them
+      # into one `params` would have shipped the generator's temperature on
+      # every judge call. Nothing downstream would have caught it - judge.py
+      # sends no per-call params at all - so a judge would have been scoring at
+      # 0.7 with top_p 0.95 and only the score variance would have shown it.
+      # `params` is therefore left empty and both roles are stated explicitly;
+      # config.py refuses a role_params key the model does not serve.
+      #
       # NO reasoning_effort HERE ON PURPOSE. Small 4's reasoning channel is
       # opt-in and the parameter belongs to the GENERATOR call only - see
-      # generate.GENERATOR_REASONING_PARAMS. Declaring it here would send it on
-      # judge calls too, which pays for a trace no judge reads.
+      # generate.GENERATOR_REASONING_PARAMS. Declaring it under role_params.
+      # generator would work too, but the value is coupled to the harness's own
+      # park-on-no-trace behaviour rather than to a sampling preference, so it
+      # stays with the code that depends on it.
       - id: mistral-small-latest
         family: mistral
         roles: [generator, judge]
         limits: {rpm: 50, tpm: 50000, tpd: 33000000, max_context: 32000, max_output: 8192}
-        params: {temperature: 0.7, top_p: 0.95}
+        params: {}
+        role_params:
+          generator: {temperature: 0.7, top_p: 0.95}
+          judge: {temperature: 0.2}
   - name: openai
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
@@ -370,14 +384,23 @@ providers:
 #
 # What the fatal gap WAS, kept because any future edit to routing.judge can
 # re-open it. A long prompt is routed past the 8k cerebras generator to
-# mistral/magistral (40k). Family separation then removes mistral from the
-# judge pool; the 8k zai-glm-4.7 is removed on context length; slot A takes
-# groq/qwen; and slot B had NOTHING LEFT. The row parked in judge_unroutable
-# having ALREADY PAID for judge A. The arithmetic made this the rule and not
-# an edge case: the generator diverts to magistral at 2,555 routing tokens of
-# prompt, and slot B died at 5,531 routing tokens of judge prompt - which
-# grounding plus a trace near think_max (3000) clears routinely. Slot B is
-# now openai/gpt-5-mini.
+# mistral/mistral-small-latest (32k). Family separation then removes mistral
+# from the judge pool; the 8k zai-glm-4.7 is removed on context length; slot A
+# takes groq/qwen; and slot B had NOTHING LEFT. The row parked in
+# judge_unroutable having ALREADY PAID for judge A. The arithmetic made this
+# the rule and not an edge case: the generator diverts to mistral at 2,555
+# routing tokens of prompt, and slot B died at 5,531 routing tokens of judge
+# prompt - which grounding plus a trace near think_max (3000) clears
+# routinely. Slot B is now openai/gpt-5-mini.
+#
+# THE FALLBACK WINDOW SHRANK 40k -> 32k on 2026-08-18, when the retired
+# magistral block was replaced by mistral-small-latest. What that costs is the
+# CEILING on a divertable prompt, not the divert point: the long-prompt
+# generator can now hold about 21,600 routing tokens of prompt where magistral
+# held about 28,000. The cliff is far from this corpus - measured pilot prompts
+# ran 1,445-2,799 routing tokens, an order of magnitude clear - and a prompt
+# that did exceed it is not silently truncated: undersized_families excludes
+# the family before the call and the row parks in gen_unroutable, recoverably.
 #
 # Recovery for rows that parked before this landed: `python -m
 # tuned.data.tasks --reopen judge_unroutable` (every stream by default;

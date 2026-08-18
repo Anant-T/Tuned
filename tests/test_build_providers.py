@@ -2585,3 +2585,79 @@ def test_the_default_hook_would_have_mangled_the_small4_shape():
     text, reasoning = QUIRKS["default"].response_hook(SMALL4_REASONING_REPLY)
     assert reasoning is None
     assert not isinstance(text, str)
+
+
+# --------------------------------------------------------------------------
+# role_params: one model, two roles, two sets of sampling.
+# --------------------------------------------------------------------------
+
+def _params_for_role(cfg, ref, role):
+    """The sampling params a call in `role` would actually put on the wire."""
+    client = _router(cfg).routed(ref).client
+    payload = client.build_payload(
+        ChatRequest(messages=({"role": "user", "content": "x"},), ref=ref, role=role)
+    )
+    return {k: v for k, v in payload.items() if k in ("temperature", "top_p")}
+
+
+def test_role_params_send_generator_sampling_to_generator_calls_only(cfg, keys):
+    """N1. One model, two roles, two temperatures - against the REAL config.
+
+    While mistral generated and judged from two config blocks, the sampling
+    difference was free. Merging them for Mistral Small 4 put the generator's
+    `temperature: 0.7, top_p: 0.95` into `params`, which
+    ModelClient.build_payload merges into EVERY payload - and judge.py sends no
+    per-call params at all, so slot A would have scored at 0.7/0.95 while every
+    test that looked at a judge temperature was reading a hard-coded fake.
+
+    Before (both roles)      temperature 0.7,  top_p 0.95
+    After  generator         temperature 0.7,  top_p 0.95
+    After  judge             temperature 0.2,  top_p absent
+
+    which is exactly what the two deleted blocks carried.
+    """
+    assert _params_for_role(cfg, MISTRAL_JUDGE, "generator") == {
+        "temperature": 0.7,
+        "top_p": 0.95,
+    }
+    assert _params_for_role(cfg, MISTRAL_JUDGE, "judge") == {"temperature": 0.2}
+    # No role layer at all -> the model's own defaults, which are empty here.
+    assert _params_for_role(cfg, MISTRAL_JUDGE, None) == {}
+
+
+def test_role_params_do_not_leak_between_models(cfg, keys):
+    """A model with no role_params is unaffected: cerebras keeps its single
+    configured temperature whichever role asks for it."""
+    ref = ModelRef("cerebras", "gpt-oss-120b")
+    assert _params_for_role(cfg, ref, "generator") == _params_for_role(cfg, ref, "judge")
+
+
+def test_a_per_call_param_still_beats_the_role_layer(cfg, keys):
+    """Precedence is model.params < role_params[role] < per-call params. The
+    caller has to stay able to override, or judge.py's own temperature would be
+    silently ignored the day a role entry is added for its model."""
+    client = _router(cfg).routed(MISTRAL_JUDGE).client
+    payload = client.build_payload(
+        ChatRequest(
+            messages=({"role": "user", "content": "x"},),
+            ref=MISTRAL_JUDGE,
+            role="judge",
+            params={"temperature": 0.9},
+        )
+    )
+    assert payload["temperature"] == 0.9
+
+
+def test_role_params_naming_a_role_the_model_does_not_serve_is_refused(tmp_path):
+    """A stale or typo'd role key would sit in the config looking like it
+    configures something and never apply - the same silent-no-op class as an
+    answer-key entry that can never fire."""
+    raw = DATA_CONFIG.read_text(encoding="utf-8")
+    broken = raw.replace("          judge: {temperature: 0.2}",
+                         "          judgge: {temperature: 0.2}")
+    assert broken != raw
+    path = tmp_path / "bad_role.yaml"
+    path.write_text(broken, encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        load_build_config(str(path), allow_unpinned=True)
+    assert "judgge" in str(exc.value) and "role_params" in str(exc.value)

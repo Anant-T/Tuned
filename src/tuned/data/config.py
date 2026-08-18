@@ -7,7 +7,7 @@ pin, dataset path. load_build_config resolves those fields out of the
 referenced training config at load time so they are never duplicated here.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -127,6 +127,21 @@ class ModelCfg:
     roles: tuple[str, ...]
     limits: dict
     params: dict
+    # role -> params that override `params` for calls made IN that role.
+    #
+    # Needed because one model can serve two roles with different sampling.
+    # mistral-small-latest generates AND judges: a generator wants
+    # temperature 0.7 / top_p 0.95 and a judge wants 0.2, and before this
+    # existed the two roles lived in two config blocks so the distinction was
+    # free. Merging those blocks (Mistral Small 4, 2026-08-18) would have sent
+    # the generator's sampling to every judge call - the same hazard
+    # reasoning_effort had, and the same shape of fix.
+    #
+    # Precedence, applied in providers.ModelClient.build_payload:
+    #     model.params  <  model.role_params[role]  <  per-call params
+    # so a role entry overrides the model default and a caller still overrides
+    # both. Roles named here must be roles the model actually declares.
+    role_params: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -305,6 +320,27 @@ def _validate(cfg: BuildConfig) -> None:
                     f"routing.{role} ref {ref_str!r} resolves to "
                     f"{provider.name}/{model.id}, which does not list role "
                     f"{role!r} (has roles {model.roles})"
+                )
+
+    # 2b: role_params may only name roles the model actually serves. A typo'd
+    # or stale key ("judgge", or a role deleted from `roles` afterwards) would
+    # otherwise sit in the config looking like it configures something and
+    # silently never apply - the same class of failure as a forbidden-section
+    # entry that can never fire.
+    for provider in cfg.providers:
+        for model in provider.models:
+            unknown = sorted(set(model.role_params) - set(model.roles))
+            if unknown:
+                raise ValueError(
+                    f"{provider.name}/{model.id}: role_params names "
+                    f"{unknown}, which {'is' if len(unknown) == 1 else 'are'} "
+                    f"not in its roles {list(model.roles)}"
+                )
+            bad = sorted(k for k, v in model.role_params.items() if not isinstance(v, dict))
+            if bad:
+                raise ValueError(
+                    f"{provider.name}/{model.id}: role_params entries {bad} "
+                    f"are not mappings"
                 )
 
     # 3: cross-family judging must be possible for every generator - the
@@ -805,6 +841,7 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
                     roles=tuple(m["roles"]),
                     limits=m["limits"],
                     params=m["params"],
+                    role_params=dict(m.get("role_params") or {}),
                 )
                 for m in p["models"]
             ),
