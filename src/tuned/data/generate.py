@@ -166,6 +166,30 @@ GENERATOR_PREFLIGHT_ROLES = ("generator", "judge", "tiebreak")
 # taken under.
 EFFORT_LADDER_RETIRED = "2026-08-18: measured uniformly negative, see pilot"
 
+# GENERATOR-ROLE PARAMS BY FAMILY, sent on every attempt. Not a ladder - the
+# value never varies with the attempt number, which is the whole point of the
+# retirement above.
+#
+# mistral is here because Mistral Small 4's reasoning channel is OPT-IN. Live
+# probe 2026-08-18: with `reasoning_effort` the reply's `content` is a list
+# carrying a `thinking` chunk beside the `text` one; without it the content is
+# a plain string and there is no trace anywhere in the response. The magistral
+# line this build used before was retired upstream on 2026-07-31 and its
+# `-latest` alias now rides Small 4, so the 43/43 traceless generations the
+# pilot recorded were this parameter being absent, not a model that cannot
+# think.
+#
+# ROLE-SCOPED BY CONSTRUCTION: this hook is only ever passed to the generator
+# call. The same mistral model now also serves the JUDGE role, and a judge is
+# cheaper and no worse without a trace, so the parameter must not reach it -
+# which is exactly what putting it in the model's config `params` would do.
+#
+# gpt-oss is deliberately absent: it declares `reasoning_effort: medium` in the
+# config and reasons by default, so its configured value stands untouched.
+GENERATOR_REASONING_PARAMS: dict[str, dict] = {
+    "mistral": {"reasoning_effort": "high"},
+}
+
 # Answer-side token allowance, in the gates' chars/4 estimate currency. Used to
 # size GENERATION_OUTPUT_TOKENS below; not itself a call parameter.
 ANSWER_TOKEN_ALLOWANCE = 1000
@@ -1127,16 +1151,22 @@ def effort_params_for_ref(attempt: int):
 
     The signature keeps `attempt` rather than being deleted outright. The
     Router's contract is a per-ref hook - the params are chosen for the ref it
-    is ABOUT TO CALL, not the one it would have picked first, because
-    reasoning_effort is a gpt-oss parameter that magistral does not declare and
-    an unknown field earns a 400, which providers.py treats as our payload
-    being broken everywhere and raises through WITHOUT failing over. That hook
-    shape is what keeps a failover survivable, and it should still be the thing
-    a future per-attempt parameter is threaded through, so it stays.
+    is ABOUT TO CALL, not the one it would have picked first, because an
+    unknown field earns a 400, which providers.py treats as our payload being
+    broken everywhere and raises through WITHOUT failing over. That hook shape
+    is what keeps a failover survivable.
+
+    IT IS ALSO WHERE AN OPT-IN REASONING CHANNEL IS TURNED ON, and this is the
+    one place that can do it correctly. GENERATOR_REASONING_PARAMS is keyed by
+    family and is sent on EVERY attempt, so it is a property of the role and
+    not a ladder. Putting it in the model's config `params` instead would send
+    it on JUDGE calls too - the same mistral model now serves both roles - and
+    a judge does not need a trace it will not read.
     """
 
     def params_for_ref(ref: ModelRef, model_cfg) -> dict:
-        return {}
+        family = str(getattr(model_cfg, "family", "") or "")
+        return dict(GENERATOR_REASONING_PARAMS.get(family, {}))
 
     return params_for_ref
 

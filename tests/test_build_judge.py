@@ -223,7 +223,7 @@ def test_undersized_families_excludes_the_8k_judges(cfg):
 def test_generation_family_falls_back_to_the_config(cfg):
     assert generation_family(cfg, {"model_family": "gpt-oss"}) == "gpt-oss"
     assert generation_family(
-        cfg, {"model_family": None, "provider": "mistral", "model": "magistral-small-latest"}
+        cfg, {"model_family": None, "provider": "mistral", "model": "mistral-small-latest"}
     ) == "mistral"
     assert generation_family(cfg, {"provider": "nope", "model": "nope"}) is None
 

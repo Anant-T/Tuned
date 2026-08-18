@@ -806,7 +806,7 @@ def test_pick_excludes_families_at_call_time(cfg, keys):
         "cerebras", "gemma-4-31b"
     )
     assert router.pick("generator", exclude_families=frozenset({"gpt-oss"})).ref == ModelRef(
-        "mistral", "magistral-small-latest"
+        "mistral", "mistral-small-latest"
     )
 
 
@@ -848,16 +848,24 @@ def test_pick_caches_routed_models(cfg, keys):
     router = _router(cfg)
     first = router.pick("judge")
     assert router.pick("judge") is first  # one client + one bucket per ref
-    # The bucket is built from THAT model's own limits, which is what makes the
-    # mistral halving reach the wire: the two mistral models share ONE 50 rpm /
-    # 50k tpm workspace bucket (header-verified 2026-08-14 - the remaining-token
-    # counter decrements across calls made with different models), while
-    # TokenBucket is per (provider, model). Each is therefore configured with
-    # half, and BOTH halves have to be here: a bucket that kept the workspace
-    # figure would issue at twice the real refill rate.
-    assert (first.bucket.rpm, first.bucket.tpm) == (25, 25000)
-    generator = router.routed(ModelRef("mistral", "magistral-small-latest"))
-    assert (generator.bucket.rpm, generator.bucket.tpm) == (25, 25000)
+    # The bucket is built from THAT model's own limits, and the mistral figures
+    # are where that matters. The workspace allows 50 rpm / 50k tpm and the
+    # bucket is per (provider, model) - header-verified 2026-08-14, the
+    # remaining-token counter decrements across calls made with different
+    # models, so the ceiling is per WORKSPACE.
+    #
+    # It used to be configured as 25/25k, and that halving was arithmetic, not
+    # policy: TWO mistral models shared the one workspace bucket, so each was
+    # given half or the pair would have issued at twice the real refill rate.
+    # The magistral line was retired upstream on 2026-07-31 and its block is
+    # gone, so there is one model, one bucket, and the whole allowance - which
+    # is a restoration rather than a raise.
+    assert (first.bucket.rpm, first.bucket.tpm) == (50, 50000)
+    # ...and now that one model carries both roles, the generator and the judge
+    # really do share that single bucket rather than each getting one.
+    generator = router.routed(ModelRef("mistral", "mistral-small-latest"))
+    assert generator is first
+    assert generator.bucket is first.bucket
 
 
 # --- 9. circuit breaker -----------------------------------------------------
@@ -1275,7 +1283,7 @@ def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys
             "generator", [{"role": "user", "content": "go"}], params_for_ref=params_for_ref
         )
     )
-    assert ref == ModelRef("mistral", "magistral-small-latest")
+    assert ref == ModelRef("mistral", "mistral-small-latest")
     assert payloads[0]["reasoning_effort"] == "high"      # cerebras/gpt-oss-120b
     assert "reasoning_effort" not in payloads[1]          # mistral/magistral
 
@@ -1400,7 +1408,9 @@ def test_build_check_request_is_pure():
 def test_check_refs_covers_every_configured_model(cfg):
     refs = check_refs(cfg)
     expected = sum(len(p.models) for p in cfg.providers)
-    assert len(refs) == expected == 9
+    # 8, not 9: the magistral generator block was removed when the line was
+    # retired upstream and mistral-small-latest took both roles.
+    assert len(refs) == expected == 8
     assert ModelRef("groq", "qwen/qwen3.6-27b") in refs
     assert check_refs(cfg, "groq/qwen/qwen3.6-27b") == (ModelRef("groq", "qwen/qwen3.6-27b"),)
     with pytest.raises(KeyError):
@@ -2505,3 +2515,73 @@ def test_eligible_refs_is_the_filter_eligible_itself_uses(cfg, keys):
     assert list(router.eligible_refs("judge", exclude_families=frozenset({"mistral"}),
                                     skipped=seen)) == walked[1:]
     assert seen == {"family-excluded"}
+
+
+# --------------------------------------------------------------------------
+# The mistral quirk: Mistral Small 4's typed content chunks.
+# --------------------------------------------------------------------------
+# Captured from a live probe on 2026-08-18, byte-shape included: the thinking
+# chunk's body is a NESTED LIST of typed parts, not a string, and the field is
+# named for the chunk's own type. `reasoning` and `reasoning_content` are both
+# absent - the trace is only ever inside `content`.
+SMALL4_REASONING_REPLY = {
+    "choices": [
+        {
+            "message": {
+                "role": "assistant",
+                "tool_calls": None,
+                "content": [
+                    {
+                        "type": "thinking",
+                        "closed": True,
+                        "thinking": [
+                            {"type": "text", "text": "I need to decide whether "},
+                            {"type": "text", "text": "the intent element is made out."},
+                        ],
+                    },
+                    {"type": "text", "text": "No, that is not theft."},
+                ],
+            }
+        }
+    ]
+}
+
+# The same model called WITHOUT the parameter: a plain string and no trace.
+SMALL4_PLAIN_REPLY = {
+    "choices": [{"message": {"role": "assistant", "content": "No, that is not theft."}}]
+}
+
+
+def test_the_mistral_quirk_flattens_the_nested_thinking_chunk():
+    text, reasoning = QUIRKS["mistral"].response_hook(SMALL4_REASONING_REPLY)
+    assert text == "No, that is not theft."
+    # Flattened, in order, with no list repr leaking into the trace.
+    assert reasoning == "I need to decide whether the intent element is made out."
+    assert "{" not in reasoning and "[" not in reasoning
+
+
+def test_the_mistral_quirk_reports_a_plain_reply_as_having_no_trace():
+    """The opt-in half of the contract, and the reason the hook must not invent
+    a trace: a generator called without `reasoning_effort` genuinely produced
+    none, and generate.py's no-reasoning-channel park is the correct outcome.
+    """
+    text, reasoning = QUIRKS["mistral"].response_hook(SMALL4_PLAIN_REPLY)
+    assert text == "No, that is not theft."
+    assert reasoning is None
+
+
+def test_the_mistral_quirk_still_reads_an_ordinary_reasoning_field():
+    """Shape-tolerant: if the API ever moves the trace back onto its own field,
+    the hook keeps working rather than silently dropping it."""
+    data = {"choices": [{"message": {"content": "answer", "reasoning": "trace"}}]}
+    assert QUIRKS["mistral"].response_hook(data) == ("answer", "trace")
+
+
+def test_the_default_hook_would_have_mangled_the_small4_shape():
+    """Why this quirk exists at all. The default hook returns `content`
+    untouched, so the whole typed-chunk list - thinking included - would be
+    handed downstream as the answer, and `reasoning` would be None: the trace
+    would be both lost AND pasted into the answer."""
+    text, reasoning = QUIRKS["default"].response_hook(SMALL4_REASONING_REPLY)
+    assert reasoning is None
+    assert not isinstance(text, str)

@@ -238,6 +238,78 @@ def _default_response_hook(data: dict) -> tuple[str, str | None]:
     return text, reasoning
 
 
+def _flatten_chunk_text(body: object) -> str:
+    """The text inside one Mistral content chunk.
+
+    A chunk's body is either a plain string or a NESTED LIST of typed parts -
+    the thinking chunk is the nested case, and flattening it is not optional:
+    `str(body)` on that list yields a Python repr with braces and quotes in it,
+    which would then be stored as the model's reasoning.
+    """
+    if isinstance(body, str):
+        return body
+    if isinstance(body, list):
+        out = []
+        for part in body:
+            if isinstance(part, str):
+                out.append(part)
+            elif isinstance(part, dict):
+                out.append(str(part.get("text") or ""))
+        return "".join(out)
+    return ""
+
+
+def _mistral_response_hook(data: dict) -> tuple[str, str | None]:
+    """Mistral Small 4 returns its reasoning as a typed content chunk.
+
+    THE MAGISTRAL LINE WAS RETIRED 2026-07-31 and `mistral-small-latest` now
+    rides Small 4, which changed the response shape rather than the field set:
+    `reasoning` and `reasoning_content` are still both None, and the trace
+    arrives inside `message.content` instead.
+
+    Two shapes, both live-probed 2026-08-18 and both handled here:
+
+      with reasoning_effort   content is a LIST -
+                              [{"type": "thinking", "closed": ..., "thinking":
+                                [{"type": "text", "text": ...}]},
+                               {"type": "text", "text": ...}]
+                              i.e. the thinking body is itself a list of parts.
+      without                 content is a plain str and there is NO thinking
+                              at all - the channel is opt-in, not hidden.
+
+    That second shape is why this hook must not fabricate a trace when it finds
+    none: a generator called without the parameter genuinely produced no
+    reasoning, and generate.py's no-reasoning-channel park is the correct and
+    visible outcome. Returning ("", None) for an empty reply keeps that path
+    reachable.
+    """
+    choices = data.get("choices") or []
+    message = (choices[0].get("message") or {}) if choices else {}
+    content = message.get("content")
+    reasoning = message.get("reasoning") or message.get("reasoning_content")
+
+    if not isinstance(content, list):
+        return (content or ""), reasoning
+
+    thinking_parts: list[str] = []
+    text_parts: list[str] = []
+    for chunk in content:
+        if not isinstance(chunk, dict):
+            if isinstance(chunk, str):
+                text_parts.append(chunk)
+            continue
+        kind = chunk.get("type")
+        # The body lives under a key named for the type ("thinking"/"text").
+        body = chunk.get(kind, chunk.get("text"))
+        if kind == "thinking":
+            thinking_parts.append(_flatten_chunk_text(body))
+        else:
+            text_parts.append(_flatten_chunk_text(body))
+
+    trace = "".join(thinking_parts).strip()
+    return "".join(text_parts), (reasoning or trace or None)
+
+
 def _default_retry_after(response: object) -> float | None:
     """Parse ``Retry-After: <seconds>``.  HTTP-date form is ignored (rare here)."""
     headers = getattr(response, "headers", None)
@@ -336,7 +408,11 @@ QUIRKS: dict[str, Quirk] = {
         retry_after=_default_retry_after,
     ),
     "groq": DEFAULT_QUIRK,
-    "mistral": DEFAULT_QUIRK,
+    "mistral": Quirk(
+        request_hook=_default_request_hook,
+        response_hook=_mistral_response_hook,
+        retry_after=_default_retry_after,
+    ),
     "openai": Quirk(
         request_hook=_openai_request_hook,
         response_hook=_default_response_hook,

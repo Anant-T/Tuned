@@ -244,16 +244,33 @@ providers:
     api_key_env: MISTRAL_API_KEY
     quirks: [mistral]
     models:
-      - id: magistral-small-latest
-        family: mistral
-        roles: [generator]
-        limits: {rpm: 25, tpm: 25000, tpd: 33000000, max_context: 40000, max_output: 8192}
-        params: {temperature: 0.7, top_p: 0.95}
+      # ONE BLOCK, TWO ROLES, since 2026-08-18. The magistral line was retired
+      # upstream on 2026-07-31 and `magistral-small-latest` no longer exists as
+      # a distinct model; `mistral-small-latest` rides Mistral Small 4, which
+      # both generates and judges. The generator block was deleted rather than
+      # re-pointed so the two roles cannot drift into two different aliases of
+      # the same weights again.
+      #
+      # THE FULL WORKSPACE BUCKET, and this is a restoration rather than an
+      # increase. The workspace limit is 50 rpm / 50k tpm and the ledger below
+      # records that BOTH mistral models drew on the ONE bucket; each was
+      # therefore given half, because providers.TokenBucket is per
+      # (provider, model) and two 50k buckets would have issued at twice the
+      # real refill rate. With one model there is one bucket, so it gets the
+      # whole workspace allowance.
+      #
+      # family stays `mistral` for both roles, which is what keeps
+      # family_separation from letting this model judge its own generations.
+      #
+      # NO reasoning_effort HERE ON PURPOSE. Small 4's reasoning channel is
+      # opt-in and the parameter belongs to the GENERATOR call only - see
+      # generate.GENERATOR_REASONING_PARAMS. Declaring it here would send it on
+      # judge calls too, which pays for a trace no judge reads.
       - id: mistral-small-latest
         family: mistral
-        roles: [judge]
-        limits: {rpm: 25, tpm: 25000, tpd: 33000000, max_context: 32000, max_output: 8192}
-        params: {temperature: 0.2}
+        roles: [generator, judge]
+        limits: {rpm: 50, tpm: 50000, tpd: 33000000, max_context: 32000, max_output: 8192}
+        params: {temperature: 0.7, top_p: 0.95}
   - name: openai
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
@@ -388,7 +405,7 @@ providers:
 # NOT an option: letting a judge share the generator's family when the pool
 # runs out. Family separation is a data-quality invariant, not a preference.
 routing:
-  generator: [cerebras/gpt-oss-120b, mistral/magistral-small-latest]
+  generator: [cerebras/gpt-oss-120b, mistral/mistral-small-latest]
   judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b, cerebras/zai-glm-4.7,
           openai/gpt-5-mini, openai/gpt-5-nano]
   tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b, cerebras/zai-glm-4.7,

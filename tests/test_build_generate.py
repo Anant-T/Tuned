@@ -206,15 +206,23 @@ def test_a_retry_re_rolls_the_same_request_and_never_bumps_effort(cfg, attempt):
     accident, a longer trace being likelier to contain one of twelve literal
     cues; that is now handled in the prompt, which hands the cues over.
 
-    So no attempt may send reasoning_effort at all: the model's configured
-    default stands on every one, which is the attempt-1 condition all of the
-    above was measured under.
+    So no attempt may send a DIFFERENT reasoning_effort from any other: what a
+    generator is asked for is a property of its family, never of how many times
+    the row has been tried. That is the attempt-1 condition all of the above
+    was measured under.
+
+    (What a family is asked for is a separate question, settled by
+    GENERATOR_REASONING_PARAMS: gpt-oss reasons by default and is sent nothing,
+    mistral's channel is opt-in and is sent the same value every time. This
+    test pins the INVARIANCE; test_the_generator_opts_mistral_into_reasoning
+    pins the value.)
     """
-    params_for_ref = effort_params_for_ref(attempt)
+    first = effort_params_for_ref(1)
+    this = effort_params_for_ref(attempt)
     for provider in cfg.providers:
         for model in provider.models:
             ref = ModelRef(provider=provider.name, model=model.id)
-            assert params_for_ref(ref, model) == {}
+            assert this(ref, model) == first(ref, model)
 
 
 # --------------------------------------------------------------------------
@@ -559,7 +567,7 @@ def test_a_missing_trace_parks_as_a_provider_fact_not_a_content_failure(
 
     CHANGED 2026-08-18. This used to assert `pending` + `regenerate:...`, i.e.
     a content problem worth two more attempts. Measured over the pilot: 43/43
-    mistral/magistral-small-latest generations came back with no trace and
+    mistral/mistral-small-latest generations came back with no trace and
     0/176 cerebras/gpt-oss-120b did, so the row was never going to improve by
     being asked again - every retry bought the identical wall and the run
     filed ~20% of its spend as three content-gate failures (think_format,
@@ -1010,7 +1018,7 @@ def test_a_long_prompt_is_routed_past_the_8k_generator(tmp_path, cfg, paths):
         # cerebras/gpt-oss-120b is 8k and first in the preference list; an
         # over-long prompt there is a 400, and a 400 does NOT fail over.
         assert "gpt-oss" in call["exclude_families"]
-        assert call["ref"] == ModelRef("mistral", "magistral-small-latest")
+        assert call["ref"] == ModelRef("mistral", "mistral-small-latest")
         assert only_task(store)["state"] == "judging"
 
 
@@ -1024,21 +1032,25 @@ def test_a_short_prompt_excludes_no_generator(tmp_path, cfg, paths):
         assert call["ref"] == ModelRef("cerebras", "gpt-oss-120b")
 
 
-def test_no_attempt_sends_reasoning_effort_on_either_generator(tmp_path, cfg, paths):
-    """The per-ref params hook survives the retired ladder, and sends nothing.
+def test_the_generator_opts_mistral_into_reasoning_and_leaves_gpt_oss_alone(
+    tmp_path, cfg, paths
+):
+    """The per-ref hook is what makes an OPT-IN reasoning channel role-correct.
 
-    CHANGED 2026-08-18. The second half used to assert
-    `{"reasoning_effort": "high"}` on the cerebras route; both routes now send
-    `{}` on every attempt, so the model's configured default stands.
+    Mistral Small 4 only reasons when asked (live probe 2026-08-18: with
+    `reasoning_effort` the content is a list carrying a thinking chunk; without
+    it, a plain string and no trace anywhere). gpt-oss reasons by default and
+    declares `medium` in the config, so sending it anything here would override
+    a configured value for no reason.
 
-    The hook SHAPE is still worth pinning even with nothing to put in it, and
-    that is why this test did not simply go away. reasoning_effort is a gpt-oss
-    parameter that magistral does not declare, and an unknown field earns a 400
-    that providers.py treats as our payload being broken everywhere - raising
-    through WITHOUT failing over. Any future per-attempt parameter has to be
-    chosen for the ref the Router is about to call, not the one it would have
-    picked first, or a failover becomes a dead task. The long-prompt route
-    below is exactly that failover.
+    THE HOOK SHAPE IS THE POINT, and it is why this is asserted per route
+    rather than globally: the params are chosen for the ref the Router is ABOUT
+    TO CALL, not the one it would have picked first. A long prompt fails over
+    from the 8k cerebras model to mistral, and if the parameter had been chosen
+    for cerebras the mistral call would carry a field it does not accept - a
+    400, which providers.py reads as our payload being broken everywhere and
+    raises through WITHOUT failing over, turning every failover into a dead
+    task. The long-prompt route below is exactly that failover.
     """
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
         router = FakeRouter(cfg)
@@ -1046,8 +1058,8 @@ def test_no_attempt_sends_reasoning_effort_on_either_generator(tmp_path, cfg, pa
         asyncio.run(generate_once(store, cfg, router, task, paths=paths, attempt=2))
         call = router.calls_for("generator")[0]
         assert call["ref"].provider == "mistral"
-        assert call["params"] == {}
-        assert store.events("effort_bump") == []
+        assert call["params"] == {"reasoning_effort": "high"}
+        assert store.events("effort_bump") != []
 
     with make_store(tmp_path / "short") as store:
         router = FakeRouter(cfg)
@@ -1157,7 +1169,7 @@ def test_a_transient_pool_skip_still_re_queues(tmp_path, cfg, paths):
         router = FakeRouter(
             cfg,
             cooling={"cerebras/gpt-oss-120b"},
-            over_budget={"mistral/magistral-small-latest"},
+            over_budget={"mistral/mistral-small-latest"},
         )
         result = asyncio.run(
             generate_once(store, cfg, router, only_task(store), paths=paths)
@@ -1281,7 +1293,7 @@ def test_the_context_estimate_routes_devanagari_past_the_8k_generator(tmp_path, 
         asyncio.run(generate_once(store, cfg, router, only_task(store), paths=paths))
         call = router.calls_for("generator")[0]
         assert "gpt-oss" in call["exclude_families"]
-        assert call["ref"] == ModelRef("mistral", "magistral-small-latest")
+        assert call["ref"] == ModelRef("mistral", "mistral-small-latest")
 
 
 def test_the_gate_estimate_is_not_moved_by_the_routing_estimate(tmp_path, cfg):
