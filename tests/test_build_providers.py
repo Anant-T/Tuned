@@ -42,7 +42,8 @@ from tuned.data.generate import (  # noqa: E402
     preflight_messages,
     worst_case_judge_tokens,
 )
-from tuned.data.providers import (  # noqa: E402
+from tuned.data.providers import (
+    QuotaLedger,  # noqa: E402
     CHARS_PER_TOKEN_LATIN,
     CONTEXT_SAFETY_MARGIN,
     DEFAULT_JUDGE_REPLY_TOKENS,
@@ -2749,3 +2750,57 @@ def test_role_params_naming_a_role_the_model_does_not_serve_is_refused(tmp_path)
     with pytest.raises(ValueError) as exc:
         load_build_config(str(path), allow_unpinned=True)
     assert "judgge" in str(exc.value) and "role_params" in str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# Observed quota: the headers the budget gate is now the authority for.
+# --------------------------------------------------------------------------
+
+def _quota_client(cfg, handler, quota):
+    provider = next(p for p in cfg.providers if p.name == "cerebras")
+    model = next(m for m in provider.models if m.id == "gpt-oss-120b")
+    return ChatClient(
+        provider, model, transport=httpx.MockTransport(handler),
+        clock=FakeClock(), sleeper=lambda d: asyncio.sleep(0), rng=random.Random(0),
+        max_retries=1, quota=quota,
+    )
+
+
+def test_rate_limit_headers_are_captured_from_a_200(cfg, keys):
+    quota = QuotaLedger()
+    headers = {
+        "x-ratelimit-limit-tokens-day": "1000000",
+        "x-ratelimit-remaining-tokens-day": "458408",
+        "x-ratelimit-remaining-requests-day": "2399",
+    }
+    client = _quota_client(cfg, lambda r: httpx.Response(200, json=_body(), headers=headers), quota)
+    asyncio.run(client.complete(ChatRequest(messages=({"role": "user", "content": "x"},),
+                                            ref=ModelRef("cerebras", "gpt-oss-120b"))))
+    obs = quota.observation("cerebras", "gpt-oss-120b")
+    assert obs is not None
+    assert obs.remaining_tokens_day == 458408
+    assert obs.limit_tokens_day == 1000000
+
+
+def test_rate_limit_headers_are_captured_from_a_429_too(cfg, keys):
+    """The 429 is the response that says the window really IS spent, so it is
+    the one the gate most needs. Capturing only 200s would leave the gate
+    trusting the last healthy number right through an exhaustion."""
+    quota = QuotaLedger()
+    headers = {"x-ratelimit-limit-tokens-day": "1000000",
+               "x-ratelimit-remaining-tokens-day": "0"}
+    client = _quota_client(cfg, lambda r: httpx.Response(429, text="slow down", headers=headers), quota)
+    with pytest.raises(ProviderError):
+        asyncio.run(client.complete(ChatRequest(messages=({"role": "user", "content": "x"},),
+                                                ref=ModelRef("cerebras", "gpt-oss-120b"))))
+    obs = quota.observation("cerebras", "gpt-oss-120b")
+    assert obs is not None and obs.remaining_tokens_day == 0
+    assert obs.allows(1) is False
+
+
+def test_a_response_without_quota_headers_leaves_no_observation(cfg, keys):
+    quota = QuotaLedger()
+    client = _quota_client(cfg, lambda r: httpx.Response(200, json=_body()), quota)
+    asyncio.run(client.complete(ChatRequest(messages=({"role": "user", "content": "x"},),
+                                            ref=ModelRef("cerebras", "gpt-oss-120b"))))
+    assert quota.observation("cerebras", "gpt-oss-120b") is None

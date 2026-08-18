@@ -315,6 +315,152 @@ def _mistral_response_hook(data: dict) -> tuple[str, str | None]:
     return "".join(text_parts), (reasoning or trace or None)
 
 
+# --------------------------------------------------------------------------
+# Observed quota: what the PROVIDER says is left, as opposed to what our own
+# ledger thinks we spent.
+# --------------------------------------------------------------------------
+# THE FAILURE THIS EXISTS FOR, measured 2026-08-18. Our budget_ledger keys
+# spend by UTC CALENDAR DAY and compares the sum against the configured `tpd`.
+# The provider meters a ROLLING window of its own and publishes what is left on
+# every response. The two drifted: the ledger read 1,015,901 tokens against a
+# 1,000,000 tpd and refused to spend anything, while a live probe of the same
+# model answered 200 with
+#
+#     x-ratelimit-remaining-tokens-day: 458408   (of 1,000,000)
+#     x-ratelimit-remaining-requests-day: 2399   (of 2,400)
+#
+# i.e. ~458k tokens genuinely available and only that probe's request counted.
+# The fleet had blocked ITSELF out of real quota, and the previous pilot spent
+# its second half diverted onto a fallback generator for the same reason - so
+# that run measured our accounting rather than the corpus.
+#
+# The provider is the authority on its own quota. Local accounting stays as the
+# fallback for the case where nothing has been observed yet.
+_QUOTA_HEADERS = {
+    "remaining_tokens_day": "x-ratelimit-remaining-tokens-day",
+    "limit_tokens_day": "x-ratelimit-limit-tokens-day",
+    "remaining_requests_day": "x-ratelimit-remaining-requests-day",
+    "limit_requests_day": "x-ratelimit-limit-requests-day",
+    "remaining_tokens_minute": "x-ratelimit-remaining-tokens-minute",
+    "limit_tokens_minute": "x-ratelimit-limit-tokens-minute",
+}
+
+# How long an observation is trusted, in seconds.
+#
+# PROVENANCE, because a freshness window that is wrong in the loose direction
+# spends money that is not there. Every response refreshes the observation, so
+# during an active run it is seconds old and this constant only bites after an
+# idle gap. The bound on how wrong a just-expired observation can be is the
+# per-minute ceiling the config already declares: at cerebras' tpm of 30,000 a
+# maximally saturated fleet can spend at most 30,000 * 5 = 150,000 tokens in
+# this window, which is the error budget being accepted. Five minutes is also
+# comfortably longer than the ~12-minute-per-100-calls cadence the pilot
+# measured, so a working fleet never falls back to the ledger by accident.
+QUOTA_OBSERVATION_TTL_S = 300.0
+
+
+@dataclass(frozen=True)
+class QuotaObservation:
+    """What one response said was left, and when it said it."""
+
+    observed_at: float
+    remaining_tokens_day: int | None = None
+    limit_tokens_day: int | None = None
+    remaining_requests_day: int | None = None
+    limit_requests_day: int | None = None
+    remaining_tokens_minute: int | None = None
+    limit_tokens_minute: int | None = None
+
+    def is_fresh(self, now: float, ttl: float = QUOTA_OBSERVATION_TTL_S) -> bool:
+        return (now - self.observed_at) <= ttl
+
+    def allows(self, est_tokens: int) -> bool | None:
+        """Does the provider's own count leave room for this call?
+
+        None means "the provider did not say", which is not the same as "no":
+        a provider that publishes no daily-token header must fall through to
+        the local ledger rather than be treated as exhausted or as unlimited.
+        """
+        if self.remaining_tokens_day is None:
+            return None
+        if self.remaining_tokens_day < est_tokens:
+            return False
+        if self.remaining_requests_day is not None and self.remaining_requests_day < 1:
+            return False
+        return True
+
+    def as_detail(self) -> dict:
+        return {
+            "remaining_tokens_day": self.remaining_tokens_day,
+            "limit_tokens_day": self.limit_tokens_day,
+            "remaining_requests_day": self.remaining_requests_day,
+            "limit_requests_day": self.limit_requests_day,
+            "remaining_tokens_minute": self.remaining_tokens_minute,
+        }
+
+
+def parse_quota_headers(headers: object, *, now: float) -> QuotaObservation | None:
+    """A QuotaObservation from response headers, or None if none were present.
+
+    Tolerant on purpose: providers publish different subsets and only some
+    publish the daily pair at all. Anything unparseable is dropped rather than
+    guessed, because a wrong number here spends real money.
+    """
+    if headers is None:
+        return None
+    get = getattr(headers, "get", None)
+    if get is None:
+        return None
+    found: dict = {}
+    for field, name in _QUOTA_HEADERS.items():
+        raw = get(name)
+        if raw is None:
+            continue
+        try:
+            found[field] = int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            continue
+    if not found:
+        return None
+    return QuotaObservation(observed_at=now, **found)
+
+
+class QuotaLedger:
+    """Latest observation per (provider, model), for this process only.
+
+    Deliberately in-memory and NOT persisted. An observation is a statement
+    about a window the provider is metering right now; replaying yesterday's
+    from disk is how the drift being fixed here got started.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._by_ref: dict[tuple[str, str], QuotaObservation] = {}
+
+    def record(self, provider: str, model: str, headers: object) -> QuotaObservation | None:
+        observation = parse_quota_headers(headers, now=self._clock())
+        if observation is not None:
+            self._by_ref[(provider, model)] = observation
+        return observation
+
+    def observation(self, provider: str, model: str) -> QuotaObservation | None:
+        return self._by_ref.get((provider, model))
+
+    def fresh(self, provider: str, model: str) -> QuotaObservation | None:
+        found = self._by_ref.get((provider, model))
+        if found is None or not found.is_fresh(self._clock()):
+            return None
+        return found
+
+    def clear(self) -> None:
+        self._by_ref.clear()
+
+
+# One process, one view of what the providers last said. The budget gate reads
+# this; ChatClient writes it on every response, 2xx and 429 alike.
+QUOTA = QuotaLedger()
+
+
 def _default_retry_after(response: object) -> float | None:
     """Parse ``Retry-After: <seconds>``.  HTTP-date form is ignored (rare here)."""
     headers = getattr(response, "headers", None)
@@ -603,9 +749,13 @@ class ChatClient:
         timeout: float = _DEFAULT_TIMEOUT_S,
         max_retry_sleep_s: float = _MAX_RETRY_SLEEP_S,
         call_deadline_s: float = _CALL_DEADLINE_S,
+        quota: "QuotaLedger | None" = None,
     ) -> None:
         self.provider = provider
         self.model = model
+        # Where observed rate-limit headers land. Defaults to the process-wide
+        # ledger the budget gate reads; injectable so a test can watch its own.
+        self.quota = quota if quota is not None else QUOTA
         self.quirk = resolve_quirks(provider.quirks)
         self.max_retries = max(1, max_retries)
         self.max_retry_sleep_s = max_retry_sleep_s
@@ -753,6 +903,11 @@ class ChatClient:
                     on_attempt(None, None)
             else:
                 status = response.status_code
+                # EVERY response, before anything else can return or raise.
+                # The headers arrive on 200s and 429s alike, and the 429 case
+                # is the one that matters most - that is the response which
+                # says the window really is spent.
+                self.quota.record(self.provider.name, self.model.id, response.headers)
                 if 200 <= status < 300:
                     latency_ms = int(max(0.0, self._clock() - started) * 1000)
                     try:

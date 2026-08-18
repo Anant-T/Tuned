@@ -442,7 +442,7 @@ class BatchStats:
 # Wiring: budget-gated router, worker identity.
 # --------------------------------------------------------------------------
 
-def budget_ok_for(store, cfg):
+def budget_ok_for(store, cfg, *, quota=None):
     """The `budget_ok` callable providers.Router takes.
 
     providers.py never imports the store on purpose (per-minute limits are
@@ -452,14 +452,90 @@ def budget_ok_for(store, cfg):
     about refs it routed from that same config, so an unknown one means the
     config changed under a running fleet, and blocking every call would be a
     worse failure than briefly not enforcing a cap.
+
+    THE PROVIDER IS THE AUTHORITY ON ITS OWN QUOTA (2026-08-18). The local
+    ledger keys spend by UTC calendar day; the provider meters a rolling window
+    and publishes what is left on every response. When those drifted, the
+    ledger read 1,015,901 tokens against a 1,000,000 tpd and refused to spend,
+    while the provider was reporting 458,408 tokens still available - the fleet
+    had blocked itself out of real budget, and the previous pilot spent its
+    second half on a fallback generator because of it. So a fresh observation
+    decides, and the ledger sum is what decides only when there is none.
+
+    The ledger is still written on every call and is NOT touched here: this
+    changes the GATE, not the spend history.
     """
+    from tuned.data.providers import QUOTA
+
+    quota = QUOTA if quota is None else quota
+    # Divergence is worth saying once per model per day, not once per call.
+    reported: set[tuple[str, str, str]] = set()
+    # See _probe_grant below.
+    probed: set[tuple[str, str, str]] = set()
 
     def budget_ok(provider: str, model: str, est_tokens: int) -> bool:
         try:
             _, model_cfg = cfg.model_for(ModelRef(provider, model))
         except KeyError:
             return True
-        return store.reserve_budget(provider, model, est_tokens, limits=model_cfg.limits)
+
+        local_ok = store.reserve_budget(
+            provider, model, est_tokens, limits=model_cfg.limits
+        )
+        observation = quota.fresh(provider, model)
+        observed_ok = None if observation is None else observation.allows(est_tokens)
+
+        if observed_ok is None:
+            # Nothing observed, or the provider publishes no daily counter.
+            #
+            # THE PROBE GRANT, and it is what makes this fix actually unblock a
+            # stuck fleet. Falling straight back to the ledger deadlocks in
+            # exactly the situation being fixed: the ledger says exhausted, so
+            # no call is made, so no headers are ever seen, so the ledger keeps
+            # deciding forever. One call per (provider, model, day) is let
+            # through to go and ask. If the provider really is spent it answers
+            # 429 - which carries the headers too - and the gate closes on the
+            # provider's own number from then on. The cost of being wrong is a
+            # single 429; the cost of not doing it is the fleet we found.
+            key = (provider, model, utcday())
+            if not local_ok and key not in probed:
+                probed.add(key)
+                store.log_event(
+                    "budget_probe_grant",
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "est_tokens": est_tokens,
+                        "reason": "local ledger says exhausted and no fresh "
+                                  "provider observation exists; allowing one "
+                                  "call to obtain one",
+                    },
+                )
+                return True
+            return local_ok
+
+        if observed_ok != local_ok:
+            key = (provider, model, utcday())
+            if key not in reported:
+                reported.add(key)
+                used = store.usage_today(provider, model)
+                store.log_event(
+                    "budget_source_divergence",
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "est_tokens": est_tokens,
+                        "decided_by": "provider",
+                        "provider_allows": observed_ok,
+                        "ledger_allows": local_ok,
+                        "ledger_tokens_today": used["prompt_tokens"] + used["completion_tokens"],
+                        "ledger_requests_today": used["requests"],
+                        "configured_tpd": model_cfg.limits.get("tpd"),
+                        "configured_rpd": model_cfg.limits.get("rpd"),
+                        **observation.as_detail(),
+                    },
+                )
+        return observed_ok
 
     return budget_ok
 

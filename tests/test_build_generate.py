@@ -64,7 +64,13 @@ from tuned.data.generate import (
 )
 from tuned.data.generate import main as generate_main
 from tuned.data.jsonl import read_at
-from tuned.data.providers import ProviderError, required_context
+from tuned.data.providers import (
+    QUOTA_OBSERVATION_TTL_S,
+    ProviderError,
+    QuotaLedger,
+    parse_quota_headers,
+    required_context,
+)
 from tuned.data.tasks import plan_wave, reopen_tasks
 
 
@@ -952,16 +958,26 @@ def test_a_lost_lease_drops_the_result_instead_of_clobbering(tmp_path, cfg, path
 # Budget wiring (contract 7).
 # --------------------------------------------------------------------------
 
-def test_budget_ok_reads_the_daily_ledger(tmp_path, cfg):
+def test_budget_ok_falls_back_to_the_daily_ledger_when_nothing_is_observed(tmp_path, cfg):
+    """With no provider observation the ledger still decides - but see the
+    probe grant: the FIRST call after the ledger says exhausted is let through
+    to go and ask the provider, because otherwise no call is made, no headers
+    are seen, and the ledger decides forever."""
     with open_store(tmp_path, n_seeds=0) as store:
-        budget_ok = budget_ok_for(store, cfg)
+        budget_ok = budget_ok_for(store, cfg, quota=QuotaLedger())
         assert budget_ok("cerebras", "gpt-oss-120b", 1000) is True
         _, model = cfg.model_for(ModelRef("cerebras", "gpt-oss-120b"))
         store.record_usage(
             "cerebras", "gpt-oss-120b",
             prompt_tokens=int(model.limits["tpd"]), completion_tokens=0,
         )
+        # One probe through...
+        assert budget_ok("cerebras", "gpt-oss-120b", 1) is True
+        assert len(store.events("budget_probe_grant")) == 1
+        # ...and then the ledger holds the door.
         assert budget_ok("cerebras", "gpt-oss-120b", 1) is False
+        assert budget_ok("cerebras", "gpt-oss-120b", 1) is False
+        assert len(store.events("budget_probe_grant")) == 1
         # A ref the config does not know is allowed rather than blocked.
         assert budget_ok("nowhere", "nothing", 10**9) is True
 
@@ -1735,3 +1751,123 @@ def test_gate_context_is_built_from_the_seed(tmp_path, cfg):
         assert ctx.expect_reasoning is True
         assert ctx.citation_index is None
         assert ctx.band is cfg.build.length_band
+
+
+# --------------------------------------------------------------------------
+# The budget gate's authority: the provider's own headers beat our ledger.
+# --------------------------------------------------------------------------
+# The live observation that produced this work, 2026-08-18: our ledger read
+# 1,015,901 tokens spent against a configured tpd of 1,000,000 and refused to
+# spend anything, while the provider answered 200 to a 12-token probe with
+# x-ratelimit-remaining-tokens-day: 458408 of 1000000 and
+# x-ratelimit-remaining-requests-day: 2399 of 2400.
+CEREBRAS_HEADERS_WITH_BUDGET = {
+    "x-ratelimit-limit-tokens-day": "1000000",
+    "x-ratelimit-remaining-tokens-day": "458408",
+    "x-ratelimit-limit-requests-day": "2400",
+    "x-ratelimit-remaining-requests-day": "2399",
+    "x-ratelimit-remaining-tokens-minute": "29988",
+}
+CEREBRAS_HEADERS_EXHAUSTED = {
+    "x-ratelimit-limit-tokens-day": "1000000",
+    "x-ratelimit-remaining-tokens-day": "0",
+    "x-ratelimit-limit-requests-day": "2400",
+    "x-ratelimit-remaining-requests-day": "1200",
+}
+
+
+def _exhaust_ledger(store, cfg, provider="cerebras", model="gpt-oss-120b"):
+    _, model_cfg = cfg.model_for(ModelRef(provider, model))
+    store.record_usage(
+        provider, model,
+        prompt_tokens=int(model_cfg.limits["tpd"]) + 15_901, completion_tokens=0,
+    )
+
+
+def test_the_gate_opens_when_the_provider_says_budget_remains(tmp_path, cfg):
+    """THE MEASURED FAILURE, as a test. Ledger over cap, provider says 458,408
+    tokens left - the fleet must spend, because the provider is the authority
+    on its own window and our UTC-day sum is only a proxy for it."""
+    quota = QuotaLedger()
+    with open_store(tmp_path, n_seeds=0) as store:
+        _exhaust_ledger(store, cfg)
+        assert store.reserve_budget(
+            "cerebras", "gpt-oss-120b", 1,
+            limits=cfg.model_for(ModelRef("cerebras", "gpt-oss-120b"))[1].limits,
+        ) is False
+
+        quota.record("cerebras", "gpt-oss-120b", CEREBRAS_HEADERS_WITH_BUDGET)
+        budget_ok = budget_ok_for(store, cfg, quota=quota)
+        assert budget_ok("cerebras", "gpt-oss-120b", 4000) is True
+        # ...and it is not blanket permission: a call bigger than what remains
+        # is still refused, on the provider's number.
+        assert budget_ok("cerebras", "gpt-oss-120b", 500_000) is False
+
+
+def test_the_gate_closes_when_the_provider_says_exhausted(tmp_path, cfg):
+    """The other direction, and the one that protects the account: the ledger
+    is comfortably under cap and the provider says the window is spent."""
+    quota = QuotaLedger()
+    with open_store(tmp_path, n_seeds=0) as store:
+        store.record_usage("cerebras", "gpt-oss-120b", prompt_tokens=10, completion_tokens=10)
+        quota.record("cerebras", "gpt-oss-120b", CEREBRAS_HEADERS_EXHAUSTED)
+        budget_ok = budget_ok_for(store, cfg, quota=quota)
+        assert budget_ok("cerebras", "gpt-oss-120b", 1) is False
+
+
+def test_a_stale_observation_falls_back_to_the_ledger(tmp_path, cfg):
+    """An observation is a statement about a window the provider is metering
+    NOW. Past the TTL it stops deciding - see QUOTA_OBSERVATION_TTL_S for the
+    error budget that number was chosen against."""
+    now = [1000.0]
+    quota = QuotaLedger(clock=lambda: now[0])
+    with open_store(tmp_path, n_seeds=0) as store:
+        _exhaust_ledger(store, cfg)
+        quota.record("cerebras", "gpt-oss-120b", CEREBRAS_HEADERS_WITH_BUDGET)
+        budget_ok = budget_ok_for(store, cfg, quota=quota)
+        assert budget_ok("cerebras", "gpt-oss-120b", 4000) is True
+
+        now[0] += QUOTA_OBSERVATION_TTL_S + 1
+        # Stale: the ledger decides again - via one probe grant, then closed.
+        assert budget_ok("cerebras", "gpt-oss-120b", 4000) is True
+        assert store.events("budget_probe_grant")
+        assert budget_ok("cerebras", "gpt-oss-120b", 4000) is False
+
+
+def test_the_divergence_is_logged_once_per_provider_model_day(tmp_path, cfg):
+    """The event that would have caught the previous pilot. It carries BOTH
+    numbers, because the whole point is that they disagreed and nothing said
+    so."""
+    quota = QuotaLedger()
+    with open_store(tmp_path, n_seeds=0) as store:
+        _exhaust_ledger(store, cfg)
+        quota.record("cerebras", "gpt-oss-120b", CEREBRAS_HEADERS_WITH_BUDGET)
+        budget_ok = budget_ok_for(store, cfg, quota=quota)
+        for _ in range(5):
+            assert budget_ok("cerebras", "gpt-oss-120b", 4000) is True
+
+        events = store.events("budget_source_divergence")
+        assert len(events) == 1
+        detail = json.loads(events[0]["detail_json"])
+        assert detail["decided_by"] == "provider"
+        assert detail["provider_allows"] is True
+        assert detail["ledger_allows"] is False
+        assert detail["remaining_tokens_day"] == 458408
+        assert detail["limit_tokens_day"] == 1000000
+        assert detail["ledger_tokens_today"] == 1_015_901
+        assert detail["configured_tpd"] == 1_000_000
+
+
+def test_quota_headers_are_parsed_and_missing_ones_are_not_guessed():
+    obs = parse_quota_headers(CEREBRAS_HEADERS_WITH_BUDGET, now=0.0)
+    assert obs.remaining_tokens_day == 458408
+    assert obs.remaining_requests_day == 2399
+    assert obs.limit_requests_day == 2400
+    # A provider that publishes nothing usable yields nothing to decide on.
+    assert parse_quota_headers({}, now=0.0) is None
+    assert parse_quota_headers({"x-ratelimit-remaining-tokens-day": "n/a"}, now=0.0) is None
+    assert parse_quota_headers(None, now=0.0) is None
+    # A provider that publishes only the minute counters cannot decide the DAY
+    # gate, and must fall through rather than be read as exhausted.
+    minute_only = parse_quota_headers({"x-ratelimit-remaining-tokens-minute": "10"}, now=0.0)
+    assert minute_only is not None and minute_only.allows(1) is None
