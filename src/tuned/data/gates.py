@@ -93,6 +93,49 @@ PERMANENT_GATES = frozenset({"citations", "temporal", "answer_key"})
 # hallucination. Extendable - callers may append, the list is not a closed
 # vocabulary. Matched case-insensitively against the whitespace-normalized
 # trace, so a cue split across a line break still counts.
+#
+# WIDENED 2026-08-18 (re-pilot re-audit), and ONLY along the two axes the
+# evidence named. Over 100 logged drafting generations, 89 traces carried no
+# cue at all; hand-classified, 37% of those were verifying in words this list
+# missed and the misses were dominated by PUNCTUATION and GRAMMATICAL PERSON
+# rather than by any new vocabulary. Frequency over the 89, measured:
+#
+#     17  'actually' with no following comma   (the cue required "actually,")
+#      7  "let me think"                       (verb absent from the list)
+#      5  "let's check" / 5 "let's verify"     (the cue was singular "let me")
+#      3  "not sure"
+#      2  "wait:"                              (the cue required "wait,")
+#      1  "re-derive"
+#
+# THE COUNTERFACTUAL THIS BOUGHT, which is the re-audit record: replaying the
+# logged run's gate results with only this list changed takes clean rows from
+# 2/100 to 16/100 - all of them on gpt-oss-120b, whose clean rate goes 5% ->
+# 36%. It changes nothing on the retired mistral generator (0/56 either way),
+# because that model fails irac_placement on a real pathology.
+#
+# WHAT WAS MEASURED AND DELIBERATELY LEFT OUT, because a gate that exists to
+# reject confident hallucination must not be widened into passing traces that
+# never doubt:
+#
+#   verify / confirm / ensure AS BARE STEMS. In a drafting deliverable
+#   "verification" is a term of art - the verification clause on a pleading -
+#   and the templates' own answer contract instructs "verification, annexures,
+#   limitation, service". Measured: "ensure" appears in 45 of the 89 failing
+#   traces, almost always as a drafting imperative ("ensure essential
+#   averments are present"), and spans like "The petition must be verified by
+#   the petitioner" are the deliverable, not doubt.
+#
+#   "uncertain". It matched 11 traces, but 8 of the 14 templates already say
+#   "genuinely uncertain" / "keep the uncertainty in view", so a trace can
+#   collect it by restating the instruction - and measured, it passed a trace
+#   carrying no doubt-marking language of any kind ("indispensable averments,
+#   gaps, uncertainties" is a topic list).
+#
+#   "need to check|verify|confirm". Same failure, measured on the same probe.
+#
+# With those three excluded the widening passes ZERO of the 15 traces that
+# show no doubt-marking of any kind. That number is the safety property, and
+# test_the_widened_cues_admit_no_trace_that_never_doubts pins it.
 VERIFICATION_CUES = (
     "let me check",
     "let me verify",
@@ -106,7 +149,66 @@ VERIFICATION_CUES = (
     "sanity check",
     "let me reconsider",
     "verify this",
+    # --- 2026-08-18 widening: person and punctuation variants of the above ---
+    "actually",
+    "wait:",
+    "let's check",
+    "let's verify",
+    "let's confirm",
+    "let's make sure",
+    "let's see",
+    "let me think",
+    "let me see",
+    "let me work",
+    "not sure",
+    "unsure",
+    "unclear",
+    "re-read",
+    "re-check",
+    "cross-check",
+    "re-derive",
 )
+
+
+# Cues that only mean self-correction when they OPEN a sentence. "actually"
+# mid-sentence is an ordinary adverb - "what actually has to be decided" is a
+# model stating its task, not changing its mind, and a bare-substring cue
+# passed exactly that trace. Measured over the re-pilot: all 17 traces this
+# cue recovers use it sentence-initially and NONE uses it only adverbially, so
+# requiring the boundary costs nothing measurable and removes the adverbial
+# reading completely. (The pre-existing "actually," keeps matching anywhere -
+# the comma is itself the discourse marker.)
+SENTENCE_INITIAL_CUES = frozenset({"actually"})
+
+# After _norm_ws there are no newlines, so a sentence opens at the start of the
+# trace or after terminal punctuation.
+_SENTENCE_START = r"(?:^|[.?!;:]\s)\s*"
+
+
+def _cue_start_pattern(cue: str) -> re.Pattern:
+    """A cue anchored at a word boundary on its LEFT ONLY.
+
+    Plain substring matching was the first cut and it cannot carry the
+    widening: "wait" is inside "awaiting" and "waited", so a bare-word cue
+    would fire on ordinary narrative past tense. `_cue_pattern` above solves
+    exactly this class for the liability cues ("void" inside "avoid") by
+    anchoring both ends - but both ends is wrong here, because
+    VERIFICATION_CUES deliberately contains PREFIXES: "re-examin" has to keep
+    matching "re-examine" and "re-examining", and a trailing \\b would break
+    it. Anchoring the left only keeps the prefixes working and still refuses
+    the inside-another-word matches, which is the only direction that was
+    producing false positives. Verified against the logged run: the verdict of
+    every pre-existing cue is unchanged on all 100 traces.
+
+    A cue in SENTENCE_INITIAL_CUES gets the stricter anchor instead, because
+    for those the position IS the meaning.
+    """
+    if cue in SENTENCE_INITIAL_CUES:
+        return re.compile(_SENTENCE_START + re.escape(cue) + r"\b", re.IGNORECASE)
+    return re.compile(r"\b" + re.escape(cue), re.IGNORECASE)
+
+
+_VERIFICATION_PATTERNS = tuple((cue, _cue_start_pattern(cue)) for cue in VERIFICATION_CUES)
 
 # Phrases that leak the synthesis harness into the trace. The student model
 # is never shown "the provided text" at inference time, so a trace that
@@ -708,12 +810,17 @@ def check_temporal(content: str, ctx: GateContext) -> GateResult:
 
 def check_self_verification(think: str | None, ctx: GateContext) -> GateResult:
     """>=1 self-verification cue in the trace. Only meaningful where a trace
-    was expected."""
+    was expected.
+
+    Matched at a LEFT word boundary rather than as a bare substring - see
+    _cue_start_pattern for why the 2026-08-18 widening required it and why the
+    boundary is on one side only.
+    """
     if not ctx.expect_reasoning:
         return GateResult("self_verification", True, {"skipped": "no-reasoning-expected"})
 
-    text = _norm_ws(think).lower()
-    hits = [cue for cue in VERIFICATION_CUES if cue.lower() in text]
+    text = _norm_ws(think)
+    hits = [cue for cue, pattern in _VERIFICATION_PATTERNS if pattern.search(text)]
     return GateResult("self_verification", bool(hits), {"cues": hits})
 
 

@@ -14,6 +14,7 @@ from tuned.data.gates import (
     PERMANENT_GATES,
     SHINGLE_STEP,
     VERIFICATION_CUES,
+    _norm_ws,
     GateContext,
     GateResult,
     check_answer_key,
@@ -1665,3 +1666,95 @@ def test_disposition_permanent_beats_retryable_when_both_fail():
 
 def test_disposition_of_an_empty_result_list_is_clean():
     assert disposition([]) is None
+
+
+# --------------------------------------------------------------------------
+# The 2026-08-18 cue widening, and its re-audit record.
+# --------------------------------------------------------------------------
+# Fixtures below are REAL SPANS from the re-pilot's logged traces, trimmed.
+# The run is not in the repo (data/ is gitignored) so the counterfactual cannot
+# be replayed in-test; these are the spans the counterfactual was computed from,
+# frequency-ranked, and the frequencies are recorded beside them.
+# The cues added on 2026-08-18, named here so the "did the old list miss
+# it?" half of the re-audit cannot silently drift out of step with gates.py.
+_WIDENING_ADDITIONS = frozenset({
+    "actually", "wait:", "let's check", "let's verify", "let's confirm",
+    "let's make sure", "let's see", "let me think", "let me see",
+    "let me work", "not sure", "unsure", "unclear", "re-read",
+    "re-check", "cross-check", "re-derive",
+})
+
+WIDENING_EVIDENCE = (
+    # (span, how many of the 89 cue-less traces this shape recovered)
+    ("Instrument likely is a revision petition? Actually we are senior drafting "
+     "a response", 17),
+    ("--- Now, let's verify the substance and ensure that the instrument", 5),
+    ("Let's check the four headings: 1", 5),
+    ("Let me think through the operative part carefully: Paragraph", 7),
+    ("Actually Section 4 deals with licensing, not sure", 3),
+    ("previous year is AY 1969-70? Wait: If transfer on 15 May 1968", 2),
+    ("Let me re-derive the relief from the provisions: Section", 1),
+)
+
+
+@pytest.mark.parametrize("span, _frequency", WIDENING_EVIDENCE)
+def test_the_widened_cues_recover_the_spans_they_were_measured_on(span, _frequency):
+    """Each of these was a trace verifying itself in words the old vocabulary
+    could not see. Together they are the 2 -> 16 clean-row counterfactual."""
+    ctx = _ctx()
+    assert check_self_verification(span, ctx).passed, span
+
+
+@pytest.mark.parametrize("span, _frequency", WIDENING_EVIDENCE)
+def test_the_old_vocabulary_missed_every_one_of_them(span, _frequency):
+    """The other half of the re-audit: if a span here starts passing under the
+    PRE-widening list, it was never evidence for the widening and this table is
+    lying about what it bought."""
+    old = tuple(c for c in VERIFICATION_CUES if c not in _WIDENING_ADDITIONS)
+    text = _norm_ws(span).lower()
+    assert not [c for c in old if c.lower() in text], span
+
+
+def test_the_widened_cues_admit_no_trace_that_never_doubts():
+    """THE SAFETY PROPERTY. A gate that exists to reject confident
+    hallucination must not be widened into passing traces that never doubt.
+
+    These are the shapes the widening was measured against and deliberately
+    left out - `verify`/`confirm`/`ensure` as bare stems, and `uncertain` -
+    because in a DRAFTING deliverable they are the instrument, not doubt.
+    Measured: "ensure" appears in 45 of the 89 cue-less traces, and "uncertain"
+    passed a trace carrying no doubt-marking language of any kind.
+    """
+    ctx = _ctx()
+    for span in (
+        "We must ensure essential averments are present and the recitals complete.",
+        "The petition must be verified by the petitioner and served on the respondent.",
+        "We need to include verification clause, annexures, limitation and service.",
+        "The fourth heading covers verification, annexures, limitation, service.",
+        "Provisions, indispensable averments, gaps, uncertainties are listed below.",
+        "I start with what actually has to be decided for my client.",
+    ):
+        assert not check_self_verification(span, ctx).passed, span
+
+
+def test_actually_counts_only_where_it_opens_a_sentence():
+    """Position is the meaning for this one: sentence-initial "Actually" is a
+    model changing its mind, mid-sentence "actually" is an adverb. The bare
+    form passed 'what actually has to be decided' - a real fixture in
+    test_build_verify - which is a trace stating its task, not doubting it."""
+    ctx = _ctx()
+    assert check_self_verification("The section applies? Actually it does not.", ctx).passed
+    assert not check_self_verification(
+        "I start with what actually has to be decided here.", ctx
+    ).passed
+
+
+def test_a_cue_is_not_matched_inside_a_longer_word():
+    """'wait' lives inside 'awaiting' and 'waited'. The pre-existing cues are
+    PREFIXES ('re-examin' must keep matching 're-examining'), so the anchor is
+    a word boundary on the LEFT only - both ends would break them."""
+    ctx = _ctx()
+    assert not check_self_verification("The parties awaited the order.", ctx).passed
+    assert not check_self_verification("Counsel is awaiting instructions.", ctx).passed
+    assert check_self_verification("Wait: the date is wrong.", ctx).passed
+    assert check_self_verification("I will re-examining that step.", ctx).passed
