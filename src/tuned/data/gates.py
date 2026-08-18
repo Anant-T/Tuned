@@ -303,6 +303,17 @@ SHINGLE_STEP = 10
 # 100% at attempt 3 on the same corpus. Retiring the effort ladder removes the
 # cause rather than the symptom, so a length-normalised variant is left
 # unwritten until there is evidence it is still needed.
+#
+# SECOND CONSUMER, and moving this number moved it too: check_statutory_
+# quotation's `reproduces_grounding` field calls find_verbatim_run with this
+# same default to decide whether a quoted span was the build's own paraphrase
+# or came from nowhere. That field is DIAGNOSTIC ONLY - it is recorded and is
+# explicitly not part of the verdict, both before and after this change - so
+# nothing about which rows pass moved with it. What did move is the label: a
+# quoted span now has to share 120 characters with the grounding, not 30,
+# before it is called a reproduction, so the flag will read `false` more often
+# on the transition stream and must not be read as "fabrication rose". Verify
+# against raw text before drawing anything from that field.
 DEFAULT_MAX_RUN = 120
 
 # A QUOTATION ATTRIBUTED TO A SECTION, which on the transition stream is a
@@ -784,6 +795,13 @@ def check_statutory_quotation(content: str, ctx: GateContext) -> GateResult:
     whether the quoted words were the build's own paraphrase or came from
     nowhere, which is worth counting over a pilot; both are refused, because
     with no bare-act corpus neither can be verified as the section's words.
+
+    IT READS DEFAULT_MAX_RUN, so it moved on 2026-08-18 when that constant went
+    30 -> 120 for check_verbatim_overlap's sake. The VERDICT is unaffected -
+    this field has never been part of it - but the threshold for calling a
+    quotation a reproduction is now four times longer, so the flag turns
+    `false` more readily and a drop in it means nothing about fabrication. See
+    the note beside DEFAULT_MAX_RUN.
     """
     if ctx.stream != TRANSITION_STREAM:
         return GateResult("statutory_quotation", True, {"skipped": "not-transition"})

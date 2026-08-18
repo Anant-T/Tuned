@@ -552,11 +552,22 @@ def test_citations_a_reporter_absent_from_the_grounding_is_still_rejected():
     """The folding must not buy the fabrication its cover.
 
     The pilot's third citation reject was real: '(1955) I LLJ 688' attached to
-    Shivnandan Sharma v. Punjab National Bank, in a matter whose grounding
-    carried no reporter at all. suspect_key only ever equates two strings that
-    are BOTH present, so there is nothing for this one to fold against.
+    Shivnandan Sharma v. Punjab National Bank. suspect_key only ever equates
+    two strings that are BOTH present, so an invention has nothing to fold
+    against.
+
+    THE GROUNDING CARRIES A DIFFERENT REPORTER ON PURPOSE (review round 2,
+    M-1). It first used prose with no citation in it at all, which made the
+    test vacuous: with an EMPTY grounding-key set every key is absent, so the
+    assertion held no matter what suspect_key returned - including the empty
+    string. A grounding carrying a real, near-miss LLJ citation is what makes
+    the folding actually run and actually have to discriminate: '1950 2 LLJ
+    921' against '1955 I LLJ 688', same reporter, different case.
     """
-    ctx = _ctx(source_text="The workman was dismissed after a domestic enquiry.")
+    ctx = _ctx(
+        source_text="Following Bharat Bank v. Employees, (1950) 2 LLJ 921, the "
+                    "tribunal proceeded to hear the reference."
+    )
     result = check_citations("the point is settled by (1955) I LLJ 688", ctx)
     assert not result.passed
     assert result.detail["suspect"] == ["(1955) I LLJ 688"]
