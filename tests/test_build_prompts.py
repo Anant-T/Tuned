@@ -35,7 +35,7 @@ from collections import Counter
 import pytest
 
 from tuned.data import prompt_registry as reg
-from tuned.data.gates import BANNED_META, VERIFICATION_CUES
+from tuned.data.gates import BANNED_META, VERIFICATION_CUES, _norm_ws
 
 # --------------------------------------------------------------------------
 # Golden hashes. A failure here is not a bug report, it is a question: did you
@@ -53,20 +53,20 @@ from tuned.data.gates import BANNED_META, VERIFICATION_CUES
 # line-initial shape the gate actually matches. No metric computed under the
 # old shas describes these prompts.
 EXPECTED_SHAS = {
-    'gen_drafting_v1': '1ba2ae4cfba6',
-    'gen_drafting_v2': 'c357363bc003',
-    'gen_irac_analysis_v1': '5126394a5593',
-    'gen_irac_analysis_v2': 'f5acd7eddb3b',
-    'gen_irac_analysis_v3': '51dec850da64',
-    'gen_irac_analysis_v4': '2e545b6c5944',
-    'gen_statute_qa_v1': 'b9fadf6b61e9',
-    'gen_statute_qa_v2': '1e19258d719c',
-    'gen_statute_qa_v3': '037388f49014',
-    'gen_statute_qa_v4': '36ff13c7e9e6',
-    'gen_summarization_v1': '4014f5fa7697',
-    'gen_summarization_v2': '9819ebfe2717',
-    'gen_transition_v1': '314c659728b3',
-    'gen_transition_v2': '9fa8be907587',
+    'gen_drafting_v1': '48534e3010f5',
+    'gen_drafting_v2': '9beafc3b8b0c',
+    'gen_irac_analysis_v1': '97185cd2068e',
+    'gen_irac_analysis_v2': 'b43d2e4afa38',
+    'gen_irac_analysis_v3': '09e8c6ffaf80',
+    'gen_irac_analysis_v4': '509cbb93c08c',
+    'gen_statute_qa_v1': '94e43b22bf48',
+    'gen_statute_qa_v2': '4d04338ba007',
+    'gen_statute_qa_v3': '5888a6c4461d',
+    'gen_statute_qa_v4': '713a9060835e',
+    'gen_summarization_v1': 'a0f723fb731e',
+    'gen_summarization_v2': '651dca540f34',
+    'gen_transition_v1': '113813116cfb',
+    'gen_transition_v2': '2f28a53e5259',
     'judge_pointwise_v1': '591d080c5b77',
     'judge_tiebreak_v1': 'a34456f4918b',
     'probe_answer_v1': '8370e47920ee',
@@ -381,12 +381,61 @@ def test_generator_self_check_is_behavioural_and_gate_visible(prompt_id):
     in one direction and harmless in the other. The ritual defuser (asserted
     separately) is what keeps the offered vocabulary from becoming a set-piece.
     """
-    lowered = _rendered(prompt_id).lower()
-    cues = [cue for cue in VERIFICATION_CUES if cue in lowered]
-    assert len(cues) >= 4, (
+    # MIRROR THE GATE EXACTLY. check_self_verification does
+    # `_norm_ws(think).lower()` and tests `cue.lower() in text`, so BOTH sides
+    # are lowered there. This matcher lowered only the haystack, which made
+    # 'am I sure' - the one cue carrying a capital - impossible to match, and
+    # the count it reported was therefore one short of the truth on every
+    # template. Whitespace is normalised for the same reason: a cue broken
+    # across a line wrap counts for the gate and must count here.
+    text = _norm_ws(_rendered(prompt_id)).lower()
+    cues = [cue for cue in VERIFICATION_CUES if cue.lower() in text]
+    assert len(cues) >= 5, (
         f"{prompt_id} offers only {cues} of gates.VERIFICATION_CUES - the "
         f"teacher is being asked to self-verify without being told which "
         f"words check_self_verification can see"
+    )
+
+
+def test_the_cue_matcher_here_mirrors_the_gate():
+    """The bug this pins is a CASE mismatch, and it hid a real shortfall.
+
+    gates.check_self_verification lowers BOTH sides - `_norm_ws(think).lower()`
+    then `cue.lower() in text`. The matcher above lowered only the haystack,
+    so 'am I sure', the one cue in VERIFICATION_CUES carrying a capital, could
+    never match and every template was reported one cue short of the truth.
+    With the shortfall hidden, the >=4 contract had no slack at all.
+    """
+    capitalised = [cue for cue in VERIFICATION_CUES if cue != cue.lower()]
+    assert capitalised, "if no cue carries a capital this test guards nothing"
+
+    probe = "I paused there. Am I sure of this reading?"
+    # What the gate sees.
+    assert [c for c in VERIFICATION_CUES if c.lower() in _norm_ws(probe).lower()]
+    # What a matcher that lowers only one side sees: nothing.
+    assert [c for c in capitalised if c in probe.lower()] == []
+
+
+# An inventory of short quoted phrases inside a REASONING instruction is the
+# enumeration shape the MSLR evidence forbids - a list the teacher fills in
+# rather than a way of thinking. _ENUM_ITEM_RE cannot see it (it scores
+# enumerations of INTERROGATIVES), so this is the guard for the other shape.
+_QUOTED_SPAN_RE = re.compile(r'"[^"\n]{1,40}"')
+_MAX_QUOTED_SPANS = 2
+
+
+@pytest.mark.parametrize("prompt_id", GEN_IDS)
+def test_generator_hands_over_the_cues_as_prose_not_an_inventory(prompt_id):
+    """ADDED 2026-08-18 (round 2). The round-1 fix handed the self-check
+    vocabulary over as a quoted list of five phrases - the right vocabulary in
+    the wrong shape, and each template carried ten quote characters because of
+    it. The cues now arrive as speech spread over two sentences, which the gate
+    matches identically and which reads as thinking rather than as a checklist.
+    """
+    spans = _QUOTED_SPAN_RE.findall(_rendered(prompt_id))
+    assert len(spans) <= _MAX_QUOTED_SPANS, (
+        f"{prompt_id} carries {len(spans)} short quoted spans {spans[:6]} - "
+        f"that is an inventory, not prose"
     )
 
 
@@ -482,9 +531,16 @@ def test_generator_user_block_is_the_intended_size(prompt_id):
 
 @pytest.mark.parametrize("task_type", sorted(EXPECTED_VARIANT_COUNTS))
 def test_variants_are_real_paraphrases(task_type):
-    """A one-word swap is not a paraphrase. The shared blocks (the banned-meta
-    enumeration, the grounding sentence) are the only text variants may hold
-    in common; persona, framing and order must differ."""
+    """A one-word swap is not a paraphrase. The standardised clauses (the
+    grounding sentence, the self-check vocabulary, the IRAC answer contract)
+    are the only text variants may hold in common; persona, framing and order
+    must differ.
+
+    The banned-meta ENUMERATION used to be named here as one of those shared
+    blocks. It no longer exists - 2026-08-18 replaced it with a descriptive
+    rule - and removing it is what dropped max pairwise similarity from 0.42
+    to 0.30.
+    """
     for a, b in itertools.combinations(reg.variants(task_type), 2):
         ratio = difflib.SequenceMatcher(None, _template_text(a), _template_text(b)).ratio()
         assert ratio < 0.8, f"{a} vs {b} are {ratio:.2f} similar"
