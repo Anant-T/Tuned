@@ -295,6 +295,57 @@ def suspect_citations(text: str) -> list[str]:
     return out
 
 
+_SUSPECT_KEY_TOKEN_RE = re.compile(r"\d+|[A-Z]+")
+
+
+def suspect_key(value: str) -> str:
+    """The form two suspect citations must share to be THE SAME citation.
+
+    suspect_citations() returns normalize()'s opaque form - whitespace
+    COLLAPSED and upper-cased - and the gate layer diffs the output's suspects
+    against the grounding's as raw strings. That diff is blind to the two ways
+    an unmodelled reporter is legitimately re-typed, and both cost a PERMANENT
+    reject in the pilot (citations is in gates.PERMANENT_GATES, so the seed is
+    burned without the attempts being spent):
+
+        grounding  '2015(4) KLT 163(LB)'   output  '2015 (4) KLT 163'
+        grounding  '[2006 (7) SCALE 28 ]'  output  '(2006) 7 SCALE 28'
+
+    Both are the same case. The first pair differs by ONE SPACE before a
+    bracket; the second by which of the year and the volume is parenthesised -
+    a re-rendering into standard form, i.e. a teacher doing its job. Neither
+    is a fabrication and neither survived a raw string comparison.
+
+    So the key keeps the TOKENS and discards the punctuation between them:
+    upper-case, drop the full stops that separate reporter letters ('A.C.' and
+    'AC' are one reporter, which _SUSPECT_RE's own reporter test already
+    assumes when it strips them), then take the maximal runs of digits and
+    letters in order and join them with a single space.
+
+        '2015 (4) KLT 163'    -> '2015 4 KLT 163'
+        '2015(4) KLT 163'     -> '2015 4 KLT 163'
+        '(2006) 7 SCALE 28'   -> '2006 7 SCALE 28'
+        '2006 (7) SCALE 28'   -> '2006 7 SCALE 28'
+
+    JOINED, NOT CONCATENATED, and the separator is load-bearing: '2015 (4) KLT
+    163' and '2015 (41) KLT 63' both concatenate to the same digits either side
+    of the reporter, and a key that dropped the boundary would fold two
+    different cases into one - on a permanent gate, in the direction that lets
+    a fabrication through. With the boundary kept they stay '2015 4 KLT 163'
+    and '2015 41 KLT 63'.
+
+    THIS DOES NOT WEAKEN THE ABSENT CASE. The third pilot reject, '(1955) I LLJ
+    688' attached to Shivnandan Sharma v. Punjab National Bank, was a citation
+    from the teacher's memory: its grounding carried NO suspects at all, so
+    there is nothing for any key to match it against and it is still rejected.
+    Folding only ever equates two strings that are both present.
+
+    Comparable to other suspect keys and to nothing else - never pass one to
+    CitationIndex.contains(), for the reason suspect_citations() gives.
+    """
+    return " ".join(_SUSPECT_KEY_TOKEN_RE.findall((value or "").upper().replace(".", "")))
+
+
 class CitationIndex:
     """In-memory set of canonical citation keys, backed by a sorted text file."""
 

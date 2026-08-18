@@ -49,7 +49,12 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
-from tuned.data.citations import CitationIndex, novel_citations, suspect_citations
+from tuned.data.citations import (
+    CitationIndex,
+    novel_citations,
+    suspect_citations,
+    suspect_key,
+)
 from tuned.data.config import LengthBand
 from tuned.data.replay import empty_think
 from tuned.data.statutes import (
@@ -257,7 +262,48 @@ def _cue_pattern(cue: str) -> re.Pattern:
 
 # Shingle stride for the verbatim scan; see find_verbatim_run.
 SHINGLE_STEP = 10
-DEFAULT_MAX_RUN = 30
+
+# HOW LONG A SHARED RUN HAS TO BE BEFORE IT IS TRANSCRIPTION.
+#
+# RAISED 30 -> 120 on 2026-08-18, and the old value is why this gate fired on
+# 151 of 221 pilot generations (68%, and 58/58 = 100% on third attempts).
+#
+# 30 characters is five or six words of Indian legal English, which is not a
+# quotation - it is a case name, a court, or the title of an Act. The gate's
+# own docstring says it exists to catch a trace that "copies the source ... it
+# is transcription", and at 30 it was not measuring that. Every one of the 120
+# distinct runs it matched was of this kind:
+#
+#     ' High Court of Madhya Pradesh '
+#     ' Central Excise and Salt Act, '
+#     ' S. Govinda Menon v. Union of '
+#     ' Section 22 Hindu Succession A'
+#
+# A trace CANNOT reason about a case without naming it, so at 30 the gate was
+# rejecting the act of thinking about the matter at all.
+#
+# THE RE-AUDIT, measured over the 55 pilot drafting traces whose grounding
+# could be recovered from the stored prompts. Longest run shared between trace
+# and source, by percentile: p0 19, p25 34, p50 54, p75 76, p90 130, p100 335.
+# Failure rate by candidate threshold:
+#
+#     max_run    30    40    50    60    80   100   120   150   200
+#     traces     82%   65%   55%   42%   24%   16%   13%   11%    9%
+#
+# 120 sits where the curve flattens: it clears the median incidental overlap
+# (54) by better than 2x, and the runs it still catches are the six genuine
+# copies measured at 167, 201, 226, 246, 261 and 335 characters - five of them
+# on attempts 2 and 3, i.e. exactly the inflated traces the retired effort
+# ladder was producing. Anything below 100 is still mostly matching proper
+# nouns; anything above 150 starts giving up real copies.
+#
+# NOT NORMALISED FOR LENGTH, and that is a known residual rather than an
+# oversight: a longer trace is monotonically likelier to contain a shared run
+# of any fixed size, which is most of why this gate read 57% at attempt 1 and
+# 100% at attempt 3 on the same corpus. Retiring the effort ladder removes the
+# cause rather than the symptom, so a length-normalised variant is left
+# unwritten until there is evidence it is still needed.
+DEFAULT_MAX_RUN = 120
 
 # A QUOTATION ATTRIBUTED TO A SECTION, which on the transition stream is a
 # thing no row may carry. This repository holds no bare-act corpus: what a
@@ -578,11 +624,35 @@ def check_citations(content: str, ctx: GateContext) -> GateResult:
     DOCSTRING: a pass carrying novel_skipped means "not yet checked", and
     verify.py must re-run this gate with the real index before the row is
     promoted.
+
+    THE SUSPECT DIFF IS KEYED, NOT LITERAL (2026-08-18). It used to compare the
+    two suspect lists as raw strings, which made re-typing a citation into
+    standard form indistinguishable from inventing one: the pilot burned two
+    seeds permanently on '2015 (4) KLT 163' against a grounding that read
+    '2015(4) KLT 163(LB)', and '(2006) 7 SCALE 28' against '[2006 (7) SCALE
+    28 ]'. citations.suspect_key folds exactly the punctuation those pairs
+    differ by. The REPORTED value stays the string the model actually wrote, so
+    the detail still reads as evidence.
+
+    SCOPE IS THE WHOLE CONTENT, TRACE INCLUDED, and it is left that way
+    deliberately. It looks inconsistent with check_answer_key, which refuses to
+    score an unparsed trace - but that refusal is about answer-key MATCHING
+    (a trace saying "the successor WOULD be s.103 BNS, but not here" would trip
+    forbidden_sections on a hypothetical), whereas a fabricated citation is a
+    fabricated citation wherever it sits. check_temporal and
+    check_statutory_quotation both state the same whole-content rule for the
+    same class of error, and test_citations_reads_the_whole_content_including_
+    the_trace pins it by name. FLAGGED, NOT CHANGED: the residual exposure is
+    that a teacher musing about a half-remembered reporter in its private
+    reasoning earns a PERMANENT reject. No pilot row hit it - all three
+    firings were citations in the ANSWER - so there is nothing measured to act
+    on, and narrowing a permanent gate on an unmeasured hunch is the wrong
+    direction to be wrong in.
     """
     text = content or ""
     source = ctx.source_text or ""
-    grounded_suspects = set(suspect_citations(source))
-    suspects = [c for c in suspect_citations(text) if c not in grounded_suspects]
+    grounded_keys = {suspect_key(c) for c in suspect_citations(source)}
+    suspects = [c for c in suspect_citations(text) if suspect_key(c) not in grounded_keys]
 
     if ctx.citation_index is None:
         detail = {"novel": None, "novel_skipped": "no-index", "suspect": suspects}

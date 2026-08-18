@@ -108,6 +108,8 @@ def _norm(text: str) -> str:
 
 # A >=30-char run lifted straight out of the source, whitespace-normalized.
 SOURCE_RUN_35 = _norm(SOURCE)[80:115]
+# A run at the gate's own threshold, derived from it so the two cannot drift.
+SOURCE_RUN_LONG = _norm(SOURCE)[80 : 80 + DEFAULT_MAX_RUN]
 
 
 # --------------------------------------------------------------------------
@@ -516,6 +518,59 @@ def test_citations_reads_the_whole_content_including_the_trace(index):
     assert not check_citations(content, ctx).passed
 
 
+# The two pairs that cost a seed each in the pilot. citations is a PERMANENT
+# gate, so both of these went straight to `rejected` with their attempts
+# unspent - one at attempts=1 - over punctuation.
+@pytest.mark.parametrize(
+    "grounding, written",
+    [
+        # A space before the bracket, and a court marker the suspect pattern
+        # does not reach.
+        ("Cooperative Bank Ltd. vs. Santosh, 2015(4) KLT 163(LB). However,",
+         "the rule in 2015 (4) KLT 163 governs"),
+        # The year re-rendered into the standard bracketed form - a teacher
+        # doing its job.
+        ("Jyothi Ademma v. Plant Engineer, Nellore, [2006 (7) SCALE 28 ] held",
+         "as held in (2006) 7 SCALE 28"),
+    ],
+)
+def test_citations_a_reformatted_suspect_is_the_same_citation(grounding, written):
+    """RE-TYPING A CITATION IS NOT INVENTING ONE (2026-08-18).
+
+    The suspect diff compared raw strings, so a citation carried in by the
+    grounding and written back in standard form read as novel. Both pairs below
+    are the same case and both burned a seed permanently. The fix folds the
+    punctuation they differ by; see citations.suspect_key.
+    """
+    ctx = _ctx(source_text=grounding)
+    result = check_citations(written, ctx)
+    assert result.passed, result.detail
+    assert result.detail["suspect"] == []
+
+
+def test_citations_a_reporter_absent_from_the_grounding_is_still_rejected():
+    """The folding must not buy the fabrication its cover.
+
+    The pilot's third citation reject was real: '(1955) I LLJ 688' attached to
+    Shivnandan Sharma v. Punjab National Bank, in a matter whose grounding
+    carried no reporter at all. suspect_key only ever equates two strings that
+    are BOTH present, so there is nothing for this one to fold against.
+    """
+    ctx = _ctx(source_text="The workman was dismissed after a domestic enquiry.")
+    result = check_citations("the point is settled by (1955) I LLJ 688", ctx)
+    assert not result.passed
+    assert result.detail["suspect"] == ["(1955) I LLJ 688"]
+    assert disposition([result]) == "reject"
+
+
+def test_citations_folding_does_not_merge_two_different_cases():
+    """The key joins tokens rather than concatenating them, because '2015 (4)
+    KLT 163' and '2015 (41) KLT 63' would otherwise fold together - a permanent
+    gate failing OPEN, which is the direction that lets a fabrication in."""
+    ctx = _ctx(source_text="Following 2015 (41) KLT 63 the appeal was allowed.")
+    assert not check_citations("relying on 2015 (4) KLT 163", ctx).passed
+
+
 # --------------------------------------------------------------------------
 # check_temporal
 # --------------------------------------------------------------------------
@@ -845,8 +900,33 @@ def test_statutory_quotation_reads_curly_quotation_marks():
 # check_verbatim_overlap / find_verbatim_run
 # --------------------------------------------------------------------------
 
-def test_verbatim_overlap_35_char_source_run_in_the_trace_fails():
+def test_verbatim_overlap_naming_the_case_and_the_statute_is_not_transcription():
+    """THE RE-AUDIT OF DEFAULT_MAX_RUN, 30 -> 120 on 2026-08-18.
+
+    This test used to assert the opposite - that a 35-character shared run
+    FAILS - and that threshold made this the pilot's worst gate: 151/221
+    generations (68%), rising to 58/58 on third attempts. 30 characters is five
+    or six words of Indian legal English, so what it actually matched was the
+    names of things. All 120 distinct matched runs were of this shape:
+    ' High Court of Madhya Pradesh ', ' Central Excise and Salt Act, ',
+    ' S. Govinda Menon v. Union of ', ' Section 22 Hindu Succession A'. A trace
+    cannot reason about a case without naming it.
+
+    Measured over the 55 pilot traces whose grounding could be recovered, the
+    longest run shared with the source ran p25 34, p50 54, p75 76, p90 130,
+    max 335 characters, and the failure rate by threshold went 30:82%, 40:65%,
+    50:55%, 60:42%, 80:24%, 100:16%, 120:13%, 150:11%. 120 clears the median
+    incidental overlap by better than 2x while still catching the six genuine
+    copies, which measured 167-335 characters.
+    """
     think = f"Working through it: {SOURCE_RUN_35} and so the link holds."
+    result = check_verbatim_overlap(think, _ctx())
+    assert result.passed
+    assert result.detail["match"] is None
+
+
+def test_verbatim_overlap_a_run_at_the_threshold_is_still_transcription():
+    think = f"Working through it: {SOURCE_RUN_LONG} and so the link holds."
     result = check_verbatim_overlap(think, _ctx())
     assert not result.passed
     assert result.detail["match"] in _norm(SOURCE)
@@ -854,16 +934,23 @@ def test_verbatim_overlap_35_char_source_run_in_the_trace_fails():
     assert disposition([result]) == "regenerate"
 
 
+def test_verbatim_overlap_threshold_is_pinned_to_the_measured_sweep():
+    """A bare pin, so moving the number is a deliberate act with a re-audit
+    attached rather than a tuning nudge. The evidence is in gates.py beside the
+    constant and in the test above."""
+    assert DEFAULT_MAX_RUN == 120
+
+
 def test_verbatim_overlap_same_run_in_the_answer_only_passes():
     # The gate never sees the answer: quoting a holding there is legitimate.
     result = check_verbatim_overlap("a paraphrased trace of my own words", _ctx())
     assert result.passed
-    content = _content("a paraphrased trace of my own words", SOURCE_RUN_35)
+    content = _content("a paraphrased trace of my own words", SOURCE_RUN_LONG)
     assert check_verbatim_overlap(split_think(content, *_tags())[0], _ctx()).passed
 
 
 def test_verbatim_overlap_survives_reflowed_whitespace():
-    reflowed = SOURCE_RUN_35.replace(" ", "\n   ")
+    reflowed = SOURCE_RUN_LONG.replace(" ", "\n   ")
     assert not check_verbatim_overlap(f"prelude {reflowed} coda", _ctx()).passed
 
 
@@ -881,12 +968,22 @@ def test_verbatim_overlap_short_or_missing_trace_passes():
     assert check_verbatim_overlap(_norm(SOURCE), _ctx(source_text="")).passed
 
 
+# Filler for the stride tests: long enough to slice a run of any threshold
+# this gate is likely to carry, and sharing nothing with SOURCE.
+_ALIGNMENT_TEXT = (
+    "the accused walked to Fort Kochi that morning and waited by the ferry "
+    "until the tide turned, saying nothing to anyone who passed him there. "
+) * 3
+
+
 @pytest.mark.parametrize("offset", range(SHINGLE_STEP))
 def test_find_verbatim_run_catches_an_exactly_max_run_copy_at_every_alignment(offset):
     # The shingle stride must not depend on where the shared run happens to
     # sit: a run of EXACTLY max_run chars is the tightest case, and step-10
     # anchoring of max_run-length shingles would miss most of these offsets.
-    run = "the accused walked to Fort Koc"
+    # Derived from the threshold rather than typed out, so raising
+    # DEFAULT_MAX_RUN cannot silently stop testing the tightest case.
+    run = _ALIGNMENT_TEXT[:DEFAULT_MAX_RUN]
     assert len(run) == DEFAULT_MAX_RUN
     source = "q" * offset + run + " padding that shares nothing else at all"
     text = "unrelated opening words here " + run + " unrelated closing words"
@@ -894,7 +991,7 @@ def test_find_verbatim_run_catches_an_exactly_max_run_copy_at_every_alignment(of
 
 
 def test_find_verbatim_run_ignores_a_shorter_shared_run():
-    run = "the accused walked to Fort Ko"  # 29 chars
+    run = _ALIGNMENT_TEXT[: DEFAULT_MAX_RUN - 1]
     assert len(run) == DEFAULT_MAX_RUN - 1
     source = "zzz" + run + "!!! nothing else in common"
     text = "yyy" + run + "??? nothing else in common at all"

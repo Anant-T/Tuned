@@ -12,6 +12,7 @@ from tuned.data.citations import (
     normalize,
     novel_citations,
     suspect_citations,
+    suspect_key,
 )
 
 CITATIONS_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "citations.py"
@@ -448,3 +449,45 @@ def test_no_module_level_dataset_import():
             names.add(node.module.split(".")[0])
     assert "datasets" not in names
     assert names <= {"os", "re", "collections", "pathlib"}
+
+
+# --------------------------------------------------------------------------
+# suspect_key - the comparison form for unmodelled reporters.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        # The two pairs measured in the 2026-08-18 pilot, each of which burned
+        # a seed on a PERMANENT gate.
+        ("2015 (4) KLT 163", "2015(4) KLT 163"),
+        ("(2006) 7 SCALE 28", "2006 (7) SCALE 28"),
+        # The same two variations stated on their own.
+        ("2011 (2) KLT 123", "2011(2) KLT 123"),
+        ("(1914) A.C. 676", "1914 AC 676"),
+    ],
+)
+def test_suspect_key_folds_bracket_and_space_variation(a, b):
+    assert suspect_key(a) == suspect_key(b)
+    # ...and the fold is to tokens, not to a blob.
+    assert " " in suspect_key(a)
+
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        # The volume/page digits shift, which a concatenating key would fold.
+        ("2015 (4) KLT 163", "2015 (41) KLT 63"),
+        ("2015 (4) KLT 163", "2016 (4) KLT 163"),
+        ("2015 (4) KLT 163", "2015 (4) MhLJ 163"),
+    ],
+)
+def test_suspect_key_keeps_different_citations_apart(a, b):
+    assert suspect_key(a) != suspect_key(b)
+
+
+def test_suspect_key_is_idempotent_and_total():
+    assert suspect_key("") == ""
+    assert suspect_key(None) == ""
+    once = suspect_key("2015 (4) KLT 163")
+    assert suspect_key(once) == once
