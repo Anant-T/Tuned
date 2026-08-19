@@ -738,10 +738,10 @@ def test_statutory_grounding_is_not_evaluated_when_the_content_did_not_parse():
         "   \n\t ",
         # THE STATE THAT ACTUALLY OCCURS, and the one a blank-string test could
         # never reach: a full narrative judgment that names no provision at
-        # all. 83 of the pilot's 508 groundings are like this and a blank one
-        # never occurred once, so keying the skip on the source string rather
-        # than on the allow-list tested a case that does not happen and missed
-        # the case that does.
+        # all. 80 of the pilot's 508 groundings are like this (91 before the
+        # materials-side widenings) and a blank one never occurred once, so
+        # keying the skip on the source string rather than on the allow-list
+        # tested a case that does not happen and missed the case that does.
         "The appellant, aged 54, was convicted by the Sessions Judge and the "
         "High Court dismissed the appeal on 12 March 2019 without reasons.",
     ],
@@ -948,7 +948,28 @@ def test_statutory_grounding_the_wider_vocabulary_is_materials_only():
     assert statutory_refs("under O. 12 R. 6 CPC") == []
     assert statutory_refs("convicted u/s 313 of the Code") == []
     assert statutory_refs("see Entry No. 8 of the Schedule") == []
+    # Each answer-side blank needs its materials-side counterpart asserted
+    # HERE, or the widening is unpinned: a mutant deleting the extension makes
+    # the fixture's allow-list empty, the gate takes the no-material-references
+    # skip, and a result.passed assertion elsewhere stays green for a reason
+    # that has nothing to do with the extension. Measured - the
+    # _REF_NUMBER_INFIX mutant survived the whole suite until this line.
     assert ("section", "313") in grounded_refs("convicted u/s 313 of the Code")
+    assert ("entry", "8") in grounded_refs("see Entry No. 8 of the Schedule")
+    assert ("rule", "6") in grounded_refs("under O. 12 R. 6 CPC")
+    assert ("order", "12") in grounded_refs("under O. 12 R. 6 CPC")
+
+
+def test_statutory_grounding_the_us_form_needs_its_slash():
+    """"before us." is the pronoun, and the materials gap tolerates a wrap, so
+    a slashless alternative read "the revenue is in appeal before us.\\n\\n6. A
+    perusal..." as section 6 - a key the materials never granted, on the side
+    where a bogus key is a silent false PASS. 23 of 508 groundings carry the
+    phrase; 9 had a number close enough behind it to be swallowed."""
+    assert grounded_refs("the revenue is in appeal before us.\n\n6. A perusal of the notification") == set()
+    assert ("section", "302") in grounded_refs("convicted u/s 302 IPC")
+    assert ("section", "302") in grounded_refs("convicted u / s 302 IPC")
+    assert ("section", "5") in grounded_refs("charged u/ss 5 and 6")
 
 
 def test_statutory_grounding_folds_the_pdf_soft_hyphen_artifact():

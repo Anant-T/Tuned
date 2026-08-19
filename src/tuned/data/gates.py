@@ -659,8 +659,17 @@ _REF_NOT_A_PERIOD = (
 # The single-letter forms are MATERIALS-ONLY on purpose: "R. 2" and "O. 12" in
 # an answer are shapes this generator has never written, and admitting them on
 # the answer side would buy nothing and risk reading an initial as a rule.
+# THE SLASH IS REQUIRED IN THE u/s FORM. A `uss?\.` alternative was here for
+# one round and it read the PRONOUN: "the revenue is in appeal before us." in
+# 23 of 508 groundings, and because the materials gap tolerates a line wrap it
+# then swallowed the next paragraph number - "before us.\n\n6. A perusal..."
+# injected ("section", "6") into 9 groundings' allow-lists. On this side a
+# bogus key is a SILENT FALSE PASS: it authorises a citation the materials
+# never made, which is the one direction a materials-side widening must never
+# fail in. Deleting it costs nothing measured - all five u/s rows (120, 133,
+# 445, 449, 458) still ground through the slashed alternative below.
 MATERIAL_FAMILIES = (
-    ("section", r"sec(?:tion|t)?s?\.?|ss?\.|§{1,2}|u\s{0,2}/\s{0,2}ss?\.?|uss?\."),
+    ("section", r"sec(?:tion|t)?s?\.?|ss?\.|§{1,2}|u\s{0,2}/\s{0,2}ss?\.?"),
     ("article", r"articles?|arts?\."),
     ("entry", r"entries|entry"),
     ("order", r"orders?|o\."),
@@ -1142,6 +1151,24 @@ def statutory_refs(text: str) -> list[tuple[str, str, str]]:
     These are left open rather than closed on speculation: each would widen the
     ANSWER vocabulary, and every widening there can manufacture a false fail,
     which is the error this gate cannot afford.
+
+    AND ONE ON THE MATERIALS SIDE - REAL, DEFERRED, AND BLOCKED ON THE DASH
+    CLASS ALONE. Gen 109 cites "Section 2(13)" against materials whose
+    definitions clause prints as:
+
+        " 2. Definitions.- In this Act, unless the context otherwise requires,
+
+    That is a genuine enacted heading and the row is a genuine false fail. Two
+    things stop _ENACTED_HEADING_RE reading it, and only one of them is the
+    blocker. The leading quotation mark defeats the ^ anchor, and TOLERATING IT
+    IS FREE - it unpins nothing, measured. The dash does not: this heading's
+    is an ASCII hyphen, and admitting ASCII hyphens into the marginal-note dash
+    class is exactly the mutant test_statutory_grounding_a_numbered_paragraph_
+    is_not_an_enacted_heading exists to kill, because every numbered paragraph
+    in every judgment would then ground a provision. Closing this needs a
+    narrower discriminator than the dash character - the Title-Case marginal
+    note, or a bare-act detector over the whole grounding - and that is a
+    round of its own, not a character added to a class.
     """
     out: list[tuple[str, str, str]] = []
     for family, numbers, written in _ref_spans(text):
@@ -1233,17 +1260,29 @@ def check_statutory_grounding(
     if not allowed:
         # AN EMPTY ALLOW-LIST CAN ONLY REJECT, NEVER INFORM - and the test is
         # the allow-list, not whether the source string is blank. Blank source
-        # text was the first cut and it never fired once in 508 rows; the state
-        # that actually occurs is materials that carry no statutory reference
-        # AT ALL, which is 83 of 508 (16%) even after the widenings above.
+        # text was the first cut and it never occurred once in 508 rows; the
+        # state that actually occurs is materials that carry no statutory
+        # reference AT ALL.
+        #
+        # TWO POPULATIONS, NAMED APART, because they are different numbers and
+        # conflating them is how the first version of this comment got 83 - a
+        # figure that reproduces under no definition:
+        #
+        #   BEFORE the materials-side widenings (MATERIAL_FAMILIES, the
+        #   enacted-heading channel, the wrapping gap), 91 of 508 groundings
+        #   yielded an empty allow-list. 14 of those 91 FIRED, and 6 of the 14
+        #   were provable false fails - the same "u/s 302" and cross-line rows
+        #   those widenings now ground. That is the evidence for this skip: on
+        #   the slice where the gate has nothing to work from it was wrong
+        #   nearly half the time it spoke.
+        #
+        #   AFTER them, 80 of 508 still yield an empty allow-list, and 74 of
+        #   the 80 reach this branch - the other 6 short-circuit above on
+        #   unparsed-format, which is checked first.
         #
         # On such a row every reference in the answer is ungrounded by
         # construction, so the gate is not measuring the answer, it is
-        # measuring that the grounding is a narrative judgment. 14 of those 83
-        # fired, and 6 of the 14 were provable false fails - the same "u/s 302"
-        # and cross-line rows fixed above - so the gate was wrong more often
-        # than it was informative on precisely the slice where it has no
-        # evidence to work from.
+        # measuring that the grounding is a narrative judgment.
         #
         # It is not a corner: 250 of 250 statute_qa tasks in the backlog carry
         # no meta section_text and fall back to the seed judgment, which is the
