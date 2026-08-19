@@ -521,48 +521,132 @@ def cfg_with_extra_judge(
     )
 
 
-def cfg_with_two_generator_families(cfg: BuildConfig) -> BuildConfig:
-    """The shipped config with a SECOND generator family put back.
+# The family the two-generator fixture supplies. Named, not literal, because
+# tests assert gap tuples and refusal strings that carry it.
+SECOND_GENERATOR_FAMILY = "secondgen"
+SECOND_GENERATOR_REF = "cerebras/second-generator"
+# Mirrors the window the departed mistral-small judge declared. Tests about
+# "each generator family is checked at the size its OWN window permits" need
+# one family genuinely narrower than the length band's longest row; with both
+# families at 131k there is nothing to narrow and those tests assert nothing.
+# It is a fixture value now rather than a fact about anybody's pool.
+SECOND_GENERATOR_CONTEXT = 32000
 
-    The build shipped two generator families until 2026-08-18, when
-    mistral-small-latest was demoted to judge-only: it produced zero
-    gate-passing rows in 56 re-pilot calls and failed irac_placement on 89% of
-    them by writing a numbered IRAC outline inside its trace, and the API
-    offers only `reasoning_effort` of 'none' or 'high', so there is no setting
-    between outlining and no trace at all.
+
+def cfg_with_two_generator_families(cfg: BuildConfig) -> BuildConfig:
+    """The shipped config with a SECOND generator family, SYNTHESISED here.
 
     A large body of pool/preflight tests is ABOUT the algorithm that walks
     generator families - each family checked at its own window, a gap reported
     per family, the router's key filter applied per family - and those
-    properties are only observable when more than one family exists. They took
-    their second family from the shipped config by coincidence, not by design.
-    This fixture supplies it explicitly so the demotion cannot silently reduce
-    those tests to a single-family walk that asserts almost nothing.
+    properties are only observable when more than one family exists.
 
-    Tests that are genuinely ABOUT THE SHIPPED POOL keep using `cfg` and now
-    describe the one-generator reality.
+    IT USED TO BORROW ITS SECOND FAMILY FROM THE SHIPPED CONFIG, promoting
+    mistral-small-latest to generator, and that broke twice: on 2026-08-18 when
+    mistral was demoted to judge-only, and on 2026-08-19 when mistral-small
+    left the build after human calibration disqualified it. The second break
+    was the loud kind only by luck - `patch()` matched on model id with no
+    `assert matched`, so it silently no-opped while appending an unresolvable
+    ref to routing.generator.
+
+    So it synthesises its own, the way every other fixture in this file already
+    does. The model is:
+
+      * its OWN family, so family separation has something to remove;
+      * in routing.judge as well as routing.generator, because the properties
+        this supports are mostly about a generation whose family must be
+        excluded from judging itself - that was mistral-small's real role here;
+      * under the CEREBRAS provider, which is the generator's own. Not
+        cosmetic: under groq it shared a key with the qwen judge, so every test
+        that withholds GROQ_API_KEY to make a JUDGE family
+        key-shaped-unavailable also deleted this generator family and collapsed
+        its own premise. Its key now travels with the generator it stands
+        beside, and `keys` covers it because cerebras is in the shipped config.
+        Tests needing an UNKEYED generator family have their own helper
+        (_with_extra_generator) and always did.
     """
     from dataclasses import replace
 
-    ref = "mistral/mistral-small-latest"
-
-    def patch(model):
-        if model.id != "mistral-small-latest":
-            return model
-        return replace(
-            model,
-            roles=("generator",) + tuple(model.roles),
-            role_params={**model.role_params,
-                         "generator": {"temperature": 0.7, "top_p": 0.95}},
-        )
-
+    extra = ModelCfg(
+        id="second-generator",
+        family=SECOND_GENERATOR_FAMILY,
+        roles=("generator", "judge"),
+        limits={
+            "rpm": 30,
+            "tpm": 8000,
+            "tpd": 200000,
+            "max_context": SECOND_GENERATOR_CONTEXT,
+            "max_output": 8192,
+        },
+        params={},
+        role_params={
+            "generator": {"temperature": 0.7, "top_p": 0.95},
+            "judge": {"temperature": 0.2},
+        },
+    )
+    providers = tuple(
+        replace(p, models=p.models + (extra,)) if p.name == "cerebras" else p
+        for p in cfg.providers
+    )
+    assert any(
+        m.id == "second-generator" for p in providers for m in p.models
+    ), "the cerebras provider is gone - this fixture has nothing to attach to"
     return replace(
         cfg,
-        providers=tuple(
-            replace(p, models=tuple(patch(m) for m in p.models)) for p in cfg.providers
+        providers=providers,
+        routing=replace(
+            cfg.routing,
+            generator=tuple(cfg.routing.generator) + (SECOND_GENERATOR_REF,),
+            judge=tuple(cfg.routing.judge) + (SECOND_GENERATOR_REF,),
         ),
-        routing=replace(cfg.routing, generator=tuple(cfg.routing.generator) + (ref,)),
     )
+
+
+def cfg_without_the_promoted_judge(cfg: BuildConfig) -> BuildConfig:
+    """The judge pool as it was before gemma was promoted into it.
+
+    A family of rules is ABOUT a judge pool that RUNS OUT: slot B parking a row
+    that has already paid for slot A, and the re-open that must not re-buy it.
+    Those need a pool with one usable family besides the generator's, and until
+    2026-08-19 the shipped config supplied one by coincidence.
+
+    gemma took mistral-small's judge seat that day, so the shipped pool no
+    longer runs out - qwen fills slot A and gemma fills slot B. Composed with
+    cfg_without_the_paid_judges this restores the shape those rules were
+    written against, by ROUTING only: gemma keeps its tiebreak seat and its
+    provider block, so every other walk has the shape it has in production.
+    """
+    from dataclasses import replace
+
+    judge = tuple(r for r in cfg.routing.judge if r != "cerebras/gemma-4-31b")
+    assert len(judge) == len(cfg.routing.judge) - 1, (
+        "cerebras/gemma-4-31b is not in routing.judge - this fixture describes "
+        "a pool that no longer exists"
+    )
+    return replace(cfg, routing=replace(cfg.routing, judge=judge))
+
+
+def cfg_without_the_free_tiebreak(cfg: BuildConfig) -> BuildConfig:
+    """A pool with NO tiebreak left for a gpt-oss row.
+
+    On the shipped config there is one: a gpt-oss generation is judged by qwen
+    and gemma, the tiebreak excludes {gpt-oss, qwen, gemma}, and
+    mistral-large-latest is the one family that survives - which is the whole
+    point of putting it in that seat on 2026-08-19.
+
+    Rules about what happens when NOTHING survives (judge.py's park-loudly
+    path, tiebreak_unroutable_two_judge_decision -> reject) therefore need the
+    condition constructed. Dropping mistral from routing.tiebreak is the
+    smallest way to do it and leaves the judge slots untouched.
+    """
+    from dataclasses import replace
+
+    tiebreak = tuple(r for r in cfg.routing.tiebreak if r != "mistral/mistral-large-latest")
+    assert len(tiebreak) == len(cfg.routing.tiebreak) - 1, (
+        "mistral/mistral-large-latest is not in routing.tiebreak - this fixture "
+        "describes a pool that no longer exists"
+    )
+    return replace(cfg, routing=replace(cfg.routing, tiebreak=tiebreak))
 
 
 def cfg_with_context(cfg: BuildConfig, *, family: str, role: str, max_context: int):
@@ -613,21 +697,39 @@ def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
     redirected = raw.replace("workdir: data/build", f"workdir: {(tmp_path / 'build').as_posix()}")
     assert redirected != raw
     if two_generator_families:
+        # The file-level twin of cfg_with_two_generator_families, and it
+        # synthesises the same family for the same reason: it used to promote
+        # the shipped mistral-small block, which no longer exists.
+        #
+        # THE ANCHOR IS A WHOLE MODEL, down to its params line. Anchoring on
+        # the first lines alone inserts the new block between that model's
+        # `roles` and its `limits`, which silently hands the new model's limits
+        # to it and leaves the real one with none.
+        anchor = (
+            "      - id: gemma-4-31b\n"
+            "        family: gemma\n"
+            "        roles: [judge, tiebreak]\n"
+            "        limits: {rpm: 5, tpm: 30000, tpd: 1000000, "
+            "max_context: 131072, max_output: 4096}\n"
+            "        params: {temperature: 0.2}\n"
+        )
+        injected = anchor + (
+            "      - id: second-generator\n"
+            f"        family: {SECOND_GENERATOR_FAMILY}\n"
+            "        roles: [generator, judge]\n"
+            "        limits: {rpm: 30, tpm: 8000, tpd: 200000, "
+            f"max_context: {SECOND_GENERATOR_CONTEXT}, max_output: 8192}}\n"
+            "        params: {}\n"
+            "        role_params:\n"
+            "          generator: {temperature: 0.7, top_p: 0.95}\n"
+            "          judge: {temperature: 0.2}\n"
+        )
         for old, new in (
-            # Anchored on the id line: two blocks in this config say
-            # `roles: [judge]` and only the mistral one is being promoted.
-            ("      - id: mistral-small-latest\n"
-             "        family: mistral\n"
-             "        roles: [judge]\n",
-             "      - id: mistral-small-latest\n"
-             "        family: mistral\n"
-             "        roles: [generator, judge]\n"),
-            ("        role_params:\n          judge: {temperature: 0.2}",
-             "        role_params:\n"
-             "          generator: {temperature: 0.7, top_p: 0.95}\n"
-             "          judge: {temperature: 0.2}"),
+            (anchor, injected),
             ("  generator: [cerebras/gpt-oss-120b]",
-             "  generator: [cerebras/gpt-oss-120b, mistral/mistral-small-latest]"),
+             f"  generator: [cerebras/gpt-oss-120b, {SECOND_GENERATOR_REF}]"),
+            ("  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,",
+             f"  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b, {SECOND_GENERATOR_REF},"),
         ):
             assert redirected.count(old) == 1, old
             redirected = redirected.replace(old, new)

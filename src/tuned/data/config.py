@@ -130,7 +130,8 @@ class ModelCfg:
     # role -> params that override `params` for calls made IN that role.
     #
     # Needed because one model can serve two roles with different sampling.
-    # mistral-small-latest generates AND judges: a generator wants
+    # One model can serve two roles - mistral-small-latest generated AND
+    # judged until 2026-08-19 - and a generator wants
     # temperature 0.7 / top_p 0.95 and a judge wants 0.2, and before this
     # existed the two roles lived in two config blocks so the distinction was
     # free. Merging those blocks (Mistral Small 4, 2026-08-18) would have sent

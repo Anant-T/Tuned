@@ -18,6 +18,7 @@ from pipeline_fakes import (
     build_cfg,
     cfg_with_fourth_judge_family,
     cfg_with_context,
+    cfg_without_the_promoted_judge,
     cfg_with_extra_judge,
     cfg_with_two_generator_families,
     cfg_with_split_pools,
@@ -29,6 +30,7 @@ from pipeline_fakes import (
 )
 
 from tuned.data import gates
+from tuned.data import generate as generate_module
 from tuned.data.config import ModelRef, load_build_config
 from tuned.data.generate import (
     GEN_UNROUTABLE_STATE,
@@ -1137,7 +1139,7 @@ def test_a_long_prompt_parks_when_no_generator_can_hold_it(tmp_path, cfg, paths)
         call = router.calls_for("generator")[0]
         assert call["est_tokens"] > NARROW_GENERATOR_CONTEXT
         assert "gpt-oss" in call["exclude_families"]
-        assert call["ref"] == ModelRef("mistral", "mistral-small-latest")
+        assert call["ref"] == ModelRef("cerebras", "second-generator")
         assert only_task(store)["state"] == "judging"
 
 
@@ -1151,8 +1153,8 @@ def test_a_short_prompt_excludes_no_generator(tmp_path, cfg, paths):
         assert call["ref"] == ModelRef("cerebras", "gpt-oss-120b")
 
 
-def test_the_generator_opts_mistral_into_reasoning_and_leaves_gpt_oss_alone(
-    tmp_path, cfg, paths
+def test_the_generator_opts_a_family_into_reasoning_and_leaves_gpt_oss_alone(
+    tmp_path, cfg, paths, monkeypatch
 ):
     """The per-ref hook is what makes an OPT-IN reasoning channel role-correct.
 
@@ -1180,13 +1182,23 @@ def test_the_generator_opts_mistral_into_reasoning_and_leaves_gpt_oss_alone(
     # shipped cerebras generator holds 131k, so LONG_SEED_TEXT no longer
     # forces the failover this contract is about. The failover is the
     # subject, so it is constructed rather than waited for.
+    # THE SUBJECT FAMILY IS SUPPLIED, because no family in the shipped pool is
+    # in GENERATOR_REASONING_PARAMS any more: the only entry is mistral's, and
+    # mistral left the build on 2026-08-19. The entry is kept as the record of
+    # a measured provider quirk (Small 4's opt-in reasoning channel) for a
+    # returning mistral; what still has to hold is the MECHANISM, so the
+    # fixture's own generator family is opted in here and the property is read
+    # against that.
+    monkeypatch.setitem(
+        generate_module.GENERATOR_REASONING_PARAMS, "secondgen", {"reasoning_effort": "high"}
+    )
     two = _narrow_generator(cfg_with_two_generator_families(cfg))
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
         router = FakeRouter(two)
         task = only_task(store)
         asyncio.run(generate_once(store, two, router, task, paths=paths, attempt=2))
         call = router.calls_for("generator")[0]
-        assert call["ref"].provider == "mistral"
+        assert call["ref"] == ModelRef("cerebras", "second-generator")
         assert call["params"] == {"reasoning_effort": "high"}
         assert store.events("effort_bump") != []
 
@@ -1594,7 +1606,7 @@ def test_idle_batches_are_announced_once(tmp_path, cfg, paths, capsys):
 def test_the_fleet_refuses_to_start_without_a_key_for_a_routed_role(tmp_path, cfg, monkeypatch):
     """"loaded 0 key(s) from .env" and then running anyway is how a wave gets
     claimed, failed and reported one row at a time instead of once."""
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.delenv(env, raising=False)
     refusals, _ = preflight_messages(cfg, ("generator",))
     assert any("routing.generator has no usable API key" in line for line in refusals)
@@ -1608,8 +1620,14 @@ def test_the_fleet_refuses_to_start_with_a_judge_slot_it_cannot_fill(cfg, monkey
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+    # DROPPING THE PROMOTED JUDGE IS WHAT MAKES THE GAP REACHABLE. Until
+    # 2026-08-19 the free judge pool was one family (qwen) plus mistral, so
+    # withholding OPENAI_API_KEY emptied slot B on a second-family generation.
+    # gemma was promoted into the judge role that day, so the paid backstop is
+    # no longer what fills slot B and withholding it leaves the pool whole.
+    # See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     # Withheld EXPLICITLY: the paid backstop is what fills slot B here, so a
     # machine that happens to export it would turn this into a test of nothing.
@@ -1642,14 +1660,14 @@ def test_the_fleet_refuses_to_start_with_a_judge_slot_it_cannot_fill(cfg, monkey
 
 
 def test_a_widened_pool_starts_clean(cfg, monkeypatch):
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     refusals, warnings = preflight_messages(cfg_with_fourth_judge_family(cfg), ("generator",))
     assert (refusals, warnings) == ([], [])
 
 
 def test_the_generator_cli_exits_rather_than_claiming_anything(tmp_path, cfg, monkeypatch, capsys):
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.delenv(env, raising=False)
     monkeypatch.setattr("tuned.data.providers.load_dotenv_keys", lambda path=None: 0)
     config_path = temp_config(tmp_path)
@@ -1671,9 +1689,16 @@ def test_the_preflight_refuses_a_16k_fourth_family_judge(cfg, monkeypatch):
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+    # DROPPING THE PROMOTED JUDGE IS WHAT MAKES THE GAP REACHABLE. Until
+    # 2026-08-19 the free judge pool was one family (qwen) plus mistral, so
+    # withholding OPENAI_API_KEY emptied slot B on a second-family generation.
+    # gemma was promoted into the judge role that day, so the paid backstop is
+    # no longer what fills slot B and withholding it leaves the pool whole.
+    # See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     sixteen_k = cfg_with_fourth_judge_family(cfg, max_context=16384)
     refusals, _ = preflight_messages(sixteen_k, ("generator",))
     assert any("routing.judge" in line for line in refusals)
@@ -1685,8 +1710,11 @@ def test_the_preflight_refuses_a_16k_fourth_family_judge(cfg, monkeypatch):
 def test_allow_pool_gaps_cannot_override_a_gap_no_row_size_escapes(cfg, monkeypatch):
     """R4-C1. The flag's justification - "running short rows while a key is
     pending is a real choice" - is true of a CONTEXT gap and false of this
-    one: an unkeyed judge family is skipped at every size, so a mistral row
-    has no slot B whatever its length.
+    one: an unkeyed judge family is skipped at every size, so a second-family
+    row has no judge for the slot whatever its length. (Which SLOT empties
+    moved with the pool - with one keyed judge family left it is slot a, where
+    it used to be slot b - and the flag's contract is about the servability of
+    the gap, not about which slot carries it.)
 
     IT IS NO LONGER "the likely first launch", and that clause was retired on
     2026-08-18 rather than reworded: it rested on the shipped config printing a
@@ -1699,10 +1727,17 @@ def test_allow_pool_gaps_cannot_override_a_gap_no_row_size_escapes(cfg, monkeypa
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
+    # THE PROMOTED JUDGE IS DROPPED TOO, and without it this measures the wrong
+    # kind of gap. gemma joined routing.judge on 2026-08-19 and is keyed by
+    # CEREBRAS_API_KEY along with the generator, so it fills a slot at every
+    # row size and the only gap left is the CONTEXT-shaped one the flag is
+    # legitimately for. With it gone the keyed judge pool is the 8k model
+    # alone, and the unkeyed families are the ones that would fill the slot at
+    # any size - which is the key-shaped, unservable gap under test.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    for env in ("CEREBRAS_API_KEY",):
         monkeypatch.setenv(env, "sk-test")
-    for env in ("GROQ_API_KEY", "OPENAI_API_KEY"):
+    for env in ("GROQ_API_KEY", "OPENAI_API_KEY", "MISTRAL_API_KEY"):
         monkeypatch.delenv(env, raising=False)
     widened = cfg_with_fourth_judge_family(cfg)  # the new judge is a groq model
     # ...plus the KEYED 8k judge the shipped pool carried until 2026-08-18. It
@@ -1751,8 +1786,14 @@ def test_a_two_generator_judge_gap_is_a_key_the_override_cannot_cover(cfg, monke
     ships."""
     # See cfg_with_two_generator_families: this property is about the ALGORITHM
     # that walks generator families, and one family cannot exercise it.
-    cfg = cfg_with_two_generator_families(cfg)
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+    # DROPPING THE PROMOTED JUDGE IS WHAT MAKES THE GAP REACHABLE. Until
+    # 2026-08-19 the free judge pool was one family (qwen) plus mistral, so
+    # withholding OPENAI_API_KEY emptied slot B on a second-family generation.
+    # gemma was promoted into the judge role that day, so the paid backstop is
+    # no longer what fills slot B and withholding it leaves the pool whole.
+    # See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     refusals, _ = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
@@ -1777,7 +1818,7 @@ def test_the_preflight_advises_one_model_that_closes_every_gap_it_reports(cfg, m
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
     cfg = cfg_with_two_generator_families(cfg)
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     refusals, warnings = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
     advised = {
@@ -1813,11 +1854,11 @@ def test_the_preflight_checks_each_generator_family_at_its_own_window(cfg, monke
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
     cfg = _narrow_generator(cfg_with_two_generator_families(cfg))
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     patched = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)
     refusals, _ = preflight_messages(patched, GENERATOR_PREFLIGHT_ROLES)
-    assert any("a mistral generation" in line for line in refusals)
+    assert any("a secondgen generation" in line for line in refusals)
     assert not any("a gpt-oss generation" in line for line in refusals)
 
 
@@ -1832,7 +1873,7 @@ def test_the_preflight_sizes_the_tiebreak_with_the_tiebreak_prompt(
     the two requirements; the parameters put the generator on each side of the
     band, because the flat number only reaches a family whose window does not
     cap it."""
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     base = cfg_with_context(
         cfg, family="gpt-oss", role="generator", max_context=generator_window
@@ -1859,7 +1900,7 @@ def test_the_preflight_refuses_a_judge_slot_that_is_only_missing_a_key(cfg, monk
     whose key has not arrived, and every routed role still passes
     unkeyed_roles because one of its refs IS keyed. The fleet used to start
     and buy judge A for every row in the wave."""
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
+    for env in ("CEREBRAS_API_KEY",):
         monkeypatch.setenv(env, "sk-test")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     widened = cfg_with_fourth_judge_family(cfg)  # the new judge is a groq model
@@ -1872,7 +1913,7 @@ def test_the_generation_fleet_checks_the_judging_keys_too(cfg, monkeypatch):
     filling a queue no judge pool can drain is money spent on rows that will
     park" - which is just as true of the judge's KEYS. It passed only
     ("generator",)."""
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
+    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.delenv(env, raising=False)
     refusals, _ = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
     assert any("routing.generator has no usable API key" in line for line in refusals)

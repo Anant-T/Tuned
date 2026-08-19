@@ -18,6 +18,8 @@ httpx = pytest.importorskip("httpx")
 
 from pipeline_fakes import (  # noqa: E402
     NARROW_GENERATOR_CONTEXT,
+    cfg_without_the_free_tiebreak,
+    cfg_without_the_promoted_judge,
     cfg_with_context,
     cfg_with_two_generator_families,
     cfg_with_split_pools,
@@ -76,8 +78,14 @@ from tuned.data.providers import (
 
 DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
 
-MISTRAL_JUDGE = ModelRef("mistral", "mistral-small-latest")
+# SLOTS A AND B since 2026-08-19, when mistral was removed from the build
+# after human calibration disqualified it (holdout precision 0.237 on n=40,
+# see the fence in the config) and gemma was promoted into the judge role.
+# qwen is first in routing.judge and gemma second, so on a gpt-oss generation
+# these are the two slots - and the failover target for a judge call is gemma
+# where it used to be qwen.
 GROQ_JUDGE = ModelRef("groq", "qwen/qwen3.6-27b")
+GEMMA_JUDGE = ModelRef("cerebras", "gemma-4-31b")
 # Third in routing.judge since 2026-08-18, when cerebras/zai-glm-4.7 left the
 # pool: the model is archived upstream and 404s on every call.
 PAID_JUDGE = ModelRef("openai", "gpt-5-mini")
@@ -197,13 +205,16 @@ def _narrow_generator(cfg):
     )
 
 
-def _narrow_tiebreak(cfg):
-    """gemma cut back the same way, and it is what re-creates the tiebreak gap
-    the shipped pool no longer has: gemma is the only tiebreak family that
-    separation leaves for a gpt-oss row, so at its real 131k there is nothing
-    for the context check to remove and the preflight reports no gaps at all.
+def _narrow_judge(cfg):
+    """gemma cut back the same way.
+
+    RENAMED FROM _narrow_tiebreak ON 2026-08-19: gemma took a JUDGE seat that
+    day, and cfg_with_context rewrites the whole model, so narrowing "gemma
+    tiebreak" narrows the gemma judge too. The honest name is what it does.
+    Anything wanting a missing TIEBREAK should use cfg_without_the_free_tiebreak,
+    which touches routing only.
     """
-    return cfg_with_context(cfg, family="gemma", role="tiebreak", max_context=8192)
+    return cfg_with_context(cfg, family="gemma", role="judge", max_context=8192)
 
 
 def _pre_probe_pool(cfg):
@@ -216,7 +227,7 @@ def _pre_probe_pool(cfg):
     fixture that narrowed only the tiebreak would reproduce the gap but not
     the number, which is the whole of what the config block is pinned against.
     """
-    return _narrow_tiebreak(_narrow_generator(cfg))
+    return _narrow_judge(_narrow_generator(cfg))
 
 
 def _unset(monkeypatch, *names: str) -> None:
@@ -826,7 +837,7 @@ def _router(cfg, **kw) -> Router:
 
 def test_pick_respects_configured_order(cfg, keys):
     router = _router(cfg)
-    assert router.pick("judge").ref == MISTRAL_JUDGE
+    assert router.pick("judge").ref == GROQ_JUDGE
     assert router.pick("generator").ref == ModelRef("cerebras", "gpt-oss-120b")
     assert router.pick("probe").ref == ModelRef("groq", "openai/gpt-oss-20b")
 
@@ -853,15 +864,15 @@ def test_pick_excludes_families_at_call_time(cfg, keys):
 
 
 def test_pick_skips_missing_key(cfg, keys, monkeypatch):
-    _unset(monkeypatch, "MISTRAL_API_KEY")
+    _unset(monkeypatch, "GROQ_API_KEY")
     router = _router(cfg)
-    assert router.pick("judge").ref == GROQ_JUDGE
+    assert router.pick("judge").ref == GEMMA_JUDGE
 
 
 def test_pick_skips_over_budget(cfg, keys):
     def budget_ok(provider, model, tokens):
         assert tokens == 500
-        return not (provider == "mistral" or model == "qwen/qwen3.6-27b")
+        return not (provider == "groq" or provider == "cerebras")
 
     router = _router(cfg, budget_ok=budget_ok)
     assert router.pick("judge", est_tokens=500).ref == PAID_JUDGE
@@ -879,7 +890,7 @@ def test_router_forwards_the_client_knobs(cfg, keys):
     router = _router(
         cfg, max_retries=2, timeout=7.0, max_retry_sleep_s=11.0, call_deadline_s=13.0
     )
-    client = router.routed(MISTRAL_JUDGE).client
+    client = router.routed(GROQ_JUDGE).client
     assert client.max_retries == 2
     assert client.max_retry_sleep_s == 11.0
     assert client.call_deadline_s == 13.0
@@ -896,16 +907,17 @@ def test_pick_caches_routed_models(cfg, keys):
     # remaining-token counter decrements across calls made with different
     # models, so the ceiling is per WORKSPACE.
     #
-    # It used to be configured as 25/25k, and that halving was arithmetic, not
-    # policy: TWO mistral models shared the one workspace bucket, so each was
-    # given half or the pair would have issued at twice the real refill rate.
-    # The magistral line was retired upstream on 2026-07-31 and its block is
-    # gone, so there is one model, one bucket, and the whole allowance - which
-    # is a restoration rather than a raise.
-    assert (first.bucket.rpm, first.bucket.tpm) == (50, 50000)
-    # ...and now that one model carries both roles, the generator and the judge
-    # really do share that single bucket rather than each getting one.
-    generator = router.routed(ModelRef("mistral", "mistral-small-latest"))
+    # THE SHARED-WORKSPACE EXAMPLE LEFT WITH ITS MODEL. This used to read the
+    # mistral pair, which shared one workspace bucket and was configured at
+    # half each so it could not issue at twice the real refill rate; mistral
+    # was removed from the build on 2026-08-19. What is under test is the
+    # CACHE, not that arithmetic, so it reads the limits the surviving slot-A
+    # judge actually declares.
+    assert (first.bucket.rpm, first.bucket.tpm) == (30, 6000)
+    # ...and asking for the same ref twice hands back the same object, bucket
+    # and all - which is the property that stops two callers issuing against
+    # two private views of one provider's allowance.
+    generator = router.routed(GROQ_JUDGE)
     assert generator is first
     assert generator.bucket is first.bucket
 
@@ -917,27 +929,27 @@ def test_circuit_breaker_cools_then_recovers(cfg, keys):
     clock = FakeClock()
     router = _router(cfg, clock=clock, breaker_threshold=2, cooldown_s=300.0)
 
-    router.report_failure(MISTRAL_JUDGE)
-    assert router.pick("judge").ref == MISTRAL_JUDGE  # below threshold
-    router.report_failure(MISTRAL_JUDGE)
+    router.report_failure(GROQ_JUDGE)
+    assert router.pick("judge").ref == GROQ_JUDGE  # below threshold
+    router.report_failure(GROQ_JUDGE)
 
-    assert router.is_cooling(MISTRAL_JUDGE)
-    assert router.pick("judge").ref == GROQ_JUDGE
+    assert router.is_cooling(GROQ_JUDGE)
+    assert router.pick("judge").ref == GEMMA_JUDGE
 
     clock.advance(299.0)
-    assert router.pick("judge").ref == GROQ_JUDGE
+    assert router.pick("judge").ref == GEMMA_JUDGE
     clock.advance(2.0)
-    assert not router.is_cooling(MISTRAL_JUDGE)
-    assert router.pick("judge").ref == MISTRAL_JUDGE
+    assert not router.is_cooling(GROQ_JUDGE)
+    assert router.pick("judge").ref == GROQ_JUDGE
 
 
 def test_report_success_resets_the_failure_run(cfg, keys):
     router = _router(cfg, breaker_threshold=2)
-    router.report_failure(MISTRAL_JUDGE)
-    router.report_success(MISTRAL_JUDGE)
-    router.report_failure(MISTRAL_JUDGE)
-    assert not router.is_cooling(MISTRAL_JUDGE)  # failures must be CONSECUTIVE
-    assert router.pick("judge").ref == MISTRAL_JUDGE
+    router.report_failure(GROQ_JUDGE)
+    router.report_success(GROQ_JUDGE)
+    router.report_failure(GROQ_JUDGE)
+    assert not router.is_cooling(GROQ_JUDGE)  # failures must be CONSECUTIVE
+    assert router.pick("judge").ref == GROQ_JUDGE
 
 
 # --- 10. Router.complete ----------------------------------------------------
@@ -976,18 +988,18 @@ def test_complete_fails_over_to_the_next_ref(cfg, keys):
         clock=clock,
         sleeper=sleeper,
         breaker_threshold=1,  # one failure cools it: proves report_failure ran
-        client_factory=_factory(clock, sleeper, seen, {"mistral": 500}),
+        client_factory=_factory(clock, sleeper, seen, {"groq": 500}),
     )
 
     ref, response = asyncio.run(
         router.complete("judge", [{"role": "user", "content": "grade this"}], est_tokens=250)
     )
 
-    assert ref == GROQ_JUDGE
-    assert response.text == "OK from groq"
-    assert seen == ["mistral", "mistral", "groq"]  # 2 in-provider retries, then failover
-    assert router.is_cooling(MISTRAL_JUDGE)
-    assert not router.is_cooling(GROQ_JUDGE)
+    assert ref == GEMMA_JUDGE
+    assert response.text == "OK from cerebras"
+    assert seen == ["groq", "groq", "cerebras"]  # 2 in-provider retries, then failover
+    assert router.is_cooling(GROQ_JUDGE)
+    assert not router.is_cooling(GEMMA_JUDGE)
 
 
 def test_complete_raises_when_every_ref_fails(cfg, keys):
@@ -999,7 +1011,7 @@ def test_complete_raises_when_every_ref_fails(cfg, keys):
         clock=clock,
         sleeper=sleeper,
         client_factory=_factory(
-            clock, sleeper, seen, {"mistral": 500, "groq": 503, "openai": 500}
+            clock, sleeper, seen, {"groq": 500, "cerebras": 503, "openai": 500}
         ),
     )
 
@@ -1008,12 +1020,11 @@ def test_complete_raises_when_every_ref_fails(cfg, keys):
 
     assert excinfo.value.retryable is True
     # Four refs over three providers: the openai backstop contributes two, and
-    # BOTH have to be tried before the role is out of options. cerebras is not
-    # among them since 2026-08-18 - zai-glm-4.7 was its only judge and it left
-    # the pool archived.
+    # BOTH have to be tried before the role is out of options. cerebras IS
+    # among them since 2026-08-19 - gemma was promoted into the judge role when
+    # mistral was removed - which is what makes this four refs and not three.
     assert "all 4 eligible model(s) failed" in str(excinfo.value)
-    assert seen.count("mistral") == 2 and seen.count("groq") == 2
-    assert seen.count("cerebras") == 0
+    assert seen.count("groq") == 2 and seen.count("cerebras") == 2
     assert seen.count("openai") == 4  # two refs, two in-provider attempts each
 
 
@@ -1025,15 +1036,15 @@ def test_complete_does_not_fail_over_on_non_retryable(cfg, keys):
         cfg,
         clock=clock,
         sleeper=sleeper,
-        client_factory=_factory(clock, sleeper, seen, {"mistral": 400}),
+        client_factory=_factory(clock, sleeper, seen, {"groq": 400}),
     )
 
     with pytest.raises(ProviderError) as excinfo:
         asyncio.run(router.complete("judge", [{"role": "user", "content": "grade this"}]))
 
     assert excinfo.value.retryable is False
-    assert seen == ["mistral"]  # a bad payload would be bad everywhere
-    assert not router.is_cooling(MISTRAL_JUDGE)
+    assert seen == ["groq"]  # a bad payload would be bad everywhere
+    assert not router.is_cooling(GROQ_JUDGE)
 
 
 @pytest.mark.parametrize("status", [401, 403, 404])
@@ -1047,17 +1058,17 @@ def test_complete_fails_over_when_a_provider_is_dead(status, cfg, keys):
         clock=clock,
         sleeper=sleeper,
         breaker_threshold=1,  # one failure cools it: proves report_failure ran
-        client_factory=_factory(clock, sleeper, seen, {"mistral": status}),
+        client_factory=_factory(clock, sleeper, seen, {"groq": status}),
     )
 
     ref, response = asyncio.run(
         router.complete("judge", [{"role": "user", "content": "grade this"}])
     )
 
-    assert ref == GROQ_JUDGE  # moved on to the next eligible judge
-    assert response.text == "OK from groq"
-    assert seen == ["mistral", "groq"]  # dead provider tried ONCE, not retried
-    assert router.is_cooling(MISTRAL_JUDGE)  # and marked failed
+    assert ref == GEMMA_JUDGE  # moved on to the next eligible judge
+    assert response.text == "OK from cerebras"
+    assert seen == ["groq", "cerebras"]  # dead provider tried ONCE, not retried
+    assert router.is_cooling(GROQ_JUDGE)  # and marked failed
 
 
 def test_complete_aborts_the_whole_call_on_a_payload_4xx(cfg, keys):
@@ -1069,7 +1080,7 @@ def test_complete_aborts_the_whole_call_on_a_payload_4xx(cfg, keys):
         cfg,
         clock=clock,
         sleeper=sleeper,
-        client_factory=_factory(clock, sleeper, seen, {"mistral": 400}),
+        client_factory=_factory(clock, sleeper, seen, {"groq": 400}),
     )
 
     with pytest.raises(ProviderError) as excinfo:
@@ -1077,8 +1088,8 @@ def test_complete_aborts_the_whole_call_on_a_payload_4xx(cfg, keys):
 
     assert excinfo.value.retryable is False
     assert excinfo.value.provider_dead is False
-    assert seen == ["mistral"]  # ref2 never called
-    assert not router.is_cooling(MISTRAL_JUDGE)
+    assert seen == ["groq"]  # ref2 never called
+    assert not router.is_cooling(GROQ_JUDGE)
 
 
 def test_no_eligible_model_is_retryable_only_when_the_reason_is_transient(cfg, keys, monkeypatch):
@@ -1154,8 +1165,8 @@ def test_retries_charge_the_rpm_bucket_too(cfg, keys):
                 "judge",
                 [{"role": "user", "content": "hi"}],
                 # Isolate the groq ref: every OTHER family in the judge pool,
-                # which now includes the gpt-oss backstop.
-                exclude_families=frozenset({"mistral", "glm", "gpt-oss"}),
+                # which since 2026-08-19 is gemma plus the gpt-oss backstop.
+                exclude_families=frozenset({"gemma", "glm", "gpt-oss"}),
                 est_tokens=100,
             )
         )
@@ -1210,7 +1221,7 @@ def test_complete_forwards_params_and_max_tokens(cfg, keys):
     )
     assert payloads[0]["temperature"] == 0.0
     assert payloads[0]["max_tokens"] == 256
-    assert payloads[0]["model"] == "mistral-small-latest"
+    assert payloads[0]["model"] == "qwen/qwen3.6-27b"
 
 
 # --- 10b. per-ref params, attempt reporting, context sizing -----------------
@@ -1280,7 +1291,7 @@ def test_router_on_attempt_carries_the_ref_across_a_failover(cfg, keys):
         cfg,
         clock=clock,
         sleeper=sleeper,
-        client_factory=_factory(clock, sleeper, [], {"mistral": 500}, max_retries=1),
+        client_factory=_factory(clock, sleeper, [], {"groq": 500}, max_retries=1),
     )
     ref, _ = asyncio.run(
         router.complete(
@@ -1289,9 +1300,9 @@ def test_router_on_attempt_carries_the_ref_across_a_failover(cfg, keys):
             on_attempt=lambda ref, status, usage: seen.append((ref.provider, status)),
         )
     )
-    assert ref.provider == "groq"
+    assert ref.provider == "cerebras"
     # The failed provider's attempt is reported under ITS ref, not the winner's.
-    assert seen == [("mistral", 500), ("groq", 200)]
+    assert seen == [("groq", 500), ("cerebras", 200)]
 
 
 def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys):
@@ -1310,7 +1321,11 @@ def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys
     def factory(provider, model):
         def handler(request):
             payloads.append(json.loads(request.content))
-            if provider.name == "cerebras":
+            # BY MODEL, not by provider: since 2026-08-19 the fixture's
+            # second generator family lives under cerebras too, so failing the
+            # whole provider would fail both refs and there would be nothing
+            # to fail over TO.
+            if model.id == "gpt-oss-120b":
                 return httpx.Response(500, text="down")
             return httpx.Response(200, json=_body())
 
@@ -1333,9 +1348,9 @@ def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys
             "generator", [{"role": "user", "content": "go"}], params_for_ref=params_for_ref
         )
     )
-    assert ref == ModelRef("mistral", "mistral-small-latest")
+    assert ref == ModelRef("cerebras", "second-generator")
     assert payloads[0]["reasoning_effort"] == "high"      # cerebras/gpt-oss-120b
-    assert "reasoning_effort" not in payloads[1]          # mistral/magistral
+    assert "reasoning_effort" not in payloads[1]          # the second family
 
 
 def test_params_for_ref_overrides_params(cfg, keys):
@@ -1402,7 +1417,7 @@ def test_undersized_families_over_the_real_pool(cfg):
     # retired (archived upstream, 404 on every call), so the first family this
     # filter can remove is the 32k one.
     assert undersized_families(cfg, "judge", 20000) == frozenset()
-    assert undersized_families(cfg, "judge", 40000) == frozenset({"mistral"})
+    assert undersized_families(cfg, "judge", 40000) == frozenset()
     # The generator pool is ONE family since 2026-08-18: cerebras/gpt-oss-120b,
     # and since the 2026-08-19 probe it holds 131,072 rather than the 8192 the
     # config had claimed since the beginning. Past that window there is no
@@ -1434,13 +1449,19 @@ def test_undersized_families_keeps_a_mixed_family_with_one_large_model(cfg):
     # 150,000 rather than 100,000 since the 2026-08-19 probe: gemma used to be
     # the small side of this comparison at a stale 8192 and is now 131k, so at
     # 100,000 NOTHING is excluded and the property would not be under test.
-    assert undersized_families(cfg, "tiebreak", 100_000) == frozenset()
+    assert undersized_families(cfg, "tiebreak", 40_000) == frozenset()
     assert "gpt-oss" not in undersized_families(cfg, "tiebreak", 150_000)
-    assert undersized_families(cfg, "tiebreak", 150_000) == frozenset({"gemma"})
+    # mistral joins gemma on the small side: its window is the PROBED 52,812
+    # floor, so it falls out first, at 42,251.
+    assert undersized_families(cfg, "tiebreak", 42_250) == frozenset()
+    assert undersized_families(cfg, "tiebreak", 42_251) == frozenset({"mistral"})
+    assert undersized_families(cfg, "tiebreak", 150_000) == frozenset({"gemma", "mistral"})
     # ...and the gpt-oss family does fall out once even its 400k models cannot
     # hold the row, which is what makes the line above a mixed-family rule and
     # not an exemption.
-    assert undersized_families(cfg, "tiebreak", 320_001) == frozenset({"gemma", "gpt-oss"})
+    assert undersized_families(cfg, "tiebreak", 320_001) == frozenset(
+        {"gemma", "gpt-oss", "mistral"}
+    )
 
 
 # --- 11. .env ---------------------------------------------------------------
@@ -1489,9 +1510,9 @@ def test_check_refs_covers_every_configured_model(cfg):
     refs = check_refs(cfg)
     expected = sum(len(p.models) for p in cfg.providers)
     # 7: the magistral generator block went when the line was retired upstream
-    # and mistral-small-latest took both roles, and zai-glm-4.7 went on
-    # 2026-08-18 when it was archived. A ref that 404s on every call is not a
-    # ref this sweep should be reporting on.
+    # and zai-glm-4.7 went on 2026-08-18 when it was archived. The mistral
+    # block survives the 2026-08-19 judge surgery - mistral-SMALL lost the
+    # judge seat to calibration, and mistral-LARGE took the tiebreak seat.
     assert len(refs) == expected == 7
     assert ModelRef("groq", "qwen/qwen3.6-27b") in refs
     assert check_refs(cfg, "groq/qwen/qwen3.6-27b") == (ModelRef("groq", "qwen/qwen3.6-27b"),)
@@ -1522,18 +1543,18 @@ def test_format_check_row_is_single_line_and_flags_failures():
     assert len(row.split("|")) == len(header.split("|"))
 
     bad = CheckResult(
-        ref="mistral/mistral-small-latest",
+        ref="groq/qwen/qwen3.6-27b",
         key_present=False,
         status=None,
         text="",
         usage_present=False,
         reasoning_present=False,
         latency_ms=None,
-        error="MISTRAL_API_KEY not set",
+        error="GROQ_API_KEY not set",
     )
     bad_row = format_check_row(bad)
     assert not bad.ok
-    assert "FAIL" in bad_row and "MISTRAL_API_KEY not set" in bad_row
+    assert "FAIL" in bad_row and "GROQ_API_KEY not set" in bad_row
     assert CheckResult(
         ref="x", key_present=True, status=500, text="", usage_present=False,
         reasoning_present=False, latency_ms=None,
@@ -1613,17 +1634,17 @@ def test_a_context_overflow_400_fails_over_instead_of_aborting(cfg, keys):
         clock=clock,
         sleeper=sleeper,
         breaker_threshold=1,  # one charged failure would cool it
-        client_factory=_overflow_factory(clock, sleeper, seen, {"mistral"}, OVERFLOW_BODY),
+        client_factory=_overflow_factory(clock, sleeper, seen, {"groq"}, OVERFLOW_BODY),
     )
 
     ref, response = asyncio.run(
         router.complete("judge", [{"role": "user", "content": "grade this"}])
     )
 
-    assert ref == GROQ_JUDGE
-    assert response.text == "OK from groq"
-    assert seen == ["mistral", "groq"]  # tried once, then moved on
-    assert not router.is_cooling(MISTRAL_JUDGE)
+    assert ref == GEMMA_JUDGE
+    assert response.text == "OK from cerebras"
+    assert seen == ["groq", "cerebras"]  # tried once, then moved on
+    assert not router.is_cooling(GROQ_JUDGE)
 
 
 @pytest.mark.parametrize(
@@ -1697,7 +1718,7 @@ def test_overflow_at_every_ref_is_reported_as_a_row_shaped_failure(cfg, keys):
         clock=clock,
         sleeper=sleeper,
         client_factory=_overflow_factory(
-            clock, sleeper, seen, {"mistral", "groq", "openai"}, OVERFLOW_BODY
+            clock, sleeper, seen, {"groq", "cerebras", "openai"}, OVERFLOW_BODY
         ),
     )
 
@@ -1709,7 +1730,7 @@ def test_overflow_at_every_ref_is_reported_as_a_row_shaped_failure(cfg, keys):
     # Every ref was offered it, the two paid backstops included - a 400 that
     # says "too long for this window" never charges the breaker, so the pass
     # runs to the end of the list rather than stopping at the first refusal.
-    assert seen == ["mistral", "groq", "openai", "openai"]
+    assert seen == ["groq", "cerebras", "openai", "openai"]
 
 
 def test_undersized_families_keeps_an_explicit_safety_margin(cfg):
@@ -1722,7 +1743,9 @@ def test_undersized_families_keeps_an_explicit_safety_margin(cfg):
     since 2026-08-19: an estimate that merely equals the probed window is a
     coin flip on a 400, exactly as it was at 8192."""
     assert CONTEXT_SAFETY_MARGIN > 1.0
-    assert "mistral" in undersized_families(cfg, "judge", 32000)
+    # 131,072, not 32,000: mistral left on 2026-08-19 and the smallest judge in
+    # the pool is now 131k, so the rule is read at that window on both sides.
+    assert "qwen" in undersized_families(cfg, "judge", 131072)
     assert "gpt-oss" in undersized_families(cfg, "generator", 131072)
     # ...and the margin does not start excluding models with real headroom.
     assert undersized_families(cfg, "judge", 4000) == frozenset()
@@ -1757,37 +1780,43 @@ def test_the_context_estimate_counts_chat_template_overhead():
 def test_unkeyed_roles_names_the_role_and_the_env_vars(cfg, monkeypatch):
     """The fleet must refuse to start when a role it routes has no usable key
     - the alternative is a wave of tasks that never reaches a provider."""
-    _unset(monkeypatch, "MISTRAL_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY")
+    _unset(monkeypatch, "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENAI_API_KEY")
     gaps = unkeyed_roles(cfg, ("generator", "judge"))
     assert set(gaps) == {"generator", "judge"}
     # The generator role routes to ONE provider since the 2026-08-18 demotion,
     # so its key list is exactly cerebras - and that key is now load-bearing
     # rather than merely preferred.
     assert gaps["generator"] == ("CEREBRAS_API_KEY",)
-    assert "MISTRAL_API_KEY" in gaps["judge"]
+    assert "GROQ_API_KEY" in gaps["judge"]
     # One key is enough to make a role usable: the rest is failover.
-    monkeypatch.setenv("MISTRAL_API_KEY", "sk-test")
+    monkeypatch.setenv("GROQ_API_KEY", "sk-test")
     assert set(unkeyed_roles(cfg, ("generator", "judge"))) == {"generator"}
     monkeypatch.setenv("CEREBRAS_API_KEY", "sk-test")
     assert unkeyed_roles(cfg, ("generator", "judge")) == {}
     # ...and a role whose every provider is still unkeyed keeps reporting.
+    # OPENAI is the one held back here: probe routes to groq, which is keyed
+    # above, so the role that can still report is the judge's paid backstop.
+    _unset(monkeypatch, "GROQ_API_KEY")
     assert unkeyed_roles(cfg, ("probe",))["probe"] == ("GROQ_API_KEY",)
 
 
 def test_the_shipped_config_has_no_fatal_judge_hole_left(cfg, keys):
     """R2-C3 CLOSED. The hole was: long rows route to magistral, family
-    separation removes mistral, the 8k glm judge is out on length, slot A takes
-    qwen and slot B has NOTHING - so the row parks having already paid for
-    judge A. The openai backstop is the fourth family that fills slot B.
+    separation removed the generator's own family, the 8k glm judge was out on
+    length, slot A took qwen and slot B had NOTHING - so the row parked having
+    already paid for judge A. The openai backstop is the fourth family that
+    fills slot B.
 
-    Pinned as "no fatal gap" AND, since 2026-08-19, as no gap at all: the
-    tiebreak holes that used to remain were gemma being removed on a context
-    length it never had, and the probe closed them. Both are asserted, and the
-    narrowed pool below is what keeps this a closure rather than a config that
-    stopped being checked."""
+    Pinned as "no fatal JUDGE gap". The tiebreak is a different matter since
+    2026-08-19: gemma was promoted into the judge role, so on a gpt-oss row it
+    fills slot B and the tiebreak has no family it has not already spent. That
+    warns rather than refuses, deliberately, and it is asserted below rather
+    than left to be discovered."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
+    # The promoted judge STAYS here: this test asserts the hole is closed, and
+    # gemma joining routing.judge on 2026-08-19 is part of what closes it.
     cfg = cfg_with_two_generator_families(cfg)
     gaps = pool_gaps(cfg, needed_tokens=worst_case_judge_tokens(cfg))
     assert [g for g in gaps if g.role == "judge"] == []
@@ -1799,37 +1828,39 @@ def test_the_shipped_config_has_no_fatal_judge_hole_left(cfg, keys):
     router = Router(cfg)
     needed = worst_case_judge_tokens(cfg)
     too_small = undersized_families(cfg, "judge", needed)
-    slot_a = next(router.eligible_refs("judge", exclude_families=frozenset({"mistral"}) | too_small))
+    slot_a = next(router.eligible_refs("judge", exclude_families=frozenset({"secondgen"}) | too_small))
     slot_b = next(
         router.eligible_refs(
-            "judge", exclude_families=frozenset({"mistral", "qwen"}) | too_small
+            "judge", exclude_families=frozenset({"secondgen", "qwen"}) | too_small
         )
     )
     assert slot_a == GROQ_JUDGE
-    assert slot_b == ModelRef("openai", "gpt-5-mini")
+    assert slot_b == GEMMA_JUDGE
 
-    # The tiebreak holes are GONE since the 2026-08-19 gemma probe - the pool
-    # has no gap at any row size this build can produce.
+    # AND NO TIEBREAK GAP EITHER, which is the 2026-08-19 surgery's second
+    # half: qwen and gemma take the judge slots on a gpt-oss row, the tiebreak
+    # excludes {gpt-oss, qwen, gemma}, and mistral-large-latest is the one
+    # family left. Take it back out and the gap returns, still only warning.
     assert [g for g in gaps if g.role == "tiebreak"] == []
-    # ...and they were closed by the window being right, not by the check
-    # going quiet: put gemma back at the stale 8192 and both return, for BOTH
-    # generator families, and still only warn.
-    narrowed = pool_gaps(
-        _narrow_tiebreak(cfg), needed_tokens=worst_case_judge_tokens(cfg)
+    without = pool_gaps(
+        cfg_without_the_free_tiebreak(cfg), needed_tokens=worst_case_judge_tokens(cfg)
     )
-    tiebreak_gaps = [g for g in narrowed if g.role == "tiebreak"]
-    assert {g.generator_family for g in tiebreak_gaps} == {"gpt-oss", "mistral"}
+    # Only the gpt-oss row: a secondgen generation has not spent the gpt-oss
+    # family, so its tiebreak still resolves there.
+    tiebreak_gaps = [g for g in without if g.role == "tiebreak"]
+    assert {g.generator_family for g in tiebreak_gaps} == {"gpt-oss"}
     assert all(not g.fatal for g in tiebreak_gaps)
 
     # ...and the hole really is closed by the ADDITION, not by the check going
     # quiet: take the backstop back out and the old gap is reported verbatim.
     before = pool_gaps(
-        cfg_without_the_paid_judges(cfg), needed_tokens=worst_case_judge_tokens(cfg)
+        cfg_without_the_promoted_judge(cfg_without_the_paid_judges(cfg)),
+        needed_tokens=worst_case_judge_tokens(cfg),
     )
     judge_gaps = [g for g in before if g.role == "judge"]
-    assert [(g.generator_family, g.slot) for g in judge_gaps] == [("mistral", "b")]
+    assert [(g.generator_family, g.slot) for g in judge_gaps] == [("secondgen", "b")]
     assert judge_gaps[0].fatal is True
-    assert "a mistral generation of" in judge_gaps[0].detail
+    assert "a secondgen generation of" in judge_gaps[0].detail
     assert "minus ['qwen'] already used" in judge_gaps[0].detail
 
 
@@ -1985,7 +2016,10 @@ def test_a_16k_fourth_family_judge_is_a_fatal_pool_gap(cfg, keys):
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    # ...and the promoted judge dropped with it: gemma joined routing.judge on
+    # 2026-08-19, so slot B fills at every size and the gap under test here
+    # cannot occur. See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     size = 16384
     patched = _with_fourth_judge(cfg_without_the_paid_judges(cfg), max_context=size)
     needed = worst_case_judge_tokens(patched)
@@ -2018,7 +2052,10 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    # ...and the promoted judge dropped with it: gemma joined routing.judge on
+    # 2026-08-19, so slot B fills at every size and the gap under test here
+    # cannot occur. See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     _unset(monkeypatch, "GROQ_API_KEY", "OPENAI_API_KEY")
@@ -2043,7 +2080,7 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
         # A magistral generation is the shape R3-C3 was found in: mistral is
         # the generator's own family, and both remaining judge families sit
         # behind the key that has not arrived.
-        gap = next(g for g in gaps if g.generator_family == "mistral")
+        gap = next(g for g in gaps if g.generator_family == "secondgen")
         assert gap.unservable is True, f"servable at needed={needed}"
         assert gap.key_shaped is True
         # BOTH pending keys are named: either one would fill the slot, and a
@@ -2057,7 +2094,7 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
     # has no gap at all and at 23,729 its gap is one the override may
     # legitimately cover.
     small = pool_gaps(widened, needed_tokens=2000)
-    assert [g.generator_family for g in small if g.fatal] == ["mistral"]
+    assert [g.generator_family for g in small if g.fatal] == ["secondgen"]
     big = pool_gaps(widened, needed_tokens=worst_case_judge_tokens(widened))
     gpt_oss = next(g for g in big if g.generator_family == "gpt-oss" and g.fatal)
     assert (gpt_oss.key_shaped, gpt_oss.unservable) == (True, False)
@@ -2078,7 +2115,10 @@ def test_a_context_shaped_judge_gap_has_row_sizes_the_pool_still_serves(cfg, key
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    # ...and the promoted judge dropped with it: gemma joined routing.judge on
+    # 2026-08-19, so slot B fills at every size and the gap under test here
+    # cannot occur. See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     sixteen_k = _with_fourth_judge(cfg_without_the_paid_judges(cfg), max_context=16384)
     assert [g for g in pool_gaps(sixteen_k, needed_tokens=2000) if g.fatal] == []
     assert [g for g in pool_gaps(sixteen_k, needed_tokens=8000) if g.fatal] == []
@@ -2101,7 +2141,7 @@ def test_the_advice_the_preflight_prints_is_the_threshold_it_enforces(cfg, keys)
     # NO GAP AT ALL (2026-08-19 probe), and a property about what a gap advises
     # needs a gap. It is also the honest fixture: this is the exact pool the
     # advice was designed against.
-    cfg = _narrow_tiebreak(cfg_with_two_generator_families(cfg))
+    cfg = cfg_without_the_free_tiebreak(cfg_with_two_generator_families(cfg))
     gaps = pool_gaps(
         cfg,
         needed_tokens=worst_case_judge_tokens(cfg),
@@ -2149,7 +2189,10 @@ def test_the_advice_never_falls_below_the_flat_worst_case(cfg, monkeypatch):
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    # ...and the promoted judge dropped with it: gemma joined routing.judge on
+    # 2026-08-19, so slot B fills at every size and the gap under test here
+    # cannot occur. See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     flat = required_context(worst_case_judge_tokens(cfg))
 
     def advice_with(*set_envs):
@@ -2158,19 +2201,20 @@ def test_the_advice_never_falls_below_the_flat_worst_case(cfg, monkeypatch):
             monkeypatch.setenv(env, "sk-test")
         return _advice(cfg)
 
-    fully_keyed = advice_with("CEREBRAS_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY")
+    fully_keyed = advice_with("CEREBRAS_API_KEY", "GROQ_API_KEY")
     assert fully_keyed == {flat}
     # The pending-key state: a real gap, narrowed to a real 15,104 check
     # (which is right - that IS the largest row an 8k generator can make) and
     # still advising the number that survives the key landing.
-    pending = advice_with("CEREBRAS_API_KEY", "GROQ_API_KEY")
+    pending = advice_with("CEREBRAS_API_KEY")
     assert judge_sizer(cfg)(8192, "judge") < worst_case_judge_tokens(cfg)
     assert pending == fully_keyed
     # ...in every other partially-keyed state too. Whichever keys are set, the
     # operator is told one number.
-    for envs in (("CEREBRAS_API_KEY",), ("MISTRAL_API_KEY",),
-                 ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"),
-                 ("GROQ_API_KEY", "MISTRAL_API_KEY")):
+    # Both generator families live under CEREBRAS since 2026-08-19, so a state
+    # without that key has no generator to walk and nothing to advise about -
+    # which is a different question from the one under test.
+    for envs in (("CEREBRAS_API_KEY",), ("CEREBRAS_API_KEY", "GROQ_API_KEY")):
         assert advice_with(*envs) == fully_keyed, envs
 
 
@@ -2184,7 +2228,10 @@ def test_unservable_is_asked_at_the_smallest_call_this_build_can_make(cfg, keys)
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    # ...and the promoted judge dropped with it: gemma joined routing.judge on
+    # 2026-08-19, so slot B fills at every size and the gap under test here
+    # cannot occur. See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     floor = min_judge_tokens(cfg)
     tiny = 3000
     assert tiny < required_context(floor), "the fixture has to be under the real floor"
@@ -2203,20 +2250,20 @@ def test_unservable_is_asked_at_the_smallest_call_this_build_can_make(cfg, keys)
     )
     patched = cfg_with_context(base, family="small", role="judge", max_context=tiny)
 
-    def mistral_gap(config):
+    def second_family_gap(config):
         gaps = pool_gaps(
             config,
             needed_tokens=worst_case_judge_tokens(config),
             servable_floor_tokens=floor,
         )
-        return next(g for g in gaps if (g.generator_family, g.slot) == ("mistral", "b"))
+        return next(g for g in gaps if (g.generator_family, g.slot) == ("secondgen", "b"))
 
-    gap = mistral_gap(patched)
+    gap = second_family_gap(patched)
     assert gap.unservable is True
     assert "no row size is servable" in gap.detail
     # The floor is what decides it: the same judge at 8,192 really can serve
     # the short rows, and that gap stays overridable.
-    assert mistral_gap(base).unservable is False
+    assert second_family_gap(base).unservable is False
 
     # ...and the consequence, at the flag: an unservable gap is a refusal
     # whatever --allow-pool-gaps says, so the fleet cannot be started against
@@ -2256,11 +2303,13 @@ def test_a_tiebreak_gap_names_the_key_that_would_fill_it(cfg, keys, monkeypatch)
     """The judge side of this is pinned; the tiebreak side was not, so the
     remedy could quietly stop naming the key that would close the gap and go
     on advising a purchase the operator does not need to make."""
-    # gemma narrowed to the stale 8192: at its probed 131k it serves every
-    # tiebreak this build can produce, so there is no gap left for a remedy
-    # string to name. See _narrow_tiebreak.
+    # gemma dropped from routing.judge, NOT narrowed. Since 2026-08-19 it
+    # serves both roles, and cfg_with_context rewrites the whole model - so
+    # narrowing "gemma tiebreak" would narrow the gemma JUDGE as well and move
+    # slot B underneath the gap this is reading. Dropping it from the judge
+    # list leaves it whole as a tiebreak, which is what the remedy is about.
     patched = _with_tiebreak_family(
-        _narrow_tiebreak(cfg), api_key_env="FIFTHPARTY_API_KEY"
+        cfg_without_the_free_tiebreak(cfg), api_key_env="FIFTHPARTY_API_KEY"
     )
     _unset(monkeypatch, "FIFTHPARTY_API_KEY")
     gap = next(
@@ -2343,7 +2392,9 @@ def test_pool_gaps_walks_the_generator_role_through_the_routers_own_filter(cfg, 
     # mistral demotion. See cfg_with_two_generator_families.
     # gemma narrowed: the ("gpt-oss", "tiebreak") entry this asserts is the
     # context check removing gemma, which at its probed 131k it no longer does.
-    cfg = _narrow_tiebreak(cfg_with_two_generator_families(cfg))
+    # gemma dropped from routing.judge: the gap this asserts is slot B running
+    # out of families, which since the 2026-08-19 promotion it does not.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     patched = _with_extra_generator(
         cfg_without_the_paid_judges(cfg), family="qwen", api_key_env="FOURTHPARTY_API_KEY"
     )
@@ -2351,8 +2402,7 @@ def test_pool_gaps_walks_the_generator_role_through_the_routers_own_filter(cfg, 
     needed = worst_case_judge_tokens(patched)
 
     assert [(g.generator_family, g.slot) for g in pool_gaps(patched, needed_tokens=needed)] == [
-        ("gpt-oss", "tiebreak"),
-        ("mistral", "b"),
+        ("secondgen", "b"),
     ]
 
     # ...and the moment that key lands the family is real, and so is its gap:
@@ -2376,7 +2426,12 @@ def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = _narrow_generator(cfg_with_two_generator_families(cfg))
+    # ...and the promoted judge dropped with it: gemma joined routing.judge on
+    # 2026-08-19, so slot B fills at every size and the gap under test here
+    # cannot occur. See cfg_without_the_promoted_judge.
+    cfg = _narrow_generator(
+        cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    )
     # 26k, not 20k: correcting the reply conversion (2026-08-18, review round
     # 2 / I6) raised the 8k-window check from 15,104 to 19,104 tokens, i.e.
     # 23,880 of required context, so a 20k judge no longer demonstrates the
@@ -2397,11 +2452,11 @@ def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg
     # Both generator families lose slot B at the flat size: qwen is now too
     # small and glm always was, so the pool is mistral + the gpt-oss backstop
     # and each family's own is one of them.
-    assert fatal() == {("gpt-oss", "b"), ("mistral", "b")}
+    assert fatal() == {("gpt-oss", "b"), ("secondgen", "b")}
     # Sized at what its own 8k window permits, the gpt-oss family's judges fit
     # again and its refusal disappears; the 40k mistral family really can make
     # the long row, so its gap stays.
-    assert fatal(needed_for_window=sizer) == {("mistral", "b")}
+    assert fatal(needed_for_window=sizer) == {("secondgen", "b")}
 
 
 def test_the_family_window_bound_never_sizes_above_the_flat_worst_case(cfg, keys):
@@ -2411,7 +2466,10 @@ def test_the_family_window_bound_never_sizes_above_the_flat_worst_case(cfg, keys
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    # ...and the promoted judge dropped with it: gemma joined routing.judge on
+    # 2026-08-19, so slot B fills at every size and the gap under test here
+    # cannot occur. See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     huge = judge_tokens_for_generator_window(cfg, 10**9)
     assert huge == worst_case_judge_tokens(cfg)
     # A window too small to hold the reply allowance contributes NO material -
@@ -2447,7 +2505,10 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    # ...and the promoted judge dropped with it: gemma joined routing.judge on
+    # 2026-08-19, so slot B fills at every size and the gap under test here
+    # cannot occur. See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     judge_needed = worst_case_judge_tokens(cfg)
     tiebreak_needed = worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
     assert required_context(judge_needed) < required_context(tiebreak_needed)
@@ -2464,7 +2525,7 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     # between the judge prompt and the tiebreak prompt.
     assert [(g.role, g.generator_family) for g in sized] == [
         ("tiebreak", "gpt-oss"),
-        ("tiebreak", "mistral"),
+        ("tiebreak", "secondgen"),
     ]
     # Sized by the JUDGE's number instead, that same model reads as big enough.
     assert pool_gaps(patched, needed_tokens=judge_needed) == []
@@ -2481,15 +2542,16 @@ def test_blocking_key_envs_names_only_keys_that_would_change_something(cfg, keys
     """Its entire purpose: naming the env var of a model that is excluded on
     family or on context length would send the operator after a key that opens
     nothing, in the middle of a launch where keys are the scarce thing."""
-    # mistral, not cerebras: cerebras stopped holding a judge at all when
-    # zai-glm-4.7 was retired on 2026-08-18, and an env var behind no judge
-    # model would make every assertion below true for the wrong reason.
-    _unset(monkeypatch, "MISTRAL_API_KEY")
+    # groq, not cerebras: since 2026-08-19 cerebras holds BOTH the generator
+    # and the promoted gemma judge, so withholding its key would make every
+    # assertion below true for more than one reason at once. groq holds
+    # exactly one judge, which is what this needs.
+    _unset(monkeypatch, "GROQ_API_KEY")
 
-    assert _blocking_key_envs(cfg, "judge", frozenset()) == ("MISTRAL_API_KEY",)
-    assert _blocking_key_envs(cfg, "judge", frozenset({"mistral"})) == ()
+    assert _blocking_key_envs(cfg, "judge", frozenset()) == ("GROQ_API_KEY",)
+    assert _blocking_key_envs(cfg, "judge", frozenset({"qwen"})) == ()
     # ...and a keyed provider is never named at all.
-    monkeypatch.setenv("MISTRAL_API_KEY", "sk-test")
+    monkeypatch.setenv("GROQ_API_KEY", "sk-test")
     assert _blocking_key_envs(cfg, "judge", frozenset()) == ()
 
 
@@ -2499,9 +2561,12 @@ def test_undersized_families_needs_every_model_in_the_family_to_be_too_small(cfg
     today's config because no family has two models in one role - and the
     config TODO asks the operator to ADD one, at which point this rule decides
     whether the family they added is usable at all."""
-    assert "mistral" in undersized_families(cfg, "judge", 40000)
-    mixed = _with_judge_model(cfg, family="mistral", model_id="mistral-big", max_context=131072)
-    assert "mistral" not in undersized_families(mixed, "judge", 40000)
+    # The family is SYNTHESISED, because no shipped judge family is small
+    # enough to be excluded at any row size since 2026-08-19.
+    small = _with_judge_model(cfg, family="tiny", model_id="tiny-judge", max_context=8192)
+    assert "tiny" in undersized_families(small, "judge", 40000)
+    mixed = _with_judge_model(small, family="tiny", model_id="tiny-big", max_context=131072)
+    assert "tiny" not in undersized_families(mixed, "judge", 40000)
     # ...and a second SMALL model does not rescue it.
     small = _with_judge_model(cfg, family="mistral", model_id="mistral-tiny", max_context=8192)
     assert "mistral" in undersized_families(small, "judge", 40000)
@@ -2598,7 +2663,12 @@ def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_che
     # The narrow generator is a fixture since the 2026-08-19 probe - see
     # _narrow_generator. Without it "the family is 8k-only" is false by
     # construction and the narrowing under test never happens.
-    cfg = _narrow_generator(cfg_with_two_generator_families(cfg))
+    # ...and the promoted judge dropped with it: gemma joined routing.judge on
+    # 2026-08-19, so slot B fills at every size and the gap under test here
+    # cannot occur. See cfg_without_the_promoted_judge.
+    cfg = _narrow_generator(
+        cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    )
     small = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)
     sizer, flat = judge_sizer(small), worst_case_judge_tokens(small)
 
@@ -2628,7 +2698,10 @@ def test_pool_gaps_applies_the_routers_own_key_filter(cfg, monkeypatch):
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    # ...and the promoted judge dropped with it: gemma joined routing.judge on
+    # 2026-08-19, so slot B fills at every size and the gap under test here
+    # cannot occur. See cfg_without_the_promoted_judge.
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     _unset(monkeypatch, "GROQ_API_KEY", "OPENAI_API_KEY")
     for env in ("MISTRAL_API_KEY", "CEREBRAS_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
@@ -2750,14 +2823,28 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
     # THE SHIPPED POOL HAS NO GAPS AT ALL since the gemma probe, so the advice
     # string has to be read off the pool that still has one. Narrowing gemma is
     # the exact config the advice was designed against.
-    refusals, warnings = preflight_messages(cfg, ("generator",))
-    assert (refusals, warnings) == ([], []), "the probed pool has no gap left to report"
-    _, narrowed_warnings = preflight_messages(_pre_probe_pool(cfg), ("generator",))
-    advised = {
-        int(line.split("max_context >= ")[1].split()[0]) for line in narrowed_warnings
-    }
-    assert len(advised) == 1, "one number: the operator buys one model"
-    required = advised.pop()
+    # THE SHIPPED POOL HAS NO GAP AT ALL since the 2026-08-19 judge surgery, so
+    # each threshold is read from the pool that still produces its own kind of
+    # gap. Both remain the numbers the code enforces; neither is transcribed.
+    assert preflight_messages(cfg, ("generator",)) == ([], []), (
+        "the probed and re-seated pool has no gap left to report"
+    )
+
+    def advice_from(lines):
+        found = {
+            int(line.split("max_context >= ")[1].split()[0])
+            for line in lines
+            if "max_context >= " in line
+        }
+        assert len(found) == 1, ("one number: the operator buys one model", found)
+        return found.pop()
+
+    # A JUDGE gap advises the judge threshold. Dropping gemma out of
+    # routing.judge is the smallest pool that still has one.
+    judge_refusals, _ = preflight_messages(
+        cfg_without_the_promoted_judge(cfg), ("generator",)
+    )
+    required = advice_from(judge_refusals)
 
     # THE ADVISED NUMBER DROPPED 29,666 -> 29,661 ON 2026-08-18, and it is the
     # documented behaviour rather than drift. `advice` is
@@ -2781,6 +2868,13 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
     assert tiebreak_required > judge_required
     assert f"max_context >= {tiebreak_required}" in text
     assert f"{tiebreak_required:,}" in text
+    # ...and it really is what a TIEBREAK gap prints, not just a number in the
+    # block: take mistral-large-latest back out of the tiebreak seat and the
+    # preflight asks for exactly this.
+    _, tiebreak_warnings = preflight_messages(
+        cfg_without_the_free_tiebreak(cfg), ("generator",)
+    )
+    assert advice_from(tiebreak_warnings) == tiebreak_required
 
     # --- the generator cliffs, both of them ---------------------------------
     reply = max_output_tokens(cfg)
@@ -2887,12 +2981,18 @@ def test_the_tiebreak_route_is_open_for_a_long_row(cfg, keys):
     from tuned.data.generate import preflight_messages
 
     assert undersized_families(cfg, "tiebreak", 20_000) == frozenset()
-    assert undersized_families(_narrow_tiebreak(cfg), "tiebreak", 20_000) == frozenset({"gemma"})
-    # ...and end to end: the shipped pool preflights clean at every role, where
-    # the pre-probe pool carried a standing tiebreak warning.
+    # ...and end to end: the shipped pool preflights CLEAN at every role. Two
+    # separate fixes were needed and this assertion fails if either is undone -
+    # the cerebras probes cleared the context-shaped tiebreak gap, and the
+    # 2026-08-19 judge surgery cleared the separation-shaped one by giving the
+    # tiebreak seat to mistral-large-latest.
     assert preflight_messages(cfg, ("generator", "judge", "tiebreak")) == ([], [])
-    _, warnings = preflight_messages(_pre_probe_pool(cfg), ("generator", "judge", "tiebreak"))
-    assert any("routing.tiebreak" in line for line in warnings)
+    # Take that seat away and the separation-shaped gap comes straight back,
+    # which is what says the seat is what closed it.
+    _, without = preflight_messages(
+        cfg_without_the_free_tiebreak(cfg), ("generator", "judge", "tiebreak")
+    )
+    assert any("routing.tiebreak" in line for line in without)
 
 
 def test_a_single_call_larger_than_tpm_waits_rather_than_deadlocking(cfg):
@@ -2935,6 +3035,110 @@ def test_a_single_call_larger_than_tpm_waits_rather_than_deadlocking(cfg):
     assert slept == [pytest.approx(60.0)]
 
 
+def test_the_judge_pool_is_the_one_calibration_left_behind(cfg):
+    """THE POOL COMPOSITION, pinned as config.
+
+    mistral-small-latest was DISQUALIFIED as a judge on 2026-08-19 by human
+    calibration - holdout precision 0.237, recall 1.000, phi 0.124 on n=40
+    against a 21.7% base rate, where the gate is 0.75 - so it holds no judge
+    seat. gemma took that seat. mistral-LARGE is a different model on different
+    weights and is UNPROVEN rather than disqualified, so it sits in the
+    tiebreak seat where its verdicts earn gold-label coverage.
+
+    This asserts the shape, not the merits: which refs hold which roles, and
+    that the disqualified model is not among the judges under any spelling.
+    """
+    roles = {
+        f"{p.name}/{m.id}": tuple(m.roles) for p in cfg.providers for m in p.models
+    }
+    assert "mistral/mistral-small-latest" not in roles, (
+        "the disqualified judge is back in the config"
+    )
+    assert roles["mistral/mistral-large-latest"] == ("tiebreak",), (
+        "mistral-large is UNPROVEN; the tiebreak seat is where it gets proven, "
+        "and a judge seat would need gold labels first"
+    )
+    assert roles["cerebras/gemma-4-31b"] == ("judge", "tiebreak")
+    assert list(cfg.routing.judge) == [
+        "groq/qwen/qwen3.6-27b",
+        "cerebras/gemma-4-31b",
+        "openai/gpt-5-mini",
+        "openai/gpt-5-nano",
+    ]
+    assert "mistral/mistral-large-latest" in cfg.routing.tiebreak
+    # The free families come before the paid backstops in both lists, which is
+    # the standing rule that keeps the ~$1/day cap for rows nothing free serves.
+    assert cfg.routing.tiebreak.index("mistral/mistral-large-latest") < (
+        cfg.routing.tiebreak.index("openai/gpt-5-mini")
+    )
+
+
+def test_the_probed_mistral_window_is_what_the_config_declares(cfg):
+    """max_context is a claim about someone else's server, and this build has
+    been bitten once by writing one down unprobed (cerebras, 8192 against a
+    real 131,072, which unroutable'd 85% of a stream).
+
+    52,812 is a MEASURED FLOOR: probed 2026-08-19, one call, max_tokens 16,
+    temperature 0, HTTP 200, finish_reason stop. It is not the model's ceiling
+    and the config says so. What it has to do is clear the worst-case tiebreak
+    requirement, which is the assertion that matters here.
+    """
+    caps = {
+        f"{p.name}/{m.id}": m.limits.get("max_context")
+        for p in cfg.providers
+        for m in p.models
+    }
+    assert caps["mistral/mistral-large-latest"] == 52812
+    tiebreak_required = required_context(
+        worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
+    )
+    assert caps["mistral/mistral-large-latest"] > tiebreak_required, (
+        "the probed floor must clear the longest tiebreak call this build makes"
+    )
+    # ...so it is never excluded on length at any row size the band permits.
+    assert "mistral" not in undersized_families(cfg, "tiebreak", tiebreak_required)
+
+
+def test_a_tiebreak_resolves_to_mistral_for_a_row_qwen_and_gemma_judged(cfg, keys):
+    """THE CONSEQUENCE THAT CHANGED, and the reason mistral-large is in the
+    pool at all.
+
+    A gpt-oss generation is judged by qwen (slot A) and gemma (slot B). The
+    tiebreak then excludes the generator's family AND both judges' -
+    {gpt-oss, qwen, gemma} - which before 2026-08-19 was every family
+    routing.tiebreak contained, so a disagreement had no third opinion and took
+    judge.py's park-loudly path. mistral is the one family that survives that
+    exclusion, which is exactly the seat it was given.
+
+    Walked through the Router's own eligible_refs, because that is what
+    judge.py calls; the exclusion set is built the same way judge.py builds it
+    (base_exclude = the generator's family, plus each answered slot's).
+    """
+    router = Router(cfg)
+    families = {
+        f"{p.name}/{m.id}": m.family for p in cfg.providers for m in p.models
+    }
+    base = frozenset({"gpt-oss"})
+    slot_a = next(router.eligible_refs("judge", exclude_families=base))
+    fam_a = families[f"{slot_a.provider}/{slot_a.model}"]
+    slot_b = next(router.eligible_refs("judge", exclude_families=base | {fam_a}))
+    fam_b = families[f"{slot_b.provider}/{slot_b.model}"]
+    assert (slot_a, slot_b) == (GROQ_JUDGE, GEMMA_JUDGE)
+    assert {fam_a, fam_b} == {"qwen", "gemma"}
+
+    tiebreak = next(
+        router.eligible_refs("tiebreak", exclude_families=base | {fam_a, fam_b}), None
+    )
+    assert tiebreak == ModelRef("mistral", "mistral-large-latest")
+
+    # ...and it is the ONLY thing holding that seat open: take it out and the
+    # row is back to two judges and a park.
+    without = Router(cfg_without_the_free_tiebreak(cfg))
+    assert next(
+        without.eligible_refs("tiebreak", exclude_families=base | {fam_a, fam_b}), None
+    ) is None
+
+
 def test_eligible_refs_is_the_filter_eligible_itself_uses(cfg, keys):
     """The preflight walks refs and the spender walks clients, but there is
     one filter: `eligible` is `eligible_refs` plus client construction. A
@@ -2945,7 +3149,7 @@ def test_eligible_refs_is_the_filter_eligible_itself_uses(cfg, keys):
     assert walked == [routed.ref for routed in router.eligible("judge")]
     # ...including the reasons, in the Router's own order.
     seen: set[str] = set()
-    assert list(router.eligible_refs("judge", exclude_families=frozenset({"mistral"}),
+    assert list(router.eligible_refs("judge", exclude_families=frozenset({"qwen"}),
                                     skipped=seen)) == walked[1:]
     assert seen == {"family-excluded"}
 
@@ -3055,17 +3259,24 @@ def test_role_params_send_generator_sampling_to_generator_calls_only(cfg, keys):
     inheriting generator sampling if the model is ever re-promoted, and a test
     that only ever saw one role would not notice it rotting.
     """
-    # Shipped reality: one role, and it is the judge's temperature.
-    assert _params_for_role(cfg, MISTRAL_JUDGE, "judge") == {"temperature": 0.2}
-    # No role layer at all -> the model's own defaults, which are empty here.
-    assert _params_for_role(cfg, MISTRAL_JUDGE, None) == {}
+    # Shipped reality: mistral-large's tiebreak layer is its temperature, and
+    # asking for any other role gets nothing from this layer. It is the only
+    # model left carrying a role_params block with a temperature in it, which
+    # is why the worked example moved here on 2026-08-19.
+    mistral_tb = ModelRef("mistral", "mistral-large-latest")
+    assert _params_for_role(cfg, mistral_tb, "tiebreak") == {"temperature": 0.2}
+    assert _params_for_role(cfg, mistral_tb, "judge") == {}
+    assert _params_for_role(cfg, mistral_tb, None) == {}
 
+    # The two-role half is read against the fixture's own family, because no
+    # shipped model serves both a generator and a judge role since 2026-08-19.
     promoted = cfg_with_two_generator_families(cfg)
-    assert _params_for_role(promoted, MISTRAL_JUDGE, "generator") == {
+    second = ModelRef("cerebras", "second-generator")
+    assert _params_for_role(promoted, second, "generator") == {
         "temperature": 0.7,
         "top_p": 0.95,
     }
-    assert _params_for_role(promoted, MISTRAL_JUDGE, "judge") == {"temperature": 0.2}
+    assert _params_for_role(promoted, second, "judge") == {"temperature": 0.2}
 
 
 def _payload_for_role(cfg, ref, role):
@@ -3101,8 +3312,9 @@ def test_the_qwen_judge_sends_reasoning_effort_none_and_only_as_a_judge(cfg, key
     # No role layer -> the model's own params, and the suppression is not there.
     assert _payload_for_role(cfg, GROQ_JUDGE, None) == {"temperature": 0.2}
     assert _payload_for_role(cfg, GROQ_JUDGE, "generator") == {"temperature": 0.2}
-    # It reaches no other judge, including the one that already works.
-    assert "reasoning_effort" not in _payload_for_role(cfg, MISTRAL_JUDGE, "judge")
+    # It reaches no other judge: gemma took a judge role on 2026-08-19 and
+    # carries no role layer, so the suppression must not follow it.
+    assert "reasoning_effort" not in _payload_for_role(cfg, GEMMA_JUDGE, "judge")
     # ...and the generator's own effort is untouched, in every role.
     generator = ModelRef("cerebras", "gpt-oss-120b")
     assert _payload_for_role(cfg, generator, "generator")["reasoning_effort"] == "medium"
@@ -3120,11 +3332,11 @@ def test_a_per_call_param_still_beats_the_role_layer(cfg, keys):
     """Precedence is model.params < role_params[role] < per-call params. The
     caller has to stay able to override, or judge.py's own temperature would be
     silently ignored the day a role entry is added for its model."""
-    client = _router(cfg).routed(MISTRAL_JUDGE).client
+    client = _router(cfg).routed(GROQ_JUDGE).client
     payload = client.build_payload(
         ChatRequest(
             messages=({"role": "user", "content": "x"},),
-            ref=MISTRAL_JUDGE,
+            ref=GROQ_JUDGE,
             role="judge",
             params={"temperature": 0.9},
         )
@@ -3137,14 +3349,14 @@ def test_role_params_naming_a_role_the_model_does_not_serve_is_refused(tmp_path)
     configures something and never apply - the same silent-no-op class as an
     answer-key entry that can never fire."""
     raw = DATA_CONFIG.read_text(encoding="utf-8")
-    broken = raw.replace("          judge: {temperature: 0.2}",
-                         "          judgge: {temperature: 0.2}")
+    broken = raw.replace("          tiebreak: {temperature: 0.2}",
+                         "          tiebreakk: {temperature: 0.2}")
     assert broken != raw
     path = tmp_path / "bad_role.yaml"
     path.write_text(broken, encoding="utf-8")
     with pytest.raises(ValueError) as exc:
         load_build_config(str(path), allow_unpinned=True)
-    assert "judgge" in str(exc.value) and "role_params" in str(exc.value)
+    assert "tiebreakk" in str(exc.value) and "role_params" in str(exc.value)
 
 
 # --------------------------------------------------------------------------

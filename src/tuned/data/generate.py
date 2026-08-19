@@ -180,7 +180,11 @@ EFFORT_LADDER_RETIRED = "2026-08-18: measured uniformly negative, see pilot"
 # think.
 #
 # ROLE-SCOPED BY CONSTRUCTION: this hook is only ever passed to the generator
-# call. The same mistral model now also serves the JUDGE role, and a judge is
+# call. NO FAMILY IN THE SHIPPED POOL MATCHES THIS DICT since 2026-08-19 -
+# mistral-small lost the judge seat to calibration and mistral-large sits in
+# the tiebreak seat, which this hook is not consulted for. The entry stays as
+# the record of a measured provider quirk, and the MECHANISM below is what is
+# still under test. A judge is
 # cheaper and no worse without a trace, so the parameter must not reach it -
 # which is exactly what putting it in the model's config `params` would do.
 #
@@ -1243,7 +1247,7 @@ def effort_params_for_ref(attempt: int):
     one place that can do it correctly. GENERATOR_REASONING_PARAMS is keyed by
     family and is sent on EVERY attempt, so it is a property of the role and
     not a ladder. Putting it in the model's config `params` instead would send
-    it on JUDGE calls too - the same mistral model now serves both roles - and
+    it on JUDGE calls too - one model used to serve both roles - and
     a judge does not need a trace it will not read.
     """
 

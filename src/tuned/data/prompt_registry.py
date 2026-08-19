@@ -63,9 +63,10 @@ and each one silently corrupts a different downstream number if it is missed:
 
   2. THE JUDGE PROMPT IS THE LONGEST PROMPT IN THE PIPELINE. It carries the
      same materials the generator saw PLUS the candidate's trace and answer,
-     so it can be twice the generator's prompt. Since 2026-08-18 the smallest
-     model in routing.judge is 32k (mistral/mistral-small-latest; the 8k
-     zai-glm-4.7 was removed as archived upstream), and since the cerebras
+     so it can be twice the generator's prompt. Since 2026-08-19 the smallest
+     model in routing.judge is 131k: the 8k zai-glm-4.7 was removed as
+     archived upstream, mistral-small (32k) lost the judge seat when human
+     calibration disqualified it, and gemma took that seat. Since the cerebras
      probes of 2026-08-19 routing.tiebreak has no small tier at all - every
      model in it declares 131k or more, gemma included, which had been pinned
      at 8192 by a config value nobody had measured. The judge worker must

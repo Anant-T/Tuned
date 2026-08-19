@@ -798,7 +798,9 @@ class ChatClient:
             req.params                what this call wants
 
         The middle layer exists because one model can serve two roles that want
-        different sampling. mistral-small-latest both generates and judges: the
+        different sampling. The worked example was mistral-small-latest, which
+        both generated and judged until 2026-08-19; the live one is
+        mistral-large-latest's tiebreak layer. The rule is unchanged: the
         generator wants temperature 0.7 / top_p 0.95 and the judge wants 0.2.
         While those were two config blocks the distinction was free; merging
         them (Mistral Small 4, 2026-08-18) would have shipped the generator's

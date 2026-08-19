@@ -14,10 +14,10 @@ model twice".
 
 CONTEXT LENGTH IS A ROUTING INPUT (contract 2). The judge prompt is the
 longest in the pipeline: the same materials the generator saw PLUS the
-candidate's trace and answer. The smallest JUDGE in the pool is 32k since
-2026-08-18, when the 8k one was removed as archived upstream; the TIEBREAK
-pool has had no small tier since the cerebras probes of 2026-08-19 corrected
-gemma's window from a never-measured 8192 to its real 131k. A candidate that
+candidate's trace and answer. Since 2026-08-19 EVERY JUDGE IS 131k or more -
+the 8k zai-glm-4.7 left archived on 2026-08-18, mistral-small (32k) lost the
+judge seat to human calibration, and gemma, promoted into it, is 131k. The
+TIEBREAK pool's smallest is mistral-large at a probed 52,812. A candidate that
 does not fit must be routed past it,
 because a silently truncated judge prompt produces a score for an answer
 nobody read - which is worse than not judging it at all. Router.pick exposes
@@ -190,9 +190,17 @@ TIEBREAK_SLOT = "tiebreak"
 #     undersized_families turns the sum into a family exclusion, so raising it
 #     raises the pool's context bar. The worst-case judge call is 23,729
 #     routing tokens and CONTEXT_SAFETY_MARGIN makes that 29,661 of required
-#     window against slot A's 32,000; +2,048 of reply budget takes the
-#     requirement to 32,221 and retires mistral from every long row - the fix
-#     would break the judge that works;
+#     window.
+#
+#     THAT ARITHMETIC WAS WRITTEN AGAINST A POOL THAT NO LONGER EXISTS, and it
+#     is worth saying rather than deleting because the SHAPE of the argument is
+#     still the reason this number is not the answer. It used to read "against
+#     slot A's 32,000; +2,048 takes the requirement to 32,221 and retires
+#     mistral from every long row". Slot A is qwen at 131k now (2026-08-19),
+#     mistral-small is out of the judge pool entirely, and both cerebras
+#     windows were probed at 131,072 - so the smallest judge window is 131k and
+#     +2,048 retires nothing at all. The fleet-wide objection stands; the
+#     specific casualty it named is gone;
 #   * it is not per-model, and the model that needs a bigger reply is the one
 #     whose tpm (6,000) is already under one call at this size (measured judge
 #     prompts 4,914-5,661 routing tokens).
@@ -379,7 +387,9 @@ def split_reply_think(text: str) -> tuple[str | None, str]:
     scored 1/1/1 before this.
 
     A reply with no tags at all is returned whole (think=None) - that is the
-    mistral shape, which is most of the judgements this build has.
+    mistral shape. That was most of the judgements this build had when the
+    parser was written; mistral-small left the judge pool on 2026-08-19, so it
+    is now a shape the parser must still handle rather than the common case.
     """
     body = text or ""
     closes = list(_REPLY_THINK_CLOSE_RE.finditer(body))

@@ -266,9 +266,19 @@ providers:
       # one is the TIEBREAK route: at 8192 no long row could reach a third
       # family at all, so every tie on a full-length generation was undecidable
       # by construction rather than by pool composition.
+      # PROMOTED TO JUDGE 2026-08-19, taking the seat mistral-small was
+      # disqualified from. It is the least-bad evidence available: the design
+      # review's hand-forensics found it the most accurate of the three judges
+      # (it caught three qwen false positives - 391, 441, 470 - that literal
+      # source comparison confirms), and calibration could not fit it only
+      # because all 9 of its gold-labelled judgements landed in the holdout
+      # fold, which is a sampling accident rather than a verdict on the model.
+      # It keeps its tiebreak seat too; family separation is what stops it
+      # breaking a tie it was party to, and that is enforced in judge.py, not
+      # here.
       - id: gemma-4-31b
         family: gemma
-        roles: [tiebreak]
+        roles: [judge, tiebreak]
         limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 131072, max_output: 4096}
         params: {temperature: 0.2}
   - name: groq
@@ -343,12 +353,53 @@ providers:
     api_key_env: MISTRAL_API_KEY
     quirks: [mistral]
     models:
-      # ONE BLOCK, TWO ROLES, since 2026-08-18. The magistral line was retired
-      # upstream on 2026-07-31 and `magistral-small-latest` no longer exists as
-      # a distinct model; `mistral-small-latest` rides Mistral Small 4, which
-      # both generates and judges. The generator block was deleted rather than
-      # re-pointed so the two roles cannot drift into two different aliases of
-      # the same weights again.
+      # MISTRAL-SMALL IS OUT OF THE JUDGE SEAT, AND THE FENCE IS ABOUT SMALL
+      # SPECIFICALLY. `mistral-small-latest` was DISQUALIFIED as a judge by
+      # human calibration on 2026-08-19, fitted on the operator's 46 gold
+      # labels (10 accept / 36 reject, base rate 21.7%) -
+      # data/build/gold/calibration_report.md:
+      #
+      #     fitted rule            mean>=3   (agreement 4/5 folds)
+      #     HOLDOUT  n=40          precision 0.237   recall 1.000   phi 0.124
+      #     cross-val n=6          precision 0.200   recall 1.000   phi 0.200
+      #
+      # The gate is precision >= 0.75. Precision 0.237 against a 21.7% base
+      # rate is no information: the rule it fitted passes essentially
+      # everything, which is exactly why recall is 1.000 and phi is 0.124.
+      #
+      # It corroborates the 2026-08-19 design review rather than repeating it:
+      # over 46 judgements that model never awarded validity >= 4 (values
+      # {2,3}, sd 0.48), emitted the single vector 5/3/4 on 59% of calls, and
+      # correlated with the other judge at r=+0.22 on the deciding axis. Its 0%
+      # pass rate was STRUCTURAL - the axis that decided its verdict could not
+      # reach the passing value. While it sat in slot A its borderline verdicts
+      # forced a wasted regeneration on 41% of rows and a paid tiebreak on 100%
+      # of accepts: 101 judge calls bought 46 scored generations.
+      #
+      # THE FENCE DOES NOT COVER mistral-large-latest, which is a different
+      # model on different weights and is UNPROVEN rather than disqualified.
+      # Nothing here claims it is good; the TIEBREAK SEAT IS WHERE IT GETS
+      # PROVEN. That seat fired 9 times over the 41-task cohort, so even a slow
+      # free tier serves it, and every verdict it casts earns gold-label
+      # coverage - which will qualify it or disqualify it with numbers, the
+      # same way small was. Promoting it to a judge slot before that evidence
+      # exists would be the mistake this fence records.
+      #
+      # LICENSING, recorded so the card's provenance story stays coherent:
+      # mistral-large weights are NOT Apache-2.0 (small and magistral are). It
+      # does not matter here and the reason is structural rather than a
+      # concession - a judge contributes SCORES to this build, never text. The
+      # open-weight requirement binds the GENERATOR, whose tokens are what ship
+      # in the dataset; the bench is measurement apparatus. What does bind is
+      # La Plateforme's output terms, which stay clean for this use (no
+      # distillation restriction on the outputs we keep, and we keep only
+      # integers and a rationale we never train on).
+      #
+      # THE PREDECESSOR NOTE, kept because it is why there is one block here:
+      # the magistral line was retired upstream on 2026-07-31 and
+      # `magistral-small-latest` no longer exists as a distinct model. The
+      # generator block was deleted rather than re-pointed so two roles cannot
+      # drift into two different aliases of the same weights again.
       #
       # THE FULL WORKSPACE BUCKET, and this is a restoration rather than an
       # increase. The workspace limit is 50 rpm / 50k tpm and the ledger below
@@ -393,17 +444,37 @@ providers:
       # two orders of magnitude of (measured range 1,445-2,799). The demotion
       # now costs approximately nothing rather than 3%.
       #
-      # SAMPLING IS STILL PER ROLE. The generator entry is gone with the role -
-      # config.py refuses a role_params key naming a role the model does not
-      # serve - but the mechanism stays and matters: it is what keeps a judge
-      # from inheriting generator sampling if this model is ever re-promoted.
-      - id: mistral-small-latest
+      # SAMPLING IS STILL PER ROLE. config.py refuses a role_params key naming
+      # a role the model does not serve, so the key below tracks the role list
+      # above; the mechanism is what keeps one role from inheriting another's
+      # sampling if this model is ever given a second seat.
+      #
+      # LIMITS: ONE MEASUREMENT AND THREE FLOORS, labelled so nobody reads a
+      # floor as a fact. This is the defect 8778800 fixed for cerebras, where
+      # an unmeasured 8192 sat in this field for the life of the project and
+      # unroutable'd 85% of a stream.
+      #
+      #   max_context 52812 IS A MEASUREMENT, and it is a FLOOR rather than the
+      #   model's ceiling: probed 2026-08-19, one call, max_tokens 16,
+      #   temperature 0 -> HTTP 200, prompt_tokens 52812, finish_reason stop.
+      #   The vendor documents a larger window; this file records what was
+      #   probed. It only has to clear required_context(worst-case tiebreak) =
+      #   29,666, which it does by 78%.
+      #
+      #   rpm 2 / tpm 30000 / tpd 500000 ARE FLOORS, NOT MEASUREMENTS. The free
+      #   "Experiment" tier publishes no per-key figures worth pinning, so
+      #   these are chosen for the ROLE's shape instead: the tiebreak fired 9
+      #   times over 41 tasks, so a low rpm costs nothing. tpm is set above one
+      #   whole tiebreak call (~24k prompt + 1k reply) on purpose - below it,
+      #   TokenBucket clamps the charge to capacity and every call waits a full
+      #   60s refill first, which is correct but needlessly slow.
+      - id: mistral-large-latest
         family: mistral
-        roles: [judge]
-        limits: {rpm: 50, tpm: 50000, tpd: 33000000, max_context: 32000, max_output: 8192}
+        roles: [tiebreak]
+        limits: {rpm: 2, tpm: 30000, tpd: 500000, max_context: 52812, max_output: 8192}
         params: {}
         role_params:
-          judge: {temperature: 0.2}
+          tiebreak: {temperature: 0.2}
   - name: openai
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
@@ -574,9 +645,19 @@ routing:
   # and swallowed 85% of the statute_qa stream; at the probed 131,072 it sits
   # at 104,858, against pilot prompts of 1,445-2,799. See the cerebras block.
   generator: [cerebras/gpt-oss-120b]
-  judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b,
+  # JUDGE: qwen then gemma, the two free families, then the paid backstops -
+  # which is the standing "every free judge is preferred to the paid one" rule.
+  # On a gpt-oss generation family separation removes both openai models, so
+  # the two slots really are qwen (A) and gemma (B).
+  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,
           openai/gpt-5-mini, openai/gpt-5-nano]
+  # TIEBREAK: mistral sits third, ahead of the paid backstops and behind the
+  # two free families that separation will usually have spent already. On a
+  # gpt-oss row judged by qwen and gemma the exclusion set is
+  # {gpt-oss, qwen, gemma} and mistral is the ONE family left - which is what
+  # keeps the third opinion free rather than paid.
   tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b,
+             mistral/mistral-large-latest,
              openai/gpt-5-mini, openai/gpt-5-nano]
   probe: [groq/openai/gpt-oss-20b]
   family_separation: true

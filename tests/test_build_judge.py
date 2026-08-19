@@ -13,7 +13,9 @@ from pipeline_fakes import (
     cfg_with_context,
     cfg_with_fourth_judge_family,
     cfg_with_two_generator_families,
+    cfg_without_the_free_tiebreak,
     cfg_without_the_paid_judges,
+    cfg_without_the_promoted_judge,
     chat_response,
     judge_reply,
     open_store,
@@ -378,22 +380,27 @@ def test_failing_rationale_takes_the_harshest_judge():
 # --------------------------------------------------------------------------
 
 def test_undersized_families_excludes_the_judges_too_small_for_the_row(cfg):
-    """The judge pool has no 8k tier since 2026-08-18: zai-glm-4.7 was the only
-    one and it left the config archived. The EMPTY set at 20,000 is the
-    assertion, not a placeholder - it says the first family this filter can
-    remove is now the 32k one, which is what a re-added small judge would
-    change and what the routing tests below are written against."""
+    """The judge pool has NO SMALL TIER AT ALL since 2026-08-19. zai-glm-4.7
+    (8k) left archived on 2026-08-18; mistral-small (32k) lost the judge seat
+    after human calibration disqualified it, and gemma - promoted into that
+    seat - is 131k. Every judge now declares 131k or more.
+
+    The EMPTY sets are the assertion, not placeholders: they say this filter
+    cannot remove a judge at any row size this build produces, so a routing
+    test that wants a judge excluded ON LENGTH has to supply one."""
     assert undersized_families(cfg, "judge", 4000) == frozenset()
     assert undersized_families(cfg, "judge", 20000) == frozenset()
-    # Past 32k only the 131k judge and the two 400k backstops survive.
-    assert undersized_families(cfg, "judge", 40000) == frozenset({"mistral"})
+    assert undersized_families(cfg, "judge", 40000) == frozenset()
+    # The smallest judge window is 131,072, so the first exclusion is there.
+    assert undersized_families(cfg, "judge", 104_858) == frozenset()
+    assert undersized_families(cfg, "judge", 104_859) == frozenset({"gemma", "qwen"})
 
 
 def test_generation_family_falls_back_to_the_config(cfg):
     assert generation_family(cfg, {"model_family": "gpt-oss"}) == "gpt-oss"
     assert generation_family(
-        cfg, {"model_family": None, "provider": "mistral", "model": "mistral-small-latest"}
-    ) == "mistral"
+        cfg, {"model_family": None, "provider": "groq", "model": "qwen/qwen3.6-27b"}
+    ) == "qwen"
     assert generation_family(cfg, {"provider": "nope", "model": "nope"}) is None
 
 
@@ -405,10 +412,10 @@ def test_judges_exclude_the_generator_family_and_each_other(tmp_path, cfg, paths
         assert len(calls) == 2
         # The generator was cerebras/gpt-oss-120b (family gpt-oss).
         assert "gpt-oss" in calls[0]["exclude_families"]
-        assert calls[0]["ref"].provider == "mistral"
+        assert calls[0]["ref"].model == "qwen/qwen3.6-27b"
         # Judge B also excludes judge A's family, so it is a different model.
-        assert {"gpt-oss", "mistral"} <= calls[1]["exclude_families"]
-        assert calls[1]["ref"].model == "qwen/qwen3.6-27b"
+        assert {"gpt-oss", "qwen"} <= calls[1]["exclude_families"]
+        assert calls[1]["ref"].model == "gemma-4-31b"
 
 
 def test_a_long_candidate_past_8k_still_fills_both_slots(tmp_path, cfg, paths):
@@ -417,8 +424,8 @@ def test_a_long_candidate_past_8k_still_fills_both_slots(tmp_path, cfg, paths):
     A row past 8,192 routing tokens used to have zai-glm-4.7 struck out of the
     pool on context length before either slot was picked. The model is gone
     (archived upstream, 2026-08-18) and NO family is excluded on length here
-    any more - the next window up is mistral's 32k - so both slots fill from
-    the same two models a short row uses.
+    any more - since 2026-08-19 the smallest judge window is 131,072 - so both
+    slots fill from the same two models a short row uses.
 
     The misreading it rejects is that dropping a model from a pool must make
     some row harder to route. It does not here, because the model dropped could
@@ -435,12 +442,20 @@ def test_a_long_candidate_past_8k_still_fills_both_slots(tmp_path, cfg, paths):
         calls = router.calls_for("judge")
         assert calls[0]["est_tokens"] > 8192
         assert calls[0]["exclude_families"] == frozenset({"gpt-oss"})
-        assert calls[0]["ref"].provider == "mistral"
-        assert calls[1]["exclude_families"] == frozenset({"gpt-oss", "mistral"})
-        assert calls[1]["ref"].model == "qwen/qwen3.6-27b"
+        assert calls[0]["ref"].model == "qwen/qwen3.6-27b"
+        assert calls[1]["exclude_families"] == frozenset({"gpt-oss", "qwen"})
+        assert calls[1]["ref"].model == "gemma-4-31b"
 
 
 def test_a_candidate_past_every_small_judge_lands_on_the_131k_model(tmp_path, cfg, paths):
+    """A NARROWED gemma is what makes this measure anything.
+
+    The premise used to come free: qwen was 131k and mistral-small 32k, so a
+    40,000-word trace excluded mistral and landed on qwen. Since 2026-08-19
+    every judge is 131k or more and nothing is excluded on length at any row
+    size, so the exclusion has to be constructed.
+    """
+    cfg = _narrow_judge(cfg)
     with judged_store(tmp_path, paths, cfg) as store:
         gen = store.latest_generation(only_task(store)["task_id"])
         store.conn.execute(
@@ -450,7 +465,7 @@ def test_a_candidate_past_every_small_judge_lands_on_the_131k_model(tmp_path, cf
         router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
         run_judge(store, cfg, router, paths)
         calls = router.calls_for("judge")
-        assert {"gpt-oss", "mistral"} <= calls[0]["exclude_families"]
+        assert {"gpt-oss", "gemma"} <= calls[0]["exclude_families"]
         assert calls[0]["ref"].model == "qwen/qwen3.6-27b"
 
 
@@ -482,7 +497,7 @@ def test_two_passes_accept_and_record_both_slots(tmp_path, cfg, paths):
         judgements = store.judgements_for(gen["gen_id"])
         assert [j["judge_slot"] for j in judgements] == ["a", "b"]
         assert judgements[0]["grounding"] == 5
-        assert judgements[0]["provider"] == "mistral"
+        assert judgements[0]["provider"] == "groq"
         assert store.accepted_count("synthesis") == 1
 
 
@@ -507,8 +522,11 @@ def test_disagreement_goes_to_a_third_family(tmp_path, cfg, paths):
         assert totals["accepted"] == 1
         tiebreak = router.calls_for("tiebreak")[0]
         # Excludes the generator AND both judges: a genuinely third family.
-        assert {"gpt-oss", "mistral", "qwen"} <= tiebreak["exclude_families"]
-        assert tiebreak["ref"].model == "gemma-4-31b"
+        # Since 2026-08-19 that third family is mistral, which is exactly why
+        # mistral-large-latest was put in the tiebreak seat: it is the one
+        # family left once {gpt-oss, qwen, gemma} are spent.
+        assert {"gpt-oss", "qwen", "gemma"} <= tiebreak["exclude_families"]
+        assert tiebreak["ref"].model == "mistral-large-latest"
         gen = store.latest_generation(only_task(store)["task_id"])
         assert [j["judge_slot"] for j in store.judgements_for(gen["gen_id"])] == [
             "a", "b", "tiebreak",
@@ -836,7 +854,7 @@ def test_an_unroutable_judge_parks_instead_of_re_queueing(tmp_path, cfg, paths):
         assert router.calls_for("judge")[0]["ref"] is None
         event = json.loads(store.events("judge_route_error")[0]["detail_json"])
         assert event["unroutable"] is True
-        assert {"gpt-oss", "mistral", "qwen"} <= set(event["excluded"])
+        assert {"gpt-oss", "qwen", "gemma"} <= set(event["excluded"])
         # And it stays parked: a second sweep does not re-claim it.
         assert run_judge(store, cfg, router, paths)["claimed"] == 0
 
@@ -890,7 +908,7 @@ def test_a_recorded_slot_is_never_bought_twice(tmp_path, cfg, paths):
         reuse = json.loads(store.events("judge_slot_reused")[0]["detail_json"])
         assert reuse["slot"] == "a"
         # Family separation survives the reuse: b still excludes a's family.
-        assert {"gpt-oss", "mistral"} <= second.calls_for("judge")[0]["exclude_families"]
+        assert {"gpt-oss", "qwen"} <= second.calls_for("judge")[0]["exclude_families"]
         assert only_task(store)["state"] == "accepted"
         judgements = store.judgements_for(gen["gen_id"])
         assert [j["judge_slot"] for j in judgements] == ["a", "b"]
@@ -910,27 +928,35 @@ def _narrow_generator(cfg):
     )
 
 
-def _narrow_tiebreak(cfg):
-    """gemma cut back the same way. It is the only tiebreak family separation
-    leaves for a gpt-oss row, so with it at its real 131k there is no
-    unroutable tiebreak to exercise on the shipped pool at all."""
-    return cfg_with_context(cfg, family="gemma", role="tiebreak", max_context=8192)
+def _narrow_judge(cfg):
+    """gemma cut back the same way.
+
+    RENAMED FROM _narrow_tiebreak ON 2026-08-19 because it stopped being one:
+    gemma took a JUDGE seat that day, and cfg_with_context rewrites the whole
+    model, so narrowing "gemma tiebreak" narrows the gemma judge as well. The
+    honest name is what it does. Anything that wants a missing TIEBREAK should
+    use cfg_without_the_free_tiebreak, which touches routing only.
+    """
+    return cfg_with_context(cfg, family="gemma", role="judge", max_context=8192)
 
 
 def test_an_unroutable_tiebreak_decides_on_the_two_judges(tmp_path, cfg, paths):
     """When no third family can take the row the disagreement stands
     unresolved - which is not an accept.
 
-    The pool is NARROWED to produce that state. It used to be the shipped
-    pool's normal behaviour for any long gpt-oss row, because gemma was pinned
-    at 8192 and removed on length; the 2026-08-19 probe put it at its real
-    131k and the preflight now reports no gaps at any row size, so the
-    condition has to be constructed. What is under test is the HANDLING, which
-    must keep working for any pool that runs out.
+    THE CONDITION IS CONSTRUCTED BY ROUTING, not by a window. It used to be
+    the shipped pool's normal behaviour for a long gpt-oss row (gemma pinned at
+    8192, removed on length); the probe put gemma at its real 131k, and then
+    the 2026-08-19 judge surgery gave the tiebreak seat to
+    mistral-large-latest precisely so a gpt-oss row judged by qwen and gemma
+    still has a third family. Dropping mistral back out of routing.tiebreak is
+    the smallest way to reach the park-loudly path, and it leaves both judge
+    slots exactly as they ship. What is under test is that HANDLING, which must
+    keep working for any pool that does run out.
     """
-    cfg = _narrow_tiebreak(cfg)
+    cfg = cfg_without_the_free_tiebreak(cfg)
     with judged_store(tmp_path, paths, cfg) as store:
-        _lengthen(store, only_task(store)["task_id"], 5000)  # ~6k tokens: 8k tiebreak out
+        _lengthen(store, only_task(store)["task_id"], 5000)
         router = FakeRouter(
             cfg, {"judge": [judge_reply(5, 5, 5), judge_reply(2, 2, 2)]}
         )
@@ -969,8 +995,13 @@ def test_slot_b_can_be_unroutable_after_slot_a_has_been_paid_for(tmp_path, cfg, 
     # cerebras window is narrowed for the same reason in reverse: since the
     # 2026-08-19 probe it holds this row comfortably, so without the narrowing
     # the prompt never diverts and the divert is this test's premise.
+    # The JUDGE pool also has to run out, which the shipped one no longer
+    # does: gemma took the second judge seat on 2026-08-19, so dropping only
+    # the paid backstop still leaves qwen for slot A and gemma for slot B.
     holed = _narrow_generator(
-        cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
+        cfg_without_the_promoted_judge(
+            cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
+        )
     )
     store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
     plan_wave(store, holed, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
@@ -982,7 +1013,7 @@ def test_slot_b_can_be_unroutable_after_slot_a_has_been_paid_for(tmp_path, cfg, 
             )
         )
         gen = store.latest_generation(only_task(store)["task_id"])
-        assert gen["model_family"] == "mistral"  # the long prompt diverted
+        assert gen["model_family"] == "secondgen"  # the long prompt diverted
         _lengthen(store, only_task(store)["task_id"], 2000)
 
         router = FakeRouter(holed, {"judge": [judge_reply(5, 5, 5, "a says fine")]})
@@ -1013,8 +1044,13 @@ def test_a_reopened_row_never_re_pays_the_judge_it_already_bought(tmp_path, cfg,
     # cerebras window is narrowed for the same reason in reverse: since the
     # 2026-08-19 probe it holds this row comfortably, so without the narrowing
     # the prompt never diverts and the divert is this test's premise.
+    # The JUDGE pool also has to run out, which the shipped one no longer
+    # does: gemma took the second judge seat on 2026-08-19, so dropping only
+    # the paid backstop still leaves qwen for slot A and gemma for slot B.
     holed = _narrow_generator(
-        cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
+        cfg_without_the_promoted_judge(
+            cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
+        )
     )
     store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
     plan_wave(store, holed, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
@@ -1041,7 +1077,8 @@ def test_a_reopened_row_never_re_pays_the_judge_it_already_bought(tmp_path, cfg,
         run_judge(store, widened, second, paths)
         assert len(second.calls_for("judge")) == 1  # slot a came from the table
         assert second.calls_for("judge")[0]["ref"].model == "fourth-judge"
-        assert {"mistral", "qwen"} <= second.calls_for("judge")[0]["exclude_families"]
+        # Slot B goes to the NEW family, never back to one already used.
+        assert {"secondgen", "qwen"} <= second.calls_for("judge")[0]["exclude_families"]
         assert store.events("judge_slot_reused")
         judgements = store.judgements_for(gen["gen_id"])
         assert [j["judge_slot"] for j in judgements] == ["a", "b"]
@@ -1173,7 +1210,7 @@ def test_a_stale_workers_judgement_cannot_overwrite_the_live_decision(tmp_path, 
         # Worker A's slot a lands while it still holds the lease.
         assert store.record_judgement(
             gen["gen_id"], "a",
-            {"provider": "mistral", "model": "mistral-small-latest", "grounding": 5,
+            {"provider": "groq", "model": "qwen/qwen3.6-27b", "grounding": 5,
              "validity": 5, "coverage": 5, "rationale": "a says fine"},
             expect_worker="worker-a",
         ) is True
@@ -1211,7 +1248,7 @@ def test_a_lost_lease_stops_the_decision_being_logged_twice(tmp_path, cfg, paths
         task = only_task(store)
         gen = store.latest_generation(task["task_id"])
         for slot, provider, model in (
-            ("a", "mistral", "mistral-small-latest"),
+            ("a", "groq", "qwen/qwen3.6-27b"),
             ("b", "groq", "qwen/qwen3.6-27b"),
         ):
             store.record_judgement(
@@ -1312,7 +1349,7 @@ def test_the_lease_is_checked_before_the_tiebreak_is_bought(tmp_path, cfg, paths
         task = _claimed(store)
         gen = store.latest_generation(task["task_id"])
         for slot, provider, model, score in (
-            ("a", "mistral", "mistral-small-latest", 5),
+            ("a", "groq", "qwen/qwen3.6-27b", 5),
             ("b", "groq", "qwen/qwen3.6-27b", 1),
         ):
             store.record_judgement(
@@ -1343,7 +1380,7 @@ def test_a_lease_lost_after_the_decision_is_logged_is_not_counted(tmp_path, cfg,
         task = _claimed(store)
         gen = store.latest_generation(task["task_id"])
         for slot, provider, model in (
-            ("a", "mistral", "mistral-small-latest"),
+            ("a", "groq", "qwen/qwen3.6-27b"),
             ("b", "groq", "qwen/qwen3.6-27b"),
         ):
             store.record_judgement(
@@ -1407,7 +1444,7 @@ def test_the_lease_is_checked_before_the_decision_is_logged(tmp_path, cfg, paths
         task = _claimed(store)
         gen = store.latest_generation(task["task_id"])
         for slot, provider, model in (
-            ("a", "mistral", "mistral-small-latest"),
+            ("a", "groq", "qwen/qwen3.6-27b"),
             ("b", "groq", "qwen/qwen3.6-27b"),
         ):
             store.record_judgement(
@@ -1528,9 +1565,9 @@ def test_a_recorded_slot_with_no_resolvable_ref_is_never_reused(cfg):
     """The three ways a recorded judgement cannot stand in for a call, at the
     unit. The ref cases collapse into one: an absent ref makes an empty
     ModelRef, which no config resolves."""
-    live = {"provider": "mistral", "model": "mistral-small-latest",
+    live = {"provider": "groq", "model": "qwen/qwen3.6-27b",
             "grounding": 5, "validity": 4, "coverage": 4, "rationale": "ok"}
-    assert _outcome_from_row(cfg, "a", live).family == "mistral"
+    assert _outcome_from_row(cfg, "a", live).family == "qwen"
     assert _outcome_from_row(cfg, "a", {**live, "coverage": None}) is None
     assert _outcome_from_row(cfg, "a", {**live, "model": "retired-model"}) is None
     assert _outcome_from_row(cfg, "a", {k: v for k, v in live.items()
@@ -1806,25 +1843,30 @@ def test_the_judge_cli_refuses_the_pool_hole_before_claiming(tmp_path, cfg, monk
     """The judge worker is the one that discovers the hole by paying for
     slot A, so it is the one that must not start into it.
 
-    The hole is produced by withholding OPENAI_API_KEY, which is both the
-    realistic case (the paid backstop is the last key an operator funds) and
-    the only way to get one from the shipped config now. It has to be
-    withheld EXPLICITLY: a machine that happens to export it would turn this
-    into a test of nothing, since the refusal it asserts would not happen.
+    THE HOLE IS NOW KEY-SHAPED ON THE SHIPPED POOL, and this test changed with
+    the pool rather than around it. Until 2026-08-19 the judge pool had one
+    free family (qwen) plus mistral, so withholding OPENAI_API_KEY emptied slot
+    B for a mistral generation and the test needed a second generator family to
+    reach it. mistral is gone (calibration: holdout precision 0.237) and gemma
+    is promoted, so there are now TWO free judge families and withholding the
+    paid backstop alone leaves slot B filled by gemma.
 
-    TWO GENERATOR FAMILIES, and it is load-bearing rather than incidental: the
-    hole is reachable only from a MISTRAL generation, because that is what
-    removes mistral from the judge pool and leaves slot B empty. mistral was
-    demoted to judge-only on 2026-08-18, and with one generator family the
-    shipped config has no hole at all - the CLI stops refusing, proceeds past
-    the preflight and starts a real run, which with keys in the environment
-    means live network calls out of a unit test. The suite HUNG on exactly
-    that before this argument existed."""
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
-        monkeypatch.setenv(env, "sk-test")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    Withholding GROQ as well is what empties it, and it is reachable from an
+    ordinary gpt-oss generation with no second family at all: judge families
+    keyed are {gemma}, separation removes nothing (gemma is not gpt-oss), slot
+    A takes gemma, and slot B has no family left. Both keys are withheld
+    EXPLICITLY, because a machine that exports either turns this into a test of
+    nothing.
+
+    THIS TEST HUNG when the pool changed under it, and that is why the
+    construction is spelled out. With no hole the CLI stops refusing, proceeds
+    past the preflight and starts a real run - which with keys in the
+    environment means live network calls out of a unit test."""
+    monkeypatch.setenv("CEREBRAS_API_KEY", "sk-test")
+    for env in ("GROQ_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(env, raising=False)
     monkeypatch.setattr("tuned.data.providers.load_dotenv_keys", lambda path=None: 0)
-    config_path = temp_config(tmp_path, two_generator_families=True)
+    config_path = temp_config(tmp_path)
     with pytest.raises(SystemExit) as excinfo:
         judge_main(["--config", config_path, "--max-batches", "1"])
     assert excinfo.value.code == 2
