@@ -67,9 +67,13 @@ and each one silently corrupts a different downstream number if it is missed:
      model in routing.judge is 131k: the 8k zai-glm-4.7 was removed as
      archived upstream, mistral-small (32k) lost the judge seat when human
      calibration disqualified it, and gemma took that seat. Since the cerebras
-     probes of 2026-08-19 routing.tiebreak has no small tier at all - every
-     model in it declares 131k or more, gemma included, which had been pinned
-     at 8192 by a config value nobody had measured. The judge worker must
+     probes of 2026-08-19 gemma is 131k too, where a config value nobody had
+     measured had pinned it at 8192. routing.tiebreak's smallest is
+     mistral-large-latest at a PROBED 52,812 - which is the number judge.py's
+     copy of this contract carries, and the two must not drift again: this
+     paragraph said "no small tier - every model declares 131k or more" for
+     one commit, which was false the moment mistral-large took the seat. The
+     judge worker must
      still budget-check materials+candidate before dispatch and route anything
      that does not fit past the model that cannot hold it: that the pool
      currently has room everywhere is a fact about today's config, not a

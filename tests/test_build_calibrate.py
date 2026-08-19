@@ -575,7 +575,13 @@ def test_the_whole_flow_runs_on_synthetic_gold(store, cfg, tmp_path):
     assert set(fits) == {JUDGE_GOOD, JUDGE_BAD}
     assert fits[JUDGE_GOOD].disqualified is False
     assert fits[JUDGE_BAD].disqualified is True
-    assert fits[JUDGE_BAD].replacement in [ref.model for ref in cfg.routing_refs("judge")]
+    # NO REPLACEMENT, and that is the fix rather than a regression: JUDGE_BAD
+    # holds no routing.judge seat in this fixture, and a replacement is a
+    # SEAT'S succession. Handing one to a model that never sat on the bench is
+    # what produced the shipped report's inverted advice. The seated case is
+    # pinned by test_a_replacement_goes_only_to_a_model_that_holds_a_judge_seat.
+    assert fits[JUDGE_BAD].replacement is None
+    assert fits[JUDGE_BAD].holds_judge_seat is False
 
     # Only the judge that passed is written, and judge.py now reads the fleet
     # as calibrated rather than provisional.
@@ -590,7 +596,10 @@ def test_the_whole_flow_runs_on_synthetic_gold(store, cfg, tmp_path):
     assert JUDGE_GOOD in report and JUDGE_BAD in report
     assert "DISQUALIFIED" in report
     assert "kappa" in report.lower()
-    assert "named replacement" in report
+    # JUDGE_BAD holds no routing.judge seat in this fixture, so the report
+    # says so instead of naming a successor it has no standing to name.
+    assert "no replacement named" in report
+    assert "named replacement" not in report
 
     event = json.loads(store.events("judges_calibrated")[0]["detail_json"])
     assert event["active"] == [JUDGE_GOOD]
@@ -781,3 +790,64 @@ def test_the_operator_instructions_say_which_way_to_round_a_doubtful_row():
     # to run toward the reader of the dataset. If this sentence goes, the
     # labels it produced afterwards mean something else.
     assert "A ROW YOU WOULD ARGUE ABOUT IS A REJECT" in " ".join(C._INSTRUCTIONS.split())
+
+
+def test_a_replacement_goes_only_to_a_model_that_holds_a_judge_seat(cfg):
+    """THE SHIPPED REPORT GOT THIS BACKWARDS, on exactly this shape.
+
+    `fits` covers every model the gold set carries judgements from, which since
+    2026-08-19 includes TIEBREAK-ONLY seats; the replacement list is
+    routing.judge alone. With no fence between them the disqualified tiebreak
+    model popped the first spare judge off the list, and the shipped
+    data/build/gold/calibration_report.md said so: gemma - then tiebreak-only -
+    was handed "named replacement: gpt-5-mini" while qwen, the actual slot-A
+    judge and also disqualified, was told "NONE LEFT IN routing.judge". The one
+    seat that had a successor available was the one told it had none.
+
+    Constructed as the shipped shape: a disqualified TIEBREAK-ONLY model listed
+    BEFORE a disqualified judge, so the tiebreak model would consume the spare
+    first if the fence were absent.
+    """
+    routed = [ref.model for ref in cfg.routing_refs("judge")]
+    seated_judge, spare_judge = routed[0], routed[1]
+    calibration = C.Calibration(n_gold=46)
+    calibration.fits.extend([
+        C.JudgeFit(model="tiebreak/only", n_gold=9, disqualified=True,
+                   reason="holdout too low"),
+        C.JudgeFit(model=seated_judge, n_gold=46, disqualified=True,
+                   reason="holdout too low"),
+    ])
+
+    C.assign_replacements(calibration, routed)
+
+    by_model = {fit.model: fit for fit in calibration.fits}
+    # The tiebreak-only model makes no claim on the judge bench...
+    assert by_model["tiebreak/only"].replacement is None
+    assert by_model["tiebreak/only"].holds_judge_seat is False
+    # ...so the spare is still there for the seat that really has one.
+    assert by_model[seated_judge].holds_judge_seat is True
+    assert by_model[seated_judge].replacement == spare_judge
+    # ...and the swap record carries the distinction too, because that is what
+    # the operator-facing report and the run_event both read.
+    swaps = {s["model"]: s for s in calibration.swaps}
+    assert swaps["tiebreak/only"]["holds_judge_seat"] is False
+    assert swaps["tiebreak/only"]["replacement"] is None
+    assert swaps[seated_judge]["replacement"] == spare_judge
+
+
+def test_the_report_does_not_claim_a_replacement_for_a_seatless_model(cfg):
+    """The rendering half: a disqualified tiebreak-only model is still
+    REPORTED - the measurement is real and the operator should see it - but the
+    line that would send them shopping for a judge is not printed for it."""
+    calibration = C.Calibration(n_gold=46)
+    seatless = C.JudgeFit(
+        model="tiebreak/only", n_gold=9, disqualified=True,
+        reason="holdout precision too low",
+    )
+    seatless.holds_judge_seat = False
+    calibration.fits.append(seatless)
+    report = C.calibration_report(calibration, cfg)
+
+    assert "tiebreak/only" in report and "DISQUALIFIED" in report
+    assert "named replacement" not in report
+    assert "no replacement named" in report and "routing.tiebreak" in report

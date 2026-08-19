@@ -36,7 +36,9 @@ so the spread is visible rather than averaged away.
 THE HOLDOUT IS TOUCHED ONCE. Fold `calibration.folds` (5, one past the CV
 folds 0-4) never enters a selection. Its precision is the P5 gate: below
 `calibration.min_precision` the judge is DISQUALIFIED and the next model in
-routing.judge that is not already calibrated is named as its replacement. The
+routing.judge that is not already calibrated is named as its replacement -
+but ONLY for a model that holds a routing.judge seat, because a replacement is
+that seat's succession and `fits` also covers tiebreak-only models. The
 swap is named, not performed - routing lives in the YAML, and a module that
 edited it would be moving a fence nobody had read.
 
@@ -625,6 +627,10 @@ class JudgeFit:
     disqualified: bool = False
     reason: str | None = None
     replacement: str | None = None
+    # False for a model the gold set covers that holds no routing.judge seat -
+    # a tiebreak-only model, since 2026-08-19. It is still fitted and still
+    # reported; it just makes no claim on the judge bench. See calibrate().
+    holds_judge_seat: bool = True
 
     @property
     def holdout_precision(self) -> float:
@@ -731,8 +737,53 @@ def _require_block(cfg) -> None:
         )
 
 
-def _routing_models(cfg) -> list[str]:
-    return [ref.model for ref in cfg.routing_refs("judge")]
+def _routing_models(cfg, role: str = "judge") -> list[str]:
+    return [ref.model for ref in cfg.routing_refs(role)]
+
+
+def assign_replacements(calibration: "Calibration", routed: list[str]) -> None:
+    """Name a successor for each disqualified JUDGE, and record the swaps.
+
+    `routed` is routing.judge, in preference order. Mutates the fits in place
+    and appends to `calibration.swaps`.
+
+    A REPLACEMENT IS A JUDGE SEAT'S SUCCESSION, and only a model holding one
+    may claim it. `calibration.fits` covers every model the gold set carries
+    judgements from, which since 2026-08-19 includes TIEBREAK-ONLY seats.
+    Without this fence a disqualified tiebreak model pops the first spare judge
+    off the list, and the shipped report said exactly that: gemma, then
+    tiebreak-only, was handed "named replacement: gpt-5-mini" while qwen - the
+    actual slot-A judge, also disqualified - was told "NONE LEFT IN
+    routing.judge". The one seat with a successor available was the one told it
+    had none.
+
+    A disqualified tiebreak-only model is still REPORTED disqualified: the
+    measurement is real and the operator should see it. What it does not get is
+    a claim on the judge bench; its own seat's succession is routing.tiebreak's
+    business, and this module does not fit that pool.
+
+    Extracted from calibrate() so the property can be tested at the unit rather
+    than only through a whole store.
+    """
+    calibrated = {fit.model for fit in calibration.fits}
+    judge_seats = set(routed)
+    spare = [model for model in routed if model not in calibrated]
+    for fit in calibration.fits:
+        if not fit.disqualified:
+            continue
+        holds_a_judge_seat = fit.model in judge_seats
+        replacement = (spare.pop(0) if spare else None) if holds_a_judge_seat else None
+        fit.replacement = replacement
+        fit.holds_judge_seat = holds_a_judge_seat
+        calibration.swaps.append(
+            {
+                "model": fit.model,
+                "replacement": replacement,
+                "holds_judge_seat": holds_a_judge_seat,
+                "reason": fit.reason,
+                "holdout_precision": fit.holdout_precision,
+            }
+        )
 
 
 def calibrate(store, cfg) -> Calibration:
@@ -769,21 +820,21 @@ def calibrate(store, cfg) -> Calibration:
 
     # A named swap, never a performed one: routing lives in the YAML and a
     # module that rewrote it would be moving a fence nobody had read.
-    calibrated = {fit.model for fit in calibration.fits}
-    spare = [model for model in routed if model not in calibrated]
-    for fit in calibration.fits:
-        if not fit.disqualified:
-            continue
-        replacement = spare.pop(0) if spare else None
-        fit.replacement = replacement
-        calibration.swaps.append(
-            {
-                "model": fit.model,
-                "replacement": replacement,
-                "reason": fit.reason,
-                "holdout_precision": fit.holdout_precision,
-            }
-        )
+    #
+    # A REPLACEMENT IS A JUDGE SEAT'S SUCCESSION, and only a model holding one
+    # may claim it. `fits` covers every model the gold set carries judgements
+    # from, which since 2026-08-19 includes TIEBREAK-ONLY seats; `routed` is
+    # routing.judge alone. Without this fence a disqualified tiebreak model
+    # popped a spare off the judge list and the shipped report said so: gemma,
+    # then tiebreak-only, was handed "replacement gpt-5-mini" while qwen - the
+    # actual slot-A judge, also disqualified - was told "NONE LEFT". The advice
+    # was inverted for the only seat that had one to give.
+    #
+    # A disqualified tiebreak-only model is still REPORTED disqualified: the
+    # measurement is real and the operator should see it. What it does not get
+    # is a claim on the judge bench. Its own seat's succession is
+    # routing.tiebreak's business and this module does not fit that pool.
+    assign_replacements(calibration, routed)
 
     # Inter-judge agreement, over the generations two judges both scored,
     # under each judge's own fitted rule. Measured on the gold set because
@@ -894,9 +945,16 @@ def calibration_report(calibration: Calibration, cfg) -> str:
             )
         if fit.disqualified:
             lines.append(f"- **DISQUALIFIED**: {fit.reason}")
-            lines.append(
-                f"- named replacement: {fit.replacement or 'NONE LEFT IN routing.judge'}"
-            )
+            if fit.holds_judge_seat:
+                lines.append(
+                    f"- named replacement: {fit.replacement or 'NONE LEFT IN routing.judge'}"
+                )
+            else:
+                lines.append(
+                    "- no replacement named: this model holds no routing.judge seat, "
+                    "so it has no judge bench to be replaced on; its own seat's "
+                    "succession is routing.tiebreak's business"
+                )
         lines.append("")
 
     lines += ["## Inter-judge agreement (Cohen's kappa)", ""]
@@ -995,7 +1053,16 @@ def main(argv=None) -> int:
                     f"holdout precision {fit.holdout_precision:.3f}  {state}"
                 )
             for swap in calibration.swaps:
-                print(f"  SWAP {swap['model']} -> {swap['replacement'] or 'NOTHING LEFT'}")
+                if swap.get("holds_judge_seat", True):
+                    print(
+                        f"  SWAP {swap['model']} -> "
+                        f"{swap['replacement'] or 'NOTHING LEFT'}"
+                    )
+                else:
+                    print(
+                        f"  SWAP {swap['model']} -> (no routing.judge seat; "
+                        f"not a judge swap)"
+                    )
     finally:
         store.close()
     return 0

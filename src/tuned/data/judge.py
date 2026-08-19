@@ -1109,6 +1109,21 @@ async def judge_task(
             # fine and a later pass can score it - reusing this slot's
             # judgement if it landed.
             #
+            # A TIEBREAK-PROVIDER KEY FAULT IS BOUNDED BUT NOT LOUD, recorded
+            # 2026-08-19 rather than fixed. providers.ROW_SHAPED_SKIPS covers
+            # `family-excluded` only, so a MISSING OR REJECTED KEY on the
+            # tiebreak provider (no LIGHTNING/MISTRAL key set, or a 401) is not
+            # classed as row-shaped: the tied row is re-queued here and comes
+            # back to the same wall until MAX_JUDGE_ATTEMPTS, then parks in
+            # judge_error. Bounded - 8 claims, no paid calls, re-openable, and
+            # judge_error is exactly where an operator looks - but noisier and
+            # slower than the unroutable park it deserves, which would say
+            # "your key is missing" on the first pass. Left alone because
+            # widening ROW_SHAPED_SKIPS to key faults would change the
+            # GENERATOR's classification too, and that one is load-bearing:
+            # generate.py already distinguishes no_eligible_model from
+            # provider_fault and a keyless wave must not be marked terminal.
+            #
             # LEDGER'D, not fixed (round 4): there is no provider_fault
             # equivalent here. generate.py parks a fleet-wide outage after 3
             # claims with `exhausted:provider-fault`; the judge spends all 8

@@ -1270,7 +1270,7 @@ def test_a_keyless_batch_leaves_the_wave_intact(tmp_path, cfg, paths):
     FIRST pilot launch does. It used to take {'pending': 3} to
     {'rejected': 3} with zero calls made, and `rejected` is terminal."""
     with make_store(tmp_path, n_seeds=3, n_tasks=3) as store:
-        router = FakeRouter(cfg, missing_keys={"cerebras", "mistral"})
+        router = FakeRouter(cfg, missing_keys={"cerebras", "lightning", "mistral"})
         totals = run(store, cfg, router, paths, n_workers=3)
         assert totals["gen_ok"] == 0
         assert totals["errors"] == 3
@@ -1283,7 +1283,7 @@ def test_a_keyless_batch_leaves_the_wave_intact(tmp_path, cfg, paths):
 
 def test_a_missing_key_is_never_a_row_shaped_failure(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg, missing_keys={"cerebras", "mistral"})
+        router = FakeRouter(cfg, missing_keys={"cerebras", "lightning", "mistral"})
         result = asyncio.run(
             generate_once(store, cfg, router, only_task(store), paths=paths)
         )
@@ -1297,7 +1297,7 @@ def test_a_keyless_task_parks_recoverably_at_the_attempt_cap(tmp_path, cfg, path
     nothing about the row was ever judged, so it must not be counted as a
     reject, and re-opening it must be able to bring it back."""
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg, missing_keys={"cerebras", "mistral"})
+        router = FakeRouter(cfg, missing_keys={"cerebras", "lightning", "mistral"})
         for _ in range(MAX_ATTEMPTS):
             run(store, cfg, router, paths)
         task = only_task(store)
@@ -1310,10 +1310,14 @@ def test_a_transient_pool_skip_still_re_queues(tmp_path, cfg, paths):
     """Cooling and over-budget lift on their own, so the row goes back to the
     queue rather than parking."""
     with make_store(tmp_path) as store:
+        # BOTH generator refs have to be transiently out, or the row simply
+        # routes to the other one: since 2026-08-19 routing.generator is
+        # cerebras (free, first) then lightning (paid overflow), and a cooling
+        # cerebras is exactly the case where lightning is meant to answer.
         router = FakeRouter(
             cfg,
             cooling={"cerebras/gpt-oss-120b"},
-            over_budget={"mistral/mistral-small-latest"},
+            over_budget={"lightning/lightning-ai/gpt-oss-120b"},
         )
         result = asyncio.run(
             generate_once(store, cfg, router, only_task(store), paths=paths)
@@ -1329,7 +1333,7 @@ def test_a_transient_pool_skip_still_re_queues(tmp_path, cfg, paths):
 
 def _park_keyless(store, cfg, paths):
     """The motivating park: nothing routable, so the row exhausts unspent."""
-    router = FakeRouter(cfg, missing_keys={"cerebras", "mistral"})
+    router = FakeRouter(cfg, missing_keys={"cerebras", "lightning", "mistral"})
     for _ in range(MAX_ATTEMPTS):
         run(store, cfg, router, paths)
     task = only_task(store)

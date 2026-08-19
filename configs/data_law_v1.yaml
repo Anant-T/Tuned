@@ -217,10 +217,23 @@ providers:
   # WHAT THE STALE PIN COST, so nobody re-tightens it on a hunch: with 8192 as
   # the generator window, undersized_families excluded the ONLY generator
   # family for any prompt over ~6.5k estimated tokens (the 8192 is compared
-  # against est x CONTEXT_SAFETY_MARGIN 1.25), which unroutable'd 85% of the
-  # statute_qa stream - 184+ tasks parked as unroutable:generator in the
-  # 2026-08-19 probe. The provider was never the constraint; the config was.
-  # The same pin on gemma closed the TIEBREAK route for long rows.
+  # against est x CONTEXT_SAFETY_MARGIN 1.25). The provider was never the
+  # constraint; the config was. The same pin on gemma closed the TIEBREAK route
+  # for long rows.
+  #
+  # THE "85%" HAS A DENOMINATOR AND IT IS WORTH STATING, because the figure was
+  # quoted for two commits without one. Counted over the statute_qa stream:
+  #
+  #     270  statute_qa tasks in total
+  #     142  parked gen_unroutable          52.6% of all statute_qa
+  #     123  disposition unroutable:generator  45.6% of all statute_qa
+  #
+  # The 85% was 123/145 - i.e. of the tasks that had REACHED a routing decision,
+  # excluding the 125 still sitting at stale_prompt. That is a real number and
+  # the right one for "of the rows we tried to route, how many did this pin
+  # eat", but it is not 85% of the stream and should not be quoted as if it
+  # were. Roughly 210 rows become newly routable; the rest were never blocked
+  # by this.
   #
   # ANYONE LOWERING THESE AGAIN MUST PROBE FIRST, exactly as above, and record
   # the prompt_tokens and status here. A max_context in this file is a claim
@@ -378,12 +391,24 @@ providers:
       #
       # THE FENCE DOES NOT COVER mistral-large-latest, which is a different
       # model on different weights and is UNPROVEN rather than disqualified.
-      # Nothing here claims it is good; the TIEBREAK SEAT IS WHERE IT GETS
-      # PROVEN. That seat fired 9 times over the 41-task cohort, so even a slow
-      # free tier serves it, and every verdict it casts earns gold-label
-      # coverage - which will qualify it or disqualify it with numbers, the
-      # same way small was. Promoting it to a judge slot before that evidence
-      # exists would be the mistake this fence records.
+      # Nothing here claims it is good.
+      #
+      # WHAT THE TIEBREAK SEAT ACTUALLY BUYS, stated exactly, because the first
+      # version of this fence said it "will be measured the same way small was"
+      # and that is not what the arithmetic supports. The seat earns gold-label
+      # COVERAGE: it fires on 11 of 56 judged generations (20%), so its
+      # verdicts do land in front of the operator. FITTING is a further step
+      # and it needs labels OUTSIDE the holdout - and the seat's previous
+      # occupant is the counter-example: gemma earned 9 gold labels and all 9
+      # landed in the holdout fold, leaving ZERO fittable rows and a
+      # DISQUALIFIED-for-no-data verdict that says nothing about the model. At
+      # the current scale (46 labels, holdout 40) only 6 rows were fittable at
+      # all, for any judge. So a real fit on this seat is realistic at GOLD
+      # ROUND 2 SCALE (~180 labels), not before.
+      #
+      # Until then this is a bet with its evidence pending, and promoting it to
+      # a judge slot before that evidence exists is the mistake this fence
+      # records.
       #
       # LICENSING, recorded so the card's provenance story stays coherent:
       # mistral-large weights are NOT Apache-2.0 (small and magistral are). It
@@ -461,20 +486,77 @@ providers:
       #   probed. It only has to clear required_context(worst-case tiebreak) =
       #   29,666, which it does by 78%.
       #
-      #   rpm 2 / tpm 30000 / tpd 500000 ARE FLOORS, NOT MEASUREMENTS. The free
-      #   "Experiment" tier publishes no per-key figures worth pinning, so
-      #   these are chosen for the ROLE's shape instead: the tiebreak fired 9
-      #   times over 41 tasks, so a low rpm costs nothing. tpm is set above one
+      #   rpm 2 / tpm 30000 / tpd 5000000 ARE FLOORS, NOT MEASUREMENTS. The
+      #   free "Experiment" tier publishes no per-key figures worth pinning, so
+      #   these are chosen for the ROLE's shape instead: the tiebreak fires on
+      #   ~20% of judged rows, so a low rpm costs nothing. tpm is set above one
       #   whole tiebreak call (~24k prompt + 1k reply) on purpose - below it,
       #   TokenBucket clamps the charge to capacity and every call waits a full
       #   60s refill first, which is correct but needlessly slow.
+      #
+      #   tpd RAISED 500,000 -> 5,000,000, and the first value was a floor set
+      #   too low to do the job. At ~24k tokens a worst-case tiebreak call,
+      #   500k bought about 21 calls a day; draining the ~210 rows the cerebras
+      #   probe made newly routable implies roughly 42. A floor that throttles
+      #   the work it was sized for is not conservative, it is wrong in the
+      #   expensive direction - the row waits and the ledger says "budget",
+      #   which reads like a provider limit and is not one. 5,000,000 is still
+      #   far under the published free-tier scale (order 1B/month) and is still
+      #   a FLOOR, not a measurement.
       - id: mistral-large-latest
         family: mistral
         roles: [tiebreak]
-        limits: {rpm: 2, tpm: 30000, tpd: 500000, max_context: 52812, max_output: 8192}
+        limits: {rpm: 2, tpm: 30000, tpd: 5000000, max_context: 52812, max_output: 8192}
         params: {}
         role_params:
           tiebreak: {temperature: 0.2}
+  # LIGHTNING IS THE PAID OVERFLOW FOR THE GENERATOR, AND IT IS SECOND IN
+  # routing.generator ON PURPOSE - see the cost ruling there. Added 2026-08-19.
+  #
+  # THE REPLY SHAPE WAS CHECKED BEFORE THE BLOCK WAS WRITTEN, because a silent
+  # mismatch would park every Lightning generation as traceless and we would
+  # have paid to discover it. Probed 2026-08-19 on lightning-ai/gpt-oss-120b:
+  #
+  #     message keys   ['content', 'reasoning_content', 'role']
+  #     content            str, the answer
+  #     reasoning_content  str, the trace - a PLAIN STRING, not Mistral's
+  #                        typed-chunk list and not an inline <think> block
+  #
+  # providers._default_response_hook already reads exactly that field
+  # (`message.get("reasoning") or message.get("reasoning_content")`), so this
+  # provider needs NO quirk of its own and generate.assemble_content wraps the
+  # trace in the trainer's tags unchanged. That is why `quirks` is empty below
+  # rather than absent-by-oversight, and a test pins the shape.
+  #
+  # max_context 51274 IS A MEASURED FLOOR, on the same discipline the cerebras
+  # block records: probed 2026-08-19, one call, max_tokens 16, temperature 0 ->
+  # HTTP 200, prompt_tokens 51274, finish_reason stop. The catalog advertises
+  # 128K; this file records what was asked for and got a 200. It only has to
+  # clear the longest prompt this build makes (measured 1,445-2,799 routing
+  # tokens), which it does by more than an order of magnitude.
+  #
+  # rpm 60 / tpm 500000 / tpd 50000000 ARE INVENTED FLOORS, not measurements,
+  # and they are deliberately generous because this provider is PAID: the
+  # binding constraint on it is the operator's wallet and the cost ruling in
+  # routing.generator, not a rate limit. Nothing here probed them.
+  #
+  # LICENSING / ToS: lightning-ai/* are OPEN WEIGHTS (gpt-oss is Apache-2.0)
+  # SELF-HOSTED by Lightning, so the upstream vendor is not a party to this
+  # transaction and only Lightning's own terms apply. THOSE TERMS HAVE NOT BEEN
+  # VERIFIED HERE - the operator has been asked to skim them and had not
+  # reported back when this landed. Recorded as pending rather than clean,
+  # because the generator's output is what ships in the dataset and its terms
+  # are the ones that bind.
+  - name: lightning
+    base_url: https://lightning.ai/api/v1
+    api_key_env: LIGHTNING_API_KEY
+    quirks: []
+    models:
+      - id: lightning-ai/gpt-oss-120b
+        family: gpt-oss
+        roles: [generator]
+        limits: {rpm: 60, tpm: 500000, tpd: 50000000, max_context: 51274, max_output: 4096}
+        params: {temperature: 0.7, top_p: 0.95, reasoning_effort: medium}
   - name: openai
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
@@ -593,14 +675,17 @@ providers:
 # 1,445-2,799, so the cliff is now two orders of magnitude away. The judge-gap
 # reasoning above still holds for any FUTURE pool where a divert is real.
 #
-# THE FALLBACK WINDOW SHRANK 40k -> 32k on 2026-08-18, when the retired
-# magistral block was replaced by mistral-small-latest. What that costs is the
-# CEILING on a divertable prompt, not the divert point: the long-prompt
-# generator can now hold about 21,600 routing tokens of prompt where magistral
-# held about 28,000. The cliff is far from this corpus - measured pilot prompts
-# ran 1,445-2,799 routing tokens, an order of magnitude clear - and a prompt
-# that did exceed it is not silently truncated: undersized_families excludes
-# the family before the call and the row parks in gen_unroutable, recoverably.
+# THE FALLBACK GENERATOR IS HISTORY - THERE IS NO SECOND GENERATOR FAMILY.
+# This paragraph described mistral-small-latest as the long-prompt fallback and
+# reasoned about its 32k ceiling (21,600 routing tokens of prompt against
+# magistral's 28,000). Both premises are gone: mistral-small stopped generating
+# on 2026-08-18 and left the build entirely on 2026-08-19, and since then
+# routing.generator has been cerebras first, lightning second - one FAMILY,
+# gpt-oss, on two providers. A prompt too long for it therefore has nowhere to
+# divert and parks in gen_unroutable, recoverably, rather than being silently
+# truncated - undersized_families excludes the family before any call is made.
+# Kept as history because the divert MACHINERY is intact and any future
+# second-family generator brings this arithmetic straight back.
 #
 # Recovery for rows that parked before this landed: `python -m
 # tuned.data.tasks --reopen judge_unroutable` (every stream by default;
@@ -644,7 +729,19 @@ routing:
   # than assumed: at the stale 8192 pin that cliff sat at 6,554 routing tokens
   # and swallowed 85% of the statute_qa stream; at the probed 131,072 it sits
   # at 104,858, against pilot prompts of 1,445-2,799. See the cerebras block.
-  generator: [cerebras/gpt-oss-120b]
+  # COST FIRST, AND THE ORDER IS THE POLICY. cerebras is a free tier and
+  # lightning is paid, so the free budget drains before the paid provider takes
+  # over: Router.pick walks this list in order and only moves on when a ref is
+  # ineligible - cooling, over its daily budget, or unkeyed - so putting
+  # cerebras first IS the cost control. Reversing these two lines would spend
+  # money while a free quota sat unused, and nothing else in the build would
+  # notice. A test pins the order and the failover.
+  #
+  # Both entries are family gpt-oss, so this is one generator FAMILY on two
+  # providers rather than a second family: family separation still removes
+  # gpt-oss from the judge pool for every row, and undersized_families still
+  # takes the family's largest window.
+  generator: [cerebras/gpt-oss-120b, lightning/lightning-ai/gpt-oss-120b]
   # JUDGE: qwen then gemma, the two free families, then the paid backstops -
   # which is the standing "every free judge is preferred to the paid one" rule.
   # On a gpt-oss generation family separation removes both openai models, so

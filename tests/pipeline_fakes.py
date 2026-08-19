@@ -525,11 +525,22 @@ def cfg_with_extra_judge(
 # tests assert gap tuples and refusal strings that carry it.
 SECOND_GENERATOR_FAMILY = "secondgen"
 SECOND_GENERATOR_REF = "cerebras/second-generator"
-# Mirrors the window the departed mistral-small judge declared. Tests about
-# "each generator family is checked at the size its OWN window permits" need
-# one family genuinely narrower than the length band's longest row; with both
-# families at 131k there is nothing to narrow and those tests assert nothing.
-# It is a fixture value now rather than a fact about anybody's pool.
+# The window the fixture's second generator declares. Mirrors what the departed
+# mistral-small judge carried, so the pool shape the older tests were written
+# against is preserved.
+#
+# ITS VALUE IS NOT LOAD-BEARING, and the previous comment here claimed it was.
+# It said tests about "each generator family is checked at the size its OWN
+# window permits" assert nothing without it - and the review disproved that by
+# setting it to 131072 and watching all 3101 tests stay green. Measured: the
+# per-family judge sizer returns the FLAT worst case (23,729) for every window
+# at or above 16,384, and only narrows below that - 12,000 gives 22,151 and
+# 8,192 gives 19,104. At 32,000 it narrows nothing and never did.
+#
+# What actually exercises the narrowing is _narrow_generator's 8192 in the
+# generate and providers suites. The curve itself is pinned by
+# test_the_judge_sizer_only_narrows_below_the_flat_worst_case, so a change to
+# the sizing rule is caught even though this constant does not catch it.
 SECOND_GENERATOR_CONTEXT = 32000
 
 

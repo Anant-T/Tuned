@@ -18,6 +18,7 @@ httpx = pytest.importorskip("httpx")
 
 from pipeline_fakes import (  # noqa: E402
     NARROW_GENERATOR_CONTEXT,
+    SECOND_GENERATOR_CONTEXT,
     cfg_without_the_free_tiebreak,
     cfg_without_the_promoted_judge,
     cfg_with_context,
@@ -1325,7 +1326,11 @@ def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys
             # second generator family lives under cerebras too, so failing the
             # whole provider would fail both refs and there would be nothing
             # to fail over TO.
-            if model.id == "gpt-oss-120b":
+            # Both cerebras generators AND the paid lightning overflow are
+            # failed, so the fixture's own second family is what answers. The
+            # test is about WHICH ref the params were resolved for, so it needs
+            # the answering ref to be a different one from the first tried.
+            if model.family == "gpt-oss":
                 return httpx.Response(500, text="down")
             return httpx.Response(200, json=_body())
 
@@ -1350,7 +1355,7 @@ def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys
     )
     assert ref == ModelRef("cerebras", "second-generator")
     assert payloads[0]["reasoning_effort"] == "high"      # cerebras/gpt-oss-120b
-    assert "reasoning_effort" not in payloads[1]          # the second family
+    assert "reasoning_effort" not in payloads[-1]         # the second family
 
 
 def test_params_for_ref_overrides_params(cfg, keys):
@@ -1509,11 +1514,12 @@ def test_build_check_request_is_pure():
 def test_check_refs_covers_every_configured_model(cfg):
     refs = check_refs(cfg)
     expected = sum(len(p.models) for p in cfg.providers)
-    # 7: the magistral generator block went when the line was retired upstream
+    # 8: the magistral generator block went when the line was retired upstream
     # and zai-glm-4.7 went on 2026-08-18 when it was archived. The mistral
     # block survives the 2026-08-19 judge surgery - mistral-SMALL lost the
-    # judge seat to calibration, and mistral-LARGE took the tiebreak seat.
-    assert len(refs) == expected == 7
+    # judge seat to calibration, and mistral-LARGE took the tiebreak seat - and
+    # lightning/gpt-oss-120b joined the same day as the paid generator overflow.
+    assert len(refs) == expected == 8
     assert ModelRef("groq", "qwen/qwen3.6-27b") in refs
     assert check_refs(cfg, "groq/qwen/qwen3.6-27b") == (ModelRef("groq", "qwen/qwen3.6-27b"),)
     with pytest.raises(KeyError):
@@ -1783,10 +1789,11 @@ def test_unkeyed_roles_names_the_role_and_the_env_vars(cfg, monkeypatch):
     _unset(monkeypatch, "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENAI_API_KEY")
     gaps = unkeyed_roles(cfg, ("generator", "judge"))
     assert set(gaps) == {"generator", "judge"}
-    # The generator role routes to ONE provider since the 2026-08-18 demotion,
-    # so its key list is exactly cerebras - and that key is now load-bearing
-    # rather than merely preferred.
-    assert gaps["generator"] == ("CEREBRAS_API_KEY",)
+    # TWO providers on the generator role since 2026-08-19: cerebras (free,
+    # first) and lightning (paid, the overflow). Both keys are named because
+    # either one alone makes the role usable - the list is the failover, and
+    # the ORDER of the refs is where the cost policy lives, not here.
+    assert gaps["generator"] == ("CEREBRAS_API_KEY", "LIGHTNING_API_KEY")
     assert "GROQ_API_KEY" in gaps["judge"]
     # One key is enough to make a role usable: the rest is failover.
     monkeypatch.setenv("GROQ_API_KEY", "sk-test")
@@ -2923,14 +2930,25 @@ def test_the_config_block_records_the_probe_that_set_the_window(cfg, keys):
     Pinned because the cost is not hypothetical - the stale value unroutable'd
     85% of the statute_qa stream, and it survived three review rounds by
     looking like a fact."""
+    # ANCHORED TO THE CEREBRAS BLOCK, not to the file. Deleting the whole
+    # 41-line cerebras provenance block used to leave 5 of 6 assertions green,
+    # because later blocks (the mistral fence, the lightning block) also carry
+    # "2026-08-19" and "HTTP 200" - so the test passed while the evidence it
+    # exists to protect was gone. Each assertion now carries a
+    # cerebras-unique token.
     text = DATA_CONFIG.read_text(encoding="utf-8")
-    assert "2026-08-19" in text
-    for evidence in ("prompt_tokens 13515", "prompt_tokens 10252", "HTTP 200"):
+    for evidence in (
+        "cerebras/gpt-oss-120b   prompt_tokens 13515   HTTP 200",
+        "cerebras/gemma-4-31b    prompt_tokens 10252   HTTP 200",
+    ):
         assert evidence in text, evidence
+    # The date must sit ON one of those probe lines, not merely somewhere.
+    assert "2026-08-19  cerebras/gpt-oss-120b" in text
     # ...and the tpm interaction the bigger window opens is answered in the
     # same place, because 131k against a 30k/minute budget is the first thing
     # a reader will worry about.
-    assert "tpm" in text and "_need_tokens" in text
+    assert "_need_tokens" in text
+    assert "tpm 30,000" in text or "tpm STAYS 30,000" in text
 
 
 def test_the_probed_windows_are_what_the_config_declares(cfg):
@@ -3137,6 +3155,157 @@ def test_a_tiebreak_resolves_to_mistral_for_a_row_qwen_and_gemma_judged(cfg, key
     assert next(
         without.eligible_refs("tiebreak", exclude_families=base | {fam_a, fam_b}), None
     ) is None
+
+
+def test_the_judge_sizer_only_narrows_below_the_flat_worst_case(cfg, keys):
+    """WHERE THE PER-FAMILY NARROWING ACTUALLY TURNS ON, measured.
+
+    `needed_for_window` exists so a generator family too small to produce the
+    length band's longest row does not have its judge slots checked at that
+    length. The curve has a cliff and the fixtures were on the wrong side of
+    it: pipeline_fakes.SECOND_GENERATOR_CONTEXT (32,000) narrows NOTHING, and
+    the comment there claimed the opposite until the review set it to 131072
+    and found the whole suite still green.
+
+    So the curve is pinned here instead. A change to the sizing rule moves
+    these numbers and fails loudly, which is the protection the inert constant
+    was pretending to give.
+    """
+    two = cfg_with_two_generator_families(cfg)
+    sizer, flat = judge_sizer(two), worst_case_judge_tokens(two)
+
+    # At and above the cliff the hook is a no-op...
+    assert sizer(16384, "judge") == flat
+    assert sizer(SECOND_GENERATOR_CONTEXT, "judge") == flat
+    assert sizer(131072, "judge") == flat
+    assert sizer(None, "judge") == flat
+    # ...and below it the family is checked at what it can really produce.
+    assert sizer(12000, "judge") < flat
+    assert sizer(NARROW_GENERATOR_CONTEXT, "judge") < sizer(12000, "judge")
+    # The fixture window and the constant cannot drift apart.
+    windows = {
+        m.id: m.limits["max_context"]
+        for p in two.providers
+        for m in p.models
+        if m.id == "second-generator"
+    }
+    assert windows["second-generator"] == SECOND_GENERATOR_CONTEXT
+
+
+def test_the_generator_prefers_the_free_provider_and_fails_over_to_the_paid_one(cfg, keys):
+    """THE COST POLICY IS THE LIST ORDER, so it is pinned like one.
+
+    cerebras is a free tier and lightning is paid. Router.pick walks
+    routing.generator in order and only moves on when a ref is INELIGIBLE, so
+    "cerebras first" is the whole of the control that drains the free quota
+    before money is spent. Reversing the two lines would spend from call one
+    and nothing else in the build would notice.
+
+    Both halves are asserted: the preference, and the failover that makes the
+    preference safe rather than merely cheap.
+    """
+    free = ModelRef("cerebras", "gpt-oss-120b")
+    paid = ModelRef("lightning", "lightning-ai/gpt-oss-120b")
+    assert list(cfg.routing.generator) == [
+        "cerebras/gpt-oss-120b",
+        "lightning/lightning-ai/gpt-oss-120b",
+    ], "the free provider must be listed first - this ordering IS the cost policy"
+
+    # Preference: with everything eligible, the free one answers.
+    assert _router(cfg).pick("generator").ref == free
+
+    # Failover on BUDGET, which is the case the ordering exists for: the free
+    # tier's daily quota runs out and the paid overflow takes the row.
+    spent = _router(
+        cfg, budget_ok=lambda provider, model, tokens: provider != "cerebras"
+    )
+    assert spent.pick("generator").ref == paid
+
+    # ...and on the other two transient reasons a ref is passed over.
+    cooling = _router(cfg)
+    cooling.report_failure(free)
+    for _ in range(10):
+        cooling.report_failure(free)
+    assert cooling.pick("generator").ref == paid
+
+
+def test_the_lightning_reply_shape_needs_no_quirk_of_its_own(cfg):
+    """THE COMPATIBILITY CHECK, pinned so it cannot rot into a paid surprise.
+
+    Probed 2026-08-19 on lightning-ai/gpt-oss-120b: the message carries
+    `content` (the answer) and `reasoning_content` (the trace) as PLAIN
+    STRINGS - not Mistral's typed-chunk list, and not an inline <think> block.
+    providers._default_response_hook already reads that field, so the provider
+    declares no quirks and generate.assemble_content wraps the trace unchanged.
+
+    The misreading this rejects is that a new provider needs a new hook. It
+    does not - but a provider whose trace field this hook does NOT read would
+    park every generation as traceless, which on a paid provider is money spent
+    to discover a shape. So the shape is asserted here rather than in a live
+    call.
+    """
+    from tuned.data.providers import QUIRKS, _default_response_hook
+
+    lightning = next(p for p in cfg.providers if p.name == "lightning")
+    assert lightning.quirks == (), (
+        "lightning uses the default OpenAI hook; a quirk here would mean the "
+        "shape changed and the comment in the config is stale"
+    )
+    assert all(q in QUIRKS for q in lightning.quirks)
+
+    probed = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "### Step-by-Step Reasoning\nThe tenant may withhold.",
+                "reasoning_content": "We need to answer as per policy. The user asks...",
+            }
+        }]
+    }
+    text, reasoning = _default_response_hook(probed)
+    assert text.startswith("### Step-by-Step")
+    assert reasoning.startswith("We need to answer")
+
+
+def test_a_lightning_reply_assembles_into_a_real_think_block(cfg):
+    """The other end of the same check: what the gates will actually see.
+
+    A traceless park is the failure this is guarding against, so the assertion
+    is that `think` is NOT None and that the content carries the trainer's tag
+    pair around the reasoning the provider returned.
+    """
+    from types import SimpleNamespace
+
+    from tuned.data.generate import assemble_content
+
+    response = SimpleNamespace(
+        text="The tenant may withhold rent.",
+        reasoning="First, identify the covenant. Then the remedy.",
+    )
+    content, think, answer = assemble_content(cfg, response)
+    assert think == "First, identify the covenant. Then the remedy."
+    assert answer == "The tenant may withhold rent."
+    assert content.startswith(cfg.think_open)
+    assert cfg.think_close in content
+    # ...and the traceless shape still parks rather than inventing a trace.
+    bare = SimpleNamespace(text="No trace here.", reasoning=None)
+    assert assemble_content(cfg, bare)[1] is None
+
+
+def test_the_lightning_window_is_the_probed_floor(cfg):
+    """Same discipline as the cerebras and mistral blocks: the number in the
+    config is one a call actually returned 200 for, not a catalog figure."""
+    caps = {
+        f"{p.name}/{m.id}": m.limits.get("max_context")
+        for p in cfg.providers
+        for m in p.models
+    }
+    assert caps["lightning/lightning-ai/gpt-oss-120b"] == 51274
+    text = DATA_CONFIG.read_text(encoding="utf-8")
+    assert "prompt_tokens 51274" in text
+    # ...and it clears the longest prompt this build makes by a wide margin, so
+    # the floor understating the real window costs nothing.
+    assert caps["lightning/lightning-ai/gpt-oss-120b"] > 10 * 2799
 
 
 def test_eligible_refs_is_the_filter_eligible_itself_uses(cfg, keys):

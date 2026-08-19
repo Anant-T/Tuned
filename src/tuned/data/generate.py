@@ -190,6 +190,19 @@ EFFORT_LADDER_RETIRED = "2026-08-18: measured uniformly negative, see pilot"
 #
 # gpt-oss is deliberately absent: it declares `reasoning_effort: medium` in the
 # config and reasons by default, so its configured value stands untouched.
+#
+# THE KEY IS A FAMILY, AND THE MEASUREMENT WAS ON ONE MODEL IN IT. `high` was
+# probed on mistral-SMALL (Small 4), whose API accepts only 'none' or 'high'.
+# The family now contains mistral-LARGE, which holds the tiebreak seat and has
+# never been probed for this parameter. Nothing reaches it today - this dict is
+# consulted for the GENERATOR role only and no mistral model generates - but
+# promoting mistral-large to generator would silently send it a value measured
+# on different weights, and an unknown `reasoning_effort` is a 400 that
+# providers.py raises straight through without failing over.
+#
+# Left keyed by family rather than by model id on purpose: a per-model key
+# would imply this build knows something per-model, and it does not. The trap
+# is written down instead, which is the cheaper true statement.
 GENERATOR_REASONING_PARAMS: dict[str, dict] = {
     "mistral": {"reasoning_effort": "high"},
 }
