@@ -1196,8 +1196,15 @@ def reply_over_budget(cfg, think: str | None, answer: str | None) -> int:
     chars/4; on the shipped config a row whose prompt is short can spend that
     remainder on a reply of 32,760 characters, twice this budget, and pass
     every gate. The per-family judge sizing would then have cleared a judge
-    that cannot hold the row: the whole 23,729 -> 15,104 narrowing IS this
-    assumption, and the window contributes almost nothing beside it.
+    that cannot hold the row: the whole 23,729 -> 15,104 narrowing WAS this
+    assumption, and the window contributed almost nothing beside it.
+
+    PAST TENSE ON PURPOSE. That narrowing was computed against a generator
+    window of 8192, which the 2026-08-19 probes retired: at 131k the sizer
+    narrows nothing on the shipped config and the flat worst case applies
+    everywhere. The premise this function enforces is unchanged and still
+    load-bearing - it is what any FUTURE narrow-window generator would rest
+    on - but nothing in the shipped pool currently depends on it.
 
     On a well-behaved provider this never fires - which is the point of
     picking a bound that is a physical fact about the call rather than a
@@ -1394,15 +1401,24 @@ async def generate_once(
     # ROUTING currency, not the gates' - see PromptBundle. chars/4 over the
     # rendered messages models neither the chat template's per-turn overhead
     # nor Devanagari (which tokenizes 2-4x harder than the estimate assumes),
-    # and under-counting here is what puts an over-long prompt at an 8k model.
+    # and under-counting here is what puts an over-long prompt at a model that
+    # cannot hold it.
     est_tokens = bundle.context_est_tokens + max_tokens
-    # CONTEXT ROUTING. cerebras/gpt-oss-120b is an 8k-context model and the
-    # first generator in the preference list; a long seed makes
-    # prompt + max_tokens exceed that, which is a 400. providers.py now
-    # RECOGNISES a context-overflow 400 and fails over rather than aborting,
-    # but reaching that point still costs a paid round trip and a wasted
-    # attempt, so the families that cannot hold this prompt are excluded
-    # before the call and it routes to magistral (40k) directly.
+    # CONTEXT ROUTING, and it is DRIVEN BY THE CONFIG, never by a number
+    # written here. A prompt longer than the chosen generator's window is a
+    # 400; providers.py RECOGNISES a context-overflow 400 and fails over
+    # rather than aborting, but reaching that point still costs a paid round
+    # trip and a wasted attempt, so families that cannot hold this prompt are
+    # excluded before the call.
+    #
+    # WHAT THAT MEANT IN PRACTICE MOVED BY 16x ON 2026-08-19 and the lesson is
+    # worth keeping at the call site. This comment used to say the sole
+    # generator was "an 8k-context model" and that a long prompt "routes to
+    # magistral (40k) directly": magistral was retired on 2026-08-18, leaving
+    # nowhere to route, and the 8k was a config value nobody had probed - the
+    # provider serves 131k. Together those two stale facts parked 85% of the
+    # statute_qa stream in gen_unroutable for a limit that did not exist. The
+    # exclusion below never needed changing; only the beliefs about it did.
     too_small = undersized_families(cfg, "generator", est_tokens)
     params_for_ref = effort_params_for_ref(attempt)
 

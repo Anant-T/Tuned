@@ -433,6 +433,15 @@ def cfg_with_split_pools(cfg: BuildConfig, *, judge_context: int, tiebreak_conte
     prompt requires and what the (slightly longer) tiebreak prompt requires -
     the two are sized separately, and nothing else in the config can tell them
     apart.
+
+    EVERY PRE-EXISTING TIEBREAK IS NARROWED OUT, which is what makes
+    ``tiebreak_context`` decisive rather than merely present. Until 2026-08-19
+    that happened by accident: the shipped tiebreak pool was gpt-oss (removed
+    by family separation on a gpt-oss row) plus gemma at a stale 8192 (removed
+    on length), so the caller's model was the only one left. The gemma probe
+    put it at 131k, it started satisfying the check on its own, and both
+    callers of this helper went green while measuring nothing. The exclusion
+    is now explicit and survives the next window correction.
     """
     from dataclasses import replace
 
@@ -445,12 +454,21 @@ def cfg_with_split_pools(cfg: BuildConfig, *, judge_context: int, tiebreak_conte
             params={"temperature": 0.2},
         )
 
+    def narrow(m):
+        if "tiebreak" not in m.roles:
+            return m
+        return replace(m, limits={**m.limits, "max_context": 1024})
+
     extra = (
         model("fourth-judge", "fourth", "judge", judge_context),
         model("fifth-tiebreak", "fifth", "tiebreak", tiebreak_context),
     )
     providers = tuple(
-        replace(p, models=p.models + extra) if p.name == "groq" else p for p in cfg.providers
+        replace(
+            p,
+            models=tuple(narrow(m) for m in p.models) + (extra if p.name == "groq" else ()),
+        )
+        for p in cfg.providers
     )
     return replace(
         cfg,
@@ -618,14 +636,41 @@ def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
     return str(path)
 
 
-# Long enough that prompt + max_tokens passes 8k - so the cerebras generator
-# cannot hold it, and the routing has to move - while the prompt + trace +
-# answer still fit the 8192-token length band, so the move happens without the
-# length gate firing and masking the result. It named the glm judge as the
-# other model it defeats until 2026-08-18; that model is gone, and every judge
-# left holds 8k comfortably, so the generator window is the whole of what this
-# length is chosen against now.
+# Long enough that prompt + max_tokens needs 11,008 tokens of declared window
+# (measured: 4,711 estimated prompt tokens + 4,096 max_output, times
+# CONTEXT_SAFETY_MARGIN), while prompt + trace + answer still fit the
+# 8192-token length band - so a test can move the routing without the length
+# gate firing and masking the result.
+#
+# IT IS NO LONGER LONG FOR THE SHIPPED POOL, and that is the point of saying
+# the number out loud. This constant was sized against a cerebras max_context
+# of 8192; the 2026-08-19 probes put the real window at 131,072, so on the
+# shipped config nothing excludes it and any test that still expected a divert
+# was measuring a config that no longer exists. Tests that need "too long for
+# the generator" must now SHRINK THE WINDOW rather than grow the text -
+# cfg_with_context(cfg, family="gpt-oss", role="generator", max_context=8192)
+# reproduces the old exclusion exactly, and refuses if the pool moves under
+# it. Growing the text instead would need ~420,000 characters, which the
+# length band would reject long before the router saw it.
 LONG_SEED_TEXT = (SEED_TEXT + " ") * 60
+
+# The window that makes LONG_SEED_TEXT too long, as a name rather than a
+# literal sprinkled through the suite. Any value below 11,008 works; 8192 is
+# used because it is the window the pilot actually ran against and the tests
+# that quote it are describing that history.
+NARROW_GENERATOR_CONTEXT = 8192
+
+# A seed no model in the SHIPPED pool can hold, for the tests that are about
+# the row rather than about the pool. Sized against the real 131,072 rather
+# than narrowed by fixture, because "no generator can hold this" is the thing
+# those tests assert and a fixture would make it true by construction.
+#
+# The arithmetic, so the next window change can redo it: exclusion needs
+# required_context(est + max_output) > 131,072, i.e. est > 100,762 at
+# CONTEXT_SAFETY_MARGIN 1.25 and max_output 4,096. At 4 chars/token that is
+# 403,048 characters; 450,000 clears it with room and still costs a test
+# nothing but memory.
+OVERSIZE_SEED_TEXT = "word " * 90_000
 
 # Everything a transition seed must carry: the four template slots AND the
 # two dates, without which check_temporal is fatally undecidable on this

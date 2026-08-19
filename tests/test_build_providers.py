@@ -17,6 +17,7 @@ import pytest
 httpx = pytest.importorskip("httpx")
 
 from pipeline_fakes import (  # noqa: E402
+    NARROW_GENERATOR_CONTEXT,
     cfg_with_context,
     cfg_with_two_generator_families,
     cfg_with_split_pools,
@@ -180,6 +181,42 @@ def _complete(client: ChatClient, req: ChatRequest):
             await client.aclose()
 
     return asyncio.run(run())
+
+
+def _narrow_generator(cfg):
+    """The sole generator family cut back to the window the pilot ran against.
+
+    Needed since 2026-08-19. Both cerebras models were pinned at 8192 by a
+    config value nobody had probed; the probes put them at 131,072, so every
+    property that is ABOUT a generator too small for the row it is handed now
+    has to construct one. cfg_with_context refuses a (family, role) it did not
+    find, so this cannot quietly no-op the way the stale pin did.
+    """
+    return cfg_with_context(
+        cfg, family="gpt-oss", role="generator", max_context=NARROW_GENERATOR_CONTEXT
+    )
+
+
+def _narrow_tiebreak(cfg):
+    """gemma cut back the same way, and it is what re-creates the tiebreak gap
+    the shipped pool no longer has: gemma is the only tiebreak family that
+    separation leaves for a gpt-oss row, so at its real 131k there is nothing
+    for the context check to remove and the preflight reports no gaps at all.
+    """
+    return cfg_with_context(cfg, family="gemma", role="tiebreak", max_context=8192)
+
+
+def _pre_probe_pool(cfg):
+    """The cerebras pool exactly as it was before the 2026-08-19 probes.
+
+    BOTH windows, not just one, and the difference is measurable rather than
+    tidy: the generator's window feeds the per-family judge sizing, so with it
+    at 8192 the gpt-oss family is checked at 19,108 tokens instead of 23,733,
+    and the advice a tiebreak gap prints is 29,661 rather than 29,666. A
+    fixture that narrowed only the tiebreak would reproduce the gap but not
+    the number, which is the whole of what the config block is pinned against.
+    """
+    return _narrow_tiebreak(_narrow_generator(cfg))
 
 
 def _unset(monkeypatch, *names: str) -> None:
@@ -1366,20 +1403,44 @@ def test_undersized_families_over_the_real_pool(cfg):
     # filter can remove is the 32k one.
     assert undersized_families(cfg, "judge", 20000) == frozenset()
     assert undersized_families(cfg, "judge", 40000) == frozenset({"mistral"})
-    # The generator pool is ONE family since 2026-08-18: cerebras/gpt-oss-120b
-    # at 8k. Past that window there is no other family to fall back to, which
-    # is why an over-long row now parks instead of diverting.
+    # The generator pool is ONE family since 2026-08-18: cerebras/gpt-oss-120b,
+    # and since the 2026-08-19 probe it holds 131,072 rather than the 8192 the
+    # config had claimed since the beginning. Past that window there is no
+    # other family to fall back to, which is why an over-long row parks instead
+    # of diverting - but the window is now two orders of magnitude above
+    # anything this build produces (pilot prompts ran 1,445-2,799).
     assert undersized_families(cfg, "generator", 4000) == frozenset()
-    assert undersized_families(cfg, "generator", 20000) == frozenset({"gpt-oss"})
-    assert undersized_families(cfg, "generator", 60000) == frozenset({"gpt-oss"})
+    assert undersized_families(cfg, "generator", 20000) == frozenset()
+    assert undersized_families(cfg, "generator", 60000) == frozenset()
+    # The cliff is where the code puts it, not where a comment says: 131,072 /
+    # CONTEXT_SAFETY_MARGIN. One token either side of it.
+    assert undersized_families(cfg, "generator", 104_858) == frozenset()
+    assert undersized_families(cfg, "generator", 104_859) == frozenset({"gpt-oss"})
+    # ...and the filter itself is unchanged - narrow the window back to the
+    # value the pilot ran against and the old exclusions return verbatim.
+    narrow = cfg_with_context(
+        cfg, family="gpt-oss", role="generator", max_context=NARROW_GENERATOR_CONTEXT
+    )
+    assert undersized_families(narrow, "generator", 20000) == frozenset({"gpt-oss"})
+    assert undersized_families(narrow, "generator", 6_554) == frozenset()
+    assert undersized_families(narrow, "generator", 6_555) == frozenset({"gpt-oss"})
 
 
 def test_undersized_families_keeps_a_mixed_family_with_one_large_model(cfg):
-    # groq's tiebreak gpt-oss model is 131k; a family is excluded only when
-    # EVERY one of its role models is too small.
-    assert "gpt-oss" not in undersized_families(cfg, "tiebreak", 100000)
-    # gemma alone: glm was the second 8k tiebreak until it was retired.
-    assert undersized_families(cfg, "tiebreak", 100000) == frozenset({"gemma"})
+    # The gpt-oss tiebreak family is groq's 131k model plus two 400k openai
+    # ones; a family is excluded only when EVERY one of its role models is too
+    # small, so the family survives on its largest.
+    #
+    # 150,000 rather than 100,000 since the 2026-08-19 probe: gemma used to be
+    # the small side of this comparison at a stale 8192 and is now 131k, so at
+    # 100,000 NOTHING is excluded and the property would not be under test.
+    assert undersized_families(cfg, "tiebreak", 100_000) == frozenset()
+    assert "gpt-oss" not in undersized_families(cfg, "tiebreak", 150_000)
+    assert undersized_families(cfg, "tiebreak", 150_000) == frozenset({"gemma"})
+    # ...and the gpt-oss family does fall out once even its 400k models cannot
+    # hold the row, which is what makes the line above a mixed-family rule and
+    # not an exemption.
+    assert undersized_families(cfg, "tiebreak", 320_001) == frozenset({"gemma", "gpt-oss"})
 
 
 # --- 11. .env ---------------------------------------------------------------
@@ -1657,10 +1718,12 @@ def test_undersized_families_keeps_an_explicit_safety_margin(cfg):
 
     The 8k judge carried this until 2026-08-18; with zai-glm-4.7 retired the
     smallest judge in the pool is mistral, so the same rule is read at its
-    window instead."""
+    window instead. The generator half is read at 131,072 for the same reason
+    since 2026-08-19: an estimate that merely equals the probed window is a
+    coin flip on a 400, exactly as it was at 8192."""
     assert CONTEXT_SAFETY_MARGIN > 1.0
     assert "mistral" in undersized_families(cfg, "judge", 32000)
-    assert "gpt-oss" in undersized_families(cfg, "generator", 8192)
+    assert "gpt-oss" in undersized_families(cfg, "generator", 131072)
     # ...and the margin does not start excluding models with real headroom.
     assert undersized_families(cfg, "judge", 4000) == frozenset()
 
@@ -1668,7 +1731,10 @@ def test_undersized_families_keeps_an_explicit_safety_margin(cfg):
 def test_the_token_estimate_counts_indic_script_far_harder_than_latin():
     """A BPE vocabulary trained on English runs ~1-2 chars/token on
     Devanagari, so chars/4 under-counts an Indic passage by 2-4x - on exactly
-    this corpus, and the under-count is what lands the prompt at an 8k model."""
+    this corpus, and the under-count is what would land a prompt at a model
+    that cannot hold it. The margin this buys is what the routing spends; it
+    does not depend on any particular window, which is just as well, because
+    the one it was written against was wrong by 16x (2026-08-19 probe)."""
     latin = "the accused was convicted under section 302 of the code " * 20
     devanagari = "अभियुक्त को भारतीय दंड संहिता की धारा तीन सौ दो के अंतर्गत " * 20
     assert abs(len(latin) - len(devanagari)) < len(latin) * 0.25
@@ -1714,9 +1780,11 @@ def test_the_shipped_config_has_no_fatal_judge_hole_left(cfg, keys):
     qwen and slot B has NOTHING - so the row parks having already paid for
     judge A. The openai backstop is the fourth family that fills slot B.
 
-    Pinned as "no fatal gap", not as "no gap": the tiebreak holes are still
-    there and still only warn, which is what makes this a closure rather than
-    a config that stopped being checked."""
+    Pinned as "no fatal gap" AND, since 2026-08-19, as no gap at all: the
+    tiebreak holes that used to remain were gemma being removed on a context
+    length it never had, and the probe closed them. Both are asserted, and the
+    narrowed pool below is what keeps this a closure rather than a config that
+    stopped being checked."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
@@ -1740,9 +1808,16 @@ def test_the_shipped_config_has_no_fatal_judge_hole_left(cfg, keys):
     assert slot_a == GROQ_JUDGE
     assert slot_b == ModelRef("openai", "gpt-5-mini")
 
-    # The tiebreak holes remain, for BOTH generator families, and remain
-    # survivable: judge.py decides on the two judges it has.
-    tiebreak_gaps = [g for g in gaps if g.role == "tiebreak"]
+    # The tiebreak holes are GONE since the 2026-08-19 gemma probe - the pool
+    # has no gap at any row size this build can produce.
+    assert [g for g in gaps if g.role == "tiebreak"] == []
+    # ...and they were closed by the window being right, not by the check
+    # going quiet: put gemma back at the stale 8192 and both return, for BOTH
+    # generator families, and still only warn.
+    narrowed = pool_gaps(
+        _narrow_tiebreak(cfg), needed_tokens=worst_case_judge_tokens(cfg)
+    )
+    tiebreak_gaps = [g for g in narrowed if g.role == "tiebreak"]
     assert {g.generator_family for g in tiebreak_gaps} == {"gpt-oss", "mistral"}
     assert all(not g.fatal for g in tiebreak_gaps)
 
@@ -2021,7 +2096,12 @@ def test_the_advice_the_preflight_prints_is_the_threshold_it_enforces(cfg, keys)
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    #
+    # gemma is narrowed back to the stale 8192 because THE SHIPPED POOL NOW HAS
+    # NO GAP AT ALL (2026-08-19 probe), and a property about what a gap advises
+    # needs a gap. It is also the honest fixture: this is the exact pool the
+    # advice was designed against.
+    cfg = _narrow_tiebreak(cfg_with_two_generator_families(cfg))
     gaps = pool_gaps(
         cfg,
         needed_tokens=worst_case_judge_tokens(cfg),
@@ -2176,7 +2256,12 @@ def test_a_tiebreak_gap_names_the_key_that_would_fill_it(cfg, keys, monkeypatch)
     """The judge side of this is pinned; the tiebreak side was not, so the
     remedy could quietly stop naming the key that would close the gap and go
     on advising a purchase the operator does not need to make."""
-    patched = _with_tiebreak_family(cfg, api_key_env="FIFTHPARTY_API_KEY")
+    # gemma narrowed to the stale 8192: at its probed 131k it serves every
+    # tiebreak this build can produce, so there is no gap left for a remedy
+    # string to name. See _narrow_tiebreak.
+    patched = _with_tiebreak_family(
+        _narrow_tiebreak(cfg), api_key_env="FIFTHPARTY_API_KEY"
+    )
     _unset(monkeypatch, "FIFTHPARTY_API_KEY")
     gap = next(
         g
@@ -2256,7 +2341,9 @@ def test_pool_gaps_walks_the_generator_role_through_the_routers_own_filter(cfg, 
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    # gemma narrowed: the ("gpt-oss", "tiebreak") entry this asserts is the
+    # context check removing gemma, which at its probed 131k it no longer does.
+    cfg = _narrow_tiebreak(cfg_with_two_generator_families(cfg))
     patched = _with_extra_generator(
         cfg_without_the_paid_judges(cfg), family="qwen", api_key_env="FOURTHPARTY_API_KEY"
     )
@@ -2277,15 +2364,19 @@ def test_pool_gaps_walks_the_generator_role_through_the_routers_own_filter(cfg, 
 
 
 def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg, keys):
-    """The 8k generator cannot be handed the longest row the length band
+    """A NARROW generator cannot be handed the longest row the length band
     permits - `undersized_families` diverts it long before - so checking its
     judge slots at that length invents a gap. Sized at what its own window
-    permits the same pool serves it, while the 40k generator, which really can
-    produce that row, still has the gap the config TODO is about."""
+    permits the same pool serves it, while the 32k generator, which really can
+    produce that row, still has the gap the config TODO is about.
+
+    The narrow window is a FIXTURE since 2026-08-19. The shipped cerebras
+    generator supplied it until the probes put that model at 131k, at which
+    point it narrows nothing and this property had no family to act on."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    cfg = _narrow_generator(cfg_with_two_generator_families(cfg))
     # 26k, not 20k: correcting the reply conversion (2026-08-18, review round
     # 2 / I6) raised the 8k-window check from 15,104 to 19,104 tokens, i.e.
     # 23,880 of required context, so a 20k judge no longer demonstrates the
@@ -2488,7 +2579,7 @@ def test_a_generator_familys_window_is_the_largest_model_it_offers(cfg, keys):
 
 def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_checked_at(cfg, keys):
     """What the rule above costs when it is wrong, at the only place it is
-    spent. The operator adds a 128k variant beside the 8k one in an existing
+    spent. The operator adds a 128k variant beside a narrow one in an existing
     generator family; the family can now produce the longest row the band
     permits, so its judges must be checked at that length. Sized at the
     SMALLEST model instead, the check runs at 19,104 (required 23,880), a 26k
@@ -2504,7 +2595,10 @@ def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_che
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    # The narrow generator is a fixture since the 2026-08-19 probe - see
+    # _narrow_generator. Without it "the family is 8k-only" is false by
+    # construction and the narrowing under test never happens.
+    cfg = _narrow_generator(cfg_with_two_generator_families(cfg))
     small = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)
     sizer, flat = judge_sizer(small), worst_case_judge_tokens(small)
 
@@ -2515,8 +2609,8 @@ def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_che
             if g.fatal
         }
 
-    # As shipped, the gpt-oss family really is 8k-only and the narrowing is
-    # right: at 19,104 the 26k judge holds every row it can produce.
+    # With the family narrowed to 8k the narrowing is right: at 19,104 the
+    # 26k judge holds every row it can produce.
     assert required_context(sizer(8192, "judge")) < 26000 < required_context(flat)
     assert ("gpt-oss", "b") not in fatal(small)
     # Add the big sibling and the same pool no longer serves that family.
@@ -2593,7 +2687,13 @@ def _divert_point(cfg, role: str, family: str, reply_tokens: int) -> int:
     Bounded, and the bound is not decoration: a family that has LEFT the role's
     pool is never undersized for it, so the unbounded loop this replaced ran
     forever and took the whole suite with it the day zai-glm-4.7 was retired.
-    A helper that hangs on a config change reports nothing at all."""
+    A helper that hangs on a config change reports nothing at all.
+
+    THE BOUND IS ALSO WHY THIS IS NOT THE HELPER FOR THE SHIPPED GENERATOR any
+    more: at the probed 131k window that family is never undersized below
+    4 x total_max, so calling it there RAISES rather than lying. That is the
+    designed behaviour - see _largest_prompt_that_fits for the number the
+    config block now quotes."""
     ceiling = 4 * cfg.build.length_band.total_max
     for size in range(1, ceiling):
         if family in undersized_families(cfg, role, size + reply_tokens):
@@ -2604,6 +2704,26 @@ def _divert_point(cfg, role: str, family: str, reply_tokens: int) -> int:
     )
 
 
+def _largest_prompt_that_fits(cfg, role: str, family: str, reply_tokens: int = 0) -> int:
+    """The largest prompt (routing tokens, reply excluded) `family` still holds.
+
+    The mirror of `_divert_point`, and the number the config block now quotes
+    for the generator: since the 2026-08-19 probe the cliff sits at 104,858
+    rather than 6,554, which is past `_divert_point`'s bound and would make it
+    raise. Bisected rather than looped, because the range is now six digits.
+    """
+    lo, hi = 0, 4_000_000
+    assert family not in undersized_families(cfg, role, lo + reply_tokens)
+    assert family in undersized_families(cfg, role, hi + reply_tokens)
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if family in undersized_families(cfg, role, mid + reply_tokens):
+            hi = mid
+        else:
+            lo = mid
+    return lo
+
+
 def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
     """That block is the operator's spec for the judge pool, and its arithmetic
     was pre-margin and ~40% high (it said ~4.2k where the real divert point is
@@ -2612,17 +2732,30 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
     of the preflight's own output, not recomputed beside it, because that
     string is what the operator shops against.
 
-    Two numbers, not one, and the difference is easy to get wrong. What is
-    still ADVISED is the tiebreak's threshold, because the tiebreak is the only
-    gap the shipped pool still has and its prompt is a little longer than the
-    judge's. What the closed judge gap was measured against is the judge's, and
-    the block has to keep it: it is the bar any replacement judge must clear."""
-    from tuned.data.generate import preflight_messages
+    Two numbers, not one, and the difference is easy to get wrong. Both
+    thresholds are quoted: the judge's is the bar any replacement judge must
+    clear, and the tiebreak's is a little higher because its prompt is longer
+    and the preflight sizes the two separately.
+
+    THE GENERATOR NUMBERS ARE THE 2026-08-19 CORRECTION, and they are pinned
+    here because this test is the only thing standing between that block and
+    the last three years of drift. The block now states BOTH cliffs - the one
+    the stale 8192 pin produced and the one the probed 131,072 produces - and
+    both are re-derived from the code rather than transcribed.
+    """
+    from tuned.data.generate import max_output_tokens, preflight_messages
 
     text = DATA_CONFIG.read_text(encoding="utf-8")
+
+    # THE SHIPPED POOL HAS NO GAPS AT ALL since the gemma probe, so the advice
+    # string has to be read off the pool that still has one. Narrowing gemma is
+    # the exact config the advice was designed against.
     refusals, warnings = preflight_messages(cfg, ("generator",))
-    assert refusals == [], "the judge gap is closed; nothing here should refuse"
-    advised = {int(line.split("max_context >= ")[1].split()[0]) for line in warnings}
+    assert (refusals, warnings) == ([], []), "the probed pool has no gap left to report"
+    _, narrowed_warnings = preflight_messages(_pre_probe_pool(cfg), ("generator",))
+    advised = {
+        int(line.split("max_context >= ")[1].split()[0]) for line in narrowed_warnings
+    }
     assert len(advised) == 1, "one number: the operator buys one model"
     required = advised.pop()
 
@@ -2648,10 +2781,27 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
     assert tiebreak_required > judge_required
     assert f"max_context >= {tiebreak_required}" in text
     assert f"{tiebreak_required:,}" in text
-    # ...and the two thresholds the block explains the (now closed) gap with.
-    from tuned.data.generate import max_output_tokens
 
-    assert f"{_divert_point(cfg, 'generator', 'gpt-oss', max_output_tokens(cfg)):,}" in text
+    # --- the generator cliffs, both of them ---------------------------------
+    reply = max_output_tokens(cfg)
+    narrow = _narrow_generator(cfg)
+    # The HISTORY the block keeps: at the stale 8192 pin the generator diverted
+    # once the prompt passed 2,555 routing tokens, and the family fell out of
+    # the pool entirely past 6,554.
+    assert f"{_divert_point(narrow, 'generator', 'gpt-oss', reply):,}" in text
+    assert f"{_largest_prompt_that_fits(narrow, 'generator', 'gpt-oss'):,}" in text
+    # The number that governs TODAY, and the one that would have to change if
+    # anybody re-pins the window.
+    assert f"{_largest_prompt_that_fits(cfg, 'generator', 'gpt-oss'):,}" in text
+    # ...and the probed window itself, in both the config value and the prose.
+    for provider in cfg.providers:
+        if provider.name != "cerebras":
+            continue
+        for model in provider.models:
+            assert model.limits["max_context"] == 131072
+    assert "131,072" in text
+    assert "max_context: 131072" in text
+
     # The judge-side number is the divert point of an 8k JUDGE, and there is no
     # 8k judge left in the pool to read it off: zai-glm-4.7 was retired on
     # 2026-08-18 as archived. What produced 5,531 was the window it declared,
@@ -2668,6 +2818,121 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
     # The size a 16k candidate would fail is stated, because most free-tier
     # candidates are 16k.
     assert "16k" in text
+
+
+def test_the_config_block_records_the_probe_that_set_the_window(cfg, keys):
+    """A max_context is a claim about someone else's server, and this one was
+    wrong by 16x for the life of the project because nothing made it carry its
+    evidence. The block must name the probe: date, both models, the
+    prompt_tokens each accepted, and the status.
+
+    Pinned because the cost is not hypothetical - the stale value unroutable'd
+    85% of the statute_qa stream, and it survived three review rounds by
+    looking like a fact."""
+    text = DATA_CONFIG.read_text(encoding="utf-8")
+    assert "2026-08-19" in text
+    for evidence in ("prompt_tokens 13515", "prompt_tokens 10252", "HTTP 200"):
+        assert evidence in text, evidence
+    # ...and the tpm interaction the bigger window opens is answered in the
+    # same place, because 131k against a 30k/minute budget is the first thing
+    # a reader will worry about.
+    assert "tpm" in text and "_need_tokens" in text
+
+
+def test_the_probed_windows_are_what_the_config_declares(cfg):
+    """The 2026-08-19 probes, pinned as config values.
+
+    This is the assertion that would have failed for the life of the project.
+    Both cerebras models declared 8192 - a number nothing measured, traceable
+    to a research note that read this build's 8192 TRAINING sequence length as
+    the provider's context window - while the provider served 131,072. It cost
+    85% of the statute_qa stream.
+    """
+    caps = {
+        f"{p.name}/{m.id}": m.limits.get("max_context")
+        for p in cfg.providers
+        for m in p.models
+    }
+    assert caps["cerebras/gpt-oss-120b"] == 131072
+    assert caps["cerebras/gemma-4-31b"] == 131072
+    # Neither is the training sequence length, and the two must never be
+    # confused again: 8192 belongs to the length band, not to a provider.
+    assert cfg.build.length_band.total_max == 8192
+    assert caps["cerebras/gpt-oss-120b"] != cfg.build.length_band.total_max
+
+
+def test_a_statute_qa_sized_prompt_now_routes_to_the_generator(cfg):
+    """THE ROUTING CONSEQUENCE, which is the whole point of the correction.
+
+    statute_qa is the stream the stale pin destroyed: its prompt carries the
+    seed AND the provision, so it is the longest generator prompt this build
+    makes, and at 8192 the only generator family was excluded for anything
+    over 6,554 routing tokens. The exclusion case is still constructible - the
+    same sizes against a fixture-narrowed window - so this pins the CHANGE,
+    not merely the current state.
+    """
+    probed, narrow = cfg, _narrow_generator(cfg)
+    for needed in (7_000, 10_000, 13_515, 25_000):
+        assert undersized_families(probed, "generator", needed) == frozenset(), needed
+        assert undersized_families(narrow, "generator", needed) == frozenset({"gpt-oss"}), needed
+    # 13,515 is not arbitrary: it is the prompt_tokens the live probe sent and
+    # the provider accepted with a 200.
+    assert undersized_families(probed, "generator", 13_515) == frozenset()
+
+
+def test_the_tiebreak_route_is_open_for_a_long_row(cfg, keys):
+    """The other half of the probe: gemma at 8192 meant no long row could
+    reach a third family at all, so every tie on a full-length generation was
+    undecidable by construction rather than by pool composition."""
+    from tuned.data.generate import preflight_messages
+
+    assert undersized_families(cfg, "tiebreak", 20_000) == frozenset()
+    assert undersized_families(_narrow_tiebreak(cfg), "tiebreak", 20_000) == frozenset({"gemma"})
+    # ...and end to end: the shipped pool preflights clean at every role, where
+    # the pre-probe pool carried a standing tiebreak warning.
+    assert preflight_messages(cfg, ("generator", "judge", "tiebreak")) == ([], [])
+    _, warnings = preflight_messages(_pre_probe_pool(cfg), ("generator", "judge", "tiebreak"))
+    assert any("routing.tiebreak" in line for line in warnings)
+
+
+def test_a_single_call_larger_than_tpm_waits_rather_than_deadlocking(cfg):
+    """THE EDGE THE BIGGER WINDOW OPENS, answered rather than assumed.
+
+    max_context is 131,072 and tpm is 30,000, so one call can be worth more
+    than a whole minute's token budget. The bucket can never hold more than
+    its capacity, so an unclamped wait condition would never become true and
+    the worker would hang forever holding the lock.
+
+    TokenBucket._need_tokens clamps the charge to capacity, which degrades to
+    "wait for a full bucket, then send" - the provider's own 429 handling with
+    backoff takes it from there. Asserted on a fake clock so the test neither
+    sleeps nor dials out: a full bucket admits the call immediately, a drained
+    one admits it after exactly one refill, and next_wait agrees with acquire.
+
+    No per-call ceiling was added because none is needed; this test is what
+    stops one being added later on a hunch, and what catches the clamp being
+    removed.
+    """
+    tpm = 30_000
+    oversize = 131_072
+    assert oversize > tpm, "the premise: one call can exceed a minute's budget"
+
+    now = [0.0]
+    slept = []
+
+    async def sleeper(delay):
+        slept.append(delay)
+        now[0] += delay
+        assert len(slept) < 100, "spinning instead of waiting"
+
+    bucket = TokenBucket(rpm=5, tpm=tpm, clock=lambda: now[0], sleeper=sleeper)
+    # A full bucket takes it at once - the charge is capped at capacity.
+    asyncio.run(asyncio.wait_for(bucket.acquire(oversize), timeout=5))
+    assert slept == []
+    # Drained, it waits exactly one refill and then proceeds.
+    assert bucket.next_wait(oversize) == pytest.approx(60.0)
+    asyncio.run(asyncio.wait_for(bucket.acquire(oversize), timeout=5))
+    assert slept == [pytest.approx(60.0)]
 
 
 def test_eligible_refs_is_the_filter_eligible_itself_uses(cfg, keys):

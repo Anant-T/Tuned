@@ -65,14 +65,17 @@ and each one silently corrupts a different downstream number if it is missed:
      same materials the generator saw PLUS the candidate's trace and answer,
      so it can be twice the generator's prompt. Since 2026-08-18 the smallest
      model in routing.judge is 32k (mistral/mistral-small-latest; the 8k
-     zai-glm-4.7 was removed as archived upstream) and the smallest in
-     routing.tiebreak is 8k (cerebras/gemma-4-31b, which serves the TIEBREAK
-     role only and never judged). The judge worker must still budget-check
-     materials+candidate before dispatch and route anything that does not fit
-     past the model that cannot hold it - the pool having grown out of its 8k
-     judge tier is a fact about today's config, not a property the routing may
-     assume. Silently truncating a judge prompt scores a partially-read
-     answer, which is worse than not judging it.
+     zai-glm-4.7 was removed as archived upstream), and since the cerebras
+     probes of 2026-08-19 routing.tiebreak has no small tier at all - every
+     model in it declares 131k or more, gemma included, which had been pinned
+     at 8192 by a config value nobody had measured. The judge worker must
+     still budget-check materials+candidate before dispatch and route anything
+     that does not fit past the model that cannot hold it: that the pool
+     currently has room everywhere is a fact about today's config, not a
+     property the routing may assume, and this build has now been bitten once
+     by treating a max_context as knowledge rather than as a claim. Silently
+     truncating a judge prompt scores a partially-read answer, which is worse
+     than not judging it.
 
   3. THE TRANSITION SLOT SPLIT IS SEMANTIC. {source} is the papers (facts,
      parties, what has happened); {scenario} is the posture and the DATES -

@@ -5,10 +5,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pipeline_fakes import (
     LONG_SEED_TEXT,
+    NARROW_GENERATOR_CONTEXT,
     TRANSITION_META,
     FakeRouter,
     StealsTheLease,
     build_cfg,
+    cfg_with_context,
     cfg_with_fourth_judge_family,
     cfg_with_two_generator_families,
     cfg_without_the_paid_judges,
@@ -895,12 +897,40 @@ def test_a_recorded_slot_is_never_bought_twice(tmp_path, cfg, paths):
         assert judgements[0]["rationale"] == "a says fine"
 
 
+def _narrow_generator(cfg):
+    """The generator family cut back to the window the pilot ran against.
+
+    Needed since 2026-08-19: the probes put cerebras at 131k, so LONG_SEED_TEXT
+    no longer diverts anywhere and the judge-side paths only a diverted row
+    reaches were never entered. cfg_with_context refuses if the (family, role)
+    is missing, so this cannot silently no-op.
+    """
+    return cfg_with_context(
+        cfg, family="gpt-oss", role="generator", max_context=NARROW_GENERATOR_CONTEXT
+    )
+
+
+def _narrow_tiebreak(cfg):
+    """gemma cut back the same way. It is the only tiebreak family separation
+    leaves for a gpt-oss row, so with it at its real 131k there is no
+    unroutable tiebreak to exercise on the shipped pool at all."""
+    return cfg_with_context(cfg, family="gemma", role="tiebreak", max_context=8192)
+
+
 def test_an_unroutable_tiebreak_decides_on_the_two_judges(tmp_path, cfg, paths):
-    """The shipped tiebreak pool is gpt-oss + two 8k models, so a long
-    candidate from the gpt-oss generator has no third family. The
-    disagreement then stands unresolved - which is not an accept."""
+    """When no third family can take the row the disagreement stands
+    unresolved - which is not an accept.
+
+    The pool is NARROWED to produce that state. It used to be the shipped
+    pool's normal behaviour for any long gpt-oss row, because gemma was pinned
+    at 8192 and removed on length; the 2026-08-19 probe put it at its real
+    131k and the preflight now reports no gaps at any row size, so the
+    condition has to be constructed. What is under test is the HANDLING, which
+    must keep working for any pool that runs out.
+    """
+    cfg = _narrow_tiebreak(cfg)
     with judged_store(tmp_path, paths, cfg) as store:
-        _lengthen(store, only_task(store)["task_id"], 5000)  # ~6k tokens: 8k judges out
+        _lengthen(store, only_task(store)["task_id"], 5000)  # ~6k tokens: 8k tiebreak out
         router = FakeRouter(
             cfg, {"judge": [judge_reply(5, 5, 5), judge_reply(2, 2, 2)]}
         )
@@ -935,8 +965,13 @@ def test_slot_b_can_be_unroutable_after_slot_a_has_been_paid_for(tmp_path, cfg, 
     # The row under test is LONG, and a long row only reaches a judge if a
     # generator can hold it. mistral was demoted to judge-only on 2026-08-18,
     # so the second generator family is supplied explicitly - otherwise this
-    # parks at the generator and never exercises the judge path at all.
-    holed = cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
+    # parks at the generator and never exercises the judge path at all. The
+    # cerebras window is narrowed for the same reason in reverse: since the
+    # 2026-08-19 probe it holds this row comfortably, so without the narrowing
+    # the prompt never diverts and the divert is this test's premise.
+    holed = _narrow_generator(
+        cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
+    )
     store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
     plan_wave(store, holed, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
     with store:
@@ -974,8 +1009,13 @@ def test_a_reopened_row_never_re_pays_the_judge_it_already_bought(tmp_path, cfg,
     # The row under test is LONG, and a long row only reaches a judge if a
     # generator can hold it. mistral was demoted to judge-only on 2026-08-18,
     # so the second generator family is supplied explicitly - otherwise this
-    # parks at the generator and never exercises the judge path at all.
-    holed = cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
+    # parks at the generator and never exercises the judge path at all. The
+    # cerebras window is narrowed for the same reason in reverse: since the
+    # 2026-08-19 probe it holds this row comfortably, so without the narrowing
+    # the prompt never diverts and the divert is this test's premise.
+    holed = _narrow_generator(
+        cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
+    )
     store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
     plan_wave(store, holed, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
     with store:

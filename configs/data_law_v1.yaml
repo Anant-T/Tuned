@@ -197,6 +197,47 @@ push:
   private: true
 
 providers:
+  # THE CEREBRAS max_context VALUES WERE WRONG BY 16x UNTIL 2026-08-19, and the
+  # cost was paid entirely by this build. Both models were pinned at 8192 - a
+  # figure nothing here ever measured. Its provenance is findable:
+  # docs/reports/2026-08-09-data-strategy-research.md tabulates cerebras as
+  # "ctx capped 8,192" and adds "8k ctx matches the bucket", which is the
+  # training sequence length of this build (8192) being read as the provider's
+  # context window. Two different 8192s, conflated once in a research note and
+  # then copied into the config as fact. The report is a dated record and is
+  # left as it is; this block is the correction. Two live probes, one call
+  # each, max_tokens 16, temperature 0:
+  #
+  #     2026-08-19  cerebras/gpt-oss-120b   prompt_tokens 13515   HTTP 200
+  #     2026-08-19  cerebras/gemma-4-31b    prompt_tokens 10252   HTTP 200
+  #
+  # Both served a prompt well past the pin without complaint; the operator
+  # console reports the real window as 131,072 for the pool.
+  #
+  # WHAT THE STALE PIN COST, so nobody re-tightens it on a hunch: with 8192 as
+  # the generator window, undersized_families excluded the ONLY generator
+  # family for any prompt over ~6.5k estimated tokens (the 8192 is compared
+  # against est x CONTEXT_SAFETY_MARGIN 1.25), which unroutable'd 85% of the
+  # statute_qa stream - 184+ tasks parked as unroutable:generator in the
+  # 2026-08-19 probe. The provider was never the constraint; the config was.
+  # The same pin on gemma closed the TIEBREAK route for long rows.
+  #
+  # ANYONE LOWERING THESE AGAIN MUST PROBE FIRST, exactly as above, and record
+  # the prompt_tokens and status here. A max_context in this file is a claim
+  # about someone else's server, and this one went three rounds of review
+  # without being checked.
+  #
+  # tpm STAYS 30,000, AND THE COMBINATION IS SAFE - checked rather than
+  # assumed, because a 131k window against a 30k/minute budget looks like a
+  # deadlock. providers.TokenBucket._need_tokens CLAMPS the charge to the
+  # bucket's capacity, so a single call bigger than a whole minute's budget
+  # degrades to "wait for a full bucket, then send" instead of waiting for a
+  # level the bucket can never reach. Measured on the real TokenBucket with an
+  # injected clock: est 131,072 against tpm 30,000 proceeds immediately on a
+  # full bucket and after exactly one 60s refill on an empty one - one sleep,
+  # no spin, no deadlock, and next_wait() agrees with acquire(). No per-call
+  # ceiling is needed and none was added; the provider's own 429 handling with
+  # backoff takes it from there.
   - name: cerebras
     base_url: https://api.cerebras.ai/v1
     api_key_env: CEREBRAS_API_KEY
@@ -205,7 +246,7 @@ providers:
       - id: gpt-oss-120b
         family: gpt-oss
         roles: [generator]
-        limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 8192, max_output: 4096}
+        limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 131072, max_output: 4096}
         params: {temperature: 0.7, top_p: 0.95, reasoning_effort: medium}
       # zai-glm-4.7 (family glm, judge + tiebreak) IS GONE, and this comment is
       # the fence against re-adding it: the model is ARCHIVED upstream and every
@@ -220,10 +261,15 @@ providers:
       # free: it is an attempt per route, on every route, forever. Anyone
       # putting a glm model back must first check it answers `python -m
       # tuned.data.providers --check --ref cerebras/<id>` with a 200.
+      # max_context raised 8192 -> 131072 on the probe recorded at the top of
+      # this provider block (prompt_tokens 10252, HTTP 200, 2026-08-19). This
+      # one is the TIEBREAK route: at 8192 no long row could reach a third
+      # family at all, so every tie on a full-length generation was undecidable
+      # by construction rather than by pool composition.
       - id: gemma-4-31b
         family: gemma
         roles: [tiebreak]
-        limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 8192, max_output: 4096}
+        limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 131072, max_output: 4096}
         params: {temperature: 0.2}
   - name: groq
     base_url: https://api.groq.com/openai/v1
@@ -335,10 +381,17 @@ providers:
       # the whole menu is outlining-at-high or traceless-at-none, and neither
       # serves a reasoning stream. Demoted rather than tuned.
       #
-      # WHAT DEMOTION COSTS, measured rather than assumed: prompts too long for
-      # the 8k cerebras window now have no generator at all and park
-      # gen_unroutable, spending nothing. That was 3 of 100 pilot prompts. The
-      # alternative was 3 billed attempts each at an 89% failure rate.
+      # WHAT DEMOTION COSTS: prompts too long for the cerebras window have no
+      # generator at all and park gen_unroutable, spending nothing. Measured at
+      # the time as 3 of 100 pilot prompts, against an alternative of 3 billed
+      # attempts each at an 89% failure rate - so the demotion was right.
+      #
+      # THAT 3% WAS AN ARTEFACT, and this is the correction rather than a
+      # re-argument: those three prompts were "too long" only against the
+      # stale 8192 pin, i.e. above 6,554 routing tokens. The probed window is
+      # 131,072 and the cliff is 104,858, which no pilot prompt came within
+      # two orders of magnitude of (measured range 1,445-2,799). The demotion
+      # now costs approximately nothing rather than 3%.
       #
       # SAMPLING IS STILL PER ROLE. The generator entry is gone with the role -
       # config.py refuses a role_params key naming a role the model does not
@@ -449,16 +502,25 @@ providers:
 # and this corpus is largely Devanagari.
 #
 # What the fatal gap WAS, kept because any future edit to routing.judge can
-# re-open it. A long prompt is routed past the 8k cerebras generator to
+# re-open it. A long prompt is routed past the cerebras generator to
 # mistral/mistral-small-latest (32k). Family separation then removes mistral
 # from the judge pool; the 8k zai-glm-4.7 was removed on context length (that
 # model has since been retired outright - archived upstream, see the cerebras
 # block); slot A takes groq/qwen; and slot B had NOTHING LEFT. The row parked in
 # judge_unroutable having ALREADY PAID for judge A. The arithmetic made this
-# the rule and not an edge case: the generator diverts to mistral at 2,555
+# the rule and not an edge case: the generator diverted to mistral at 2,555
 # routing tokens of prompt, and slot B died at 5,531 routing tokens of judge
 # prompt - which grounding plus a trace near think_max (3000) clears
 # routinely. Slot B is now openai/gpt-5-mini.
+#
+# THE DIVERT POINT IN THAT PARAGRAPH IS HISTORY, NOT CURRENT BEHAVIOUR. It was
+# computed against the stale cerebras max_context of 8192; with the probed
+# 131,072 the generator does not divert at 2,555 routing tokens, or at 20,000.
+# Measured against undersized_families on the real config: the gpt-oss family
+# is excluded only above 104,858 routing tokens (131,072 / CONTEXT_SAFETY_
+# MARGIN), where before it was excluded above 6,554. Pilot prompts ran
+# 1,445-2,799, so the cliff is now two orders of magnitude away. The judge-gap
+# reasoning above still holds for any FUTURE pool where a divert is real.
 #
 # THE FALLBACK WINDOW SHRANK 40k -> 32k on 2026-08-18, when the retired
 # magistral block was replaced by mistral-small-latest. What that costs is the
@@ -474,20 +536,28 @@ providers:
 # --reopen-stream narrows it). A re-opened row re-pays only the slot it never
 # bought, and comes back with its attempt budget restored.
 #
-# What is LEFT, and only warns. The TIEBREAK pool cannot serve a long row
-# from EITHER generator family, and closing the judge gap made the second of
-# those visible rather than causing it: pool_gaps stops walking a generator
-# family at its first fatal judge gap, so the mistral case was never reached
-# before. For a gpt-oss generation, separation removes every gpt-oss tiebreak
-# - the groq 20b and both openai models, which are lumped into that family on
-# purpose - and the context check removes gemma, which since the glm
-# retirement is the only tiebreak family separation had left. For a mistral
-# generation, the two judge slots take qwen and gpt-oss, which leaves the
-# tiebreak with no family it has not already spent. In both cases judge.py
-# decides on the two judges it has and rejects the unresolved disagreement
-# (run_event tiebreak_unroutable_two_judge_decision - the metric to watch).
+# WHAT WAS LEFT IS NOW CLOSED, and it was closed by the max_context probe
+# rather than by adding a model. The standing warning read: for a gpt-oss
+# generation, separation removes every gpt-oss tiebreak (the groq 20b and both
+# openai models, lumped into that family on purpose) and THE CONTEXT CHECK
+# REMOVED GEMMA, which since the glm retirement was the only tiebreak family
+# separation had left - so judge.py decided on two judges and rejected the
+# unresolved disagreement (run_event tiebreak_unroutable_two_judge_decision).
 #
-# Closing THAT would take one more tiebreak in a family that is none of
+# The context check removed gemma because gemma was pinned at 8192. It is not:
+# probed 2026-08-19 at 10,252 prompt tokens, HTTP 200, and the pin is now
+# 131,072. Measured on the real preflight, generate.preflight_messages over
+# all three roles with every key present:
+#
+#     cerebras pinned 8192   0 refusals, 1 warning   (the tiebreak gap above)
+#     cerebras at 131072     0 refusals, 0 warnings
+#
+# So the pool has no gaps at any row size this build can produce. The warning
+# was never about pool composition - it was the stale pin, and it had been
+# read as a fact about the fleet for three review rounds.
+#
+# IF IT COMES BACK - any edit to routing.tiebreak, or a model retirement -
+# closing it takes one more tiebreak in a family that is none of
 # gpt-oss/mistral/qwen/gemma, with max_context >= 29666. The five over
 # the judge threshold are real and not a typo: the tiebreak prompt is a
 # little longer than the judge prompt and the preflight sizes the two
@@ -497,9 +567,12 @@ providers:
 # runs out. Family separation is a data-quality invariant, not a preference.
 routing:
   # ONE generator since 2026-08-18 - see the mistral block for the measurement
-  # that removed the second. A prompt too long for this model's 8k window has
-  # nowhere to go and parks gen_unroutable without spending: 3% of pilot
-  # prompts, against a fallback that produced 0 usable rows in 56 calls.
+  # that removed the second. A prompt too long for this model's window has
+  # nowhere to go and parks gen_unroutable without spending, which is why the
+  # window's declared value is load-bearing and why it is now probed rather
+  # than assumed: at the stale 8192 pin that cliff sat at 6,554 routing tokens
+  # and swallowed 85% of the statute_qa stream; at the probed 131,072 it sits
+  # at 104,858, against pilot prompts of 1,445-2,799. See the cerebras block.
   generator: [cerebras/gpt-oss-120b]
   judge: [mistral/mistral-small-latest, groq/qwen/qwen3.6-27b,
           openai/gpt-5-mini, openai/gpt-5-nano]

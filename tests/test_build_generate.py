@@ -9,6 +9,8 @@ from pipeline_fakes import (
     FABRICATED_ANSWER,
     FABRICATED_SUSPECT,
     LONG_SEED_TEXT,
+    NARROW_GENERATOR_CONTEXT,
+    OVERSIZE_SEED_TEXT,
     SEED_TEXT,
     TRANSITION_META,
     FakeRouter,
@@ -1056,32 +1058,70 @@ def test_streams_are_claimed_separately(tmp_path, cfg, paths):
 
 
 # --------------------------------------------------------------------------
-# Context routing for the GENERATOR (an 8k model is first in the list).
+# Context routing for the GENERATOR.
+#
+# THE WINDOW IS NARROWED BY FIXTURE, NEVER BY THE SHIPPED CONFIG. Until
+# 2026-08-19 the shipped cerebras generator declared 8192 and LONG_SEED_TEXT
+# was sized to beat it, so these tests exercised the filter for free. The
+# probed window is 131,072 and no prompt this build can produce comes near it,
+# so the exclusion has to be CONSTRUCTED - cfg_with_context refuses if the
+# (family, role) it was asked to narrow is not there, which is what stops
+# these tests quietly measuring the shipped pool again.
 # --------------------------------------------------------------------------
 
-def test_a_long_prompt_now_parks_because_there_is_no_second_generator(
+def _narrow_generator(cfg):
+    """The config with the sole generator family cut back to the window the
+    pilot actually ran against."""
+    return cfg_with_context(
+        cfg, family="gpt-oss", role="generator", max_context=NARROW_GENERATOR_CONTEXT
+    )
+
+
+def test_the_shipped_generator_window_holds_the_longest_row_this_build_makes(
     tmp_path, cfg, paths
 ):
+    """The 2026-08-19 probe, asserted where it changes behaviour.
+
+    LONG_SEED_TEXT needs 11,008 tokens of declared window. Against the stale
+    8192 pin that emptied the generator pool and parked the row; against the
+    probed 131,072 it is an ordinary prompt. This is the test that would have
+    caught the pin, and it is the one that fails if anybody lowers it again.
+    """
+    with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
+        router = FakeRouter(cfg)
+        run(store, cfg, router, paths)
+        (attempt,) = router.calls_for("generator")
+        assert attempt["est_tokens"] > NARROW_GENERATOR_CONTEXT
+        assert attempt["exclude_families"] == frozenset()
+        assert attempt["ref"] == ModelRef("cerebras", "gpt-oss-120b")
+        assert only_task(store)["state"] == "judging"
+
+
+def test_a_long_prompt_parks_when_no_generator_can_hold_it(tmp_path, cfg, paths):
     """WHAT THE 2026-08-18 DEMOTION COSTS, asserted rather than assumed.
 
     This used to divert to mistral. mistral is judge-only now - over 56
     re-pilot generations it produced zero gate-passing rows and failed
     irac_placement on 89% of them by outlining IRAC inside its trace - so a
-    prompt the 8k cerebras model cannot hold has nowhere to go.
+    prompt the generator cannot hold has nowhere to go.
 
     The row PARKS and spends NOTHING: no call, recoverable via --reopen. That
     is the trade the demotion made, and it is the cheap side of it - the
-    alternative was three billed attempts at an 89% failure rate. Measured on
-    the re-pilot, 3 of 100 prompts are this long.
+    alternative was three billed attempts at an 89% failure rate.
+
+    The window is narrowed by fixture: on the probed 131k pool no prompt the
+    length band permits reaches this path, so the 3-of-100 figure the pilot
+    measured was an artefact of the stale pin, not a property of the corpus.
     """
+    narrow = _narrow_generator(cfg)
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
-        router = FakeRouter(cfg)
-        run(store, cfg, router, paths)
+        router = FakeRouter(narrow)
+        run(store, narrow, router, paths)
         # The attempt is recorded, but `ref is None` - the context filter
         # emptied the pool before any provider was reached, so nothing was
         # spent.
         (attempt,) = router.calls_for("generator")
-        assert attempt["est_tokens"] > 8192
+        assert attempt["est_tokens"] > NARROW_GENERATOR_CONTEXT
         assert attempt["exclude_families"] == frozenset({"gpt-oss"})
         assert attempt["ref"] is None
         task = only_task(store)
@@ -1090,12 +1130,12 @@ def test_a_long_prompt_now_parks_because_there_is_no_second_generator(
 
     # ...and with a second generator family present it still diverts, so the
     # routing itself is intact and only the pool changed.
-    two = cfg_with_two_generator_families(cfg)
+    two = _narrow_generator(cfg_with_two_generator_families(cfg))
     with make_store(tmp_path / "two", text=LONG_SEED_TEXT) as store:
         router = FakeRouter(two)
         run(store, two, router, paths)
         call = router.calls_for("generator")[0]
-        assert call["est_tokens"] > 8192
+        assert call["est_tokens"] > NARROW_GENERATOR_CONTEXT
         assert "gpt-oss" in call["exclude_families"]
         assert call["ref"] == ModelRef("mistral", "mistral-small-latest")
         assert only_task(store)["state"] == "judging"
@@ -1136,7 +1176,11 @@ def test_the_generator_opts_mistral_into_reasoning_and_leaves_gpt_oss_alone(
     # fixture. The CODE is deliberately kept - it is family-keyed, harmless
     # while the family serves no generator role, and it records the finding
     # that Small 4's reasoning channel is opt-in.
-    two = cfg_with_two_generator_families(cfg)
+    # The window is narrowed by fixture: since the 2026-08-19 probe the
+    # shipped cerebras generator holds 131k, so LONG_SEED_TEXT no longer
+    # forces the failover this contract is about. The failover is the
+    # subject, so it is constructed rather than waited for.
+    two = _narrow_generator(cfg_with_two_generator_families(cfg))
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
         router = FakeRouter(two)
         task = only_task(store)
@@ -1163,9 +1207,11 @@ def test_a_row_no_generator_can_hold_parks_recoverably(tmp_path, cfg, paths):
     alongside the answers that were legally wrong - and the write is fenced by
     the lease the claim actually handed out."""
     with make_store(tmp_path) as store:
-        # A seed longer than every generator's context window.
+        # A seed longer than every generator's context window - sized
+        # against the REAL 131k window, not a narrowed one, because "no
+        # generator can hold this row" is exactly what is being asserted.
         store.upsert_seeds(
-            [{**seed_rows(1)[0], "text": "word " * 60000}]
+            [{**seed_rows(1)[0], "text": OVERSIZE_SEED_TEXT}]
         )
         worker = "gen-fence-1"
         task = store.claim_tasks(worker, 1)[0]
@@ -1189,7 +1235,7 @@ def test_a_stale_worker_cannot_park_a_task_it_no_longer_holds(tmp_path, cfg, pat
     """The fence is the point of passing worker_id at all: with it disabled
     the permanent-close path was never tested against a live lease."""
     with make_store(tmp_path) as store:
-        store.upsert_seeds([{**seed_rows(1)[0], "text": "word " * 60000}])
+        store.upsert_seeds([{**seed_rows(1)[0], "text": OVERSIZE_SEED_TEXT}])
         task = store.claim_tasks("stale-worker", 1)[0]
         result = asyncio.run(generate_once(store, cfg, FakeRouter(cfg), task, paths=paths))
         assert result.unroutable is True
@@ -1362,33 +1408,50 @@ def test_a_plain_payload_400_costs_attempts_not_the_row(tmp_path, cfg, paths):
         assert only_task(store)["attempts"] == 1
 
 
-def test_the_context_estimate_routes_devanagari_past_the_8k_generator(tmp_path, cfg, paths):
-    """Same character count, different script: chars/4 says both fit the 8k
-    generator, and for the Devanagari one that is a 400 nobody fails over."""
+def test_the_context_estimate_routes_devanagari_past_a_generator_latin_fits(
+    tmp_path, cfg, paths
+):
+    """Same character count, different script: chars/4 says both fit, and for
+    the Devanagari one that is a 400 nobody fails over.
+
+    Run against a fixture-narrowed window. The property is about the ESTIMATE
+    - that Devanagari is charged 2-4x harder than Latin - and that property
+    needs a window the Latin text clears and the Devanagari text does not.
+    The shipped 131k window is cleared by both, so at the shipped size this
+    test would pass while measuring nothing.
+    """
+    narrow = _narrow_generator(cfg)
     latin = "the accused was convicted under section 302 of the code " * 90
     devanagari = "अभियुक्त को भारतीय दंड संहिता की धारा तीन सौ दो के अंतर्गत " * 90
     assert abs(len(latin) - len(devanagari)) < len(latin) * 0.25
 
     with make_store(tmp_path, text=latin) as store:
-        router = FakeRouter(cfg)
-        asyncio.run(generate_once(store, cfg, router, only_task(store), paths=paths))
+        router = FakeRouter(narrow)
+        asyncio.run(generate_once(store, narrow, router, only_task(store), paths=paths))
         assert router.calls_for("generator")[0]["ref"].provider == "cerebras"
 
     with make_store(tmp_path / "indic", text=devanagari) as store:
-        router = FakeRouter(cfg)
+        router = FakeRouter(narrow)
         result = asyncio.run(
-            generate_once(store, cfg, router, only_task(store), paths=paths)
+            generate_once(store, narrow, router, only_task(store), paths=paths)
         )
-        # The script-aware estimate still excludes the 8k family - that is the
-        # property under test - but since the 2026-08-18 demotion there is no
-        # second generator to receive the row, so it parks unspent instead of
-        # diverting. See test_a_long_prompt_now_parks_because_there_is_no_
-        # second_generator.
+        # The script-aware estimate still excludes the narrowed family - that
+        # is the property under test - but since the 2026-08-18 demotion there
+        # is no second generator to receive the row, so it parks unspent
+        # instead of diverting. See
+        # test_a_long_prompt_parks_when_no_generator_can_hold_it.
         (attempt,) = router.calls_for("generator")
         assert attempt["ref"] is None
         assert result.unroutable is True
         event = json.loads(store.events("generation_error")[0]["detail_json"])
         assert "gpt-oss" in event["excluded_families"]
+
+    # ...and on the SHIPPED window both scripts route, which is the 2026-08-19
+    # probe showing up as behaviour rather than as a config line.
+    with make_store(tmp_path / "shipped", text=devanagari) as store:
+        router = FakeRouter(cfg)
+        asyncio.run(generate_once(store, cfg, router, only_task(store), paths=paths))
+        assert router.calls_for("generator")[0]["ref"].provider == "cerebras"
 
 
 def test_the_gate_estimate_is_not_moved_by_the_routing_estimate(tmp_path, cfg):
@@ -1553,9 +1616,20 @@ def test_the_fleet_refuses_to_start_with_a_judge_slot_it_cannot_fill(cfg, monkey
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     refusals, warnings = preflight_messages(cfg, ("generator",))
     assert any("routing.judge slot b" in line for line in refusals)
-    # The tiebreak gap has a defined fallback, so it warns rather than refuses.
-    assert any("routing.tiebreak" in line for line in warnings)
+    # A tiebreak gap warns rather than refuses, because it has a defined
+    # fallback (judge.py decides on the two judges). The SHIPPED pool no longer
+    # has one to demonstrate: gemma was the family that separation left and a
+    # stale 8192 removed on length, and the 2026-08-19 probe put it at 131k.
+    # Narrow it back and the warning returns, unchanged in kind.
+    assert not any("routing.tiebreak" in line for line in warnings)
     assert not any("routing.tiebreak" in line for line in refusals)
+    narrow_tb = cfg_with_context(cfg, family="gemma", role="tiebreak", max_context=8192)
+    _, tb_warnings = preflight_messages(narrow_tb, ("generator",))
+    assert any("routing.tiebreak" in line for line in tb_warnings)
+    assert not any(
+        "routing.tiebreak" in line
+        for line in preflight_messages(narrow_tb, ("generator",))[0]
+    )
     # The judge gap SURVIVES the override, and that is the 2026-08-18 change
     # rather than a regression: the slot-B candidate a short mistral row used
     # to have here was cerebras/zai-glm-4.7, and it was retired as archived.
@@ -1719,20 +1793,26 @@ def test_the_preflight_advises_one_model_that_closes_every_gap_it_reports(cfg, m
 
 
 def test_the_preflight_checks_each_generator_family_at_its_own_window(cfg, monkeypatch):
-    """The 8k generator is diverted long before the length band's longest row,
-    so a judge gap reported for it at that length is a refusal about a
-    combination that cannot occur. The 40k generator's gap is real and stays.
+    """A NARROW generator is diverted long before the length band's longest
+    row, so a judge gap reported for it at that length is a refusal about a
+    combination that cannot occur. The 32k generator's gap is real and stays.
 
     The probe judge is 26k, not 20k, since 2026-08-18 (review round 2, I6):
     correcting the reply conversion from 4.0 to the measured 5.5 chars/token
     raised the 8k-window check from 15,104 to 19,104 tokens (23,880 of required
     context), so a 20k judge no longer clears it and this test would be
     asserting the absence of a refusal for the wrong reason.
+
+    THE NARROW WINDOW IS NOW A FIXTURE. Until 2026-08-19 the shipped cerebras
+    generator supplied it; the probe put that model at 131k, which narrows
+    nothing, so the suppression this test is about had no family left to act
+    on and the test was asserting the absence of a refusal that could not have
+    been raised. Narrowed explicitly, the property is measured again.
     """
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    cfg = _narrow_generator(cfg_with_two_generator_families(cfg))
     for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     patched = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)

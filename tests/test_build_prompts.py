@@ -513,8 +513,10 @@ def _word_count(text: str) -> int:
 @pytest.mark.parametrize("prompt_id", GEN_IDS)
 def test_generator_user_block_is_the_intended_size(prompt_id):
     # Long enough to carry every property above, short enough that the
-    # instruction does not swamp the chunk it wraps (the teacher's context is
-    # 8k on Cerebras and the chunk has to fit beside it). The target is the
+    # instruction does not swamp the chunk it wraps. That rationale used to be
+    # stated as "the teacher's context is 8k on Cerebras"; the 2026-08-19 probe
+    # put it at 131k, so the ceiling now rests on READABILITY and on not
+    # drowning the chunk, not on a window. The target is the
     # brief's ~250-450; the ceiling carries a small tolerance so that adding
     # one clause to the longest template is not a forced rewrite.
     #
@@ -523,8 +525,10 @@ def test_generator_user_block_is_the_intended_size(prompt_id):
     # old tolerance was never sized for, and the two longest templates sat 2
     # and 5 words under it. The context rationale is unaffected at this size -
     # measured pilot prompt_est ran 1,445-2,799 est tokens and the net change
-    # is +22 words (~30 tokens), against an 8k window that generate.py already
-    # routes away from when a seed does not fit.
+    # is +22 words (~30 tokens), against a probed 131k window whose cliff sits
+    # at 104,858 routing tokens - two orders of magnitude clear. generate.py
+    # still routes a seed away when it does not fit; nothing this build
+    # produces gets near it.
     words = _word_count(reg.load(prompt_id).user)
     assert 250 <= words <= 500, f"{prompt_id} user block is {words} words"
 

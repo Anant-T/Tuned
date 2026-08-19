@@ -1104,9 +1104,18 @@ def undersized_families(cfg: BuildConfig, role: str, needed_tokens: int) -> froz
     guessing "too small" would silently remove a working provider.
 
     Callers on both sides of a generation need this - the generator because
-    an over-long prompt at an 8k model is a 400, the judge because its prompt
-    carries the same materials PLUS the candidate and is the longest in the
-    pipeline.
+    an over-long prompt at a model that cannot hold it is a 400, the judge
+    because its prompt carries the same materials PLUS the candidate and is
+    the longest in the pipeline.
+
+    THE INPUT IS A DECLARED WINDOW, WHICH IS A CLAIM AND NOT A FACT. This
+    filter is only ever as right as ``max_context`` in the config, and on
+    2026-08-19 that value was wrong by 16x for both cerebras models - each
+    pinned at 8192 against a real 131,072. Nothing here misbehaved; the filter
+    faithfully excluded the only generator family for any prompt over 6,554
+    routing tokens and parked 85% of the statute_qa stream. A wrong window
+    fails silently and in the expensive direction, so a change to one is a
+    change that must be probed.
     """
     required = required_context(needed_tokens)
     fits_by_family: dict[str, bool] = {}
@@ -1391,10 +1400,13 @@ def pool_gaps(
     (generate.worst_case_judge_tokens) and this reports what it is given.
 
     ``needed_for_window(window, role)`` is the OTHER half of "a gap that
-    cannot occur is not a gap": a generator family whose largest window is 8k
-    cannot be handed the longest row the length band permits, so checking its
-    judge slots at that length invents a refusal.  Given the hook, each family
-    is checked at what its own window permits (never above the flat number).
+    cannot occur is not a gap": a generator family with a narrow window cannot
+    be handed the longest row the length band permits, so checking its judge
+    slots at that length invents a refusal.  Given the hook, each family is
+    checked at what its own window permits (never above the flat number).
+    Inert on the shipped config since the 2026-08-19 cerebras probes - a 131k
+    generator can produce the longest row the band allows, so there is nothing
+    to narrow - and kept because it is the mechanism, not the measurement.
 
     ``servable_floor_tokens`` is the smallest judge call the build can make.
     It bounds the "is ANY row size servable" walk behind ``PoolGap
@@ -1416,7 +1428,11 @@ def pool_gaps(
     MISTRAL_API_KEY pending the shipped config advised 18,880, and the moment
     the key landed the same config wanted 29,661 and refused to start.  Being
     told to buy a bigger model costs nothing; being told to buy 18,880 and
-    discovering the fleet then refuses costs a purchase.
+    discovering the fleet then refuses costs a purchase.  (That worked example
+    is from the 8k-generator era and no longer reproduces on this config - the
+    18,880 was ``required_context`` of a narrowing the 131k window removed.
+    It is kept because the PROPERTY it demonstrates is about which families
+    are keyed, not about any window, and the next narrow model brings it back.)
 
     Deliberately NOT a fallback: reusing a family when the pool runs out
     would put a model's own family in front of its own prose, which is the

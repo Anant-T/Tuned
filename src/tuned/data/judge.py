@@ -15,8 +15,10 @@ model twice".
 CONTEXT LENGTH IS A ROUTING INPUT (contract 2). The judge prompt is the
 longest in the pipeline: the same materials the generator saw PLUS the
 candidate's trace and answer. The smallest JUDGE in the pool is 32k since
-2026-08-18, when the 8k one was removed as archived upstream; the smallest
-TIEBREAK is still 8k. A candidate that does not fit must be routed past it,
+2026-08-18, when the 8k one was removed as archived upstream; the TIEBREAK
+pool has had no small tier since the cerebras probes of 2026-08-19 corrected
+gemma's window from a never-measured 8192 to its real 131k. A candidate that
+does not fit must be routed past it,
 because a silently truncated judge prompt produces a score for an answer
 nobody read - which is worse than not judging it at all. Router.pick exposes
 no context filter, so the length check is turned into a family exclusion
@@ -24,11 +26,14 @@ no context filter, so the length check is turned into a family exclusion
 only when EVERY one of its models in that role is too small.
 
 WHEN THE POOL RUNS OUT, IT RUNS OUT LOUDLY AND ONCE. Family separation and
-context length together can empty a role for a given row - the shipped
-tiebreak pool is gpt-oss + one 8k model (gemma; the second, glm, left the
-config archived on 2026-08-18), so a long candidate from the gpt-oss
-generator has no eligible tiebreak at all. Three rules keep that from
-becoming a paid loop:
+context length together can empty a role for a given row. That combination
+used to bite the SHIPPED pool - the tiebreak was gpt-oss plus gemma, gemma was
+pinned at 8192, so separation removed the first and length removed the second
+and a long candidate from the gpt-oss generator had no eligible tiebreak at
+all. It does not bite it today: the 2026-08-19 probes put gemma at 131k and
+the preflight now reports zero gaps at every row size this build can produce.
+The three rules below stay, because the condition is one config edit or one
+model retirement away and they are what keep it from becoming a paid loop:
 
   * a NON-RETRYABLE routing failure parks the task in 'judge_unroutable'
     immediately instead of re-queueing it - nothing about tomorrow's claim
@@ -1151,9 +1156,12 @@ async def judge_task(
                     stats.lost_leases += 1
                     return LOST_LEASE
                 return JUDGE_STATE_FROM
-            # No third family can take this row (the shipped tiebreak pool is
-            # entirely 8k+gpt-oss, so a long candidate from a gpt-oss
-            # generator has nowhere to go). Decide on the two judges we have
+            # No third family can take this row. On the shipped pool that is
+            # now a rare event rather than the norm - it used to fire on every
+            # long gpt-oss row, because gemma was the only tiebreak family
+            # separation left and a stale 8192 pin removed it on length; both
+            # cerebras windows were probed and corrected on 2026-08-19 and the
+            # preflight reports no gaps. Decide on the two judges we have
             # rather than park a fully-judged row: the disagreement stands
             # unresolved, and an unresolved disagreement is not an accept.
             tiebreak_unroutable = True
