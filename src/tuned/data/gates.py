@@ -12,15 +12,27 @@ out the other side (see `disposition`):
               never regenerated - the seed is burned. PERMANENT_GATES.
   regenerate  format, length, missing self-verification, scripted IRAC in the
               think trace, verbatim copying, meta-references to "the provided
-              text". The teacher was asked the right question and answered it
-              badly; ask again (<=2 attempts).
+              text", a section/article/entry number the materials never showed
+              the teacher. The teacher was asked the right question and
+              answered it badly; ask again (<=2 attempts).
 
 Nothing here re-implements the hard primitives. Citation existence lives in
 citations.py (`novel_citations` + the `suspect_citations` second channel),
 the IPC/CrPC/IEA -> BNS/BNSS/BSA transition rules live in statutes.py
 (`cross_code_review`, `extract_sections`), the byte-exact empty-think block
 lives in replay.py (`empty_think`). This module only composes them and
-records WHY something failed.
+records WHY something failed. The ONE exception is statutory-reference
+grounding, whose population no existing primitive can see - see
+STATUTORY_FAMILIES for the diagnosis and why it is its own gate.
+
+GATE_ORDER IS THIS MODULE'S VERSION. There is no numeric GATES_VERSION: the
+tuple is the pinned surface (tests/test_build_gates.py::test_gate_order_and_
+permanent_gates is the golden), and adding or removing a name is the bump.
+A stored gate_result set that carries only the TEN names this tuple held
+before 2026-08-19 predates statutory_grounding and has never been checked for
+it, exactly as a novel_skipped detail predates the citation index; verify.py
+re-runs the current set over the stored bytes and is how such a row is
+brought up to date.
 
 MANDATORY FOLLOW-UP, and it is not optional: a GateContext built with
 citation_index=None runs only the SUSPECT half of the citation gate (the
@@ -46,6 +58,7 @@ enforcement happens at assembly, against the pinned tokenizer.
 """
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 
@@ -76,6 +89,7 @@ GATE_ORDER = (
     "think_format",
     "length_band",
     "citations",
+    "statutory_grounding",
     "temporal",
     "self_verification",
     "irac_placement",
@@ -461,6 +475,171 @@ _SECTION_SUBJECT_RE = re.compile(
 )
 _SENTENCE_BREAK_RE = re.compile(r"[.!?]\s")
 
+# A STATUTORY REFERENCE, and WHY check_citations cannot see one.
+#
+# THE DIAGNOSIS (GATE-1 design review, 2026-08-19). 21 of 23 judge rejections
+# were verified substantive by literal string comparison and the dominant
+# defect was a FABRICATED STATUTORY REFERENCE: "Section 313", "Article 136",
+# "Entry 54" where the materials cite Entry 56, "Order XII Rule 6" - numbers
+# that appear NOWHERE in what the generator was shown. check_citations passed
+# 503 of 508 generations and caught none of it, and it could not have:
+#
+#   citations.py models CASE-AUTHORITY citations and nothing else. Both of its
+#   channels require a year, a reporter token and a page - the known patterns
+#   (insc/hc_neutral/scc/scc_online/air/scr/crilj) all bind (?P<year>\d{4})
+#   and (?P<page>\d{1,5}), and _SUSPECT_RE, the catch-all, additionally
+#   demands a capitalised reporter run carrying two adjacent capitals. A bare
+#   "Section 313" has no year, no reporter and no page, so it is not a
+#   citation-shaped string, is never extracted, and is never asked about.
+#
+#   statutes.extract_sections does read section numbers, but only ones welded
+#   to a CODE ("302 IPC", "Section 302 of the BNS") - _STATUTE_RE is
+#   _PREFIX _NUM _JOIN _CODE and the code is mandatory. Every measured defect
+#   is code-less. And its consumer, check_temporal, asks a different question
+#   anyway: which family governs on these dates, never whether the number was
+#   in the materials.
+#
+# EXTENSION WAS CONSIDERED AND REJECTED, on three counts. (i) The GROUND TRUTH
+# differs: check_citations asks a 17M-row corpus index whether an authority
+# EXISTS; there is no such index for statutory references and none is wanted -
+# BNS s.103 exists and citing it on a matter that was never shown it is still
+# the defect. The question here is support, not existence. (ii) The
+# DISPOSITION differs: citations is PERMANENT (the seed is burned), and it is
+# permanent because an authority that does not exist is a false statement no
+# rewriting repairs. A real section the materials did not carry is not false,
+# it is unsupported, and a fresh answer over the same materials can be
+# supported - so it is a regenerate, and folding it into a permanent gate
+# would burn seeds this repository has already had to un-burn once. (iii) The
+# POPULATIONS are disjoint by construction, which is what keeps one defect on
+# one gate: nothing citation-shaped reaches here (a reporter citation has no
+# section keyword) and nothing here reaches check_citations.
+#
+# THE FIVE FAMILIES, and why the list stops there. These are the shapes the
+# measured defects name. Clause / Part / Paragraph / Schedule / Regulation
+# were built, measured over the same 46 judged generations and DROPPED: in a
+# drafting deliverable "Clause 9(1)" and "Part II" are limbs of the instrument
+# being drafted, and "Paragraph 102" is a paragraph of the judgment in the
+# materials - adding them took the ACCEPTED row 483 from pass to fail on
+# "Paragraph 102/103" and added one more false fail on 469, for zero extra
+# catches. A gate that rejects a clean answer for numbering its own clauses is
+# worse than the hole it closes.
+#
+# Keyword-anchored, never digit-anchored: materials reading "the complainant,
+# then aged 54" must not ground "Entry 54". The keyword alternations reuse
+# statutes.py's three measured tightenings verbatim - the single-letter form
+# REQUIRES its dot ("S. 302", so "S. Vaidhyanathan" is not a section), "art"
+# requires its dot, and a bare number with no marker is never a reference.
+STATUTORY_FAMILIES = (
+    ("section", r"sec(?:tion|t)?s?\.?|ss?\.|§{1,2}"),
+    ("article", r"articles?|arts?\."),
+    ("entry", r"entries|entry"),
+    ("order", r"orders?"),
+    ("rule", r"rules?"),
+)
+
+# HOW MANY UNGROUNDED REFERENCES AN ANSWER MAY CARRY. Zero, and the measurement
+# says zero is affordable: over the 46 judged generations the gate fires on 9
+# rows, all 9 already non-accepted (7 rejected, 2 gen_unroutable), and on NONE
+# of the 4 accepted rows. There is no tolerance band to tune because there is
+# no measured cost to paying it - a single invented section is the whole of
+# the defect this gate exists for.
+MAX_UNGROUNDED_REFS = 0
+
+# Dashes that a generation uses interchangeably. gpt-oss-120b writes
+# "Section 32‑A" (NON-BREAKING HYPHEN) where the materials print
+# "Section 32-A", and separates keyword from number with U+202F NARROW NO-BREAK
+# SPACE on every single reference it emits - measured, 434 references across
+# the 46 answers. Both fold: \s matches U+202F under Python's Unicode rules,
+# and _ref_number strips this class after NFKC.
+_REF_DASH = r"[-\u2010-\u2015\u2212]"
+
+# Three digits, never four. Every reference number in Indian law fits: BNSS
+# s.531 is the longest code, Article 395 closes the Constitution, and the
+# Seventh Schedule stops at Entry 97. A four-digit number after one of these
+# keywords is a YEAR ("the Companies Rules 2016"), not a reference. The
+# (?<!\d)/(?!\d) fences are why "the Indian Penal Code, 1860" yields nothing
+# rather than section 186.
+_REF_NUM = (
+    r"(?<!\d)\d{1,3}(?!\d)"
+    r"(?:" + _REF_DASH + r"?[A-Za-z]{1,2}(?![A-Za-z]))?"
+    r"(?:\s{0,2}\(\s{0,2}[0-9A-Za-z]{1,4}\s{0,2}\)){0,3}"
+)
+# A LIST separator and a RANGE separator, kept apart because only the range
+# has an interior (see grounded_refs).
+#
+# THE DASH IS BOTH A RANGE SEPARATOR AND A SUFFIX JOINER - "Sections 62-65"
+# against "Section 120-B" - and what tells them apart is _REF_NUM's suffix
+# group, not the separator: that group is greedy and letter-only, so it takes
+# the "-B" and never sees the "-6". Get it wrong and "Section 120-B" reads as
+# a list of 120 and B, which would ground IPC 120B against materials that only
+# ever named s.120 - exactly the fold SectionRef.base_number refuses ("IPC
+# 304B is not IPC 304"). A digit-fenced separator was tried here first and was
+# a no-op: it could not survive a mutation run, because _REF_NUM had already
+# consumed the suffix before any separator was reached.
+_REF_LIST_SEP = r"(?:\s{0,3}(?:,|/|&|and|or)\s{0,3})"
+_REF_RANGE_SEP = r"(?:\s{0,3}to\s{0,3}|\s{0,2}" + _REF_DASH + r"\s{0,2})"
+_REF_SEP = r"(?:" + _REF_LIST_SEP + r"|" + _REF_RANGE_SEP + r")"
+
+# A number followed by a time unit is a PERIOD, not a reference: "an order 30
+# days later" would otherwise read as Order 30 and false-fail a clean answer.
+# Zero occurrences across the 46 judged generations (answers, traces and
+# grounding alike), so this buys nothing measured - it is here because the
+# shape is one line of ordinary legal English away and the guard costs
+# nothing, no reference in this vocabulary being followed by "days".
+#
+# It is a whole-match guard rather than part of the number, and it therefore
+# also SHIELDS a keyword-less reading of any such phrase. Keep that out of the
+# fixtures that exist to pin the keyword anchor: a bare number chosen with a
+# time unit after it passes those tests for the wrong reason (measured - the
+# keyword-less mutant survived until STAT_SOURCE stopped saying "54 years").
+_REF_NOT_A_PERIOD = r"(?!\s{0,3}(?:days?|weeks?|months?|years?)\b)"
+
+_REF_PATTERNS = tuple(
+    (
+        family,
+        re.compile(
+            r"(?<![A-Za-z])(?:" + keywords + r")\s{0,3}"
+            r"(?P<numbers>" + _REF_NUM + r"(?:" + _REF_SEP + _REF_NUM + r"){0,9})"
+            r"(?![A-Za-z])" + _REF_NOT_A_PERIOD,
+            re.IGNORECASE,
+        ),
+    )
+    for family, keywords in STATUTORY_FAMILIES
+)
+_REF_NUM_RE = re.compile(_REF_NUM, re.IGNORECASE)
+_REF_RANGE_RE = re.compile(
+    r"(?<!\d)(\d{1,3})(?!\d)" + _REF_RANGE_SEP + r"(?<!\d)(\d{1,3})(?!\d)(?![A-Za-z(])"
+)
+
+# How wide a range the MATERIALS may hand over. "Sections 62 to 65" appears in
+# the pilot's grounding text and an answer that cites s.63 off the back of it
+# is doing what it was asked to do, so the interior grounds too. Capped so a
+# malformed "ss. 1 to 999" cannot spray a thousand keys into the allow-list.
+RANGE_SPAN_MAX = 50
+
+# ENACTED TEXT NAMES ITS SECTIONS WITHOUT SAYING "SECTION", and missing that
+# is a false fail on exactly the rows this gate must not touch. The pilot's
+# grounding for gen 412 IS bare-act text - "395. Punishment for dacoity.-
+# Whoever commits dacoity..." - so a keyword-only scan of the materials found
+# ZERO sections there and read the answer's three correct citations (395, 396,
+# 397) as inventions. This is the statute_qa shape, which is 125 of the
+# 416-task backlog.
+#
+# The marginal-note dash is what makes it a heading rather than a numbered
+# paragraph: a judgment's "58. In our view the High Court erred" has no dash
+# and must not register, or every paragraph number in the materials would
+# ground a section. Measured over all 46 groundings: this matches 1 of 46,
+# the bare-act one, and all three of its sections. The one-line wrap is
+# needed - s.397's marginal note breaks across a newline before its dash, and
+# a single-line form found 395 and 396 but not 397. A DOTALL form found a
+# spurious heading in another row's judgment text, so the wrap is bounded to
+# one line.
+_ENACTED_HEADING_RE = re.compile(
+    r"^[ \t]{0,3}(?P<number>\d{1,3}[A-Za-z]{0,2})[ \t]{0,2}\.[ \t]{0,3}"
+    r"[A-Z][^\n]{0,90}(?:\n[^\n]{0,90})?[\u2013\u2014]",
+    re.MULTILINE,
+)
+
 
 @dataclass(frozen=True)
 class GateResult:
@@ -774,6 +953,156 @@ def check_citations(content: str, ctx: GateContext) -> GateResult:
     novel = novel_citations(text, source, ctx.citation_index)
     detail = {"novel": novel, "suspect": suspects}
     return GateResult("citations", not novel and not suspects, detail)
+
+
+def _ref_number(raw: str) -> str:
+    """A reference number reduced to the identity two spellings must share.
+
+    NFKC first, because the generator and the materials disagree on the
+    characters: "Section 32‑A" (U+2011) against "Section 32-A", "Section 12‑A"
+    against "Section\\n12-A". Then whitespace out, the SUBSECTION dropped, and
+    the remaining dashes and dots removed - so 32-A, 32‑A and 32A are one key.
+
+    THE SUBSECTION IS DROPPED ON BOTH SIDES, and that is the designed
+    granularity rather than an oversight. What the materials establish is that
+    a SECTION was put in front of the teacher; an answer entitled to cite s.14
+    is entitled to be precise about which limb of it applies, and materials
+    that print only "Section 14(1)" have plainly shown it s.14. Symmetric
+    dropping is the only rule that gets both directions right. The LETTER
+    suffix is never dropped, for statutes.py's reason: 304B is not 304, so
+    "Section 15Z" does not ground against materials that name s.15.
+
+    THE RESIDUAL, stated because it is real: an answer that swaps subsections
+    inside a section the materials did name - "s.313(2)" where the materials
+    say "s.313(1)" - grounds. No row in the judged cohort does it, and the
+    measured defect is a base number that appears nowhere at all; tightening
+    would false-fail the commoner direction (refining a bare-section reference)
+    to catch a class nothing has yet produced.
+    """
+    token = unicodedata.normalize("NFKC", raw or "")
+    token = "".join(token.split()).split("(", 1)[0]
+    return re.sub(_REF_DASH + r"|\.", "", token).upper()
+
+
+def _ref_spans(text: str):
+    """(family, numbers_body, as_written) for every keyword-anchored reference
+    span. One span may carry a list - "Sections 504/506", "§§ 376, 302, 201"."""
+    for family, pattern in _REF_PATTERNS:
+        for match in pattern.finditer(text or ""):
+            yield family, match.group("numbers"), match.group(0)
+
+
+def statutory_refs(text: str) -> list[tuple[str, str, str]]:
+    """Every statutory reference in `text` as (family, number, as_written).
+
+    Grouped by family in STATUTORY_FAMILIES order, and within a family in text
+    order - the scan is one pass per family, and the detail dict inherits that
+    ordering. NOT deduped: the raw list is what makes "17 occurrences of Entry
+    54" countable, and the caller decides.
+    """
+    out: list[tuple[str, str, str]] = []
+    for family, numbers, written in _ref_spans(text):
+        for token in _REF_NUM_RE.findall(numbers):
+            number = _ref_number(token)
+            if number:
+                out.append((family, number, written))
+    return out
+
+
+def grounded_refs(materials: str) -> set[tuple[str, str]]:
+    """THE ALLOW-LIST: (family, number) keys the materials put in front of the
+    teacher. Three channels, and the two extra ones exist only to remove false
+    fails - a key added here can never reject anything.
+
+    * the keyword-anchored references themselves.
+    * the INTERIOR of a range. Materials reading "Sections 62 to 65" have
+      shown the teacher s.63; see RANGE_SPAN_MAX.
+    * ENACTED SECTION HEADINGS. Bare-act text numbers its sections without the
+      word "Section"; see _ENACTED_HEADING_RE.
+    """
+    keys = {(family, number) for family, number, _ in statutory_refs(materials)}
+    for family, numbers, _written in _ref_spans(materials):
+        for low, high in _REF_RANGE_RE.findall(unicodedata.normalize("NFKC", numbers)):
+            low, high = int(low), int(high)
+            if 0 < high - low <= RANGE_SPAN_MAX:
+                keys.update((family, str(number)) for number in range(low + 1, high))
+    for match in _ENACTED_HEADING_RE.finditer(materials or ""):
+        number = _ref_number(match.group("number"))
+        if number:
+            keys.add(("section", number))
+    return keys
+
+
+def check_statutory_grounding(
+    answer: str, ctx: GateContext, *, think: str | None = ""
+) -> GateResult:
+    """Every statutory reference in the ANSWER must be one the materials
+    carried. See STATUTORY_FAMILIES for the diagnosis this gate was cut from
+    and for why it is not an extension of check_citations.
+
+    THE ANSWER ONLY, and the trace deliberately not. A trace exists to reach
+    for a provision and put it down again, and the judged cohort contains the
+    proof: the ACCEPTED row 367 names Article 15 in its trace and then
+    refuses it in terms - "not in materials ... we cannot cite statutes
+    not in materials" - which is this exact discipline working out loud. The
+    answer is what ships, so the answer is what is scored. The cost is
+    measured and is not hidden: gens 361 and 370 fabricated s.313 and Art.136
+    in their traces ONLY (answer count 0 for both), and this gate passes them.
+
+    `think` is split_think's verdict, not text this gate reads, and it is here
+    for check_answer_key's reason: think is None means the content did not
+    parse, so `answer` is the WHOLE generation and scoring it would score the
+    trace - the very thing the paragraph above refuses. check_think_format has
+    already failed such a row, so it is retried regardless; say "not
+    evaluated" rather than banking a verdict about the wrong text.
+
+    THE GROUND TRUTH IS ctx.source_text, which generate.grounding_text builds
+    as the UNION of every material slot - {source} plus {section_text},
+    {old_section_text}, {new_section_text}, {savings_text}. A seed-only check
+    would false-fail every statute_qa row whose provision arrives through
+    {section_text} rather than the seed chunk, and statute_qa is 125 of the
+    416-task backlog. prompt_registry's contract 1 is the same requirement for
+    the same reason, and this gate now depends on it twice over.
+
+    REGENERATE, not reject: see STATUTORY_FAMILIES (ii). Nothing about the
+    materials made the answer wrong, so the seed is not burned - the teacher
+    reached outside what it was shown and can be asked again.
+    """
+    if think is None:
+        return GateResult("statutory_grounding", True, {"skipped": "unparsed-format"})
+    materials = ctx.source_text or ""
+    if not materials.strip():
+        # No materials means no allow-list, and an empty allow-list would fail
+        # every reference an answer carries. Replay rows are copied
+        # general-domain text and have no grounding at all; a manufactured
+        # context can be bare too. Neither is evidence of a fabrication.
+        return GateResult("statutory_grounding", True, {"skipped": "no-materials"})
+
+    allowed = grounded_refs(materials)
+    found = statutory_refs(answer or "")
+    ungrounded: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for family, number, written in found:
+        key = (family, number)
+        if key in allowed or key in seen:
+            continue
+        seen.add(key)
+        # The string the model actually wrote, so the detail reads as
+        # evidence - the same rule check_citations follows for suspects.
+        ungrounded.append(
+            {"family": family, "number": number, "as_written": _norm_ws(written)[:40]}
+        )
+
+    detail = {
+        "ungrounded": ungrounded,
+        "ungrounded_count": len(ungrounded),
+        "tolerated": MAX_UNGROUNDED_REFS,
+        "answer_refs": len({(family, number) for family, number, _ in found}),
+        "material_refs": len(allowed),
+    }
+    return GateResult(
+        "statutory_grounding", len(ungrounded) <= MAX_UNGROUNDED_REFS, detail
+    )
 
 
 def check_temporal(content: str, ctx: GateContext) -> GateResult:
@@ -1232,6 +1561,7 @@ def run_all(content: str, prompt_est_tokens: int, ctx: GateContext) -> list[Gate
         check_think_format(text, ctx),
         check_length_band(prompt_est_tokens, _est_tokens(think), _est_tokens(answer), ctx),
         check_citations(text, ctx),
+        check_statutory_grounding(answer, ctx, think=think),
         check_temporal(text, ctx),
         check_self_verification(think, ctx),
         check_irac_placement(think, answer, ctx),

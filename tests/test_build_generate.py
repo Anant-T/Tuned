@@ -139,6 +139,31 @@ def test_statute_qa_grounding_carries_the_section_text(tmp_path, cfg):
         assert source_only.detail["suspect"] == [FABRICATED_SUSPECT]
 
 
+def test_statute_qa_grounding_carries_the_section_number_the_gate_checks(tmp_path, cfg):
+    """CONTRACT 1 again, for statutory_grounding. The provision arrives through
+    {section_text}, so a gate wired to the SEED sees no s.9 anywhere and reads
+    the one citation the task exists to elicit as a fabrication. statute_qa is
+    125 of the 416-task backlog, which is what makes the distinction
+    load-bearing rather than tidy."""
+    meta = {"section_text": "Section 9. No suit shall lie in respect of a claim so barred."}
+    with make_store(tmp_path, meta=meta, mix={"statute_qa": 1.0}) as store:
+        task = only_task(store)
+        seed = store.get_seed(task["seed_id"])
+        bundle = build_prompt(cfg, task, seed)
+        assert "Section 9" not in seed["text"]
+
+        answer = "Issue\nWhether the suit lies.\n\nConclusion\nSection 9 bars it."
+        full = gates.check_statutory_grounding(
+            answer, gate_context(cfg, task, seed, bundle.grounding)
+        )
+        source_only = gates.check_statutory_grounding(
+            answer, gate_context(cfg, task, seed, seed["text"])
+        )
+        assert full.passed
+        assert not source_only.passed
+        assert source_only.detail["ungrounded"][0]["number"] == "9"
+
+
 def test_statute_qa_falls_back_to_the_seed_text(tmp_path, cfg):
     with make_store(tmp_path, mix={"statute_qa": 1.0}) as store:
         task = only_task(store)

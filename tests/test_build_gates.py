@@ -11,8 +11,11 @@ from tuned.data.gates import (
     DEFAULT_MAX_RUN,
     GATE_ORDER,
     IRAC_REQUIRED,
+    MAX_UNGROUNDED_REFS,
     PERMANENT_GATES,
+    RANGE_SPAN_MAX,
     SHINGLE_STEP,
+    STATUTORY_FAMILIES,
     VERIFICATION_CUES,
     _norm_ws,
     GateContext,
@@ -23,15 +26,18 @@ from tuned.data.gates import (
     check_irac_placement,
     check_length_band,
     check_self_verification,
+    check_statutory_grounding,
     check_temporal,
     check_think_format,
     check_statutory_quotation,
     check_verbatim_overlap,
     disposition,
     find_verbatim_run,
+    grounded_refs,
     irac_headings,
     run_all,
     split_think,
+    statutory_refs,
 )
 from tuned.data.statutes import APPOINTED_DAY
 
@@ -41,13 +47,23 @@ AFTER = date(2024, 9, 1)
 
 # The grounding chunk the teacher is shown. Cites one real reporter citation
 # and carries a holding worth quoting.
+#
+# IT ALSO NAMES THE CHARGE, and that sentence is load-bearing rather than
+# scene-setting: GOOD_ANSWER opens its Rule limb with "Section 302 IPC governs
+# the charge", and under check_statutory_grounding an answer that names a
+# provision the materials never carried is not a valid example - it is the
+# GATE-1 defect. Without this line the end-to-end "fully valid" fixture
+# asserts that a row citing a section from nowhere passes every gate. Appended
+# rather than woven in, so SOURCE_RUN_35 / SOURCE_RUN_LONG keep slicing the
+# same prose.
 SOURCE = (
     "In Anwar Ali v. State, (2008) 1 SCC 1, the Supreme Court held that a "
     "conviction may rest on circumstantial evidence only where the chain of "
     "circumstances is so complete as to exclude every hypothesis except the "
     "guilt of the accused. The trial court had relied on the recovery of a "
     "blood-stained weapon at the instance of the accused and on the testimony "
-    "of a single eye witness who deposed four days after the incident."
+    "of a single eye witness who deposed four days after the incident. "
+    "The appellant stands convicted under Section 302 IPC."
 )
 
 INDEX_ENTRIES = ["(2008) 1 SCC 1", "2023 INSC 45", "AIR 1973 SC 1461"]
@@ -205,6 +221,7 @@ def test_gate_order_and_permanent_gates():
         "think_format",
         "length_band",
         "citations",
+        "statutory_grounding",
         "temporal",
         "self_verification",
         "irac_placement",
@@ -219,6 +236,12 @@ def test_gate_order_and_permanent_gates():
     # so rewriting the prose does make it right, which is this module's own
     # definition of a regenerate.
     assert "statutory_quotation" not in PERMANENT_GATES
+    # statutory_grounding is not permanent either, and for the neighbouring
+    # reason: a section the materials never carried is UNSUPPORTED, not false.
+    # A fresh answer over the same materials can be supported, so the seed is
+    # not burned. citations is permanent because an authority that does not
+    # exist is false however it is rewritten.
+    assert "statutory_grounding" not in PERMANENT_GATES
     assert PERMANENT_GATES <= set(GATE_ORDER)
 
 
@@ -581,6 +604,287 @@ def test_citations_folding_does_not_merge_two_different_cases():
     gate failing OPEN, which is the direction that lets a fabrication in."""
     ctx = _ctx(source_text="Following 2015 (41) KLT 63 the appeal was allowed.")
     assert not check_citations("relying on 2015 (4) KLT 163", ctx).passed
+
+
+# --------------------------------------------------------------------------
+# check_statutory_grounding
+# --------------------------------------------------------------------------
+
+# Materials able to express every misreading the tests below exist to reject.
+# Nothing here is decoration:
+#   Section 319       a reference the answer may legitimately make.
+#   Entry 56          the NEIGHBOUR of the fabricated Entry 54, so a numeric
+#                     mismatch is a mismatch and not merely an absence.
+#   "then aged 54"    the digits 54 in prose, so a digit-anchored check has
+#                     something to be wrong about. NOT "54 years": a period
+#                     is refused by _REF_NOT_A_PERIOD, which would shield a
+#                     keyword-less mutant from the test that exists to kill
+#                     it (measured - that mutant survived until this line
+#                     changed).
+#   Sections 62 to 65 a range whose interior no keyword names.
+#   Section 14(1)     a subsection-only mention of a section.
+#   397. ... hurt.—   enacted text naming its own section with no keyword,
+#                     the marginal note wrapping across a line as bare-act
+#                     text really does.
+STAT_SOURCE = (
+    "The charge-sheet was laid under Section 319 of the Code, and the "
+    "competence question turns on Entry 56 of List II. The complainant, then "
+    "aged 54, deposed on affidavit. Sections 62 to 65 were pressed, "
+    "as was Section 14(1) of the Act.\n"
+    "397. Robbery, or dacoity, with attempt to cause death or grievous\n"
+    "hurt.—If, at the time of committing robbery, the offender uses any "
+    "deadly weapon, the imprisonment shall not be less than seven years."
+)
+
+
+def _stat_ctx(**over):
+    over.setdefault("source_text", STAT_SOURCE)
+    return _ctx(**over)
+
+
+def test_statutory_grounding_a_reference_the_materials_never_carried_fails():
+    # The measured GATE-1 defect: s.313 appears nowhere in what the generator
+    # was shown. Regenerate, never reject - the seed is not the problem.
+    result = check_statutory_grounding(
+        "The accused must be examined under Section 313 of the Code.", _stat_ctx()
+    )
+    assert not result.passed
+    assert [(u["family"], u["number"]) for u in result.detail["ungrounded"]] == [
+        ("section", "313")
+    ]
+    assert result.detail["ungrounded"][0]["as_written"] == "Section 313"
+    assert "statutory_grounding" not in PERMANENT_GATES
+
+
+def test_statutory_grounding_a_reference_the_materials_carried_passes():
+    result = check_statutory_grounding(
+        "Section 319 of the Code empowers the court to summon the absent "
+        "accused, and Entry 56 of List II settles competence.",
+        _stat_ctx(),
+    )
+    assert result.passed
+    assert result.detail["ungrounded"] == []
+    assert result.detail["answer_refs"] == 2
+
+
+def test_statutory_grounding_a_neighbouring_number_is_not_the_same_reference():
+    """Entry 54 against materials that cite Entry 56 - measured 17 times in
+    gen 395, and the reason the number is compared and not merely the keyword.
+    A check that asked 'does the answer cite SOME entry the materials cite'
+    would pass this."""
+    assert check_statutory_grounding("Entry 56 of List II governs.", _stat_ctx()).passed
+    result = check_statutory_grounding("Entry 54 of List II governs.", _stat_ctx())
+    assert not result.passed
+    assert result.detail["ungrounded"][0]["number"] == "54"
+
+
+def test_statutory_grounding_a_bare_number_in_prose_does_not_ground_a_reference():
+    """The materials say the complainant was 54 years of age. Those digits are
+    not Entry 54, and a check anchored on the digits rather than on the
+    reference keyword would call the fabrication grounded."""
+    assert ("entry", "54") not in grounded_refs(STAT_SOURCE)
+    assert ("section", "54") not in grounded_refs(STAT_SOURCE)
+    assert not check_statutory_grounding("Entry 54 of List II.", _stat_ctx()).passed
+
+
+def test_statutory_grounding_the_keyword_is_required_on_both_sides():
+    # No marker, no reference: the digits alone are never a citation, in the
+    # answer or in the materials.
+    assert statutory_refs("In 2023 some 302 appeals were filed; 54 succeeded.") == []
+    assert check_statutory_grounding(
+        "In 2023 some 302 appeals were filed.", _stat_ctx()
+    ).passed
+
+
+def test_statutory_grounding_ignores_a_reference_that_appears_only_in_the_trace():
+    """A trace exists to reach for a provision and put it down again - gen 367
+    was ACCEPTED after naming Article 15 in its trace and then refusing it in
+    terms. Scoring the trace would reject that discipline for practising it.
+
+    The fixture has to be able to express the misreading, so the fabricated
+    reference is in the trace and the answer is otherwise clean.
+    """
+    think = (
+        " Let me check whether Section 313 of the Code is engaged. It is not "
+        "in the materials, so I will not cite it. "
+    )
+    answer = "\nIssue\nWhether the summons lies.\n\nConclusion\nSection 319 answers it."
+    content = _content(think, answer)
+    ctx = _stat_ctx()
+
+    by_gate = {result.gate: result for result in run_all(content, 100, ctx)}
+    assert by_gate["statutory_grounding"].passed
+    # ... and the mutant that reads the whole content instead of the answer
+    # really would have failed it, so the test is not vacuous.
+    assert not check_statutory_grounding(content, ctx).passed
+
+
+def test_statutory_grounding_is_not_evaluated_when_the_content_did_not_parse():
+    """think is None means split_think could not parse the content, so
+    `answer` is the WHOLE generation, trace included. Scoring it would score
+    the trace - the very thing the test above pins. check_answer_key refuses
+    the same shape for the same reason; check_think_format has already failed
+    the row, so nothing is lost by declining."""
+    whole = "<think>Section 313 might apply.</think> Section 319 applies."
+    result = check_statutory_grounding(whole, _stat_ctx(), think=None)
+    assert result.passed
+    assert result.detail == {"skipped": "unparsed-format"}
+
+
+def test_statutory_grounding_skips_when_there_are_no_materials():
+    # An empty allow-list would fail every reference an answer carries.
+    result = check_statutory_grounding("Section 319 applies.", _stat_ctx(source_text=""))
+    assert result.passed
+    assert result.detail == {"skipped": "no-materials"}
+
+
+def test_statutory_grounding_reads_enacted_headings_in_the_materials():
+    """Bare-act text numbers its sections without ever writing "Section", and
+    the pilot's gen 412 proved the cost: its grounding IS bare-act text, so a
+    keyword-only scan found no sections there and read three correct citations
+    as inventions. The marginal-note dash is what separates a heading from a
+    judgment's numbered paragraph."""
+    assert ("section", "397") in grounded_refs(STAT_SOURCE)
+    assert check_statutory_grounding("Section 397 is attracted.", _stat_ctx()).passed
+    # A numbered paragraph is not a section heading - no dash, no reference.
+    paragraphs = "58. In our view the High Court erred in reversing the acquittal."
+    assert ("section", "58") not in grounded_refs(paragraphs)
+
+
+def test_statutory_grounding_grounds_the_interior_of_a_range():
+    # "Sections 62 to 65" shows the teacher s.63 as surely as naming it does.
+    assert ("section", "63") in grounded_refs(STAT_SOURCE)
+    assert check_statutory_grounding("Section 63 is engaged.", _stat_ctx()).passed
+    # Bounded, so a malformed range cannot spray the allow-list: the interior
+    # of a span wider than RANGE_SPAN_MAX is not handed over, only its ends.
+    wide = f"Sections 1 to {RANGE_SPAN_MAX + 200} of the Act."
+    interior = str(RANGE_SPAN_MAX + 100)
+    assert ("section", "1") in grounded_refs(wide)
+    assert ("section", interior) not in grounded_refs(wide)
+
+
+def test_statutory_grounding_drops_the_subsection_but_never_the_letter_suffix():
+    """The materials mention only s.14(1); an answer entitled to cite s.14 is
+    entitled to say which limb applies, and materials that print a subsection
+    have plainly shown the section. The LETTER suffix is a different section
+    (statutes.py: IPC 304B is not IPC 304) and is never folded away."""
+    assert check_statutory_grounding("Section 14 applies.", _stat_ctx()).passed
+    assert check_statutory_grounding("Section 14(3) applies.", _stat_ctx()).passed
+    for suffixed in ("Section 14A", "Section 14-A"):
+        result = check_statutory_grounding(f"{suffixed} applies.", _stat_ctx())
+        assert not result.passed
+        assert result.detail["ungrounded"][0]["number"] == "14A"
+    # The identity survives the fold in the other direction too: materials
+    # naming only the suffixed section do not ground the bare one.
+    ctx = _stat_ctx(source_text="Section 14A of the Act was invoked.")
+    assert not check_statutory_grounding("Section 14 applies.", ctx).passed
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        # U+202F NARROW NO-BREAK SPACE, the separator gpt-oss-120b put in
+        # all 434 references it wrote across the 46 judged answers. Python's
+        # \s matches it, and _norm_ws folds it, so the detail reads plainly.
+        "Section 319",
+        "Section 319",
+        "section 319",
+        "Sec. 319",
+        "S. 319",
+        "§319",
+        "§§ 319",
+        "Sections 319 and 397",
+        "Sections 319/397",
+    ],
+)
+def test_statutory_grounding_reads_the_forms_the_generator_actually_writes(written):
+    assert check_statutory_grounding(f"{written} of the Code applies.", _stat_ctx()).passed
+
+
+def test_statutory_grounding_folds_the_dashes_a_generation_mixes():
+    # Measured: the answer writes "Section 32-A" with U+2011 where the
+    # materials print U+002D. Same section, and NFKC plus the dash class is
+    # what makes them one key.
+    ctx = _stat_ctx(source_text="Section 32-A of the Act was invoked.")
+    assert check_statutory_grounding("Section 32‑A applies.", ctx).passed
+    assert check_statutory_grounding("Section 32A applies.", ctx).passed
+    # ... and 32 alone is a different section.
+    assert not check_statutory_grounding("Section 32 applies.", ctx).passed
+
+
+def test_statutory_grounding_never_splits_a_letter_suffix_off_at_the_dash():
+    """The dash is a RANGE separator between digits and a suffix joiner before
+    a letter. Without that fence "Section 120-B" splits into 120 and B, and
+    IPC 120B would ground against materials that only ever named s.120."""
+    assert [(f, n) for f, n, _ in statutory_refs("Section 120-B")] == [
+        ("section", "120B")
+    ]
+    assert [(f, n) for f, n, _ in statutory_refs("Sections 62-65")] == [
+        ("section", "62"),
+        ("section", "65"),
+    ]
+
+
+def test_statutory_grounding_a_period_is_not_a_reference():
+    # "an order 30 days later" is a period, not Order 30.
+    assert statutory_refs("The court passed an order 30 days later.") == []
+    assert check_statutory_grounding(
+        "The court passed an order 30 days later.", _stat_ctx()
+    ).passed
+
+
+def test_statutory_grounding_an_initial_is_not_a_section():
+    # "S." only marks a section when a NUMBER follows it, or every Indian
+    # name beginning with an initial becomes a citation.
+    assert statutory_refs("Per S. Vaidhyanathan J., the appeal fails.") == []
+
+
+def test_statutory_grounding_families_are_the_five_the_defects_named():
+    # Clause/Part/Paragraph/Schedule were measured and dropped: they are limbs
+    # of a drafted instrument or paragraphs of the judgment in the materials,
+    # and adding them false-failed an ACCEPTED row on "Paragraph 102".
+    assert [family for family, _ in STATUTORY_FAMILIES] == [
+        "section",
+        "article",
+        "entry",
+        "order",
+        "rule",
+    ]
+    assert statutory_refs("Clause 9(1) of this deed and Part II of Schedule 3.") == []
+
+
+def test_statutory_grounding_reports_every_ungrounded_reference_once():
+    result = check_statutory_grounding(
+        "Order 12 Rule 6 is invoked, and Rule 6 again, and Article 136.",
+        _stat_ctx(),
+    )
+    assert not result.passed
+    assert [(u["family"], u["number"]) for u in result.detail["ungrounded"]] == [
+        ("article", "136"),
+        ("order", "12"),
+        ("rule", "6"),
+    ]
+    assert result.detail["ungrounded_count"] == 3
+    assert result.detail["tolerated"] == MAX_UNGROUNDED_REFS == 0
+
+
+def test_statutory_grounding_detail_survives_json():
+    result = check_statutory_grounding("Section 313 applies.", _stat_ctx())
+    assert json.loads(json.dumps(result.detail)) == result.detail
+
+
+def test_statutory_grounding_never_raises_on_empty_or_junk():
+    assert check_statutory_grounding("", _stat_ctx()).passed
+    assert check_statutory_grounding(None, _stat_ctx()).passed
+    assert statutory_refs("") == []
+    assert grounded_refs("") == set()
+
+
+def test_statutory_grounding_failure_is_a_regenerate_not_a_burnt_seed():
+    results = [
+        GateResult(gate, gate != "statutory_grounding", {}) for gate in GATE_ORDER
+    ]
+    assert disposition(results) == "regenerate"
 
 
 # --------------------------------------------------------------------------
