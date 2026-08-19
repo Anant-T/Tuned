@@ -551,7 +551,11 @@ MAX_UNGROUNDED_REFS = 0
 # SPACE on every single reference it emits - measured, 434 references across
 # the 46 answers. Both fold: \s matches U+202F under Python's Unicode rules,
 # and _ref_number strips this class after NFKC.
-_REF_DASH = r"[-\u2010-\u2015\u2212]"
+# U+00AC is in the class and is not a dash at all: it is what this corpus's PDF
+# extractor emits for a soft hyphen, so the grounding for gens 419/423/430
+# prints the section the answer correctly cites as "Section 260\u00acA". Three
+# of 508 groundings carry it, ten times each.
+_REF_DASH = r"[-\u2010-\u2015\u2212\u00ac]"
 
 # Three digits, never four. Every reference number in Indian law fits: BNSS
 # s.531 is the longest code, Article 395 closes the Constitution, and the
@@ -580,6 +584,44 @@ _REF_LIST_SEP = r"(?:\s{0,3}(?:,|/|&|and|or)\s{0,3})"
 _REF_RANGE_SEP = r"(?:\s{0,3}to\s{0,3}|\s{0,2}" + _REF_DASH + r"\s{0,2})"
 _REF_SEP = r"(?:" + _REF_LIST_SEP + r"|" + _REF_RANGE_SEP + r")"
 
+# THE KEYWORD AND ITS NUMBER MUST SIT ON ONE LINE, in an ANSWER. \s spans
+# newlines and that is how a markdown table cell and an IRAC heading become
+# citations: "**Rule**\n1. Section 15(1) of the Act provides" is a numbered
+# list under a heading, not Rule 1, and "TRIBUNAL ORDER\n\n1. The Applicant"
+# is a title followed by a paragraph. Five of 508 rows fired on exactly that
+# shape (127, 265, 299, 306, 383) and every one was a clean answer. The
+# genuine catches are unharmed because a real citation is written inline -
+# gen 424's "Order XII, Rule 6 of the CPC" and gen 382's "Order 1 Rule 1 of
+# the Supreme Court Rules" are both on one line.
+#
+# MATERIALS GET THE PERMISSIVE GAP INSTEAD (_REF_GAP_WRAPPED). Grounding text
+# is extracted from PDFs and wraps mid-citation - "Section\n12-A" is in the
+# pilot's own corpus - and on that side a missed reference is a FALSE FAIL,
+# the error this gate cannot afford. The asymmetry is the cost function, not
+# an inconsistency.
+_REF_GAP = r"[^\S\n]{0,3}"
+_REF_GAP_WRAPPED = r"\s{0,3}"
+
+# "sub-rule 2" IS NOT RULE 2 and "sub-section 2(a)" is not section 2. The
+# (?<![A-Za-z]) fence stops at "subsection" because b is a letter, but a
+# hyphenated or spaced "sub-" slipped straight through: gen 90's answer cites
+# "sub-rule 2 of Rule 7" against materials that say "sub-rule (2) of Rule 7",
+# and gen 372's cites "sub-section 2 (a)" against "under clause (a) of
+# sub-section (2)". Both are the answer repeating the materials exactly.
+#
+# THIS IS WHAT DECIDED THE ORDER/RULE FAMILIES. The review ruled that any
+# rule/order false fire surviving the same-line fence costs those two families
+# their place. Exactly one survived it - gen 90's "sub-rule 2" - and it is not
+# a fact about the ORDER/RULE vocabulary at all: its identical twin sits in the
+# SECTION family (gen 372), which cannot be dropped, so dropping order and rule
+# would have left the defect standing and taken the two judged catches (382's
+# Order 1, 424's Rule 6) with it. Fenced at the cause instead, both rows clear
+# and zero rule/order false fires remain.
+#
+# One character class, fixed width 4, because Python lookbehind must be:
+# "sub" plus a hyphen, any dash, or a space.
+_REF_NOT_A_SUBDIVISION = r"(?<!sub[-\s\u2010-\u2015\u2212])"
+
 # A number followed by a time unit is a PERIOD, not a reference: "an order 30
 # days later" would otherwise read as Order 30 and false-fail a clean answer.
 # Zero occurrences across the 46 judged generations (answers, traces and
@@ -592,19 +634,62 @@ _REF_SEP = r"(?:" + _REF_LIST_SEP + r"|" + _REF_RANGE_SEP + r")"
 # fixtures that exist to pin the keyword anchor: a bare number chosen with a
 # time unit after it passes those tests for the wrong reason (measured - the
 # keyword-less mutant survived until STAT_SOURCE stopped saying "54 years").
-_REF_NOT_A_PERIOD = r"(?!\s{0,3}(?:days?|weeks?|months?|years?)\b)"
+_REF_MONTH = (
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?"
+    r"|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+)
+_REF_NOT_A_PERIOD = (
+    r"(?!\s{0,3}(?:days?|weeks?|months?|years?)\b)"
+    r"(?!\s{0,3}(?:" + _REF_MONTH + r")\b)"
+)
+
+# THE MATERIALS SIDE READS A WIDER VOCABULARY THAN THE ANSWER SIDE, and every
+# widening here is one-directional: it can only add a key to the allow-list, so
+# it can only ever turn a rejection into a pass. That is why the two sides are
+# allowed to disagree, and why this list is generous where STATUTORY_FAMILIES
+# is strict. Each entry is a spelling the pilot's own grounding text uses:
+#
+#   u/s, u/ss    25 of 508 groundings, and it cost 5 false fails - gens 120,
+#                133, 445, 449, 458 all cite s.302/s.201 against materials
+#                whose only mention is "convicted u/s 302 and 201 IPC".
+#   R. , O.      14 of 508. Gens 263, 267 and 275 cite "Rule 2" against
+#                materials reading "section 26-A of the Act read with R. 2".
+#   "No." infix  gen 227 cites "Entry 8" against "Exemption Entry No.8".
+#
+# The single-letter forms are MATERIALS-ONLY on purpose: "R. 2" and "O. 12" in
+# an answer are shapes this generator has never written, and admitting them on
+# the answer side would buy nothing and risk reading an initial as a rule.
+MATERIAL_FAMILIES = (
+    ("section", r"sec(?:tion|t)?s?\.?|ss?\.|§{1,2}|u\s{0,2}/\s{0,2}ss?\.?|uss?\."),
+    ("article", r"articles?|arts?\."),
+    ("entry", r"entries|entry"),
+    ("order", r"orders?|o\."),
+    ("rule", r"rules?|r\."),
+)
+
+# "Entry No.8", "Taxation Entry No. 61". Materials only, for the same reason.
+_REF_NUMBER_INFIX = r"(?:nos?\.?\s{0,3})?"
+
+
+def _ref_pattern(keywords: str, *, gap: str, infix: str = "") -> re.Pattern:
+    """One family's reference pattern. `gap` is what separates the keyword from
+    its number and is the whole of the answer/materials asymmetry - see
+    _REF_GAP."""
+    return re.compile(
+        r"(?<![A-Za-z])" + _REF_NOT_A_SUBDIVISION + r"(?:" + keywords + r")" + gap + infix
+        + r"(?P<numbers>" + _REF_NUM + r"(?:" + _REF_SEP + _REF_NUM + r"){0,9})"
+        r"(?![A-Za-z])" + _REF_NOT_A_PERIOD,
+        re.IGNORECASE,
+    )
+
 
 _REF_PATTERNS = tuple(
-    (
-        family,
-        re.compile(
-            r"(?<![A-Za-z])(?:" + keywords + r")\s{0,3}"
-            r"(?P<numbers>" + _REF_NUM + r"(?:" + _REF_SEP + _REF_NUM + r"){0,9})"
-            r"(?![A-Za-z])" + _REF_NOT_A_PERIOD,
-            re.IGNORECASE,
-        ),
-    )
+    (family, _ref_pattern(keywords, gap=_REF_GAP))
     for family, keywords in STATUTORY_FAMILIES
+)
+_MATERIAL_REF_PATTERNS = tuple(
+    (family, _ref_pattern(keywords, gap=_REF_GAP_WRAPPED, infix=_REF_NUMBER_INFIX))
+    for family, keywords in MATERIAL_FAMILIES
 )
 _REF_NUM_RE = re.compile(_REF_NUM, re.IGNORECASE)
 _REF_RANGE_RE = re.compile(
@@ -617,25 +702,45 @@ _REF_RANGE_RE = re.compile(
 # malformed "ss. 1 to 999" cannot spray a thousand keys into the allow-list.
 RANGE_SPAN_MAX = 50
 
-# ENACTED TEXT NAMES ITS SECTIONS WITHOUT SAYING "SECTION", and missing that
+# ENACTED TEXT NAMES ITS PROVISIONS WITHOUT SAYING "SECTION", and missing that
 # is a false fail on exactly the rows this gate must not touch. The pilot's
 # grounding for gen 412 IS bare-act text - "395. Punishment for dacoity.-
 # Whoever commits dacoity..." - so a keyword-only scan of the materials found
 # ZERO sections there and read the answer's three correct citations (395, 396,
-# 397) as inventions. This is the statute_qa shape, which is 125 of the
-# 416-task backlog.
+# 397) as inventions.
+#
+# A DESIGN BET FOR statute_qa, and it must not be read as a measurement of one.
+# The whole pilot contains ZERO statute_qa generations - all 508 are drafting
+# (288) or irac_analysis (220) - and all 250 statute_qa tasks in the backlog
+# carry no meta section_text, so every one of them takes build_slots' fallback
+# and is grounded in the SEED text rather than in a bare act. This channel is
+# therefore calibrated on exactly one row, gen 412, whose judgment happened to
+# quote the IPC. It is the shape a real statute corpus will have (P7), and it
+# costs nothing to carry until then, but nothing here has measured it at scale.
 #
 # The marginal-note dash is what makes it a heading rather than a numbered
 # paragraph: a judgment's "58. In our view the High Court erred" has no dash
 # and must not register, or every paragraph number in the materials would
-# ground a section. Measured over all 46 groundings: this matches 1 of 46,
-# the bare-act one, and all three of its sections. The one-line wrap is
-# needed - s.397's marginal note breaks across a newline before its dash, and
-# a single-line form found 395 and 396 but not 397. A DOTALL form found a
-# spurious heading in another row's judgment text, so the wrap is bounded to
-# one line.
+# ground a provision. Measured over all 508 groundings the whole channel fires
+# on 3 of them. The one-line wrap is needed - s.397's marginal note breaks
+# across a newline before its dash, and a single-line form found 395 and 396
+# but not 397. A DOTALL form found a spurious heading in another row's judgment
+# text, so the wrap is bounded to one line.
+#
+# THE FOOTNOTE NUMBER IS TOLERATED because the extractor leaves it welded to
+# the heading: gen 280's grounding prints "16 57. Suspension of rules.- Any
+# member may..." and "17 58. General Powers of Speaker.-", where 16 and 17 are
+# footnote markers and 57 and 58 are the rules the answer correctly cites.
+#
+# AND THE NUMBER LANDS IN THREE FAMILIES, not one. Enacted text numbers rules
+# and orders exactly as it numbers sections, and nothing in the layout says
+# which it is - gen 280's headings are RULES of a legislative assembly's
+# procedure, so emitting them under `section` alone left the answer's "Rule 57"
+# ungrounded and the row rejected. Emitting all three is the permissive
+# reading, and on this channel permissive is the only safe direction.
+_ENACTED_HEADING_FAMILIES = ("section", "rule", "order")
 _ENACTED_HEADING_RE = re.compile(
-    r"^[ \t]{0,3}(?P<number>\d{1,3}[A-Za-z]{0,2})[ \t]{0,2}\.[ \t]{0,3}"
+    r"^[ \t]{0,3}(?:\d{1,3}[ \t]{1,3})?(?P<number>\d{1,3}[A-Za-z]{0,2})[ \t]{0,2}\.[ \t]{0,3}"
     r"[A-Z][^\n]{0,90}(?:\n[^\n]{0,90})?[\u2013\u2014]",
     re.MULTILINE,
 )
@@ -977,17 +1082,22 @@ def _ref_number(raw: str) -> str:
     say "s.313(1)" - grounds. No row in the judged cohort does it, and the
     measured defect is a base number that appears nowhere at all; tightening
     would false-fail the commoner direction (refining a bare-section reference)
-    to catch a class nothing has yet produced.
+    to catch a class nothing has yet produced. The other recorded blind spots
+    are spelling-shaped rather than number-shaped and live on statutory_refs.
     """
     token = unicodedata.normalize("NFKC", raw or "")
     token = "".join(token.split()).split("(", 1)[0]
     return re.sub(_REF_DASH + r"|\.", "", token).upper()
 
 
-def _ref_spans(text: str):
+def _ref_spans(text: str, patterns=_REF_PATTERNS):
     """(family, numbers_body, as_written) for every keyword-anchored reference
-    span. One span may carry a list - "Sections 504/506", "§§ 376, 302, 201"."""
-    for family, pattern in _REF_PATTERNS:
+    span. One span may carry a list - "Sections 504/506", "§§ 376, 302, 201".
+
+    `patterns` is the answer vocabulary by default and _MATERIAL_REF_PATTERNS
+    for the allow-list side; see MATERIAL_FAMILIES for why they differ.
+    """
+    for family, pattern in patterns:
         for match in pattern.finditer(text or ""):
             yield family, match.group("numbers"), match.group(0)
 
@@ -999,6 +1109,39 @@ def statutory_refs(text: str) -> list[tuple[str, str, str]]:
     order - the scan is one pass per family, and the detail dict inherits that
     ordering. NOT deduped: the raw list is what makes "17 occurrences of Entry
     54" countable, and the caller decides.
+
+    WHAT THE ANSWER SIDE DOES NOT SEE, recorded so the blind spots are
+    documented rather than silent. Every one of these is a reference a
+    generation could fabricate and this gate would not notice. They are all
+    spellings the MATERIALS side does read (MATERIAL_FAMILIES) but the answer
+    side does not, and the asymmetry is deliberate - on the materials side a
+    missed spelling is a false fail, on the answer side it is only a miss:
+
+        u/s 313, u/ss 5 and 6      the abbreviation Indian charge-sheets use.
+                                   0 occurrences in the 508 answers swept.
+        Entry No. 8, Order No. 12  the "No." infix. 0 occurrences.
+        Section-313                a dash where the gap expects a space; the
+                                   answer-side gap is horizontal whitespace
+                                   only, so this matches nothing at all.
+                                   0 occurrences.
+        O. 43 R. 1                 the single-letter forms, and this one IS
+                                   paid for: gen 390 writes "S. 96(1) CPC read
+                                   with O. 43 R. 1" and "Order VII R. 11(d)"
+                                   seven times over, and the gate sees none of
+                                   them. 1 row of 508.
+        Order XII, Part II         roman numerals, invisible on BOTH sides and
+                                   deliberately so. A roman alternative reads
+                                   ordinary English as a reference number, and
+                                   the sweep re-confirms it: the only two
+                                   answers matching "<keyword> <roman>" are
+                                   "the rule I must apply" and "the only
+                                   material rule I have" - the pronoun, not
+                                   rule 1. "Order XII Rule 6" is caught through
+                                   its RULE limb instead.
+
+    These are left open rather than closed on speculation: each would widen the
+    ANSWER vocabulary, and every widening there can manufacture a false fail,
+    which is the error this gate cannot afford.
     """
     out: list[tuple[str, str, str]] = []
     for family, numbers, written in _ref_spans(text):
@@ -1014,14 +1157,19 @@ def grounded_refs(materials: str) -> set[tuple[str, str]]:
     teacher. Three channels, and the two extra ones exist only to remove false
     fails - a key added here can never reject anything.
 
-    * the keyword-anchored references themselves.
+    * the keyword-anchored references themselves, read with MATERIAL_FAMILIES'
+      wider vocabulary and across a line wrap.
     * the INTERIOR of a range. Materials reading "Sections 62 to 65" have
       shown the teacher s.63; see RANGE_SPAN_MAX.
-    * ENACTED SECTION HEADINGS. Bare-act text numbers its sections without the
-      word "Section"; see _ENACTED_HEADING_RE.
+    * ENACTED HEADINGS. Bare-act text numbers its provisions without the word
+      "Section"; see _ENACTED_HEADING_RE.
     """
-    keys = {(family, number) for family, number, _ in statutory_refs(materials)}
-    for family, numbers, _written in _ref_spans(materials):
+    keys: set[tuple[str, str]] = set()
+    for family, numbers, _written in _ref_spans(materials, _MATERIAL_REF_PATTERNS):
+        for token in _REF_NUM_RE.findall(numbers):
+            number = _ref_number(token)
+            if number:
+                keys.add((family, number))
         for low, high in _REF_RANGE_RE.findall(unicodedata.normalize("NFKC", numbers)):
             low, high = int(low), int(high)
             if 0 < high - low <= RANGE_SPAN_MAX:
@@ -1029,7 +1177,7 @@ def grounded_refs(materials: str) -> set[tuple[str, str]]:
     for match in _ENACTED_HEADING_RE.finditer(materials or ""):
         number = _ref_number(match.group("number"))
         if number:
-            keys.add(("section", number))
+            keys.update((family, number) for family in _ENACTED_HEADING_FAMILIES)
     return keys
 
 
@@ -1058,11 +1206,21 @@ def check_statutory_grounding(
 
     THE GROUND TRUTH IS ctx.source_text, which generate.grounding_text builds
     as the UNION of every material slot - {source} plus {section_text},
-    {old_section_text}, {new_section_text}, {savings_text}. A seed-only check
-    would false-fail every statute_qa row whose provision arrives through
-    {section_text} rather than the seed chunk, and statute_qa is 125 of the
-    416-task backlog. prompt_registry's contract 1 is the same requirement for
-    the same reason, and this gate now depends on it twice over.
+    {old_section_text}, {new_section_text}, {savings_text}. prompt_registry's
+    contract 1 is the same requirement for the same reason, and this gate now
+    depends on it twice over.
+
+    THAT UNION IS A DESIGN BET FOR statute_qa, NOT A MEASUREMENT. A seed-only
+    check would false-fail any row whose provision arrives through
+    {section_text} rather than the seed chunk - but no such row exists yet, and
+    the earlier claim that "statute_qa is 125 of the backlog" said nothing
+    about whether the distinction bites. Measured instead: the pilot holds ZERO
+    statute_qa generations (508 rows, all drafting or irac_analysis), and all
+    250 statute_qa tasks carry a seed with no meta section_text, so every one
+    of them takes build_slots' fallback and {section_text} is a copy of the
+    seed that grounding_text then dedupes away. The union costs nothing today
+    and is right for the statute corpus P7 will bring; it is simply untested at
+    scale, and the test that pins it is a constructed seed, not a pilot row.
 
     REGENERATE, not reject: see STATUTORY_FAMILIES (ii). Nothing about the
     materials made the answer wrong, so the seed is not burned - the teacher
@@ -1070,15 +1228,34 @@ def check_statutory_grounding(
     """
     if think is None:
         return GateResult("statutory_grounding", True, {"skipped": "unparsed-format"})
-    materials = ctx.source_text or ""
-    if not materials.strip():
-        # No materials means no allow-list, and an empty allow-list would fail
-        # every reference an answer carries. Replay rows are copied
-        # general-domain text and have no grounding at all; a manufactured
-        # context can be bare too. Neither is evidence of a fabrication.
-        return GateResult("statutory_grounding", True, {"skipped": "no-materials"})
 
-    allowed = grounded_refs(materials)
+    allowed = grounded_refs(ctx.source_text or "")
+    if not allowed:
+        # AN EMPTY ALLOW-LIST CAN ONLY REJECT, NEVER INFORM - and the test is
+        # the allow-list, not whether the source string is blank. Blank source
+        # text was the first cut and it never fired once in 508 rows; the state
+        # that actually occurs is materials that carry no statutory reference
+        # AT ALL, which is 83 of 508 (16%) even after the widenings above.
+        #
+        # On such a row every reference in the answer is ungrounded by
+        # construction, so the gate is not measuring the answer, it is
+        # measuring that the grounding is a narrative judgment. 14 of those 83
+        # fired, and 6 of the 14 were provable false fails - the same "u/s 302"
+        # and cross-line rows fixed above - so the gate was wrong more often
+        # than it was informative on precisely the slice where it has no
+        # evidence to work from.
+        #
+        # It is not a corner: 250 of 250 statute_qa tasks in the backlog carry
+        # no meta section_text and fall back to the seed judgment, which is the
+        # shape that lands here.
+        #
+        # THE COST, stated: 8 rows that look like genuine Article 136/32/226
+        # fabrications stop firing. They are unprovable either way from the
+        # materials, and a gate that guesses on no evidence is the failure this
+        # whole review round is about.
+        return GateResult(
+            "statutory_grounding", True, {"skipped": "no-material-references"}
+        )
     found = statutory_refs(answer or "")
     ungrounded: list[dict] = []
     seen: set[tuple[str, str]] = set()

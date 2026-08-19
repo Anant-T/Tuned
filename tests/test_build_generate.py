@@ -144,9 +144,16 @@ def test_statute_qa_grounding_carries_the_section_number_the_gate_checks(tmp_pat
     {section_text}, so a gate wired to the SEED sees no s.9 anywhere and reads
     the one citation the task exists to elicit as a fabrication. statute_qa is
     125 of the 416-task backlog, which is what makes the distinction
-    load-bearing rather than tidy."""
+    load-bearing rather than tidy.
+
+    The seed text has to name SOME provision of its own, or the seed-only
+    context has an empty allow-list and skips - which would leave the test
+    green for a reason that has nothing to do with the slot union. See the
+    no-material-references skip.
+    """
     meta = {"section_text": "Section 9. No suit shall lie in respect of a claim so barred."}
-    with make_store(tmp_path, meta=meta, mix={"statute_qa": 1.0}) as store:
+    seed_text = SEED_TEXT + "\n\nThe suit was instituted under Section 34 of the Act."
+    with make_store(tmp_path, meta=meta, mix={"statute_qa": 1.0}, text=seed_text) as store:
         task = only_task(store)
         seed = store.get_seed(task["seed_id"])
         bundle = build_prompt(cfg, task, seed)

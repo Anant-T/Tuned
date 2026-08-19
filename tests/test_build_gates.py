@@ -731,11 +731,38 @@ def test_statutory_grounding_is_not_evaluated_when_the_content_did_not_parse():
     assert result.detail == {"skipped": "unparsed-format"}
 
 
-def test_statutory_grounding_skips_when_there_are_no_materials():
-    # An empty allow-list would fail every reference an answer carries.
-    result = check_statutory_grounding("Section 319 applies.", _stat_ctx(source_text=""))
+@pytest.mark.parametrize(
+    "materials",
+    [
+        "",
+        "   \n\t ",
+        # THE STATE THAT ACTUALLY OCCURS, and the one a blank-string test could
+        # never reach: a full narrative judgment that names no provision at
+        # all. 83 of the pilot's 508 groundings are like this and a blank one
+        # never occurred once, so keying the skip on the source string rather
+        # than on the allow-list tested a case that does not happen and missed
+        # the case that does.
+        "The appellant, aged 54, was convicted by the Sessions Judge and the "
+        "High Court dismissed the appeal on 12 March 2019 without reasons.",
+    ],
+)
+def test_statutory_grounding_skips_when_the_allow_list_is_empty(materials):
+    # An empty allow-list can only reject, never inform: every reference the
+    # answer carries is ungrounded by construction, so the gate would be
+    # scoring the shape of the grounding rather than the answer.
+    result = check_statutory_grounding("Section 319 applies.", _stat_ctx(source_text=materials))
     assert result.passed
-    assert result.detail == {"skipped": "no-materials"}
+    assert result.detail == {"skipped": "no-material-references"}
+    assert grounded_refs(materials) == set()
+
+
+def test_statutory_grounding_still_scores_a_row_with_one_material_reference():
+    # The skip is keyed on emptiness, not on scarcity - a single key is enough
+    # to make the answer's references answerable. Pins that the widened skip
+    # did not become "skip whenever the grounding is thin".
+    ctx = _stat_ctx(source_text="The charge was laid under Section 319 of the Code.")
+    assert check_statutory_grounding("Section 319 applies.", ctx).passed
+    assert not check_statutory_grounding("Section 313 applies.", ctx).passed
 
 
 def test_statutory_grounding_reads_enacted_headings_in_the_materials():
@@ -878,6 +905,181 @@ def test_statutory_grounding_never_raises_on_empty_or_junk():
     assert check_statutory_grounding(None, _stat_ctx()).passed
     assert statutory_refs("") == []
     assert grounded_refs("") == set()
+
+
+# --------------------------------------------------------------------------
+# check_statutory_grounding - the 508-row review round.
+#
+# Every test below rejects a misreading that a full-population sweep caught the
+# first version making. The gen ids are the rows that proved it.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("materials", "answer", "gens"),
+    [
+        # u/s: 25 of 508 groundings, 5 false fails.
+        ("The accused was convicted u/s 302 and 201 IPC by the Sessions Judge.",
+         "Section 302 IPC and s. 201 IPC are made out.", "120/133/445/449/458"),
+        # the "No." infix.
+        ("When Act No.32 of 1994 amended Schedule III, Exemption Entry No.8 "
+         "did not include the word 'like'.",
+         "Only the nouns in the brackets of Entry 8 are exempt.", "227"),
+        # single-letter R. / O.: 14 of 508 groundings.
+        ("The application under section 26-A of the Act read with R. 2 was "
+         "refused, and O. 43 was not invoked.",
+         "Section 26-A and Rule 2 require every partner to sign. Order 43 too.",
+         "263/267/275"),
+    ],
+)
+def test_statutory_grounding_reads_the_spellings_the_materials_use(materials, answer, gens):
+    """The materials vocabulary is WIDER than the answer vocabulary, and every
+    widening is one-directional: it can only add an allow-list key, so it can
+    only turn a rejection into a pass. Each row here is a generation that
+    repeated its materials correctly and was rejected for it."""
+    result = check_statutory_grounding(answer, _stat_ctx(source_text=materials))
+    assert result.passed, (gens, result.detail["ungrounded"])
+
+
+def test_statutory_grounding_the_wider_vocabulary_is_materials_only():
+    # The single-letter and "No." forms are deliberately NOT read in an answer:
+    # they are shapes this generator has never written, and admitting them
+    # there would risk reading an initial as a rule for no measured gain. The
+    # cost is recorded on statutory_refs and pinned here.
+    assert statutory_refs("under O. 12 R. 6 CPC") == []
+    assert statutory_refs("convicted u/s 313 of the Code") == []
+    assert statutory_refs("see Entry No. 8 of the Schedule") == []
+    assert ("section", "313") in grounded_refs("convicted u/s 313 of the Code")
+
+
+def test_statutory_grounding_folds_the_pdf_soft_hyphen_artifact():
+    """The extractor writes U+00AC where the PDF had a soft hyphen, so gens
+    419/423/430 are grounded in "Section 260¬A" while the answer writes
+    "Section 260-A". Both are s.260A, and 260 alone is a different section."""
+    ctx = _stat_ctx(source_text="The appellant filed an appeal under Section 260¬A of the Act.")
+    assert check_statutory_grounding("Section 260-A is the route.", ctx).passed
+    assert check_statutory_grounding("Section 260A is the route.", ctx).passed
+    assert not check_statutory_grounding("Section 260 is the route.", ctx).passed
+
+
+def test_statutory_grounding_keyword_and_number_must_share_a_line():
+    """A markdown heading followed by a numbered list is not a citation.
+    "**Rule**\\n1. Section 15(1) of the Act provides" fired on five clean rows
+    (127, 265, 299, 306, 383) because \\s spans newlines.
+
+    The genuine catch is written inline and survives - that is the whole point
+    of the fence, so both halves are asserted here."""
+    assert statutory_refs("**Rule**\n1. Section 15(1) of the Act provides") == [
+        ("section", "15", "Section 15(1)")
+    ]
+    assert statutory_refs("APPLICATION TO RESTORE TRIBUNAL ORDER\n\n1.  The Applicant") == []
+    assert [(f, n) for f, n, _ in statutory_refs("Under Order XII, Rule 6 of the CPC")] == [
+        ("rule", "6")
+    ]
+
+
+def test_statutory_grounding_materials_may_wrap_where_an_answer_may_not():
+    """The asymmetry is the cost function. Grounding text comes out of a PDF
+    and wraps mid-citation, and on that side a missed spelling is a FALSE FAIL;
+    on the answer side it is only a miss."""
+    assert ("section", "12A") in grounded_refs("was invoked under Section\n12-A of the Act")
+    assert statutory_refs("was invoked under Section\n12-A of the Act") == []
+
+
+def test_statutory_grounding_a_date_is_not_a_reference():
+    """Gen 39 wrote "interim status-quo order 1 June 1990" and gens 410/415
+    wrote "Section 6A - 01 January 1966"; the first reads as Order 1 and the
+    second lets the dash split "6A - 01" into a range. A month name after the
+    number settles both."""
+    assert statutory_refs("an interim status-quo order 1 June 1990 was passed") == []
+    assert [(f, n) for f, n, _ in statutory_refs("the dates in Section 6A - 01 January 1966")] == [
+        ("section", "6A")
+    ]
+    # ... and the guard is about the MONTH, not about the digits: a real
+    # reference followed by ordinary prose is untouched.
+    assert [(f, n) for f, n, _ in statutory_refs("Section 6A applies")] == [("section", "6A")]
+
+
+def test_statutory_grounding_a_subdivision_is_not_the_provision_it_divides():
+    """"sub-rule 2" is not Rule 2 and "sub-section 2(a)" is not Section 2. Gen
+    90 cites "sub-rule 2 of Rule 7" against materials reading "sub-rule (2) of
+    Rule 7", and gen 372 cites "sub-section 2 (a)" against "clause (a) of
+    sub-section (2)" - both the answer repeating its materials exactly.
+
+    THIS IS WHAT KEPT THE ORDER AND RULE FAMILIES. Gen 90's was the only
+    rule/order false fire to survive the same-line fence, and its twin is in
+    the SECTION family, which cannot be dropped - so dropping order and rule
+    would have left the defect standing and taken two judged catches with it.
+    """
+    assert [(f, n) for f, n, _ in statutory_refs("under sub-rule 2 of Rule 7")] == [
+        ("rule", "7")
+    ]
+    assert [(f, n) for f, n, _ in statutory_refs("under sub‑section 2 (a) and sub-section 3")] == []
+    assert statutory_refs("subsection 2 of the Act") == []
+    # The un-prefixed reference in the same sentence is untouched.
+    assert [(f, n) for f, n, _ in statutory_refs("Section 20 and sub-section 2")] == [
+        ("section", "20")
+    ]
+
+
+def test_statutory_grounding_or_is_a_list_separator():
+    """Materials reading "not by way of writ under Article 226 or 32" name
+    BOTH articles, and gen 424's answer cites "Articles 226/32". Without "or"
+    in the separator the 32 read as an invention."""
+    materials = "relief lies under Article 227 but not by way of writ under Article 226 or 32."
+    assert ("article", "32") in grounded_refs(materials)
+    assert ("article", "226") in grounded_refs(materials)
+    assert check_statutory_grounding("Articles 226/32 are unavailable.", _stat_ctx(
+        source_text=materials)).passed
+
+
+def test_statutory_grounding_enacted_headings_ground_three_families():
+    """Enacted text numbers rules and orders exactly as it numbers sections and
+    the layout does not say which. Gen 280's grounding prints the assembly's
+    RULES as "57. Suspension of rules.-", so emitting the number under
+    `section` alone left the answer's "Rule 57" ungrounded."""
+    keys = grounded_refs("x\n57. Suspension of rules.— Any member may move that")
+    assert ("rule", "57") in keys
+    assert ("section", "57") in keys
+    assert ("order", "57") in keys
+    # ... and nothing else: the channel does not invent an article or an entry.
+    assert ("article", "57") not in keys
+    assert ("entry", "57") not in keys
+
+
+def test_statutory_grounding_enacted_headings_tolerate_a_footnote_number():
+    """The extractor leaves the footnote marker welded to the heading: gen
+    280's grounding reads "16 57. Suspension of rules.-", where 16 is the
+    footnote and 57 is the rule the answer cites."""
+    keys = grounded_refs("x\n16 57. Suspension of rules.— Any member may move that")
+    assert ("rule", "57") in keys
+    assert check_statutory_grounding("Rule 57 lets the Speaker suspend it.", _stat_ctx(
+        source_text="x\n16 57. Suspension of rules.— Any member may move that")).passed
+
+
+@pytest.mark.parametrize(
+    "materials",
+    [
+        # NO MARGINAL-NOTE DASH. A judgment's numbered paragraph must not
+        # register, or every paragraph number in the materials grounds a
+        # provision. This is the mutant that survived the first round: an
+        # ASCII hyphen is NOT the dash, and nothing pinned it.
+        "x\n58. In our view the High Court erred in reversing the acquittal.",
+        "x\n58. Suspension of rules - any member may move that a rule be suspended.",
+        "x\n58. Suspension of rules -- any member may move that a rule be suspended.",
+    ],
+)
+def test_statutory_grounding_a_numbered_paragraph_is_not_an_enacted_heading(materials):
+    assert ("section", "58") not in grounded_refs(materials)
+    assert ("rule", "58") not in grounded_refs(materials)
+
+
+def test_statutory_grounding_an_enacted_heading_must_open_its_line():
+    """The ^ anchor is what separates a heading from a sentence that happens to
+    contain a number, a dot and a dash. Without it "...decided in 1998. Suspension
+    of rules - see..." would ground a provision out of running prose."""
+    inline = "The question was decided long ago. 58. Suspension of rules.— see below."
+    assert ("section", "58") in grounded_refs("x\n58. Suspension of rules.— see below.")
+    assert ("section", "58") not in grounded_refs(inline)
 
 
 def test_statutory_grounding_failure_is_a_regenerate_not_a_burnt_seed():
