@@ -231,8 +231,12 @@ JUDGEABLE_STREAMS = frozenset({"synthesis", "curated_c2", "transition"})
 # the same task forever.
 MAX_JUDGE_ATTEMPTS = 8
 
+# "ground_faithfulness" is not a spelling we invented: a gpt-5-mini judge
+# emitted it on exp_harmony 2026-08-21 and a complete, well-formed, PAID
+# verdict was discarded for it. Aliases are read-side only - the rubric still
+# asks for one spelling, and nothing here loosens what a score has to be.
 _AXIS_ALIASES = {
-    "grounding": ("grounding", "grounding_faithfulness"),
+    "grounding": ("grounding", "grounding_faithfulness", "ground_faithfulness"),
     "validity": ("validity", "reasoning_validity"),
     "coverage": ("coverage", "issue_coverage"),
 }

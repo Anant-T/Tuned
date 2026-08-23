@@ -2138,3 +2138,19 @@ def test_an_unroutable_judge_is_still_not_a_quality_reject(tmp_path, cfg, paths)
         assert task["state"] == "judge_unroutable"
         assert task["disposition"] != "judge:reject"
         assert not str(task["disposition"]).startswith("judge:reject")
+
+
+def test_ground_faithfulness_is_read_as_the_grounding_axis():
+    """One exp_harmony reply used ground_faithfulness and was discarded.
+
+    The reply was complete and well formed; only the axis key was one
+    character off the rubric's own name. Throwing away a paid verdict over
+    that is the parser being brittle, not defensive.
+    """
+    reply = (
+        '{"ground_faithfulness": 4, "reasoning_validity": 3, '
+        '"issue_coverage": 5, "rationale": "sound"}'
+    )
+    scores = parse_judge_reply(reply)
+    assert (scores.grounding, scores.validity, scores.coverage) == (4, 3, 5)
+    assert scores.rationale == "sound"
