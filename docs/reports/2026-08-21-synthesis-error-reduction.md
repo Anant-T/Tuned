@@ -4,6 +4,16 @@
 **Workspace:** `C:\Users\Anant\Desktop\projects\tuned`  
 **Related:** `2026-08-22-data-pipeline-investigation.md` (diagnosis + probes) · canvas `tuned-status.canvas.tsx`
 
+> **Correction (23 Aug 2026).** Every `$0 spent` figure below was true at this
+> note's 16:08 IST snapshot and went stale three minutes later. Between
+> **16:11 and 18:44 IST on 21 Aug** the `exp_harmony` store spent **≈ $0.34**
+> of the $2 cap on `openai/gpt-5-mini` (124 requests, 377,537 prompt /
+> 122,607 completion tokens), and roughly **78% of it bought nothing** — 95 of
+> 96 `judge_parse_error` events are empty replies and only 27 usable
+> judgements came back. Read the cause and the fix before spending more:
+> `2026-08-22-data-pipeline-investigation.md` § "OpenAI $2 hard cap". The live
+> store's ledger does still show genuinely 0 OpenAI requests.
+
 Working note for Cursor. Live synthesis sqlite is **no longer frozen** (judges are draining). Harmony work stays in `data/build/exp_harmony/`.
 
 ## Current snapshot (21 Aug, ~16:08 IST)
@@ -15,7 +25,7 @@ Working note for Cursor. Live synthesis sqlite is **no longer frozen** (judges a
 
 - First Harmony+s1 12-task probe: token-1 12/12, format 11/12, **3 accept / 9 reject**.
 - Expanded wave: format 27/36 (75%). Validity still kills (mean 3.17, need ≥ 4).
-- OpenAI judging: **$2 hard cap** (mini+nano one wallet). Exp yaml family `gpt-5` so it can grade gpt-oss rows. Live yaml still lumps OpenAI as `gpt-oss`. **$0 spent.**
+- OpenAI judging: **$2 hard cap** (mini+nano one wallet). Exp yaml family `gpt-5` so it can grade gpt-oss rows. Live yaml still lumps OpenAI as `gpt-oss`. **$0 spent.** *(True at 16:08 IST only — $0.34 by 18:44; see the correction above.)*
 - Generation: free Cerebras `gpt-oss-120b` first. No OpenAI/Gemini teachers (ToS).
 - Tests: 459 passed (`test_build_{generate,judge,providers,harmony,config}`).
 
@@ -100,7 +110,7 @@ Keep law gates. Change **opening control** of the analysis channel.
 | 2 | **Same-turn think excerpt in the live user message** (not a prior assistant turn). | Stays in this turn’s echo window. Harmony will not drop it. | **In `prompts_dialect/`** |
 | 3 | **Harmony Completions analysis prefill** (not Chat Completions `assistant.reasoning`). | Only hosted way to lock token-1 of analysis on Cerebras. Chat Completions ignored the reasoning field. | **Wired. Token-1 12/12 on Harmony+s1.** |
 | 4 | **s1 continue** `" Wait"` when the continuation has no cue. | Salvage. Must not be `Wait,` / `am I sure` (those are `VERIFICATION_CUES`). | **In exp yaml. First wave 13 continue events, 0 errors.** |
-| 5 | Drain judging and fit `judge_threshold`. | Format is no longer the only bottleneck. ~20–28% accept among judged format-passers. | **Live 76 left; Harmony 15 left. OpenAI $2 cap, $0 spent.** |
+| 5 | Drain judging and fit `judge_threshold`. | Format is no longer the only bottleneck. ~20–28% accept among judged format-passers. | **Live 76 left; Harmony 15 left. OpenAI $2 cap, $0 spent.** *(superseded — $0.34 spent by 18:44 IST, see correction)* |
 | 6 | JSON schema on **visible IRAC / citations only**, `reasoning_format=parsed`. | None on think dialect; can hide reasoning if mis-set. | After dialect yield is real |
 | 7 | Self-host vLLM + Harmony analysis prefill, or a teacher with think-prefill (Qwen3). | Highest control. Days. | Fallback |
 

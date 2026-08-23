@@ -353,6 +353,15 @@ This supersedes the “live sqlite frozen / 6 accept / 109 judging” snapshot i
 
 Attempted yield **15 / ~641 ≈ 2.3%**. Among judged format-passers **15 / (15+39) = 28%**. Validity still kills. OpenAI ledger on this file: **0 requests** (live yaml still declares gpt-5-* as `family: gpt-oss`, so family separation skips them on gpt-oss-120b rows). A judge worker is draining Qwen + Gemma + Mistral.
 
+> **Correction (23 Aug 2026).** That drain has since **stalled, on routing rather
+> than on validity.** The 76 (+1) judging rows are now 43 `judging` + 34
+> `judge_error`, with **zero** new accepts or rejects — accepted is still 15 and
+> rejected still 414. All 34 carry one disposition: `judge-slot-b: role 'judge':
+> no eligible model (skipped: cooling, family-excluded)` (235 `judge_route_error`
+> events). Slot B had nobody left after gemma + gpt-oss family exclusion.
+> Reopening those tasks before the pool has an eligible slot-B member will just
+> re-park them.
+
 ### Harmony+s1 isolated store (`exp_harmony`)
 
 Official [openai/harmony](https://github.com/openai/harmony) render/parse + simplescaling/s1 `" Wait"` continue. Generator **cerebras/gpt-oss-120b only**. Overlay strips the 450–700 packet. Live prompt SHAs unchanged.
@@ -372,7 +381,34 @@ Operator: OpenAI may judge, **$2 TOTAL** across `gpt-5-mini` + `gpt-5-nano`, har
 
 - Live yaml: `usd_cap: 2.0` but family still `gpt-oss` → key unused on live gpt-oss rows.
 - Exp yaml: family **`gpt-5`** so Harmony rows can be graded if Qwen/Gemma cannot serve.
-- Spend so far: **$0** on both stores.
+- Spend so far: **$0** on both stores. *(True when this addendum was written;
+  superseded the same evening — see the correction below.)*
+
+> **Correction (23 Aug 2026).** Between **16:11 and 18:44 IST on 21 Aug**, after
+> this addendum's snapshot, `exp_harmony` ran **124 `openai/gpt-5-mini` judge
+> requests — 377,537 prompt / 122,607 completion tokens ≈ $0.34** of the $2 cap.
+> The live store is still genuinely at 0 OpenAI requests, for the `family:
+> gpt-oss` reason given above.
+>
+> **~78% of that spend bought nothing.** 95 of the store's 96
+> `judge_parse_error` events are empty replies (`no object found: ''`), all from
+> `gpt-5-mini`; only **27 usable judgements** came out of 124 requests. Cause:
+> judge calls send `max_tokens=1024` (`DEFAULT_JUDGE_REPLY_TOKENS`), the
+> `openai` quirk in `providers.py` renames it `max_completion_tokens`, and the
+> gpt-5 family bills *reasoning* tokens against that same budget while the exp
+> yaml leaves `params: {}` — no `reasoning_effort`. Mean completion was **989
+> tokens/request**, i.e. essentially every call spent its whole reply budget
+> thinking and returned empty content. **Before spending the remaining ~$1.66:**
+> set `reasoning_effort: minimal` on both gpt-5 refs, and/or raise the reply
+> allowance for that ref alone.
+>
+> The 1 non-empty parse failure is a separate alias gap: the model emitted
+> `ground_faithfulness`, the alias table accepts `grounding_faithfulness`.
+>
+> One caveat for the accept counts above: `exp_harmony`'s accept lift (3 → 8) is
+> confounded by judge composition — gpt-5-mini's mean grounding is **4.48** vs
+> gemma's **3.12** on the same store. Validity remains the kill axis for every
+> judge (2.86–3.74).
 
 Closed-API **generations** (OpenAI/Gemini as teacher) stay out of the training mix (spec line 14 / ToS).
 
