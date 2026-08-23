@@ -636,7 +636,20 @@ def first_attempt_unit(store, unit: MatchedRow) -> MatchedRow:
     )
 
 
-def select_cohort(store, n_per: int = STRATUM_N) -> Selection:
+def select_cohort(
+    store, n_per: int = STRATUM_N, *, strata: Sequence[str] | None = None
+) -> Selection:
+    """Pair the latest control generation per seed, within the declared strata.
+
+    ``strata`` defaults to TASK_TYPES - the four-way cohort the live contract
+    pre-registered. An experiment passes a shorter tuple ONLY when a stratum
+    is unfillable for a data reason; the tuple then travels into the manifest
+    so a short cohort can never be read as a full one.
+    """
+    wanted = tuple(strata) if strata else TASK_TYPES
+    unknown = sorted(set(wanted) - set(TASK_TYPES))
+    if unknown:
+        raise ValueError(f"unknown cohort strata: {unknown}")
     gold = gold_linked_seeds(store)
     excluded = {
         "stale": 0,
@@ -648,12 +661,12 @@ def select_cohort(store, n_per: int = STRATUM_N) -> Selection:
     latest_by_task = {row["task_id"]: row for row in store.latest_generations()}
     events_map = _events_by_gen(store)
     seed_cache: dict[str, dict | None] = {}
-    buckets: dict[str, dict[str, dict]] = {name: {} for name in TASK_TYPES}
+    buckets: dict[str, dict[str, dict]] = {name: {} for name in wanted}
 
     for task in store.conn.execute("SELECT * FROM task"):
         task = dict(task)
         task_type = task["task_type"]
-        if task_type not in TASK_TYPES:
+        if task_type not in wanted:
             continue
         seed_id = task["seed_id"]
         if seed_id in gold:
@@ -692,7 +705,7 @@ def select_cohort(store, n_per: int = STRATUM_N) -> Selection:
     counts: dict[str, int] = {}
     blocked = False
     reasons: list[str] = []
-    for task_type in TASK_TYPES:
+    for task_type in wanted:
         ranked = sorted(
             buckets[task_type].values(),
             key=lambda row: _rank(row["seed_id"], task_type),
@@ -917,6 +930,7 @@ def evaluate(
     candidate_decisions_path: str | Path | None = None,
     manifest=None,
     n_per: int = STRATUM_N,
+    strata: Sequence[str] | None = None,
 ) -> EvalReport:
     if manifest is not None:
         raise TypeError("evaluate requires manifest_path, not an in-memory manifest")
@@ -932,7 +946,7 @@ def evaluate(
     if control is None or treatment is None:
         raise ValueError("evaluate needs control and treatment contracts or configs")
 
-    selected = select_cohort(control_store, n_per=n_per)
+    selected = select_cohort(control_store, n_per=n_per, strata=strata)
     empty_box = LockboxReport(0, 0, 0, 0, False, {}, valid=False, reason="lockbox-cardinality")
     empty_metrics = _empty_metrics()
 
@@ -1079,7 +1093,7 @@ def evaluate(
         lockbox_reject_flips=box.reject_flips,
         lockbox_new_false_negatives=box.new_false_negatives,
         types_with_format_pass=types_with_pass,
-        generated_types=generated_types or set(TASK_TYPES),
+        generated_types=generated_types or set(strata or TASK_TYPES),
         selection_blocked=False,
         contract_ok=True,
         missing_gate_data=missing_gate_data,
@@ -1124,7 +1138,13 @@ def control_snapshot_fingerprint(selection: Selection, contract: EvalContract) -
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def cohort_manifest(selection: Selection, *, contract: EvalContract) -> dict:
+def cohort_manifest(
+    selection: Selection,
+    *,
+    contract: EvalContract,
+    strata: Sequence[str] | None = None,
+) -> dict:
+    wanted = tuple(strata) if strata else TASK_TYPES
     pairs = [
         {
             "seed_id": row.seed_id,
@@ -1138,7 +1158,8 @@ def cohort_manifest(selection: Selection, *, contract: EvalContract) -> dict:
     return {
         "n": len(selection.pairs),
         "n_per_stratum": STRATUM_N,
-        "task_types": list(TASK_TYPES),
+        "strata": list(wanted),
+        "task_types": list(wanted),
         "think_min": contract.think_min,
         "teacher_family": contract.teacher_family,
         "teacher_model": contract.teacher_model,
@@ -1149,23 +1170,36 @@ def cohort_manifest(selection: Selection, *, contract: EvalContract) -> dict:
 
 
 def validate_pretreatment_manifest(
-    manifest: Mapping | None, *, treatment: EvalContract
+    manifest: Mapping | None,
+    *,
+    treatment: EvalContract,
+    strata: Sequence[str] | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
-    """Validate a persisted 80-pair pre-treatment manifest against treatment."""
+    """Validate a persisted pre-treatment manifest against treatment."""
     if not isinstance(manifest, Mapping):
         return False, ("pretreatment-manifest-invalid",)
+    wanted = tuple(strata) if strata else TASK_TYPES
     reasons: list[str] = []
+    declared_strata = manifest.get("strata")
+    # A missing "strata" key means the manifest predates this field (or the
+    # writer chose not to declare it); that is not itself a mismatch - the
+    # n/per-stratum checks below still catch a composition that doesn't fit
+    # `wanted`. An explicitly declared strata list that disagrees is a
+    # mismatch even if the pair count happens to line up.
+    if declared_strata is not None and tuple(declared_strata) != wanted:
+        reasons.append("contract-mismatch:strata")
+    expected_n = STRATUM_N * len(wanted)
     pairs = list(manifest.get("pairs") or ())
-    if manifest.get("n") != 80 or len(pairs) != 80:
+    if manifest.get("n") != expected_n or len(pairs) != expected_n:
         reasons.append("pretreatment-manifest-n")
-    counts = {name: 0 for name in TASK_TYPES}
+    counts = {name: 0 for name in wanted}
     for row in pairs:
         if not isinstance(row, Mapping):
             continue
         task_type = row.get("task_type")
         if task_type in counts:
             counts[task_type] += 1
-    for task_type in TASK_TYPES:
+    for task_type in wanted:
         if counts[task_type] != STRATUM_N:
             reasons.append(f"underfilled-stratum:{task_type}")
     if tuple(manifest.get("gate_contract") or ()) != tuple(GATE_ORDER):
@@ -1200,7 +1234,9 @@ def require_pretreatment_manifest(cfg, *, repo_root=None) -> dict:
         raise ValueError(f"pretreatment manifest is missing: {path}")
     manifest = json.loads(path.read_text(encoding="utf-8"))
     ok, reasons = validate_pretreatment_manifest(
-        manifest, treatment=contract_from_config(cfg)
+        manifest,
+        treatment=contract_from_config(cfg),
+        strata=getattr(cfg.build, "eval_cohort_strata", None),
     )
     if not ok:
         raise ValueError("pretreatment manifest refused: " + ",".join(reasons))
@@ -1220,6 +1256,7 @@ def write_manifest(
     treatment_empty: bool = False,
     contract: EvalContract,
     n_per: int = STRATUM_N,
+    strata: Sequence[str] | None = None,
 ) -> dict:
     if treatment_store is None and not treatment_empty:
         raise ValueError("treatment store is required to prove pre-treatment")
@@ -1227,10 +1264,10 @@ def write_manifest(
         raise ValueError(
             "pre-treatment manifest refused: treatment already has generations"
         )
-    selected = select_cohort(control_store, n_per=n_per)
+    selected = select_cohort(control_store, n_per=n_per, strata=strata)
     if selected.blocked:
         raise ValueError(selected.reason or "underfilled-stratum")
-    manifest = cohort_manifest(selected, contract=contract)
+    manifest = cohort_manifest(selected, contract=contract, strata=strata)
     Path(path).write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     return manifest
 
@@ -1301,6 +1338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "write-manifest":
         control_contract = contract_from_config(control_cfg)
+        strata = getattr(treatment_cfg.build, "eval_cohort_strata", None)
         control_store = open_eval_store(control_db)
         try:
             if Path(treatment_db).exists():
@@ -1311,6 +1349,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         control_store,
                         treatment_store=treatment_store,
                         contract=control_contract,
+                        strata=strata,
                     )
                 finally:
                     treatment_store.close()
@@ -1320,6 +1359,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     control_store,
                     treatment_empty=True,
                     contract=control_contract,
+                    strata=strata,
                 )
         finally:
             control_store.close()
@@ -1335,6 +1375,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             treatment_cfg=treatment_cfg,
             manifest_path=args.manifest,
             candidate_decisions_path=args.candidate_decisions,
+            strata=getattr(treatment_cfg.build, "eval_cohort_strata", None),
         )
         print(f"decision={report.decision} synthesis={report.synthesis_label}")
         print("reasons=" + ",".join(report.reasons))

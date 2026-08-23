@@ -1474,3 +1474,77 @@ def test_write_manifest_cli_writes_before_treatment(tmp_path):
         control.close()
         treatment.close()
 
+
+def test_declared_strata_fill_where_the_four_way_default_blocks(store):
+    """One pool, two contracts: four strata block on statute_qa, three do not.
+
+    The statute_qa seeds carry a section_text equal to the seed body, which
+    is the live control store's actual condition - 270 tasks, 0 eligible
+    seeds - so statute_section_eligible refuses every one of them.
+    """
+    for task_type in TASK_TYPES:
+        for i in range(22):
+            _plant_unit(
+                store,
+                seed_id=f"{task_type}-{i:03d}",
+                task_type=task_type,
+                gates=_gate_rows(),
+                state="accepted",
+                section=SOURCE_BODY if task_type == "statute_qa" else SECTION,
+            )
+
+    four = E.select_cohort(store, n_per=20)
+    assert four.blocked is True
+    assert "underfilled-stratum:statute_qa" in four.reason
+
+    declared = ("irac_analysis", "drafting", "summarization")
+    three = E.select_cohort(store, n_per=20, strata=declared)
+    assert three.blocked is False
+    assert len(three.pairs) == 60
+    assert set(three.stratum_counts) == set(declared)
+    assert "statute_qa" not in {row.task_type for row in three.pairs}
+
+
+def test_unknown_stratum_is_refused_rather_than_silently_empty(store):
+    """A typo'd stratum would otherwise select nothing and block on itself."""
+    with pytest.raises(ValueError, match="unknown cohort strata"):
+        E.select_cohort(store, strata=("irac_analysis", "not_a_task_type"))
+
+
+
+def test_manifest_records_strata_and_sizes_n_from_them(tmp_path, store):
+    _eligible_pool(store, per_type=25)
+    strata = ("irac_analysis", "drafting", "summarization")
+    with Store.open(tmp_path / "treat" / "law_v1.sqlite3") as treatment:
+        manifest = E.write_manifest(
+            tmp_path / "cohort.json",
+            store,
+            treatment_store=treatment,
+            contract=_contract(),
+            strata=strata,
+        )
+    assert manifest["strata"] == list(strata)
+    assert manifest["n"] == 60
+    assert len(manifest["pairs"]) == 60
+    ok, reasons = E.validate_pretreatment_manifest(
+        manifest, treatment=_contract(), strata=strata
+    )
+    assert ok, reasons
+
+
+def test_manifest_written_for_three_strata_is_refused_against_four(store, tmp_path):
+    """A 60-pair cohort must not validate as the 80-pair contract."""
+    _eligible_pool(store, per_type=25)
+    strata = ("irac_analysis", "drafting", "summarization")
+    with Store.open(tmp_path / "treat" / "law_v1.sqlite3") as treatment:
+        manifest = E.write_manifest(
+            tmp_path / "cohort.json",
+            store,
+            treatment_store=treatment,
+            contract=_contract(),
+            strata=strata,
+        )
+    ok, reasons = E.validate_pretreatment_manifest(manifest, treatment=_contract())
+    assert ok is False
+    assert "contract-mismatch:strata" in reasons
+
