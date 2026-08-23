@@ -894,3 +894,48 @@ def test_recovery_openai_cap_is_the_remaining_headroom_not_a_fresh_two_dollars()
             f"openai/{name} declares usd_cap {model.limits['usd_cap']!r}; the "
             "$2.00 operator total already has $0.3396 spent in exp_harmony"
         )
+
+
+def test_gpt5_judge_and_tiebreak_calls_carry_minimal_reasoning_effort():
+    """gpt-5 bills reasoning against max_completion_tokens.
+
+    With params {} the model spent its whole 1,024-token reply budget
+    thinking and returned empty content on 95 of 96 parse failures in
+    exp_harmony. JUDGE_MAX_TOKENS cannot be the answer - it is fleet-wide,
+    and build_payload assigns max_tokens AFTER the role_params merge - so
+    the effort knob is the fix, as judge.py's own comment says.
+    """
+    import httpx
+
+    from tuned.data.providers import ChatClient, ChatRequest
+
+    def _never_called(request):  # build_payload performs no request
+        raise AssertionError("build_payload must not perform a request")
+
+    cfg = load_build_config(
+        RECOVERY_CONFIG, allow_unpinned=True
+    )
+    for name in ("gpt-5-mini", "gpt-5-nano"):
+        ref = ModelRef("openai", name)
+        provider, model = cfg.model_for(ref)
+        for role in ("judge", "tiebreak"):
+            assert model.role_params[role]["reasoning_effort"] == "minimal", (
+                f"openai/{name} role_params[{role!r}] does not pin "
+                "reasoning_effort"
+            )
+            client = ChatClient(
+                provider, model, transport=httpx.MockTransport(_never_called)
+            )
+            payload = client.build_payload(
+                ChatRequest(
+                    messages=({"role": "user", "content": "score this"},),
+                    ref=ref,
+                    role=role,
+                    max_tokens=1024,
+                )
+            )
+            assert payload["reasoning_effort"] == "minimal"
+            # the openai quirk renames the allowance and drops temperature
+            assert payload["max_completion_tokens"] == 1024
+            assert "max_tokens" not in payload
+            assert "temperature" not in payload

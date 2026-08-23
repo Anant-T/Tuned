@@ -602,6 +602,17 @@ providers:
         limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
                  usd_cap: 1.66, usd_per_1m_prompt: 0.25, usd_per_1m_completion: 2.0}
         params: {}
+        # gpt-5 bills REASONING against max_completion_tokens, and judge.py's
+        # reply allowance is a fleet-wide 1,024 it cannot raise per model
+        # (build_payload assigns max_tokens after this merge). Measured on
+        # exp_harmony 2026-08-21: mean completion 989 tokens/request, and 95
+        # of 96 parse failures were EMPTY replies - the model spent the whole
+        # budget thinking and never reached the verdict. 'minimal' is the
+        # lowest effort this family accepts; the free qwen seat carries the
+        # same fix as reasoning_effort 'none'.
+        role_params:
+          judge: {reasoning_effort: 'minimal'}
+          tiebreak: {reasoning_effort: 'minimal'}
       - id: gpt-5-nano
         family: gpt-5
         roles: [judge, tiebreak]
@@ -609,6 +620,17 @@ providers:
         limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
                  usd_cap: 1.66, usd_per_1m_prompt: 0.05, usd_per_1m_completion: 0.40}
         params: {}
+        # gpt-5 bills REASONING against max_completion_tokens, and judge.py's
+        # reply allowance is a fleet-wide 1,024 it cannot raise per model
+        # (build_payload assigns max_tokens after this merge). Measured on
+        # exp_harmony 2026-08-21: mean completion 989 tokens/request, and 95
+        # of 96 parse failures were EMPTY replies - the model spent the whole
+        # budget thinking and never reached the verdict. 'minimal' is the
+        # lowest effort this family accepts; the free qwen seat carries the
+        # same fix as reasoning_effort 'none'.
+        role_params:
+          judge: {reasoning_effort: 'minimal'}
+          tiebreak: {reasoning_effort: 'minimal'}
 
 # Mistral rpm/tpm are console+header-verified 2026-08-14 and are no longer
 # placeholders. The workspace limit is 50 rpm / 50k tpm and BOTH models draw
