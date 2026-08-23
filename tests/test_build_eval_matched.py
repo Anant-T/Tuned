@@ -1236,6 +1236,112 @@ def test_contract_from_config_reads_think_min_and_teacher(tmp_path):
     assert control_c.gate_contract == tuple(GATE_ORDER)
 
 
+def _cohort_selection(strata, *, n_per=20, gen_id_start=1):
+    """A Selection with dummy MatchedRows, shaped only enough for
+    cohort_manifest (seed_id/task_type/task_id/gen_id/attempt)."""
+    pairs = []
+    gen_id = gen_id_start
+    for task_type in strata:
+        for i in range(n_per):
+            seed_id = f"{task_type}-{i:03d}"
+            pairs.append(
+                E.MatchedRow(
+                    seed_id=seed_id,
+                    task_type=task_type,
+                    task_id=f"{seed_id}:{task_type}",
+                    gen_id=gen_id,
+                    attempt=1,
+                    state="accepted",
+                    model="dummy",
+                    finish_reason="stop",
+                    gates={},
+                    judgements={},
+                )
+            )
+            gen_id += 1
+    return E.Selection(
+        pairs=pairs,
+        blocked=False,
+        stratum_counts={t: n_per for t in strata},
+        excluded={},
+        decision=None,
+        reason="",
+    )
+
+
+def test_require_pretreatment_manifest_enforces_recovery_configs_declared_strata(
+    tmp_path,
+):
+    """require_pretreatment_manifest (eval_matched.py:1219) is the seam that
+    connects configs/data_law_v1_exp_recovery.yaml's eval_cohort_strata to
+    validate_pretreatment_manifest, the production gate generate.main calls
+    before creating the recovery workdir. If getattr(cfg.build,
+    "eval_cohort_strata", None) at eval_matched.py:1240 were ever wrong, the
+    rest of the suite would still pass and the arm would still be silently
+    blocked (or silently NOT blocked) - this test is the only thing pinning
+    that one line against the real config.
+
+    Proves both directions: a manifest matching the recovery config's
+    3-stratum declaration is accepted, and the 4-stratum default is refused
+    by name (contract-mismatch:strata).
+    """
+    import dataclasses
+
+    from tuned.data.config import load_build_config
+
+    recovery = load_build_config(
+        Path(__file__).parent.parent / "configs" / "data_law_v1_exp_recovery.yaml",
+        allow_unpinned=True,
+    )
+    assert recovery.build.eval_cohort_strata == (
+        "irac_analysis",
+        "drafting",
+        "summarization",
+    )
+    contract = E.contract_from_config(recovery)
+
+    # -- Direction 1: a 60-pair / 3-strata manifest matching the config is
+    # accepted and returned as-is.
+    matching_manifest = E.cohort_manifest(
+        _cohort_selection(recovery.build.eval_cohort_strata),
+        contract=contract,
+        strata=recovery.build.eval_cohort_strata,
+    )
+    assert matching_manifest["n"] == 60
+    assert matching_manifest["strata"] == list(recovery.build.eval_cohort_strata)
+    matching_path = tmp_path / "matching-manifest.json"
+    matching_path.write_text(json.dumps(matching_manifest), encoding="utf-8")
+    assert matching_path.is_absolute()
+    accepted_cfg = dataclasses.replace(
+        recovery,
+        build=dataclasses.replace(
+            recovery.build, pretreatment_manifest=str(matching_path)
+        ),
+    )
+    result = E.require_pretreatment_manifest(accepted_cfg)
+    assert result == matching_manifest
+
+    # -- Direction 2: an 80-pair / 4-strata manifest (the eval_matched
+    # four-way default) is refused, and named as a strata mismatch - not
+    # silently swallowed into some other reason.
+    mismatched_manifest = E.cohort_manifest(
+        _cohort_selection(E.TASK_TYPES, gen_id_start=1000),
+        contract=contract,
+        strata=E.TASK_TYPES,
+    )
+    assert mismatched_manifest["n"] == 80
+    mismatched_path = tmp_path / "mismatched-manifest.json"
+    mismatched_path.write_text(json.dumps(mismatched_manifest), encoding="utf-8")
+    refused_cfg = dataclasses.replace(
+        recovery,
+        build=dataclasses.replace(
+            recovery.build, pretreatment_manifest=str(mismatched_path)
+        ),
+    )
+    with pytest.raises(ValueError, match="contract-mismatch:strata"):
+        E.require_pretreatment_manifest(refused_cfg)
+
+
 def test_live_style_store_event_is_seen_on_latest_unit(store):
     gen_id = _plant_unit(
         store,

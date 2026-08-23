@@ -1,9 +1,10 @@
 """Read-only matched evaluator for the law-v1 recovery cohort.
 
-Selects a fixed 80-seed (20x4) control cohort, pairs latest generations by
-(seed_id, task_type), computes locked denominators with Wilson / one-sided
-exact McNemar, confirms the 46-label lockbox by gen_id under the
-pre-registered dual-judge rule, and returns promote | refuse | inconclusive.
+Selects a 20-per-stratum control cohort (four-way 80-seed by default), pairs
+latest generations by (seed_id, task_type), computes locked denominators with
+Wilson / one-sided exact McNemar, confirms the 46-label lockbox by gen_id
+under the pre-registered dual-judge rule, and returns promote | refuse |
+inconclusive.
 
 Accepted synthesis is high-confidence pseudo-gold, never gold. This module
 does not fit thresholds, write labels, or call a model.
