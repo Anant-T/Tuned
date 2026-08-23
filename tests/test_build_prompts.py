@@ -762,3 +762,83 @@ def test_live_judge_sha_stays_put_when_recovery_overlay_is_armed():
         reg.set_overlay(None)
     for prompt_id in JUDGE_IDS:
         assert reg.load(prompt_id).sha == EXPECTED_SHAS[prompt_id]
+
+
+# Overlay drift. The overlay is sixteen near-copies of prompts/ and must stay
+# copies: prompt_sha is sha256 of RAW FILE BYTES, so a generated overlay would
+# have no bytes to hash and the exp_harmony rows would stop being comparable.
+# What these pin is that the copies stay in step with what they copied.
+
+_PACKET_MARKERS = ("450 to 700 words", "Let me check this, or actually")
+
+_EXPECTED_OVERLAY_SHAS = {
+    "gen_drafting_v1": "609834efa759",
+    "gen_drafting_v2": "ea66b7bba577",
+    "gen_irac_analysis_v1": "088c0442f674",
+    "gen_irac_analysis_v2": "5fa4ce5dba19",
+    "gen_irac_analysis_v3": "d3635ee18266",
+    "gen_irac_analysis_v4": "5bc40d3c1bef",
+    "gen_statute_qa_v1": "bf49860e80dc",
+    "gen_statute_qa_v2": "aaaaec660f01",
+    "gen_statute_qa_v3": "9d2859618af8",
+    "gen_statute_qa_v4": "598deaeafd23",
+    "gen_summarization_v1": "42ee72ab542c",
+    "gen_summarization_v2": "84e8a00c5425",
+    "gen_transition_v1": "717e0c99aea7",
+    "gen_transition_v2": "73a97936afa1",
+    "judge_pointwise_v1": "e2798dd5c81c",
+    "judge_tiebreak_v1": "85a0c7f8da47",
+}
+
+
+def test_every_overlay_file_has_a_pinned_sha():
+    on_disk = {path.stem for path in _OVERLAY_DIR.glob("*.md")}
+    assert on_disk == set(_EXPECTED_OVERLAY_SHAS)
+
+
+def test_overlay_bytes_are_pinned_like_the_live_bytes_are():
+    for prompt_id, expected in sorted(_EXPECTED_OVERLAY_SHAS.items()):
+        raw = (_OVERLAY_DIR / f"{prompt_id}.md").read_bytes()
+        actual = hashlib.sha256(raw).hexdigest()[:12]
+        assert actual == expected, (
+            f"{prompt_id} overlay changed: {actual} != {expected}. An overlay "
+            f"edit is deliberate or it is drift - move the pin on purpose."
+        )
+
+
+def test_generator_overlays_differ_from_their_base_in_exactly_two_lines():
+    ids = [p for p in _EXPECTED_OVERLAY_SHAS if p.startswith("gen_")]
+    assert len(ids) == 14
+    for prompt_id in sorted(ids):
+        base = (reg.PROMPTS_DIR / f"{prompt_id}.md").read_text(encoding="utf-8").splitlines()
+        over = (_OVERLAY_DIR / f"{prompt_id}.md").read_text(encoding="utf-8").splitlines()
+        assert len(base) == len(over), f"{prompt_id}: overlay changed line count"
+        changed = [i for i, (b, o) in enumerate(zip(base, over)) if b != o]
+        assert len(changed) == 2, (
+            f"{prompt_id}: {len(changed)} lines differ from the base, expected 2. "
+            f"Editing a base prompt without carrying the packet strip across is "
+            f"what this catches."
+        )
+
+
+def test_the_packet_is_in_every_base_and_in_no_generator_overlay():
+    ids = [p for p in _EXPECTED_OVERLAY_SHAS if p.startswith("gen_")]
+    for prompt_id in sorted(ids):
+        base = (reg.PROMPTS_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
+        over = (_OVERLAY_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
+        for marker in _PACKET_MARKERS:
+            assert marker in base, f"{prompt_id}: base lost {marker!r}"
+            assert marker not in over, (
+                f"{prompt_id}: overlay carries {marker!r} - stripping the packet "
+                f"is the whole reason this overlay exists"
+            )
+
+
+def test_judge_overlays_drop_the_example_verdict():
+    for prompt_id in JUDGE_IDS:
+        base = (reg.PROMPTS_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
+        over = (_OVERLAY_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
+        assert '"grounding": 4' in base
+        assert '"grounding": 4' not in over
+        assert "no example verdict" in over
+        assert len(over.splitlines()) == len(base.splitlines()) - 2
