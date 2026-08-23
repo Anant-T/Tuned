@@ -178,6 +178,22 @@ class SegmentationResult:
         # would be counted under a tier no downstream report knows about.
         if self.tier not in TIERS:
             raise ValueError(f"unknown tier {self.tier!r}")
+        # The degradation contract above, enforced rather than described.
+        # chunks.py copies this field straight into every chunk's meta_json,
+        # so it is the only surviving record of why the roles tier did not
+        # carry a document. `degradation` defaults to None, which means a new
+        # packing return path that forgets it would degrade silently.
+        if self.tier == TIER_PACKING:
+            if not isinstance(self.degradation, dict):
+                raise ValueError(
+                    f"{TIER_PACKING} tier requires a degradation dict, "
+                    f"got {self.degradation!r}"
+                )
+        elif self.degradation is not None:
+            raise ValueError(
+                f"{self.tier} tier degraded nothing but carries a "
+                f"degradation {self.degradation!r}"
+            )
 
 
 # --------------------------------------------------------------------------

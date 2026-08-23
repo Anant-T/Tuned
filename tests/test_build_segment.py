@@ -798,6 +798,41 @@ def test_a_result_cannot_claim_a_tier_the_contract_does_not_name():
 def test_each_named_tier_constructs():
     from tuned.data import segment as seg
 
+    # Each tier is built the one way its degradation contract allows: packing
+    # always carries the dict, the other two never do.
     for tier in seg.TIERS:
-        result = seg.SegmentationResult(tier=tier, why="under test", segments=())
+        degradation = {"from": "roles", "reason": "under test"}
+        result = seg.SegmentationResult(
+            tier=tier,
+            why="under test",
+            segments=(),
+            degradation=degradation if tier == seg.TIER_PACKING else None,
+        )
         assert result.tier == tier
+
+
+def test_the_packing_tier_must_say_why_it_degraded():
+    # chunks.py copies this dict straight into every chunk's meta_json, and it
+    # is the only surviving record of why the roles tier did not carry the
+    # document. The field defaults to None, so a packing return path that
+    # forgets it degrades silently - the reader sees a fallback with no cause.
+    from tuned.data import segment as seg
+
+    with pytest.raises(ValueError, match="degradation"):
+        seg.SegmentationResult(tier=seg.TIER_PACKING, why=seg.WHY_PACKING, segments=())
+
+
+def test_a_tier_that_did_not_degrade_cannot_claim_a_degradation():
+    # The inverse error, and the one that corrupts counts rather than losing
+    # them: a toc/roles row carrying a degradation reports a fallback that
+    # never happened.
+    from tuned.data import segment as seg
+
+    for tier, why in ((seg.TIER_TOC, seg.WHY_TOC), (seg.TIER_ROLES, seg.WHY_ROLES)):
+        with pytest.raises(ValueError, match="degradation"):
+            seg.SegmentationResult(
+                tier=tier,
+                why=why,
+                segments=(),
+                degradation={"from": "roles", "reason": "no_role_spans"},
+            )
