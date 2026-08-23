@@ -939,3 +939,40 @@ def test_gpt5_judge_and_tiebreak_calls_carry_minimal_reasoning_effort():
             assert payload["max_completion_tokens"] == 1024
             assert "max_tokens" not in payload
             assert "temperature" not in payload
+
+
+def test_eval_cohort_strata_defaults_to_none_on_the_live_config():
+    cfg = load_build_config("configs/data_law_v1.yaml", allow_unpinned=True)
+    assert cfg.build.eval_cohort_strata is None
+
+
+def test_recovery_config_declares_three_strata_as_a_tuple():
+    cfg = load_build_config(
+        "configs/data_law_v1_exp_recovery.yaml", allow_unpinned=True
+    )
+    assert cfg.build.eval_cohort_strata == (
+        "irac_analysis",
+        "drafting",
+        "summarization",
+    )
+
+
+def test_eval_cohort_strata_refuses_empty_duplicate_and_non_string(tmp_path):
+    """A stratum list is a pre-registration, so it is validated at load.
+
+    An empty list, a repeat, or a non-string is a typo that would otherwise
+    reach the cohort selector and silently change the cohort's size.
+    """
+    import yaml as _yaml
+
+    base = _yaml.safe_load(
+        Path("configs/data_law_v1_exp_recovery.yaml").read_text(encoding="utf-8")
+    )
+    for bad in ([], ["irac_analysis", "irac_analysis"], ["irac_analysis", 7], "drafting"):
+        doc = dict(base)
+        doc["build"] = dict(base["build"])
+        doc["build"]["eval_cohort_strata"] = bad
+        path = tmp_path / "bad.yaml"
+        path.write_text(_yaml.safe_dump(doc), encoding="utf-8")
+        with pytest.raises(ValueError, match="eval_cohort_strata"):
+            load_build_config(path, allow_unpinned=True)

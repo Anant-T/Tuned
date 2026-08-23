@@ -55,6 +55,19 @@ class BuildCfg:
     # a yaml sets the flag; Harmony stays off until it opts in.
     require_pretreatment_manifest: bool = False
     pretreatment_manifest: str | None = None
+    # Which task-type strata the matched evaluator's cohort draws from.
+    # None = every stratum eval_matched knows (the four-way default), which
+    # is what the live wave declares by saying nothing.
+    #
+    # An experiment declares a SHORTER list only when a stratum cannot be
+    # filled for a DATA reason, and the reason belongs in the yaml next to
+    # the list. Measured 2026-08-23: the control store holds 270 statute_qa
+    # tasks and 0 seeds carrying a section_text distinct from the seed body,
+    # so statute_section_eligible refuses every one of them and the stratum
+    # is unfillable until real Gazette provision text exists. Declaring it
+    # here - rather than letting the selector return a short cohort - is what
+    # keeps a 60-pair result from being read as an 80-pair one.
+    eval_cohort_strata: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -888,10 +901,29 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
             "build.pretreatment_manifest is required when "
             "require_pretreatment_manifest is true"
         )
+    strata = build_raw.pop("eval_cohort_strata", None)
+    if strata is not None:
+        if not isinstance(strata, list) or not strata:
+            raise ValueError(
+                "build.eval_cohort_strata must be a non-empty YAML list of "
+                f"task-type names, got {strata!r}"
+            )
+        if not all(isinstance(name, str) and name.strip() for name in strata):
+            raise ValueError(
+                "build.eval_cohort_strata entries must be non-empty strings, "
+                f"got {strata!r}"
+            )
+        strata = tuple(name.strip() for name in strata)
+        if len(set(strata)) != len(strata):
+            raise ValueError(
+                f"build.eval_cohort_strata repeats a stratum: {strata!r}. A "
+                "repeat would double one stratum's share of the cohort."
+            )
     build = BuildCfg(
         length_band=length_band,
         require_pretreatment_manifest=require_manifest,
         pretreatment_manifest=pretreatment_manifest,
+        eval_cohort_strata=strata,
         **build_raw,
     )
 

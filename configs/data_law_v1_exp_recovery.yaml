@@ -29,6 +29,25 @@ build:
   require_pretreatment_manifest: true
   pretreatment_manifest: .superpowers/sdd/law-v1-recovery_893eff3d/cohort-manifest.json
 
+  # THREE STRATA, NOT FOUR, AND THE MISSING ONE IS A DATA FACT NOT A CHOICE.
+  # eval_matched.statute_section_eligible requires a seed whose
+  # meta_json.section_text differs from the seed body. Measured 2026-08-23 on
+  # the read-only control store: 270 statute_qa tasks, 0 eligible seeds - no
+  # seed in that database carries provision text at all, so the stratum
+  # cannot be filled and select_cohort blocks with
+  # underfilled-stratum:statute_qa before anything is spent.
+  #
+  # Filling it needs official Gazette Act bodies attached to seeds (the
+  # gazette.py work on branch law-v1-foundation, whose manifest holds
+  # identities only), and attaching them would mean WRITING to the control
+  # store, which this arm may not do.
+  #
+  # Consequence, recorded here so the report cannot forget it: the cohort is
+  # 60 pairs, not 80. McNemar runs on a smaller discordant pool, and this arm
+  # may make NO claim about statute_qa - which is also the stream whose live
+  # accepts went 0 -> 2 under the corrected prompts, so the gap is real.
+  eval_cohort_strata: [irac_analysis, drafting, summarization]
+
 # --------------------------------------------------------------------------
 # The assembly tail: split.py -> assemble.py -> stats.py.
 # --------------------------------------------------------------------------
