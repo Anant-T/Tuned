@@ -875,3 +875,22 @@ def test_rewrite_dataset_revision_inserts_when_missing():
     text = "hub:\n  checkpoint_repo: x\n"
     new = rewrite_dataset_revision(text, "newsha")
     assert new == "hub:\n  dataset_revision: newsha\n  checkpoint_repo: x\n"
+
+
+def test_recovery_openai_cap_is_the_remaining_headroom_not_a_fresh_two_dollars():
+    """budget_ledger is per-store, so a new store resets usd_cap.
+
+    exp_harmony already spent $0.3396 of the operator's $2.00 total
+    (gpt-5-mini, 124 requests, 377,537 prompt / 122,607 completion tokens).
+    The recovery yaml must declare the REMAINDER, or the arm silently
+    authorises a second full wallet.
+    """
+    cfg = load_build_config(
+        RECOVERY_CONFIG, allow_unpinned=True
+    )
+    for name in ("gpt-5-mini", "gpt-5-nano"):
+        _provider, model = cfg.model_for(ModelRef("openai", name))
+        assert model.limits["usd_cap"] == 1.66, (
+            f"openai/{name} declares usd_cap {model.limits['usd_cap']!r}; the "
+            "$2.00 operator total already has $0.3396 spent in exp_harmony"
+        )

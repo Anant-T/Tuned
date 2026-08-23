@@ -580,6 +580,16 @@ providers:
       # usd_cap shared by mini and nano. The cap is the spend brake; these
       # refs still sit LAST in routing.judge / routing.tiebreak so every free
       # judge is tried first.
+      # THE NUMBER HERE IS 1.66, NOT 2.00, AND THAT IS NOT A TYPO. usd_cap is
+      # enforced by generate._openai_usd_spent, which sums budget_ledger from
+      # THE STORE IT IS GIVEN - and budget_ledger is per-workdir. A brand-new
+      # exp_recovery store starts at zero however much has been spent
+      # elsewhere, so declaring 2.00 here would authorise a SECOND full wallet.
+      # Measured 2026-08-23 on data/build/exp_harmony/state/law_v1.sqlite3:
+      # gpt-5-mini, 124 requests, 377,537 prompt + 122,607 completion tokens
+      # = $0.3396 at the prices below. 2.00 - 0.3396 = 1.6604, rounded DOWN.
+      # Any future store recomputes the remainder the same way; the arithmetic
+      # belongs to the operator's total, not to this file.
       #
       # Neither block carries `temperature`: the gpt-5 family accepts the
       # default and 400s on any other value (measured 2026-08-15). The
@@ -590,14 +600,14 @@ providers:
         family: gpt-5
         roles: [judge, tiebreak]
         limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
-                 usd_cap: 2.0, usd_per_1m_prompt: 0.25, usd_per_1m_completion: 2.0}
+                 usd_cap: 1.66, usd_per_1m_prompt: 0.25, usd_per_1m_completion: 2.0}
         params: {}
       - id: gpt-5-nano
         family: gpt-5
         roles: [judge, tiebreak]
         # The cheaper sibling: ~5x mini. Shares the same $2 usd_cap wallet.
         limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
-                 usd_cap: 2.0, usd_per_1m_prompt: 0.05, usd_per_1m_completion: 0.40}
+                 usd_cap: 1.66, usd_per_1m_prompt: 0.05, usd_per_1m_completion: 0.40}
         params: {}
 
 # Mistral rpm/tpm are console+header-verified 2026-08-14 and are no longer
