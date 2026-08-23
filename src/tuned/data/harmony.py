@@ -33,7 +33,6 @@ KNOWLEDGE_CUTOFF = "2024-06"
 # sentence. Bare "Wait" is not a VERIFICATION_CUES hit ("wait," / "wait:" are).
 S1_WAIT = " Wait"
 
-_ANALYSIS_HEADER = "<|start|>assistant<|channel|>analysis<|message|>"
 _FINAL_MARKERS = (
     "<|end|><|start|>assistant<|channel|>final<|message|>",
     "<|start|>assistant<|channel|>final<|message|>",
