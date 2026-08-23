@@ -49,7 +49,14 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 from tuned.data import gates
-from tuned.data.generate import SlotError, build_prompt, gate_context
+from tuned.data.generate import (
+    INPUT_INELIGIBLE_DISPOSITION,
+    INPUT_INELIGIBLE_STATE,
+    SlotError,
+    build_prompt,
+    gate_context,
+    statute_qa_input_ineligible,
+)
 from tuned.data.jsonl import read_at
 from tuned.data.store import DEFAULT_LEASE_S, _TS_FMT
 
@@ -177,12 +184,19 @@ def rerun_gates(
         "clean": 0,
         "demoted": 0,
         "soft_fail": 0,
+        # Diagnostic-only misses (self_verification). Recorded and reported,
+        # never a hard/soft disposition and never a demotion.
+        "diagnostic": 0,
         "missing_seed": 0,
         # Counted apart from missing_seed: a row whose SLOTS no longer render
         # (a transition row generated before the dates became mandatory) is a
         # row that will never be verified, and folding it into "missing seed"
         # hid that class inside a number that reads as "nothing to do here".
         "slot_error": 0,
+        # Statute-QA whose seed still has no genuine distinct provision.
+        # Counted apart from slot_error so a legacy ineligible row is not
+        # silently folded into "never verified" without a named class.
+        "input_ineligible": 0,
         # Demotions skipped because a worker holds the row right now.
         "held_by_worker": 0,
         "rebuilt_content": 0,
@@ -202,6 +216,39 @@ def rerun_gates(
         try:
             bundle = build_prompt(cfg, gen, seed)
         except (SlotError, KeyError) as exc:  # unrenderable slots / retired prompt id
+            if statute_qa_input_ineligible(gen, seed):
+                # Do not re-gate, do not treat source prose as a provision,
+                # and do not promote. Report the class by name; park an
+                # accepted/judging row so the operator can reopen after
+                # genuine section metadata is supplied.
+                counts["input_ineligible"] += 1
+                store.log_event(
+                    "verify_input_ineligible",
+                    {
+                        "task_id": gen["task_id"],
+                        "reason": f"{type(exc).__name__}: {exc}"[:200],
+                        "from_state": gen["task_state"],
+                    },
+                )
+                if gen["task_state"] in demote_states:
+                    if respect_leases and lease_is_live(store, gen["task_id"]):
+                        counts["held_by_worker"] += 1
+                        store.log_event(
+                            "verify_demotion_deferred",
+                            {
+                                "task_id": gen["task_id"],
+                                "gen_id": int(gen["gen_id"]),
+                                "from_state": gen["task_state"],
+                                "gates": ["input_ineligible"],
+                            },
+                        )
+                    else:
+                        store.set_task_state(
+                            gen["task_id"],
+                            INPUT_INELIGIBLE_STATE,
+                            INPUT_INELIGIBLE_DISPOSITION,
+                        )
+                continue
             counts["slot_error"] += 1
             store.log_event(
                 "verify_skipped",
@@ -222,7 +269,19 @@ def rerun_gates(
         disposition = gates.disposition(results)
         failed = [g.gate for g in results if not g.passed]
         if disposition is None:
-            counts["clean"] += 1
+            diagnostic = [gate for gate in failed if gate in gates.DIAGNOSTIC_GATES]
+            if diagnostic:
+                counts["diagnostic"] += 1
+                store.log_event(
+                    "verify_diagnostic",
+                    {
+                        "task_id": gen["task_id"],
+                        "gen_id": int(gen["gen_id"]),
+                        "gates": diagnostic,
+                    },
+                )
+            else:
+                counts["clean"] += 1
             continue
         permanent = [gate for gate in failed if gate in PERMANENT_GATES]
         if not permanent:

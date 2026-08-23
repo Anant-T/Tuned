@@ -26,6 +26,7 @@ from pipeline_fakes import (
 from tuned.data.generate import build_prompt, judge_messages, judge_needed_tokens, run_workers
 from tuned.data.jsonl import read_at
 from tuned.data.providers import ProviderError
+from tuned.data import judge as judge_mod
 from tuned.data.judge import (
     BORDERLINE,
     FAIL,
@@ -90,6 +91,27 @@ def only_task(store):
 
 def scores(g=5, v=5, c=5, rationale="fine"):
     return JudgeScores(grounding=g, validity=v, coverage=c, rationale=rationale)
+
+
+# Exact model ids the shipped FakeRouter lands on for slots a / b / tiebreak.
+QWEN = "qwen/qwen3.6-27b"
+GEMMA = "gemma-4-31b"
+MISTRAL = "mistral-large-latest"
+
+
+def _activate_rules(store, *specs):
+    """Write active judge_threshold rows. Each spec is (model, rule, threshold)."""
+    store.record_judge_thresholds(
+        [
+            {
+                "calib_id": f"task4-{i}-{model}",
+                "model": model,
+                "rule": rule,
+                "threshold": threshold,
+            }
+            for i, (model, rule, threshold) in enumerate(specs)
+        ]
+    )
 
 
 # --------------------------------------------------------------------------
@@ -627,11 +649,8 @@ def test_the_decision_event_is_marked_provisional(tmp_path, cfg, paths):
 
 def test_calibrated_thresholds_flip_the_provisional_flag(tmp_path, cfg, paths):
     with judged_store(tmp_path, paths, cfg) as store:
-        store.conn.execute(
-            "INSERT INTO judge_threshold (calib_id, judge_slot, rule, threshold, active) "
-            "VALUES ('c1', 'a', 'min-axis', 4, 1)"
-        )
-        assert thresholds_active(store) == 1
+        _activate_rules(store, (QWEN, "min_axis", 4), (GEMMA, "min_axis", 4))
+        assert thresholds_active(store) == 2
         run_judge(store, cfg, FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]}), paths)
         event = json.loads(store.events("judge_decision")[0]["detail_json"])
         assert event["provisional"] is False
@@ -1881,3 +1900,241 @@ def test_judge_batch_line(tmp_path, cfg, paths, capsys):
         run_judge(store, cfg, FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]}), paths)
         out = capsys.readouterr().out
         assert "judge batch 1: claimed=1 decided=1 accepted=1" in out
+
+
+# --------------------------------------------------------------------------
+# Task 4: apply active per-model rules; unfitted seats cannot mint accepts.
+# --------------------------------------------------------------------------
+
+def resolve_slot(*args, **kwargs):
+    fn = getattr(judge_mod, "resolve_slot", None)
+    assert fn is not None, "judge.resolve_slot must apply per-model threshold rules"
+    return fn(*args, **kwargs)
+
+
+def test_no_thresholds_keeps_the_provisional_four_four_four_pass():
+    """The shipped 4/2 bands stay when the fleet has no active row at all."""
+    four = resolve_slot(scores(4, 4, 4), model=QWEN, rules={}, fleet_active=False)
+    thin = resolve_slot(scores(5, 5, 3), model=QWEN, rules={}, fleet_active=False)
+    bad = resolve_slot(scores(5, 5, 2), model=QWEN, rules={}, fleet_active=False)
+    assert (four.verdict, four.provisional, four.unfitted, four.coerced) == (
+        PASS, True, False, False,
+    )
+    assert four.rule == "min_axis" and four.threshold == 4
+    assert thin.verdict == BORDERLINE and thin.provisional is True
+    assert bad.verdict == FAIL and bad.provisional is True
+
+
+_EQUIV_AXES = (
+    (1, 1, 1),
+    (2, 2, 2),
+    (3, 3, 3),
+    (4, 4, 4),
+    (5, 5, 5),
+    (5, 5, 3),
+    (5, 3, 3),
+    (4, 4, 5),
+    (5, 1, 5),
+    (2, 5, 5),
+    (5, 5, 2),
+    (1, 5, 5),
+    (4, 3, 5),
+    (3, 4, 5),
+    (5, 4, 3),
+)
+
+
+@pytest.mark.parametrize("rule", ["min_axis", "mean", "both"])
+@pytest.mark.parametrize("threshold", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("axes", _EQUIV_AXES)
+def test_judge_pass_predicate_matches_calibrate_decides_pass(rule, threshold, axes):
+    """Both implementations must stay one predicate. A drift here ships a
+    different accept rule than the one P5 fitted."""
+    from tuned.data.calibrate import Candidate, decides_pass
+
+    scored = JudgeScores(grounding=axes[0], validity=axes[1], coverage=axes[2])
+    judge_fn = getattr(judge_mod, "rule_passes", None)
+    assert judge_fn is not None, "judge.rule_passes must exist to lock against calibrate.decides_pass"
+    assert judge_fn(rule, threshold, scored) is decides_pass(Candidate(rule, threshold), axes)
+    decision = resolve_slot(
+        scored,
+        model="locked-model",
+        rules={"locked-model": {"rule": rule, "threshold": threshold}},
+        fleet_active=True,
+    )
+    assert (decision.verdict == PASS) is decides_pass(Candidate(rule, threshold), axes)
+
+
+def test_fitted_min_axis_mean_and_both_rules_change_the_slot_verdict():
+    """A (5,5,3) is borderline on min_axis>=4, a pass on mean>=4, and not both."""
+    axes = scores(5, 5, 3)
+    min_axis = resolve_slot(
+        axes, model=QWEN, rules={QWEN: {"rule": "min_axis", "threshold": 4}},
+        fleet_active=True,
+    )
+    mean = resolve_slot(
+        axes, model=QWEN, rules={QWEN: {"rule": "mean", "threshold": 4}},
+        fleet_active=True,
+    )
+    both = resolve_slot(
+        axes, model=QWEN, rules={QWEN: {"rule": "both", "threshold": 4}},
+        fleet_active=True,
+    )
+    both_clear = resolve_slot(
+        scores(4, 4, 5), model=QWEN, rules={QWEN: {"rule": "both", "threshold": 4}},
+        fleet_active=True,
+    )
+    assert (min_axis.verdict, min_axis.fitted, min_axis.provisional) == (BORDERLINE, True, False)
+    assert mean.verdict == PASS and mean.rule == "mean" and mean.threshold == 4
+    assert both.verdict == BORDERLINE
+    assert both_clear.verdict == PASS
+
+
+def test_exact_model_identity_is_the_only_lookup():
+    """A provider-prefixed or family-only key must not steal another model's rule."""
+    rules = {"groq/qwen/qwen3.6-27b": {"rule": "min_axis", "threshold": 1}}
+    decision = resolve_slot(scores(4, 4, 4), model=QWEN, rules=rules, fleet_active=True)
+    assert decision.unfitted is True
+    assert decision.verdict == BORDERLINE
+    assert decision.coerced is True
+
+
+def test_an_unfitted_model_cannot_supply_a_pass_once_any_threshold_is_active():
+    decision = resolve_slot(scores(5, 5, 5), model=GEMMA, rules={QWEN: {"rule": "min_axis", "threshold": 4}}, fleet_active=True)
+    assert decision.unfitted is True
+    assert decision.coerced is True
+    assert decision.verdict == BORDERLINE
+    assert decision.verdict != PASS
+    fail = resolve_slot(scores(1, 1, 1), model=GEMMA, rules={QWEN: {"rule": "min_axis", "threshold": 4}}, fleet_active=True)
+    assert fail.verdict == FAIL
+    assert fail.coerced is False
+
+
+def test_a_malformed_or_unknown_active_rule_fails_closed():
+    unknown = resolve_slot(
+        scores(5, 5, 5), model=QWEN,
+        rules={QWEN: {"rule": "median", "threshold": 4}}, fleet_active=True,
+    )
+    bad_threshold = resolve_slot(
+        scores(5, 5, 5), model=QWEN,
+        rules={QWEN: {"rule": "min_axis", "threshold": 9}}, fleet_active=True,
+    )
+    hyphen = resolve_slot(
+        scores(5, 5, 5), model=QWEN,
+        rules={QWEN: {"rule": "min-axis", "threshold": 4}}, fleet_active=True,
+    )
+    for decision in (unknown, bad_threshold, hyphen):
+        assert decision.valid is False
+        assert decision.verdict == FAIL
+        assert decision.verdict != PASS
+        assert decision.reason
+
+
+def test_a_fitted_mean_rule_accepts_a_row_the_provisional_band_would_regenerate(
+    tmp_path, cfg, paths
+):
+    """(5,5,3) is borderline under min_axis>=4 and a pass under mean>=4."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        _activate_rules(store, (QWEN, "mean", 4), (GEMMA, "mean", 4))
+        totals = run_judge(store, cfg, FakeRouter(cfg, {"judge": [judge_reply(5, 5, 3)]}), paths)
+        assert totals["accepted"] == 1
+        assert only_task(store)["state"] == "accepted"
+        event = json.loads(store.events("judge_decision")[0]["detail_json"])
+        assert event["provisional"] is False
+        assert event["verdicts"] == ["pass", "pass"]
+        assert event["any_unfitted"] is False
+        used = {row["model"]: row for row in event["slot_rules"]}
+        assert used[QWEN]["rule"] == "mean" and used[QWEN]["threshold"] == 4
+        assert used[GEMMA]["rule"] == "mean"
+
+
+def test_a_stricter_min_axis_stops_a_provisional_four_four_four_accept(tmp_path, cfg, paths):
+    with judged_store(tmp_path, paths, cfg) as store:
+        _activate_rules(store, (QWEN, "min_axis", 5), (GEMMA, "min_axis", 5))
+        run_judge(store, cfg, FakeRouter(cfg, {"judge": [judge_reply(4, 4, 4)]}), paths)
+        event = json.loads(store.events("judge_decision")[0]["detail_json"])
+        assert event["verdicts"] == ["borderline", "borderline"]
+        assert event["action"] != "accept"
+        assert only_task(store)["state"] != "accepted"
+
+
+def test_an_unfitted_seat_cannot_mint_an_accept_once_thresholds_exist(tmp_path, cfg, paths):
+    with judged_store(tmp_path, paths, cfg) as store:
+        _activate_rules(store, ("some-other-judge", "min_axis", 4))
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)], "generator": [chat_response()]})
+        run_judge(store, cfg, router, paths)
+        first = json.loads(store.events("judge_decision")[0]["detail_json"])
+        assert first["verdicts"] == ["borderline", "borderline"]
+        assert first["action"] == "regenerate"
+        assert first["any_unfitted"] is True
+        assert first["provisional"] is False
+        assert store.events("judge_unfitted_coerced")
+        assert only_task(store)["state"] != "accepted"
+        assert only_task(store)["disposition"] != "judge:accept"
+
+
+def test_mixed_fitted_and_unfitted_slots_cannot_accept_through_tiebreak(tmp_path, cfg, paths):
+    """Only gemma is fitted. A 5/5/5 from qwen must not pair with it into an accept."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        _activate_rules(store, (GEMMA, "min_axis", 4))
+        router = FakeRouter(
+            cfg,
+            {
+                "judge": [judge_reply(5, 5, 5)],
+                "tiebreak": [judge_reply(5, 5, 5)],
+                "generator": [chat_response()],
+            },
+        )
+        run_judge(store, cfg, router, paths)
+        first = json.loads(store.events("judge_decision")[0]["detail_json"])
+        assert first["verdicts"][0] == "borderline"  # qwen unfitted
+        assert first["verdicts"][1] == "pass"        # gemma fitted
+        assert first["any_unfitted"] is True
+        assert first["action"] in {"tiebreak", "regenerate", "reject"}
+        assert only_task(store)["state"] != "accepted"
+        assert only_task(store)["disposition"] != "judge:accept"
+        coerced = [json.loads(e["detail_json"]) for e in store.events("judge_unfitted_coerced")]
+        assert any(row["model"] == QWEN for row in coerced)
+
+
+def test_a_malformed_active_rule_rejects_closed_and_names_the_reason(tmp_path, cfg, paths):
+    with judged_store(tmp_path, paths, cfg) as store:
+        store.conn.execute(
+            "INSERT INTO judge_threshold (calib_id, model, rule, threshold, active) "
+            "VALUES ('bad-qwen', ?, 'median', 4, 1), ('bad-gemma', ?, 'median', 4, 1)",
+            (QWEN, GEMMA),
+        )
+        run_judge(store, cfg, FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]}), paths)
+        task = only_task(store)
+        assert task["state"] == "rejected"
+        assert task["disposition"] == "judge:reject"
+        events = [json.loads(e["detail_json"]) for e in store.events("judge_threshold_invalid")]
+        assert events
+        assert any("median" in str(row.get("reason")) for row in events)
+        decision = json.loads(store.events("judge_decision")[0]["detail_json"])
+        assert decision["verdicts"] == ["fail", "fail"]
+        assert all(row["valid"] is False for row in decision["slot_rules"])
+
+
+def test_a_cooling_judge_pool_parks_without_a_quality_reject(tmp_path, cfg, paths):
+    with judged_store(tmp_path, paths, cfg) as store:
+        cooling = {f"{ref.provider}/{ref.model}" for ref in cfg.routing_refs("judge")}
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]}, cooling=cooling)
+        totals = run_judge(store, cfg, router, paths)
+        task = only_task(store)
+        assert task["state"] != "rejected"
+        assert task["disposition"] != "judge:reject"
+        assert totals["rejected"] == 0
+        assert task["state"] == JUDGE_STATE_FROM
+
+
+def test_an_unroutable_judge_is_still_not_a_quality_reject(tmp_path, cfg, paths):
+    """Routing emptiness stays an operational park after thresholds exist."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        _activate_rules(store, (QWEN, "min_axis", 4), (GEMMA, "min_axis", 4))
+        _lengthen(store, only_task(store)["task_id"], 200000)
+        run_judge(store, cfg, FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]}), paths)
+        task = only_task(store)
+        assert task["state"] == "judge_unroutable"
+        assert task["disposition"] != "judge:reject"
+        assert not str(task["disposition"]).startswith("judge:reject")

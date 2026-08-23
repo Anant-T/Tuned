@@ -9,7 +9,9 @@ from tuned.data.config import LengthBand, load_build_config
 from tuned.data.gates import (
     BANNED_META,
     DEFAULT_MAX_RUN,
+    DIAGNOSTIC_GATES,
     GATE_ORDER,
+    IRAC_ANSWER_TASK_TYPES,
     IRAC_REQUIRED,
     MAX_UNGROUNDED_REFS,
     PERMANENT_GATES,
@@ -228,6 +230,7 @@ def test_gate_order_and_permanent_gates():
         "verbatim_overlap",
         "statutory_quotation",
         "banned_meta",
+        "prompt_echo",
         "answer_key",
     )
     assert PERMANENT_GATES == frozenset({"citations", "temporal", "answer_key"})
@@ -1282,6 +1285,116 @@ def test_irac_placement_skipped_when_no_reasoning_expected():
     assert result.detail == {"skipped": "no-reasoning-expected"}
 
 
+# A deliverable-shaped answer with no line-initial IRAC headings. Long enough
+# that a caller using the live length band still clears answer_min.
+NO_IRAC_ANSWER = (
+    "The petition should be settled as a revision. The facts as recorded do not "
+    "make out the charge, and the delay in the deposition is unexplained. The "
+    "client should be advised to press that gap rather than to negotiate around "
+    "it. Service, limitation and the verification clause must all be attended to "
+    "in the instrument itself, not left as an afterthought in the reasoning."
+)
+
+
+def test_drafting_answer_without_irac_headings_passes_placement():
+    result = check_irac_placement("clean trace", NO_IRAC_ANSWER, _ctx(task_type="drafting"))
+    assert result.passed
+    assert result.detail["missing_in_answer"] == []
+    assert result.detail["required"] == []
+
+
+def test_summarization_answer_without_irac_headings_passes_placement():
+    result = check_irac_placement(
+        "clean trace", NO_IRAC_ANSWER, _ctx(task_type="summarization")
+    )
+    assert result.passed
+    assert result.detail["missing_in_answer"] == []
+    assert result.detail["required"] == []
+
+
+@pytest.mark.parametrize(
+    "task_type",
+    ("irac_analysis", "statute_qa", "transition", "drafting", "summarization"),
+)
+def test_think_side_irac_still_fails_for_every_task_type(task_type):
+    think = "First pass.\n\nIssue: whether the appeal lies.\n\nMore thinking."
+    result = check_irac_placement(think, GOOD_ANSWER, _ctx(task_type=task_type))
+    assert not result.passed
+    assert result.detail["think_headings"] == ["issue"]
+    assert disposition([result]) == "regenerate"
+
+
+@pytest.mark.parametrize("task_type", ("irac_analysis", "statute_qa", "transition"))
+def test_analysis_statute_and_transition_answers_still_require_irac(task_type):
+    result = check_irac_placement("clean trace", NO_IRAC_ANSWER, _ctx(task_type=task_type))
+    assert not result.passed
+    assert result.detail["missing_in_answer"] == ["issue", "conclusion"]
+    assert result.detail["required"] == ["issue", "conclusion"]
+    assert task_type in IRAC_ANSWER_TASK_TYPES
+
+
+# --------------------------------------------------------------------------
+# prompt_echo — conservative instruction-packet restatement on stored think.
+# --------------------------------------------------------------------------
+
+_ECHO_OPENING = (
+    "We need to produce a legal analysis in first person with 450-700 words "
+    "of deliberation before writing the answer."
+)
+_ECHO_SPAN = (
+    "The facts are thin. Never write as though the matter had been handed to "
+    "you as a text, and keep quotation for the answer."
+)
+_NORMAL_THINK = (
+    "I start from the facts. The complaint alleges theft and the recovery is "
+    "said to complete the chain. Let me check the dates against the "
+    "charge-sheet, because a chronology settled quickly is a chronology "
+    "settled badly. The source of the obligation is the provision both "
+    "sides invoke, not a passage handed to me as homework."
+)
+
+
+def test_known_instruction_restatement_fails_prompt_echo():
+    assert "prompt_echo" in GATE_ORDER
+    for think in (_ECHO_OPENING, _ECHO_SPAN):
+        results = run_all(_content(think, GOOD_ANSWER), 200, _ctx())
+        echo = next(result for result in results if result.gate == "prompt_echo")
+        assert not echo.passed, think
+        assert disposition([echo]) == "regenerate"
+
+
+def test_ordinary_legal_reasoning_does_not_fail_prompt_echo():
+    results = run_all(_content(_NORMAL_THINK, GOOD_ANSWER), 200, _ctx())
+    echo = next(result for result in results if result.gate == "prompt_echo")
+    assert echo.passed
+    assert echo.detail.get("skipped") is None
+
+
+_DRAFTING_PROCESS = (
+    "I need to write the plaint from the pleaded facts, naming the parties "
+    "and the relief the papers actually support."
+)
+_INSTRUCTION_RESTATE = (
+    "We need to produce a response/reasoning that follows the packet before "
+    "turning to the pleaded facts."
+)
+
+
+def test_first_person_drafting_process_does_not_fail_prompt_echo():
+    results = run_all(_content(_DRAFTING_PROCESS, GOOD_ANSWER), 200, _ctx())
+    echo = next(result for result in results if result.gate == "prompt_echo")
+    assert echo.passed
+    assert echo.detail.get("restated_opening") is False
+
+
+def test_we_need_to_produce_response_reasoning_fails_prompt_echo():
+    results = run_all(_content(_INSTRUCTION_RESTATE, GOOD_ANSWER), 200, _ctx())
+    echo = next(result for result in results if result.gate == "prompt_echo")
+    assert not echo.passed
+    assert echo.detail["restated_opening"] is True
+    assert disposition([echo]) == "regenerate"
+
+
 # --------------------------------------------------------------------------
 # check_statutory_quotation
 # --------------------------------------------------------------------------
@@ -2178,9 +2291,28 @@ def test_disposition_mapping():
         mixed = [GateResult(g, g != gate, {}) for g in GATE_ORDER]
         assert disposition(mixed) == "reject", gate
 
-    for gate in set(GATE_ORDER) - PERMANENT_GATES:
+    for gate in set(GATE_ORDER) - PERMANENT_GATES - DIAGNOSTIC_GATES:
         mixed = [GateResult(g, g != gate, {}) for g in GATE_ORDER]
         assert disposition(mixed) == "regenerate", gate
+
+    for gate in DIAGNOSTIC_GATES:
+        mixed = [GateResult(g, g != gate, {}) for g in GATE_ORDER]
+        assert disposition(mixed) is None, gate
+
+
+def test_self_verification_only_failure_is_stored_but_does_not_decide_disposition():
+    results = [GateResult(gate, gate != "self_verification", {}) for gate in GATE_ORDER]
+    failed = [result for result in results if not result.passed]
+    assert [result.gate for result in failed] == ["self_verification"]
+    assert disposition(results) is None
+
+
+def test_self_verification_does_not_appear_in_disposition_when_another_gate_fails():
+    results = [
+        GateResult("self_verification", False, {"cues": []}),
+        GateResult("irac_placement", False, {"missing_in_answer": ["conclusion"]}),
+    ]
+    assert disposition(results) == "regenerate"
 
 
 def test_disposition_permanent_beats_retryable_when_both_fail():

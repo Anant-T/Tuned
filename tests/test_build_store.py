@@ -541,9 +541,23 @@ def test_the_task_states_the_workers_use_are_the_ones_the_store_lists():
         generate.GEN_UNROUTABLE_STATE, judge.JUDGE_STATE_FROM, judge.JUDGE_STATE_TO,
         judge.ACCEPTED_STATE, judge.REJECTED_STATE, judge.SKIPPED_STATE,
         judge.ERROR_STATE, judge.UNROUTABLE_STATE, verify.REJECTED_STATE,
+        generate.FORMAT_PARKED_STATE,
+        generate.INPUT_INELIGIBLE_STATE,
     }
     assert written <= set(TASK_STATES)
     assert len(TASK_STATES) == len(set(TASK_STATES))
+
+
+def test_format_parked_is_a_listed_task_state():
+    from tuned.data.store import TASK_STATES
+
+    assert "format_parked" in TASK_STATES
+
+
+def test_input_ineligible_is_a_listed_task_state():
+    from tuned.data.store import TASK_STATES
+
+    assert "input_ineligible" in TASK_STATES
 
 
 def test_gates_round_trip(store):
@@ -1549,6 +1563,28 @@ def test_judgements_by_gen_reads_many_at_once_and_matches_the_row_at_a_time_path
     # A generation nobody judged comes back as an empty list rather than
     # missing, so the caller's dict lookup cannot KeyError on it.
     assert store.judgements_by_gen([9999]) == {9999: []}
+
+
+def test_gates_by_gen_reads_more_than_five_hundred_ids_and_matches_row_at_a_time(store):
+    n = 501
+    _populate(store, n=n)
+    gen_ids = []
+    for i in range(n):
+        gen_id = store.record_generation(
+            {**_gen_envelope(f"t{i}", attempt=1), "raw_path": "raw.ndjson", "raw_offset": i}
+        )
+        store.record_gates(
+            gen_id,
+            [("think_format", True, None), ("citations", i % 2 == 0, None)],
+        )
+        gen_ids.append(gen_id)
+
+    bulk = store.gates_by_gen(gen_ids)
+    assert set(bulk) == set(gen_ids)
+    assert len(bulk) == 501
+    for gen_id in gen_ids:
+        assert bulk[gen_id] == store.gates_for(gen_id)
+    assert store.gates_by_gen([9999]) == {9999: {}}
 
 
 def test_gold_labels_round_trip_and_the_second_file_wins(store):

@@ -106,6 +106,18 @@ GEN_UNROUTABLE_STATE = "gen_unroutable"
 # and cheap to re-park because the guard fires before any render or spend.
 STALE_PROMPT_STATE = "stale_prompt"
 
+# Exhausted rows whose remaining failures are format/soft. Re-openable;
+# not a legal reject. Permanent gates still close as rejected.
+FORMAT_PARKED_STATE = "format_parked"
+
+# Statute-QA planned against input that is not a genuine distinct provision.
+# Parked rather than rejected: nothing here says the example is wrong about
+# the law, and a quality reject would spend the per-seed cap on a row that
+# can become valid once section metadata is supplied. Re-openable; free.
+INPUT_INELIGIBLE_STATE = "input_ineligible"
+INPUT_INELIGIBLE_SKIP = "input_ineligible"
+INPUT_INELIGIBLE_DISPOSITION = "input-ineligible:section_text"
+
 # Skip reasons that are facts about the ROW rather than about the moment or
 # the configuration. "family-excluded" here always means the context filter:
 # generate.py excludes exactly the families too small to hold this prompt, so
@@ -160,10 +172,9 @@ GENERATOR_PREFLIGHT_ROLES = ("generator", "judge", "tiebreak")
 # literal cues by chance. That is now fixed where it belongs, in the prompt,
 # which hands the cue vocabulary over explicitly.
 #
-# So a retry now re-rolls the SAME request. Effort is whatever the model's
-# config declares (params.reasoning_effort in configs/data_law_v1.yaml) on
-# every attempt, which is the attempt-1 condition every measurement above was
-# taken under.
+# So a retry now sends the SAME effort params. The request body may grow a
+# machine-generated repair note derived from the failed hard/format gates;
+# effort itself stays whatever the model's config declares.
 EFFORT_LADDER_RETIRED = "2026-08-18: measured uniformly negative, see pilot"
 
 # GENERATOR-ROLE PARAMS BY FAMILY, sent on every attempt. Not a ladder - the
@@ -314,8 +325,9 @@ REVIEWER_NOTE_TEMPLATE = (
 class SlotError(ValueError):
     """The task cannot be rendered from what the seed carries.
 
-    Permanent: no teacher call is made, no money is spent, and the task is
-    rejected with a diagnostic rather than retried into the same wall.
+    No teacher call is made and no money is spent. Statute-QA input that is
+    not a genuine distinct provision parks as input_ineligible; other
+    unrenderable slots stay a skip:slots reject.
     """
 
 
@@ -459,6 +471,45 @@ class BatchStats:
 # Wiring: budget-gated router, worker identity.
 # --------------------------------------------------------------------------
 
+def _usd_per_1m(limits: Mapping, *, completion: bool) -> float:
+    key = "usd_per_1m_completion" if completion else "usd_per_1m_prompt"
+    return float(limits.get(key) or 0.0)
+
+
+def _openai_usd_cap(cfg) -> float | None:
+    """Shared OpenAI wallet if the config declared one. None means uncapped."""
+    for provider in cfg.providers:
+        if provider.name != "openai":
+            continue
+        cap = getattr(provider, "usd_cap", None)
+        if cap is not None:
+            return float(cap)
+        for model in provider.models:
+            if "usd_cap" in model.limits:
+                return float(model.limits["usd_cap"])
+    return None
+
+
+def _openai_usd_spent(store, cfg, *, day: str | None = None) -> float:
+    spent = 0.0
+    for provider in cfg.providers:
+        if provider.name != "openai":
+            continue
+        for model in provider.models:
+            used = store.usage_today("openai", model.id, day=day)
+            spent += (
+                used["prompt_tokens"]
+                * _usd_per_1m(model.limits, completion=False)
+                / 1_000_000.0
+            )
+            spent += (
+                used["completion_tokens"]
+                * _usd_per_1m(model.limits, completion=True)
+                / 1_000_000.0
+            )
+    return spent
+
+
 def budget_ok_for(store, cfg, *, quota=None):
     """The `budget_ok` callable providers.Router takes.
 
@@ -495,6 +546,17 @@ def budget_ok_for(store, cfg, *, quota=None):
             _, model_cfg = cfg.model_for(ModelRef(provider, model))
         except KeyError:
             return True
+
+        if provider == "openai":
+            usd_cap = _openai_usd_cap(cfg)
+            if usd_cap is not None:
+                est_cost = (
+                    float(est_tokens)
+                    * _usd_per_1m(model_cfg.limits, completion=False)
+                    / 1_000_000.0
+                )
+                if _openai_usd_spent(store, cfg) + est_cost > usd_cap:
+                    return False
 
         local_ok = store.reserve_budget(
             provider, model, est_tokens, limits=model_cfg.limits
@@ -895,6 +957,24 @@ def seed_answer_key(seed: Mapping) -> dict | None:
     return key if isinstance(key, dict) else None
 
 
+def statute_qa_section_eligible(source, section_text) -> bool:
+    """True only when statute QA has a genuine provision distinct from the seed."""
+    provision = " ".join(str(section_text or "").split())
+    if not provision:
+        return False
+    body = " ".join(str(source or "").split())
+    return provision != body
+
+
+def statute_qa_input_ineligible(task: Mapping, seed: Mapping) -> bool:
+    """True when this row is statute QA without a genuine distinct provision."""
+    if task.get("task_type") != "statute_qa":
+        return False
+    return not statute_qa_section_eligible(
+        seed.get("text") or "", seed_meta(seed).get("section_text")
+    )
+
+
 def _require(meta: Mapping, name: str, task_type: str, seed_id: str) -> str:
     value = meta.get(name)
     if not value or not str(value).strip():
@@ -930,12 +1010,9 @@ def build_slots(cfg, task: Mapping, seed: Mapping) -> dict:
     Pilot fallbacks are explicit and narrow, because a silent fallback is how
     a stream ends up measuring something other than what it claims:
 
-    * statute_qa - {section_text} comes from the seed's meta_json when the
-      seed has one, and otherwise from the seed TEXT itself, so a case-text
-      seed reads as "here is the matter, here is the provision" with the same
-      material in both. That is honest for the pilot (the teacher is shown
-      nothing it is not also being asked about) and it is what the statute
-      corpus in P7 replaces.
+    * statute_qa - {section_text} must be a genuine, distinct provision.
+      Missing, blank, or source-equal text is ineligible: the teacher is
+      never called, and nothing is fabricated or relabelled from case prose.
     * irac_analysis - {focus_issue} falls back to the seed's case_type.
     * drafting - {document_kind}/{party_context} fall back to neutral phrases.
     * transition - NO fallbacks, and the DATES are required too even though
@@ -963,7 +1040,13 @@ def build_slots(cfg, task: Mapping, seed: Mapping) -> dict:
             meta.get("focus_issue") or f"how the {case_type} point in these papers should be decided"
         )
     elif task_type == "statute_qa":
-        slots["section_text"] = str(meta.get("section_text") or source)
+        raw = meta.get("section_text")
+        if not statute_qa_section_eligible(source, raw):
+            raise SlotError(
+                f"seed {seed_id!r} carries no distinct section_text for statute_qa; "
+                f"missing, blank, or source-equal provision text is ineligible"
+            )
+        slots["section_text"] = str(raw)
     elif task_type == "drafting":
         slots["document_kind"] = str(
             meta.get("document_kind") or "the document this matter now calls for"
@@ -989,10 +1072,8 @@ def grounding_text(slots: Mapping) -> str:
     the module docstring: anything less turns a correct citation into a
     permanent reject.
 
-    Deduped because a slot is often filled from another slot - the pilot's
-    statute_qa fallback puts the seed text in both {source} and
-    {section_text}. A part already carried (as normalized text) by one that
-    was kept is dropped.
+    Deduped because a slot can repeat material already carried (as
+    normalized text) by one that was kept. A part already seen is dropped.
 
     What that saves, precisely: this string is the JUDGE's {source} and the
     gates' verbatim/citation corpus, so the dedup halves the judge prompt and
@@ -1123,6 +1204,7 @@ def gate_context(cfg, task: Mapping, seed: Mapping, grounding: str, *, citation_
         stream=task["stream"],
         expect_reasoning=expects_reasoning(task["stream"]),
         answer_key=seed_answer_key(seed),
+        task_type=task.get("task_type"),
     )
 
 
@@ -1182,6 +1264,74 @@ def legal_reply_chars(cfg) -> int:
 # statement about the CALL that produced them (what max_tokens was asked for),
 # which the stored row does not carry.
 REPLY_BUDGET_GATE = "reply_budget"
+
+# Provider truncation is the same class of fact as reply_budget: it is about
+# the CALL (finish_reason), not the stored bytes, so verify.py cannot
+# re-derive it. Named here, logged as an event, never written as a gate_result.
+TRUNCATION_GATE = "truncated"
+TRUNCATION_REASONS = frozenset({"length", "max_tokens"})
+
+# Repair hints for a retry. Structural only: no VERIFICATION_CUES phrase,
+# no BANNED_META phrase, no case facts.
+_REPAIR_HINTS = {
+    "think_format": "The reply must contain exactly one well-formed reasoning block.",
+    "length_band": "Keep the reasoning and the answer inside the length band.",
+    "irac_placement": "Do not put IRAC headings in the reasoning.",
+    "verbatim_overlap": "Do not copy long runs of source wording into the reasoning.",
+    "banned_meta": "Do not refer to the materials as a named object of the reasoning.",
+    "prompt_echo": "Do not restate the instruction packet in the reasoning.",
+    "statutory_grounding": "Name only provisions the materials already named.",
+    "statutory_quotation": "Do not present recorded effect as enacted wording.",
+    TRUNCATION_GATE: "The previous reply was cut short. Finish the answer inside the token budget.",
+    REPLY_BUDGET_GATE: "The previous reply exceeded the reply budget. Write a shorter answer.",
+}
+
+
+def finish_was_truncated(finish_reason) -> bool:
+    return str(finish_reason or "").strip().lower() in TRUNCATION_REASONS
+
+
+def _non_diagnostic_gates(failed_gates: Sequence[str]) -> tuple[str, ...]:
+    return tuple(gate for gate in failed_gates if gate not in gates.DIAGNOSTIC_GATES)
+
+
+def format_repair_instruction(
+    failed_gates: Sequence[str], task_type: str | None = None
+) -> str:
+    """Concise machine-generated repair note from failed hard/format gates."""
+    parts: list[str] = []
+    for gate in failed_gates:
+        hint = _REPAIR_HINTS.get(gate)
+        if hint:
+            parts.append(hint)
+        if gate == "irac_placement" and (
+            task_type is None or task_type in gates.IRAC_ANSWER_TASK_TYPES
+        ):
+            parts.append("The answer must include Issue and Conclusion headings.")
+    if not parts:
+        parts.append("Repair the previous format failure and write the answer afresh.")
+    return " ".join(parts)
+
+
+def repair_note_from_prior(store, task: Mapping) -> str | None:
+    """Build a repair note from the latest generation of this task, or None."""
+    latest = store.latest_generation(task["task_id"])
+    if latest is None:
+        return None
+    stored = store.gates_for(latest["gen_id"]) or {}
+    failed: list[str] = [
+        gate
+        for gate in gates.GATE_ORDER
+        if stored.get(gate) is False and gate not in gates.DIAGNOSTIC_GATES
+    ]
+    if finish_was_truncated(latest.get("finish_reason")) and TRUNCATION_GATE not in failed:
+        failed.append(TRUNCATION_GATE)
+    prior = str(task.get("disposition") or "")
+    if REPLY_BUDGET_GATE in prior and REPLY_BUDGET_GATE not in failed:
+        failed.append(REPLY_BUDGET_GATE)
+    if not failed:
+        return None
+    return format_repair_instruction(failed, task.get("task_type"))
 
 
 def reply_budget_chars(cfg) -> int:
@@ -1403,14 +1553,24 @@ async def generate_once(
         result.skipped = "missing-seed"
         store.log_event("generation_skipped", {"task_id": task["task_id"], "reason": "missing-seed"})
         return result
+    # A judge-driven regeneration already carries an explicit note. A
+    # worker retry for a repairable gate failure must not re-send the
+    # unchanged request: attach a note derived from the failed gates.
+    if reviewer_note is None:
+        reviewer_note = repair_note_from_prior(store, task)
     try:
         bundle = build_prompt(cfg, task, seed, reviewer_note=reviewer_note)
     except (SlotError, KeyError) as exc:
-        result.skipped = "slots"
+        if statute_qa_input_ineligible(task, seed):
+            result.skipped = INPUT_INELIGIBLE_SKIP
+            reason = INPUT_INELIGIBLE_SKIP
+        else:
+            result.skipped = "slots"
+            reason = "slots"
         result.error = str(exc)
         store.log_event(
             "generation_skipped",
-            {"task_id": task["task_id"], "reason": "slots", "error": str(exc)},
+            {"task_id": task["task_id"], "reason": reason, "error": str(exc)},
         )
         return result
 
@@ -1438,6 +1598,26 @@ async def generate_once(
     # exclusion below never needed changing; only the beliefs about it did.
     too_small = undersized_families(cfg, "generator", est_tokens)
     params_for_ref = effort_params_for_ref(attempt)
+    harmony_on = bool(getattr(cfg.build, "harmony_completions", False))
+    prefill = getattr(cfg.build, "harmony_prefill", None) or ""
+    harmony_prompt = None
+    if harmony_on:
+        from tuned.data.harmony import DEFAULT_PREFILL, render_for_analysis_prefill
+
+        prefill = prefill or DEFAULT_PREFILL
+        effort = "medium"
+        gen_refs = cfg.routing_refs("generator")
+        if gen_refs:
+            effort = str(
+                (cfg.model_for(gen_refs[0])[1].params or {}).get("reasoning_effort")
+                or "medium"
+            )
+        harmony_prompt = render_for_analysis_prefill(
+            bundle.messages,
+            prefill,
+            reasoning_effort=effort,
+            current_date=date.today().isoformat(),
+        )
 
     try:
         ref, response = await router.complete(
@@ -1448,6 +1628,7 @@ async def generate_once(
             est_tokens=est_tokens,
             exclude_families=too_small,
             on_attempt=usage_recorder(store, day),
+            prompt=harmony_prompt,
         )
     except ProviderError as exc:
         # Every attempt this call made is already ledgered by on_attempt,
@@ -1499,6 +1680,65 @@ async def generate_once(
     result.ref = ref
     result.prompt_tokens = int(response.prompt_tokens or 0)
     result.completion_tokens = int(response.completion_tokens or 0)
+
+    if harmony_on:
+        from tuned.data.harmony import (
+            DEFAULT_PREFILL,
+            S1_WAIT,
+            needs_s1_continue,
+            parse_completion,
+            stitch_s1,
+        )
+
+        used_prefill = prefill or DEFAULT_PREFILL
+        parsed = parse_completion(response.text, used_prefill)
+        if getattr(cfg.build, "harmony_s1_continue", False) and needs_s1_continue(parsed):
+            first_cont = parsed.analysis_continuation
+            s1_prompt = (harmony_prompt or "") + first_cont + S1_WAIT
+            try:
+                _, response2 = await router.complete(
+                    "generator",
+                    bundle.messages,
+                    params_for_ref=params_for_ref,
+                    max_tokens=max_tokens,
+                    est_tokens=est_tokens,
+                    exclude_families=too_small,
+                    on_attempt=usage_recorder(store, day),
+                    prompt=s1_prompt,
+                )
+            except ProviderError as exc:
+                store.log_event(
+                    "s1_continue_error",
+                    {
+                        "task_id": task["task_id"],
+                        "attempt": attempt,
+                        "status": exc.status,
+                        "error": str(exc)[:500],
+                    },
+                )
+            else:
+                parsed = stitch_s1(
+                    parsed, parse_completion(response2.text, ""), used_prefill
+                )
+                result.prompt_tokens += int(response2.prompt_tokens or 0)
+                result.completion_tokens += int(response2.completion_tokens or 0)
+                response.prompt_tokens = result.prompt_tokens
+                response.completion_tokens = result.completion_tokens
+                # Truncation is a fact about the last provider call. A first
+                # Completions hit that ended on length can still s1-continue
+                # into a complete stitch; a second call that is still
+                # length/max_tokens must stay non-accepting.
+                response.finish_reason = response2.finish_reason
+                store.log_event(
+                    "s1_continue",
+                    {
+                        "task_id": task["task_id"],
+                        "attempt": attempt,
+                        "first_cont_chars": len(first_cont),
+                    },
+                )
+        response.reasoning = parsed.think or None
+        response.text = parsed.final
 
     _, model_cfg = cfg.model_for(ref)
     # What was actually sent - resolved against the ref that answered, which
@@ -1624,6 +1864,20 @@ async def generate_once(
         # reject back to a retry.
         if result.disposition is None:
             result.disposition = "regenerate"
+    if finish_was_truncated(response.finish_reason):
+        store.log_event(
+            "generation_truncated",
+            {
+                "task_id": task["task_id"],
+                "attempt": attempt,
+                "gen_id": gen_id,
+                "ref": f"{ref.provider}/{ref.model}",
+                "finish_reason": response.finish_reason,
+            },
+        )
+        result.failed_gates = result.failed_gates + (TRUNCATION_GATE,)
+        if result.disposition is None:
+            result.disposition = "regenerate"
     return result
 
 
@@ -1633,12 +1887,15 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
     * stale prompt     -> stale_prompt at once, before anything else is
                           considered: the template moved under the plan, so
                           the row was never rendered and never spent.
-    * clean            -> judging (judge.py's queue)
-    * regenerate       -> pending while attempts remain, else rejected. The
-                          next claim re-rolls the IDENTICAL request: the
-                          reasoning-effort ladder that used to escalate here
-                          was retired 2026-08-18 as measurably harmful, see
-                          EFFORT_LADDER_RETIRED.
+    * input ineligible -> input_ineligible at once: statute QA without a
+                          genuine distinct provision. Not a quality reject.
+    * clean            -> judging (judge.py's queue). Diagnostic-only
+                          failures (self_verification) are clean here.
+    * regenerate       -> pending while attempts remain, else format_parked.
+                          The next claim keeps the same effort params and
+                          carries a repair note derived from the failed
+                          hard/format gates. Diagnostic names stay out of
+                          the disposition reason.
     * reject           -> rejected. A permanent gate means the example is
                           wrong about the law; the seed is burned, never
                           retried.
@@ -1677,7 +1934,14 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
             f"stale-prompt:{task['prompt_id']}:{planned}!={live}",
         )
     elif not result.ok:
-        if result.skipped is not None:
+        if result.skipped == INPUT_INELIGIBLE_SKIP:
+            # Input, not quality: the teacher was never called. Park so the
+            # operator can reopen after genuine section metadata arrives.
+            state, disposition = (
+                INPUT_INELIGIBLE_STATE,
+                INPUT_INELIGIBLE_DISPOSITION,
+            )
+        elif result.skipped is not None:
             # A missing seed or an unrenderable slot set is permanent: the
             # next attempt would hit the identical wall, unspent.
             state, disposition = REJECTED_STATE, f"skip:{result.skipped}"
@@ -1727,13 +1991,15 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
     elif result.disposition is None:
         state, disposition = JUDGING_STATE, None
     elif result.disposition == "regenerate":
+        named = ",".join(_non_diagnostic_gates(result.failed_gates))
         state, disposition = (
-            (REJECTED_STATE, "exhausted:regenerate:" + ",".join(result.failed_gates))
+            (FORMAT_PARKED_STATE, "exhausted:format:" + named)
             if exhausted
-            else (PENDING_STATE, "regenerate:" + ",".join(result.failed_gates))
+            else (PENDING_STATE, "regenerate:" + named)
         )
     else:
-        state, disposition = REJECTED_STATE, "reject:" + ",".join(result.failed_gates)
+        named = ",".join(_non_diagnostic_gates(result.failed_gates))
+        state, disposition = REJECTED_STATE, "reject:" + named
 
     moved = store.set_task_state(task_id, state, disposition, expect_worker=worker_id)
     if not moved:
@@ -1928,6 +2194,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cfg = load_build_config(args.config)
+    from tuned.data.eval_matched import require_pretreatment_manifest
+
+    require_pretreatment_manifest(cfg)
     print(f"loaded {load_dotenv_keys()} key(s) from .env")
     # Before anything is claimed: a role with no key, or a judge slot no
     # model can fill, is knowable now and costs paid rows to discover later.

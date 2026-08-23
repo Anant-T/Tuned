@@ -76,7 +76,7 @@ from tuned.data.providers import (
     parse_quota_headers,
     required_context,
 )
-from tuned.data.tasks import plan_wave, reopen_tasks
+from tuned.data.tasks import PER_SEED_CAP, plan_wave, reopen_tasks
 
 
 @pytest.fixture
@@ -175,11 +175,128 @@ def test_statute_qa_grounding_carries_the_section_number_the_gate_checks(tmp_pat
         assert source_only.detail["ungrounded"][0]["number"] == "9"
 
 
-def test_statute_qa_falls_back_to_the_seed_text(tmp_path, cfg):
-    with make_store(tmp_path, mix={"statute_qa": 1.0}) as store:
+DISTINCT_SECTION = (
+    "Section 34. When a criminal act is done by several persons in furtherance "
+    "of the common intention of all, each of such persons is liable for that act "
+    "in the same manner as if it were done by him alone."
+)
+
+
+def _plant_statute_qa_task(store, cfg, seed_id="seed000"):
+    """Insert a statute_qa task even when the planner would refuse the seed."""
+    from tuned.data import prompt_registry
+    from tuned.data.tasks import task_id_for
+
+    prompt_id = prompt_registry.pick_variant("statute_qa", seed_id, 0)
+    row = {
+        "task_id": task_id_for(seed_id, "statute_qa", prompt_id, 0),
+        "seed_id": seed_id,
+        "stream": "synthesis",
+        "task_type": "statute_qa",
+        "prompt_id": prompt_id,
+        "prompt_sha": prompt_registry.load(prompt_id).sha,
+        "sample_ix": 0,
+    }
+    store.create_tasks([row])
+    return dict(store.conn.execute("SELECT * FROM task LIMIT 1").fetchone())
+
+
+@pytest.mark.parametrize(
+    "section_text",
+    (None, "", "   ", SEED_TEXT, "  " + SEED_TEXT + "  "),
+)
+def test_ineligible_statute_text_cannot_call_the_teacher(
+    tmp_path, cfg, paths, section_text
+):
+    meta = {"section_text": section_text}
+    with open_store(tmp_path, n_seeds=1, meta=meta) as store:
+        task = _plant_statute_qa_task(store, cfg)
+        seed = store.get_seed(task["seed_id"])
+        with pytest.raises(SlotError, match="section_text"):
+            build_slots(cfg, task, seed)
+        router = FakeRouter(cfg, {"generator": [chat_response()]})
+        result = asyncio.run(
+            generate_once(store, cfg, router, task, paths=paths, attempt=1)
+        )
+        assert result.ok is False
+        assert result.skipped == "input_ineligible"
+        assert router.calls_for("generator") == []
+        assert apply_gate_disposition(store, task, result, worker_id=None) == "input_ineligible"
+        parked = only_task(store)
+        assert parked["state"] == "input_ineligible"
+        assert parked["disposition"] == "input-ineligible:section_text"
+
+
+def test_ineligible_statute_park_reopens_once_section_text_is_supplied(
+    tmp_path, cfg, paths
+):
+    with open_store(tmp_path, n_seeds=1, meta={"section_text": None}) as store:
+        task = _plant_statute_qa_task(store, cfg)
+        router = FakeRouter(cfg, {"generator": [chat_response()]})
+        result = asyncio.run(
+            generate_once(store, cfg, router, task, paths=paths, attempt=1)
+        )
+        assert result.skipped == "input_ineligible"
+        assert apply_gate_disposition(store, task, result, worker_id=None) == (
+            "input_ineligible"
+        )
+        assert router.calls_for("generator") == []
+
+        store.conn.execute(
+            "UPDATE seed SET meta_json = ?",
+            (json.dumps({"section_text": DISTINCT_SECTION}),),
+        )
+        store.conn.commit()
+        assert reopen_tasks(store, ["input_ineligible"]) == {"input_ineligible": 1}
+        task = only_task(store)
+        assert task["state"] == "pending"
+        result = asyncio.run(
+            generate_once(store, cfg, router, task, paths=paths, attempt=1)
+        )
+        assert result.ok
+        assert router.calls_for("generator")
+
+
+def test_ineligible_statute_park_does_not_block_the_per_seed_cap(tmp_path, cfg, paths):
+    with open_store(tmp_path, n_seeds=1, meta={"section_text": None}) as store:
+        task = _plant_statute_qa_task(store, cfg)
+        result = asyncio.run(
+            generate_once(
+                store, cfg, FakeRouter(cfg), task, paths=paths, attempt=1
+            )
+        )
+        assert apply_gate_disposition(store, task, result, worker_id=None) == (
+            "input_ineligible"
+        )
+        added = plan_wave(
+            store,
+            cfg,
+            "synthesis",
+            PER_SEED_CAP,
+            task_type_mix={"irac_analysis": 1.0},
+        )
+        assert added == PER_SEED_CAP
+        total = store.conn.execute("SELECT COUNT(*) FROM task").fetchone()[0]
+        assert total == PER_SEED_CAP + 1
+        parked = store.conn.execute(
+            "SELECT COUNT(*) FROM task WHERE state = 'input_ineligible'"
+        ).fetchone()[0]
+        assert parked == 1
+
+
+def test_eligible_distinct_statute_text_still_renders_and_generates(tmp_path, cfg, paths):
+    meta = {"section_text": DISTINCT_SECTION}
+    with make_store(tmp_path, meta=meta, mix={"statute_qa": 1.0}) as store:
         task = only_task(store)
         slots = build_slots(cfg, task, store.get_seed(task["seed_id"]))
-        assert slots["section_text"] == SEED_TEXT
+        assert slots["section_text"] == DISTINCT_SECTION
+        assert slots["source"] == SEED_TEXT
+        router = FakeRouter(cfg, {"generator": [chat_response()]})
+        totals = run(store, cfg, router, paths)
+        assert totals["gen_ok"] == 1
+        assert router.calls_for("generator")
+        task = only_task(store)
+        assert task["state"] == "judging"
 
 
 def test_seed_meta_question_overrides_the_standing_ask(tmp_path, cfg):
@@ -425,6 +542,41 @@ def test_next_attempt_reconciles_claims_and_generations(tmp_path, cfg, paths):
 # Gate wiring.
 # --------------------------------------------------------------------------
 
+def test_gate_context_carries_the_task_type(tmp_path, cfg):
+    with make_store(tmp_path, mix={"drafting": 1.0}) as store:
+        task = only_task(store)
+        seed = store.get_seed(task["seed_id"])
+        ctx = gate_context(cfg, task, seed, SEED_TEXT)
+        assert ctx.task_type == "drafting"
+
+
+@pytest.mark.parametrize("task_type", ("drafting", "summarization"))
+def test_drafting_and_summarization_answers_without_irac_reach_judging(
+    tmp_path, cfg, paths, task_type
+):
+    with make_store(tmp_path, mix={task_type: 1.0}) as store:
+        router = FakeRouter(cfg, {"generator": [chat_response(PLAIN_ANSWER, CLEAN_THINK)]})
+        run(store, cfg, router, paths)
+        task = only_task(store)
+        assert task["task_type"] == task_type
+        assert task["state"] == "judging"
+        gen = store.latest_generation(task["task_id"])
+        assert store.gates_for(gen["gen_id"])["irac_placement"] is True
+
+
+@pytest.mark.parametrize("task_type", ("irac_analysis", "statute_qa"))
+def test_analysis_and_statute_answers_without_irac_still_regenerate(
+    tmp_path, cfg, paths, task_type
+):
+    meta = {"section_text": DISTINCT_SECTION} if task_type == "statute_qa" else None
+    with make_store(tmp_path, mix={task_type: 1.0}, meta=meta) as store:
+        router = FakeRouter(cfg, {"generator": [chat_response(PLAIN_ANSWER, CLEAN_THINK)]})
+        run(store, cfg, router, paths)
+        task = only_task(store)
+        assert task["state"] == "pending"
+        assert "irac_placement" in (task["disposition"] or "")
+
+
 def test_a_fabricated_citation_is_a_permanent_reject(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
         router = FakeRouter(cfg, {"generator": [chat_response(FABRICATED_ANSWER, CLEAN_THINK)]})
@@ -460,6 +612,23 @@ NO_CUE_THINK = (
     "The right pleaded rests on the section both parties invoke, and the "
     "question is whether the facts as recorded bring the case within it. "
 ) * 20
+
+# A content regeneration that is NOT a self-verification miss: the trace
+# still carries a cue, and a line-initial IRAC heading trips irac_placement.
+FORMAT_FAIL_THINK = CLEAN_THINK + "\n\nIssue: whether the appeal lies.\n"
+
+# Deliverable-shaped answer with no IRAC headings. Live answer_min is 120
+# estimate-tokens (480 characters); this stays above that.
+PLAIN_ANSWER = (
+    "The petition should be settled as a revision. The facts as recorded do not "
+    "make out the charge, and the delay in the deposition is unexplained. The "
+    "client should be advised to press that gap rather than to negotiate around "
+    "it. Service, limitation and the verification clause must all be attended to "
+    "in the instrument itself, not left as an afterthought in the reasoning. "
+    "The prayer is for the record to be called for and the order set aside. "
+    "The instrument should name the court, the parties, the order under challenge, "
+    "and the grounds on which the record is sought, in that order and in full."
+)
 
 
 def test_the_generation_budget_covers_the_largest_gate_legal_reply(cfg):
@@ -797,34 +966,105 @@ def test_reopening_a_free_park_still_restores_the_budget(tmp_path, cfg, paths):
         assert task["disposition"] == f"reopened:from-{GEN_UNROUTABLE_STATE}"
 
 
-def test_a_retry_sends_the_identical_request_and_logs_no_effort_bump(
+def test_self_verification_only_failure_is_stored_but_reaches_judging(
     tmp_path, cfg, paths
 ):
-    """INVERTED 2026-08-18 - this used to pin `calls[1]["params"] ==
-    {"reasoning_effort": "high"}` and one effort_bump event per retry. The
-    ladder is retired; see
-    test_a_retry_re_rolls_the_same_request_and_never_bumps_effort for the
-    measurement, and generate.EFFORT_LADDER_RETIRED for the numbers."""
     with make_store(tmp_path) as store:
         router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, NO_CUE_THINK)]})
         run(store, cfg, router, paths)
+        task = only_task(store)
+        assert task["state"] == "judging"
+        gen = store.latest_generation(task["task_id"])
+        gates_for = store.gates_for(gen["gen_id"])
+        assert gates_for["self_verification"] is False
+        assert all(
+            passed for gate, passed in gates_for.items() if gate != "self_verification"
+        )
+
+
+def test_self_verification_does_not_appear_in_the_regenerate_disposition(
+    tmp_path, cfg, paths
+):
+    # NO_CUE_THINK fails self_verification; a line-initial IRAC heading is the
+    # real regenerate. The diagnostic miss must stay in gate_result and stay
+    # out of the reason the next claim sees.
+    think = NO_CUE_THINK + "\n\nIssue: whether the appeal lies.\n"
+    with make_store(tmp_path) as store:
+        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, think)]})
+        run(store, cfg, router, paths)
+        task = only_task(store)
+        assert task["state"] == "pending"
+        assert task["disposition"].startswith("regenerate:")
+        assert "irac_placement" in task["disposition"]
+        assert "self_verification" not in task["disposition"]
+        gen = store.latest_generation(task["task_id"])
+        assert store.gates_for(gen["gen_id"])["self_verification"] is False
+        assert store.gates_for(gen["gen_id"])["irac_placement"] is False
+
+
+def test_provider_truncation_blocks_judging_when_gates_are_clean(tmp_path, cfg, paths):
+    with make_store(tmp_path) as store:
+        router = FakeRouter(
+            cfg,
+            {
+                "generator": [
+                    chat_response(CLEAN_ANSWER, CLEAN_THINK, finish_reason="length")
+                ]
+            },
+        )
+        run(store, cfg, router, paths)
+        task = only_task(store)
+        gen = store.latest_generation(task["task_id"])
+        assert store.gates_for(gen["gen_id"]) == {gate: True for gate in gates.GATE_ORDER}
+        assert gen["finish_reason"] == "length"
+        assert task["state"] == "pending"
+        assert task["disposition"] == "regenerate:truncated"
+
+
+def test_a_retry_carries_failed_gate_repair_guidance_and_no_cue_forcing_phrase(
+    tmp_path, cfg, paths
+):
+    """A repairable retry must change the request. Effort stays un-bumped;
+    the change is a machine-generated note derived from the failed gates,
+    not a self-verification cue forced into the prompt."""
+    with make_store(tmp_path) as store:
+        router = FakeRouter(
+            cfg, {"generator": [chat_response(CLEAN_ANSWER, FORMAT_FAIL_THINK)]}
+        )
+        run(store, cfg, router, paths)
         run(store, cfg, router, paths)
         calls = router.calls_for("generator")
+        assert len(calls) == 2
         assert calls[0]["params"] == {}
         assert calls[1]["params"] == {}
         assert store.events("effort_bump") == []
+        first = calls[0]["messages"][-1]["content"]
+        second = calls[1]["messages"][-1]["content"]
+        assert second != first
+        assert first in second
+        added = second[len(first) :]
+        assert "irac" in added.lower() or "heading" in added.lower()
+        for cue in gates.VERIFICATION_CUES:
+            assert cue.lower() not in added.lower(), cue
 
 
 def test_regeneration_is_exhausted_at_the_attempt_cap(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, NO_CUE_THINK)]})
+        router = FakeRouter(
+            cfg, {"generator": [chat_response(CLEAN_ANSWER, FORMAT_FAIL_THINK)]}
+        )
         for _ in range(MAX_ATTEMPTS):
             run(store, cfg, router, paths)
         task = only_task(store)
         assert task["attempts"] == MAX_ATTEMPTS
-        assert task["state"] == "rejected"
-        assert task["disposition"].startswith("exhausted:regenerate:")
-        assert "self_verification" in task["disposition"]
+        assert task["state"] == "format_parked"
+        assert task["disposition"].startswith("exhausted:format:")
+        assert "irac_placement" in task["disposition"]
+        assert "self_verification" not in task["disposition"]
+        assert reopen_tasks(store, ["format_parked"]) == {"format_parked": 1}
+        reopened = only_task(store)
+        assert reopened["state"] == "pending"
+        assert reopened["attempts"] == 0
 
 
 def test_gates_run_without_an_index_and_say_so(tmp_path, cfg, paths):
@@ -900,19 +1140,19 @@ def test_the_generation_attempt_cap_is_three_and_there_is_no_fourth_claim(tmp_pa
     claim that does not happen."""
     assert MAX_ATTEMPTS == 3
     with make_store(tmp_path) as store:
-        # A trace that never doubts itself: check_self_verification fails the
-        # row into a regeneration every time, which is the path that spends.
-        # (A traceless reply used to be the stimulus here; since 2026-08-18 it
-        # parks as a provider fact and spends nothing, which is the point of
-        # that change and would make this test vacuous.)
-        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, NO_CUE_THINK)]})
+        # A format failure (IRAC heading in the trace) is the path that spends
+        # and now parks at the cap. A self-verification-only miss reaches
+        # judging and would make this test vacuous.
+        router = FakeRouter(
+            cfg, {"generator": [chat_response(CLEAN_ANSWER, FORMAT_FAIL_THINK)]}
+        )
         for _ in range(MAX_ATTEMPTS + 2):
             run(store, cfg, router, paths)
 
         assert len(router.calls_for("generator")) == MAX_ATTEMPTS
         task = only_task(store)
         assert task["attempts"] == MAX_ATTEMPTS
-        assert task["state"] == "rejected"
+        assert task["state"] == "format_parked"
 
 
 def test_run_workers_does_not_count_a_disposition_the_fence_refused(tmp_path, cfg, paths):
@@ -1017,6 +1257,47 @@ def test_budget_ok_falls_back_to_the_daily_ledger_when_nothing_is_observed(tmp_p
         assert len(store.events("budget_probe_grant")) == 1
         # A ref the config does not know is allowed rather than blocked.
         assert budget_ok("nowhere", "nothing", 10**9) is True
+
+
+def test_openai_usd_cap_is_hard_and_shared_across_models(tmp_path, cfg):
+    """OpenAI judging is a $2 TOTAL hard cap, not a per-model token tpd.
+
+    Mini and nano share the same wallet. The tpd probe grant must not fire:
+    a hard dollar cap that lets one extra paid call through is not a hard cap.
+    """
+    from dataclasses import replace
+
+    priced = []
+    for provider in cfg.providers:
+        if provider.name != "openai":
+            priced.append(provider)
+            continue
+        models = tuple(
+            replace(
+                model,
+                limits={
+                    **model.limits,
+                    "usd_per_1m_prompt": 0.25 if model.id == "gpt-5-mini" else 0.05,
+                    "usd_per_1m_completion": 2.0 if model.id == "gpt-5-mini" else 0.40,
+                    "usd_cap": 2.0,
+                },
+            )
+            for model in provider.models
+        )
+        priced.append(replace(provider, models=models))
+    cfg = replace(cfg, providers=tuple(priced))
+
+    with open_store(tmp_path, n_seeds=0) as store:
+        budget_ok = budget_ok_for(store, cfg, quota=QuotaLedger())
+        assert budget_ok("openai", "gpt-5-mini", 1000) is True
+        # gpt-5-mini prompt is $0.25 / 1M: 8,000,000 tokens = $2.00 exactly.
+        store.record_usage(
+            "openai", "gpt-5-mini",
+            prompt_tokens=8_000_000, completion_tokens=0,
+        )
+        assert budget_ok("openai", "gpt-5-mini", 1) is False
+        assert budget_ok("openai", "gpt-5-nano", 1) is False
+        assert store.events("budget_probe_grant") == []
 
 
 # --------------------------------------------------------------------------
@@ -1375,12 +1656,13 @@ def test_a_reopened_row_still_buys_the_regenerations_it_never_used(tmp_path, cfg
         _park_keyless(store, cfg, paths)
         reopen_tasks(store, [GEN_UNROUTABLE_STATE])
 
-        sent_back = chat_response(CLEAN_ANSWER, reasoning=NO_CUE_THINK)
+        sent_back = chat_response(CLEAN_ANSWER, reasoning=FORMAT_FAIL_THINK)
         run(store, cfg, FakeRouter(cfg, {"generator": [sent_back]}), paths)
         task = only_task(store)
         assert task["state"] == "pending"
         assert task["disposition"].startswith("regenerate:")
-        assert "self_verification" in task["disposition"]
+        assert "irac_placement" in task["disposition"]
+        assert "self_verification" not in task["disposition"]
 
 
 # --------------------------------------------------------------------------
@@ -1487,15 +1769,11 @@ def test_the_gate_estimate_is_not_moved_by_the_routing_estimate(tmp_path, cfg):
 # Grounding hygiene and the transition stream's date requirement.
 # --------------------------------------------------------------------------
 
-def test_grounding_collapses_a_duplicated_slot(tmp_path, cfg):
-    """The pilot's statute_qa fallback puts the seed text in {source} AND
-    {section_text}; concatenating both doubles every judge prompt and every
-    context estimate for no added grounding."""
-    with make_store(tmp_path, mix={"statute_qa": 1.0}) as store:
-        task = only_task(store)
-        bundle = build_prompt(cfg, task, store.get_seed(task["seed_id"]))
-        assert bundle.grounding == SEED_TEXT
-        assert bundle.grounding.count(SEED_TEXT) == 1
+def test_grounding_collapses_a_duplicated_slot():
+    """Identical material in two slots must not double the judge/gate corpus."""
+    slots = {"source": SEED_TEXT, "section_text": SEED_TEXT, "question": "ignored"}
+    assert grounding_text(slots) == SEED_TEXT
+    assert grounding_text(slots).count(SEED_TEXT) == 1
 
 
 def test_grounding_keeps_a_distinct_section_text(tmp_path, cfg):
@@ -1668,6 +1946,18 @@ def test_a_widened_pool_starts_clean(cfg, monkeypatch):
         monkeypatch.setenv(env, "sk-test")
     refusals, warnings = preflight_messages(cfg_with_fourth_judge_family(cfg), ("generator",))
     assert (refusals, warnings) == ([], [])
+
+
+def test_generate_cli_refuses_a_recovery_config_on_the_live_workdir(tmp_path):
+    from test_build_config import _base_doc, _write
+
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build"
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts_harmony"
+    doc["build"]["harmony_completions"] = True
+    path = _write(tmp_path, doc)
+    with pytest.raises(ValueError, match="live workdir"):
+        generate_main(["--config", str(path), "--max-batches", "1"])
 
 
 def test_the_generator_cli_exits_rather_than_claiming_anything(tmp_path, cfg, monkeypatch, capsys):
@@ -2072,3 +2362,207 @@ def test_quota_headers_are_parsed_and_missing_ones_are_not_guessed():
     # gate, and must fall through rather than be read as exhausted.
     minute_only = parse_quota_headers({"x-ratelimit-remaining-tokens-minute": "10"}, now=0.0)
     assert minute_only is not None and minute_only.allows(1) is None
+
+
+# --- pre-treatment manifest gate on generate.main ----------------------------
+
+
+def _isolated_experiment_doc(tmp_path, *, require=True, manifest_path=None, s1=False):
+    from test_build_config import _base_doc
+
+    doc = _base_doc()
+    doc["build"]["workdir"] = str(tmp_path / "exp_recovery")
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts_harmony"
+    doc["build"]["harmony_completions"] = True
+    doc["build"]["harmony_prefill"] = "I start from the facts. "
+    doc["build"]["harmony_s1_continue"] = s1
+    if require:
+        doc["build"]["require_pretreatment_manifest"] = True
+        doc["build"]["pretreatment_manifest"] = str(
+            manifest_path or (tmp_path / "missing-cohort.json")
+        )
+    return doc
+
+
+def _complete_pretreatment_manifest(path, cfg):
+    from tuned.data.eval_matched import TASK_TYPES, contract_from_config
+    from tuned.data.gates import GATE_ORDER
+
+    contract = contract_from_config(cfg)
+    pairs = []
+    for task_type in TASK_TYPES:
+        for i in range(20):
+            pairs.append(
+                {
+                    "seed_id": f"{task_type}-{i:03d}",
+                    "task_type": task_type,
+                    "control_task_id": f"{task_type}-{i:03d}:t",
+                    "control_gen_id": i + 1,
+                    "control_attempt": 1,
+                }
+            )
+    payload = {
+        "n": 80,
+        "n_per_stratum": 20,
+        "task_types": list(TASK_TYPES),
+        "think_min": contract.think_min,
+        "teacher_family": contract.teacher_family,
+        "teacher_model": contract.teacher_model,
+        "gate_contract": list(GATE_ORDER),
+        "pairs": pairs,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def _trap_generate_side_effects(monkeypatch):
+    hits = []
+
+    def boom_ensure(self):
+        hits.append("ensure")
+        raise AssertionError("BuildPaths.ensure")
+
+    def boom_router(*_a, **_k):
+        hits.append("router")
+        raise AssertionError("make_router")
+
+    def boom_preflight(*_a, **_k):
+        hits.append("preflight")
+        raise AssertionError("print_preflight")
+
+    monkeypatch.setattr("tuned.data.paths.BuildPaths.ensure", boom_ensure)
+    monkeypatch.setattr(generate_module, "make_router", boom_router)
+    monkeypatch.setattr(generate_module, "print_preflight", boom_preflight)
+    monkeypatch.setattr(
+        "tuned.data.providers.load_dotenv_keys",
+        lambda path=None: hits.append("dotenv") or 0,
+    )
+    return hits
+
+
+def test_recovery_generate_refuses_missing_pretreatment_manifest_before_ensure(
+    tmp_path, monkeypatch
+):
+    from test_build_config import _write
+
+    hits = _trap_generate_side_effects(monkeypatch)
+    path = _write(tmp_path, _isolated_experiment_doc(tmp_path, require=True))
+    with pytest.raises(ValueError, match="pretreatment|manifest"):
+        generate_main(["--config", str(path), "--max-batches", "1"])
+    assert "ensure" not in hits
+    assert "router" not in hits
+    assert "preflight" not in hits
+    assert not (tmp_path / "exp_recovery").exists()
+
+
+def test_recovery_generate_refuses_partial_pretreatment_manifest_before_ensure(
+    tmp_path, monkeypatch
+):
+    from test_build_config import _write
+    from tuned.data.eval_matched import TASK_TYPES
+    from tuned.data.gates import GATE_ORDER
+
+    hits = _trap_generate_side_effects(monkeypatch)
+    man = tmp_path / "partial-cohort.json"
+    pairs = [
+        {
+            "seed_id": f"{task_type}-{i:03d}",
+            "task_type": task_type,
+            "control_task_id": f"{task_type}-{i:03d}:t",
+            "control_gen_id": i + 1,
+            "control_attempt": 1,
+        }
+        for task_type in TASK_TYPES[:3]
+        for i in range(20)
+    ]
+    man.write_text(
+        json.dumps(
+            {
+                "n": 60,
+                "n_per_stratum": 20,
+                "task_types": list(TASK_TYPES[:3]),
+                "think_min": 500,
+                "teacher_family": "fam-gen",
+                "teacher_model": "gen1",
+                "gate_contract": list(GATE_ORDER),
+                "pairs": pairs,
+            }
+        ),
+        encoding="utf-8",
+    )
+    path = _write(tmp_path, _isolated_experiment_doc(tmp_path, manifest_path=man))
+    with pytest.raises(ValueError, match="pretreatment|manifest|underfill|n="):
+        generate_main(["--config", str(path), "--max-batches", "1"])
+    assert "ensure" not in hits
+    assert "router" not in hits
+    assert not (tmp_path / "exp_recovery").exists()
+
+
+def test_recovery_generate_refuses_mismatched_pretreatment_manifest_before_ensure(
+    tmp_path, monkeypatch
+):
+    from test_build_config import _write
+
+    hits = _trap_generate_side_effects(monkeypatch)
+    cfg_path = _write(tmp_path, _isolated_experiment_doc(tmp_path, require=False))
+    cfg = load_build_config(cfg_path, allow_unpinned=True)
+    man = tmp_path / "mismatch-cohort.json"
+    payload = _complete_pretreatment_manifest(man, cfg)
+    payload["think_min"] = 200
+    payload["gate_contract"] = list(payload["gate_contract"])[:-1]
+    man.write_text(json.dumps(payload), encoding="utf-8")
+    path = _write(tmp_path, _isolated_experiment_doc(tmp_path, manifest_path=man))
+    with pytest.raises(ValueError, match="contract|think_min|gate"):
+        generate_main(["--config", str(path), "--max-batches", "1"])
+    assert "ensure" not in hits
+    assert "router" not in hits
+    assert not (tmp_path / "exp_recovery").exists()
+
+
+def test_complete_pretreatment_manifest_reaches_preflight_not_ensure(
+    tmp_path, monkeypatch
+):
+    from test_build_config import _write
+
+    hits = _trap_generate_side_effects(monkeypatch)
+    cfg_path = _write(tmp_path, _isolated_experiment_doc(tmp_path, require=False))
+    cfg = load_build_config(cfg_path, allow_unpinned=True)
+    man = tmp_path / "complete-cohort.json"
+    _complete_pretreatment_manifest(man, cfg)
+    path = _write(tmp_path, _isolated_experiment_doc(tmp_path, manifest_path=man))
+    with pytest.raises(AssertionError, match="print_preflight"):
+        generate_main(["--config", str(path), "--max-batches", "1"])
+    assert "preflight" in hits
+    assert "ensure" not in hits
+    assert "router" not in hits
+    assert not (tmp_path / "exp_recovery").exists()
+
+
+def test_harmony_generate_does_not_require_pretreatment_manifest(tmp_path, monkeypatch):
+    from test_build_config import _write
+
+    hits = _trap_generate_side_effects(monkeypatch)
+    path = _write(
+        tmp_path, _isolated_experiment_doc(tmp_path, require=False, s1=True)
+    )
+    with pytest.raises(AssertionError, match="print_preflight"):
+        generate_main(["--config", str(path), "--max-batches", "1"])
+    assert "preflight" in hits
+    assert "ensure" not in hits
+
+
+def test_recovery_filename_without_knobs_does_not_require_manifest(
+    tmp_path, monkeypatch
+):
+    from test_build_config import _base_doc
+    import yaml
+
+    hits = _trap_generate_side_effects(monkeypatch)
+    doc = _isolated_experiment_doc(tmp_path, require=False)
+    path = tmp_path / "data_law_v1_exp_recovery.yaml"
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    with pytest.raises(AssertionError, match="print_preflight"):
+        generate_main(["--config", str(path), "--max-batches", "1"])
+    assert "preflight" in hits
+    assert "ensure" not in hits
+    assert _base_doc()["build"].get("require_pretreatment_manifest") in (None, False)

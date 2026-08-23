@@ -31,6 +31,7 @@ import itertools
 import json
 import re
 from collections import Counter
+from pathlib import Path
 
 import pytest
 
@@ -718,3 +719,46 @@ def test_pick_variant_separates_samples_of_one_seed():
         reg.pick_variant("irac_analysis", "one-seed", ix) for ix in range(8)
     }
     assert len(picks) > 1
+
+
+# --------------------------------------------------------------------------
+# Recovery overlay isolation. Live bytes stay the control.
+# --------------------------------------------------------------------------
+
+_OVERLAY_DIR = Path(__file__).parent.parent / "src" / "tuned" / "data" / "prompts_harmony"
+
+
+def test_live_prompt_files_are_untouched_when_the_overlay_is_armed():
+    live_before = {
+        prompt_id: (reg.PROMPTS_DIR / f"{prompt_id}.md").read_bytes()
+        for prompt_id in EXPECTED_SHAS
+    }
+    try:
+        reg.set_overlay(_OVERLAY_DIR)
+        overlaid = reg.load("gen_irac_analysis_v1")
+        assert overlaid.sha != EXPECTED_SHAS["gen_irac_analysis_v1"]
+        live_after = {
+            prompt_id: (reg.PROMPTS_DIR / f"{prompt_id}.md").read_bytes()
+            for prompt_id in EXPECTED_SHAS
+        }
+        assert live_before == live_after
+    finally:
+        reg.set_overlay(None)
+    assert reg.load("gen_irac_analysis_v1").sha == EXPECTED_SHAS["gen_irac_analysis_v1"]
+
+
+def test_live_judge_sha_stays_put_when_recovery_overlay_is_armed():
+    live_bytes = {
+        prompt_id: (reg.PROMPTS_DIR / f"{prompt_id}.md").read_bytes()
+        for prompt_id in JUDGE_IDS
+    }
+    try:
+        reg.set_overlay(_OVERLAY_DIR)
+        for prompt_id in JUDGE_IDS:
+            overlaid = reg.load(prompt_id)
+            assert overlaid.sha != EXPECTED_SHAS[prompt_id]
+            assert (reg.PROMPTS_DIR / f"{prompt_id}.md").read_bytes() == live_bytes[prompt_id]
+    finally:
+        reg.set_overlay(None)
+    for prompt_id in JUDGE_IDS:
+        assert reg.load(prompt_id).sha == EXPECTED_SHAS[prompt_id]

@@ -1,7 +1,17 @@
 import hashlib
+import json
 
 import pytest
-from pipeline_fakes import SOURCE_ID, build_cfg, open_store, paths_for, seed_rows, temp_config
+from pipeline_fakes import (
+    SEED_TEXT,
+    SOURCE_ID,
+    STATUTE_SECTION_TEXT,
+    build_cfg,
+    open_store,
+    paths_for,
+    seed_rows,
+    temp_config,
+)
 
 from tuned.data import prompt_registry
 from tuned.data.tasks import main as tasks_main
@@ -9,7 +19,9 @@ from tuned.data.generate import MAX_ATTEMPTS
 from tuned.data.tasks import (
     CURATED_C2_MIX,
     PER_SEED_CAP,
+    REOPEN_STATES,
     SYNTHESIS_MIX,
+    TERMINALLY_DEAD,
     allocate,
     default_mix,
     parse_mix,
@@ -169,6 +181,63 @@ def test_sample_ix_advances_on_the_next_wave(tmp_path, cfg):
         assert all(r["sample_ix"] >= 1 for r in rows)
 
 
+def test_planner_does_not_assign_statute_qa_to_an_ineligible_seed(tmp_path, cfg):
+    distinct = (
+        "Section 34. When a criminal act is done by several persons in "
+        "furtherance of the common intention of all, each is liable."
+    )
+    with open_store(tmp_path, n_seeds=0) as store:
+        store.upsert_seeds(
+            [
+                {
+                    "seed_id": "eligible-statute",
+                    "source_id": SOURCE_ID,
+                    "native_id": "ok",
+                    "case_type": "criminal",
+                    "code_era": "ipc",
+                    "text": SEED_TEXT,
+                    "token_count": len(SEED_TEXT) // 4,
+                    "meta_json": {"section_text": distinct},
+                },
+                {
+                    "seed_id": "ineligible-blank",
+                    "source_id": SOURCE_ID,
+                    "native_id": "blank",
+                    "case_type": "criminal",
+                    "code_era": "ipc",
+                    "text": SEED_TEXT,
+                    "token_count": len(SEED_TEXT) // 4,
+                    "meta_json": {"section_text": ""},
+                },
+                {
+                    "seed_id": "ineligible-equal",
+                    "source_id": SOURCE_ID,
+                    "native_id": "equal",
+                    "case_type": "criminal",
+                    "code_era": "ipc",
+                    "text": SEED_TEXT,
+                    "token_count": len(SEED_TEXT) // 4,
+                    "meta_json": {"section_text": SEED_TEXT},
+                },
+                {
+                    "seed_id": "ineligible-missing",
+                    "source_id": SOURCE_ID,
+                    "native_id": "missing",
+                    "case_type": "criminal",
+                    "code_era": "ipc",
+                    "text": SEED_TEXT,
+                    "token_count": len(SEED_TEXT) // 4,
+                    "meta_json": {},
+                },
+            ]
+        )
+        rows = plan_rows(
+            store, cfg, "synthesis", 4, task_type_mix={"statute_qa": 1.0}
+        )
+        assert rows
+        assert {row["seed_id"] for row in rows} == {"eligible-statute"}
+
+
 def test_per_seed_cap_bounds_the_wave(tmp_path, cfg):
     with open_store(tmp_path, n_seeds=2) as store:
         created = plan_wave(store, cfg, "synthesis", 40)
@@ -182,7 +251,13 @@ def test_per_seed_cap_bounds_the_wave(tmp_path, cfg):
 
 
 def test_sample_ix_is_per_seed_and_task_type(tmp_path, cfg):
-    with open_store(tmp_path, n_seeds=1) as store:
+    meta = {
+        "section_text": (
+            "Section 34. When a criminal act is done by several persons in "
+            "furtherance of the common intention of all, each is liable."
+        )
+    }
+    with open_store(tmp_path, n_seeds=1, meta=meta) as store:
         plan_wave(store, cfg, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
         rows = plan_rows(store, cfg, "synthesis", 2, task_type_mix={"statute_qa": 1.0})
         # One irac task exists; the first statute_qa sample still starts at 0.
@@ -415,6 +490,197 @@ def test_reopen_returns_parked_rows_to_the_queue_that_owns_them(store, cfg):
 def test_reopen_refuses_a_state_it_does_not_own(store, cfg):
     with pytest.raises(ValueError, match="rejected"):
         reopen_tasks(store, ["rejected"])
+
+
+def test_format_parked_reopens_to_pending_and_is_not_terminally_dead():
+    assert REOPEN_STATES["format_parked"] == "pending"
+    assert "format_parked" not in TERMINALLY_DEAD
+
+
+def test_input_ineligible_reopens_to_pending_and_is_terminally_dead():
+    assert REOPEN_STATES["input_ineligible"] == "pending"
+    assert "input_ineligible" in TERMINALLY_DEAD
+
+
+def test_input_ineligible_reopens_with_a_fresh_attempt_budget(tmp_path, cfg):
+    with open_store(tmp_path, n_seeds=4) as store:
+        assert plan_wave(store, cfg, "synthesis", 1) == 1
+        task_id = store.conn.execute("SELECT task_id FROM task").fetchone()[0]
+        store.conn.execute(
+            "UPDATE task SET attempts = ? WHERE task_id = ?",
+            (MAX_ATTEMPTS, task_id),
+        )
+        store.set_task_state(
+            task_id, "input_ineligible", "input-ineligible:section_text"
+        )
+        skipped: dict[str, int] = {}
+        assert reopen_tasks(store, ["input_ineligible"], skipped=skipped) == {
+            "input_ineligible": 1
+        }
+        assert skipped == {}
+        row = dict(store.conn.execute("SELECT * FROM task").fetchone())
+        assert row["state"] == "pending"
+        assert row["attempts"] == 0
+
+
+def _plant_legacy_skip_slots(store, seed_id="seed000", task_type="statute_qa"):
+    prompt_id = prompt_registry.pick_variant(task_type, seed_id, 0)
+    store.create_tasks(
+        [
+            {
+                "task_id": task_id_for(seed_id, task_type, prompt_id, 0),
+                "seed_id": seed_id,
+                "stream": "synthesis",
+                "task_type": task_type,
+                "prompt_id": prompt_id,
+                "prompt_sha": prompt_registry.load(prompt_id).sha,
+                "sample_ix": 0,
+            }
+        ]
+    )
+    task_id = store.conn.execute("SELECT task_id FROM task").fetchone()[0]
+    store.set_task_state(task_id, "rejected", "skip:slots")
+    return task_id
+
+
+def test_legacy_skip_slots_zero_generation_does_not_block_the_per_seed_cap(tmp_path, cfg):
+    with open_store(tmp_path, n_seeds=1, meta={"section_text": None}) as store:
+        task_id = _plant_legacy_skip_slots(store)
+        assert store.latest_generation(task_id) is None
+        store.conn.execute(
+            "UPDATE seed SET meta_json = ?",
+            (json.dumps({"section_text": STATUTE_SECTION_TEXT}),),
+        )
+        store.conn.commit()
+        assert plan_wave(
+            store,
+            cfg,
+            "synthesis",
+            PER_SEED_CAP,
+            task_type_mix={"irac_analysis": 1.0},
+        ) == PER_SEED_CAP
+        row = dict(
+            store.conn.execute(
+                "SELECT * FROM task WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        )
+        assert row["state"] == "rejected"
+        assert row["disposition"] == "skip:slots"
+        assert store.latest_generation(task_id) is None
+
+
+def test_legacy_skip_slots_generated_row_does_not_block_the_per_seed_cap(tmp_path, cfg):
+    with open_store(tmp_path, n_seeds=1, meta={"section_text": None}) as store:
+        task_id = _plant_legacy_skip_slots(store)
+        store.record_generation(
+            {
+                "kind": "generation",
+                "task_id": task_id,
+                "attempt": 1,
+                "provider": "cerebras",
+                "model": "gpt-oss-120b",
+                "think": "reasoning...",
+                "answer": "Issue\nX\n\nConclusion\nY",
+                "prompt_tokens": 10,
+                "completion_tokens": 10,
+                "raw_path": str(tmp_path / "raw" / "gen.ndjson"),
+                "raw_offset": 0,
+            }
+        )
+        store.set_task_state(task_id, "rejected", "skip:slots")
+        assert store.latest_generation(task_id) is not None
+        store.conn.execute(
+            "UPDATE seed SET meta_json = ?",
+            (json.dumps({"section_text": STATUTE_SECTION_TEXT}),),
+        )
+        store.conn.commit()
+        assert plan_wave(
+            store,
+            cfg,
+            "synthesis",
+            PER_SEED_CAP,
+            task_type_mix={"irac_analysis": 1.0},
+        ) == PER_SEED_CAP
+        row = dict(
+            store.conn.execute(
+                "SELECT * FROM task WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        )
+        assert row["state"] == "rejected"
+        assert row["disposition"] == "skip:slots"
+        assert store.latest_generation(task_id) is not None
+
+
+@pytest.mark.parametrize("task_type", ("irac_analysis", "transition"))
+def test_non_statute_skip_slots_still_spends_the_per_seed_cap(tmp_path, cfg, task_type):
+    with open_store(tmp_path, n_seeds=1) as store:
+        task_id = _plant_legacy_skip_slots(store, task_type=task_type)
+        added = plan_wave(
+            store,
+            cfg,
+            "synthesis",
+            PER_SEED_CAP,
+            task_type_mix={"irac_analysis": 1.0},
+        )
+        assert added == PER_SEED_CAP - 1
+        total = store.conn.execute("SELECT COUNT(*) FROM task").fetchone()[0]
+        assert total == PER_SEED_CAP
+        row = dict(
+            store.conn.execute(
+                "SELECT * FROM task WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        )
+        assert row["state"] == "rejected"
+        assert row["disposition"] == "skip:slots"
+        assert row["task_type"] == task_type
+
+
+def test_input_ineligible_does_not_block_the_per_seed_cap(tmp_path, cfg):
+    with open_store(tmp_path, n_seeds=1, meta={"section_text": None}) as store:
+        assert plan_wave(
+            store, cfg, "synthesis", 1, task_type_mix={"irac_analysis": 1.0}
+        ) == 1
+        task_id = store.conn.execute("SELECT task_id FROM task").fetchone()[0]
+        store.set_task_state(
+            task_id, "input_ineligible", "input-ineligible:section_text"
+        )
+        assert plan_wave(
+            store,
+            cfg,
+            "synthesis",
+            PER_SEED_CAP,
+            task_type_mix={"irac_analysis": 1.0},
+        ) == PER_SEED_CAP
+        total = store.conn.execute("SELECT COUNT(*) FROM task").fetchone()[0]
+        assert total == PER_SEED_CAP + 1
+
+
+def test_exhausted_format_park_reopens_with_a_fresh_attempt_budget(tmp_path, cfg):
+    with open_store(tmp_path, n_seeds=40) as store:
+        assert plan_wave(store, cfg, "synthesis", 4) == 4
+        ids = [r[0] for r in store.conn.execute("SELECT task_id FROM task ORDER BY rowid")]
+        store.conn.execute(
+            "UPDATE task SET attempts = ? WHERE task_id = ?", (MAX_ATTEMPTS, ids[0])
+        )
+        store.set_task_state(ids[0], "format_parked", "exhausted:format:irac_placement")
+        store.set_task_state(ids[1], "rejected", "reject:citations")
+        store.conn.commit()
+
+        # A recoverable park holds its slot; a rejected legal failure does not.
+        assert plan_wave(store, cfg, "synthesis", 4) == 1
+
+        skipped: dict[str, int] = {}
+        assert reopen_tasks(store, ["format_parked"], skipped=skipped) == {"format_parked": 1}
+        assert skipped == {}
+        row = dict(
+            store.conn.execute("SELECT * FROM task WHERE task_id = ?", (ids[0],)).fetchone()
+        )
+        assert row["state"] == "pending"
+        assert row["attempts"] == 0
+        rejected = dict(
+            store.conn.execute("SELECT * FROM task WHERE task_id = ?", (ids[1],)).fetchone()
+        )
+        assert rejected["state"] == "rejected"
 
 
 def test_reopen_cli_reports_what_it_re_opened(tmp_path, cfg, capsys):

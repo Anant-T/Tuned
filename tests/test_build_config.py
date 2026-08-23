@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -8,12 +9,14 @@ from tuned.data.config import (
     CALIBRATION_RULES,
     JUDGE_SCORE_RANGE,
     DifficultyCfg,
+    ModelRef,
     TransitionCfg,
     load_build_config,
 )
 from tuned.train.config import load_config
 
 DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
+RECOVERY_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1_exp_recovery.yaml"
 TRAIN_CONFIG = Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml"
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
@@ -641,6 +644,221 @@ def test_the_difficulty_target_is_not_restated_in_the_difficulty_block():
     raw = yaml.safe_load(DATA_CONFIG.read_text(encoding="utf-8"))
     assert "difficulty_target" not in raw["difficulty"]
     assert set(raw["difficulty"]) == {"probe_sample", "mix_tolerance"}
+
+
+# --- recovery isolation -----------------------------------------------------
+
+_RECOVERY_KNOBS = (
+    "harmony_prefill",
+    "harmony_completions",
+    "harmony_s1_continue",
+    "prompt_overlay",
+)
+
+
+def test_live_config_has_no_recovery_or_harmony_experiment_knobs():
+    raw = yaml.safe_load(DATA_CONFIG.read_text(encoding="utf-8"))
+    for key in _RECOVERY_KNOBS:
+        assert key not in raw["build"], key
+    assert "require_pretreatment_manifest" not in raw["build"]
+    assert "pretreatment_manifest" not in raw["build"]
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    assert cfg.build.workdir == "data/build"
+    assert cfg.build.harmony_prefill is None
+    assert cfg.build.harmony_completions is False
+    assert cfg.build.harmony_s1_continue is False
+    assert cfg.build.prompt_overlay is None
+    assert cfg.build.require_pretreatment_manifest is False
+    assert cfg.build.pretreatment_manifest is None
+
+
+_RECOVERY_SPEND_KEYS = ("usd_cap", "usd_per_1m_prompt", "usd_per_1m_completion")
+
+
+def test_live_openai_limits_have_no_recovery_spend_keys():
+    """Pin the reverted live-config leakage: experiment usd_cap/pricing
+    must not reappear on the frozen OpenAI backstop. Family stays gpt-oss
+    so live family separation still excludes those judges from gpt-oss rows.
+    """
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    provider, _ = cfg.model_for(ModelRef("openai", "gpt-5-mini"))
+    models = {model.id: model for model in provider.models}
+    assert set(models) == {"gpt-5-mini", "gpt-5-nano"}
+    for model in models.values():
+        assert model.family == "gpt-oss", model.id
+        for key in _RECOVERY_SPEND_KEYS:
+            assert key not in model.limits, (model.id, key)
+
+
+def test_recovery_config_is_isolated_and_cerebras_only():
+    assert RECOVERY_CONFIG.is_file()
+    raw = yaml.safe_load(RECOVERY_CONFIG.read_text(encoding="utf-8"))
+    assert raw["build"]["workdir"] == "data/build/exp_recovery"
+    assert raw["build"]["prompt_overlay"] == "src/tuned/data/prompts_harmony"
+    assert raw["build"]["harmony_completions"] is True
+    assert raw["build"]["harmony_s1_continue"] is False
+    assert raw["build"]["length_band"]["think_min"] == 500
+    cfg = load_build_config(RECOVERY_CONFIG, allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_recovery"
+    assert cfg.build.prompt_overlay == "src/tuned/data/prompts_harmony"
+    assert cfg.build.harmony_s1_continue is False
+    assert cfg.build.length_band.think_min == 500
+    assert cfg.routing.generator == ("cerebras/gpt-oss-120b",)
+    assert raw["build"]["require_pretreatment_manifest"] is True
+    assert raw["build"]["pretreatment_manifest"]
+    assert cfg.build.require_pretreatment_manifest is True
+    assert cfg.build.pretreatment_manifest == raw["build"]["pretreatment_manifest"]
+
+
+HARMONY_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1_exp_harmony.yaml"
+LIVE_PUSH_REPO = "tantan01/tuned-law-v1-data"
+
+
+def test_harmony_config_does_not_opt_into_pretreatment_manifest():
+    raw = yaml.safe_load(HARMONY_CONFIG.read_text(encoding="utf-8"))
+    assert "require_pretreatment_manifest" not in raw["build"]
+    assert "pretreatment_manifest" not in raw["build"]
+    cfg = load_build_config(HARMONY_CONFIG, allow_unpinned=True)
+    assert cfg.build.require_pretreatment_manifest is False
+    assert cfg.build.pretreatment_manifest is None
+
+
+def test_recovery_push_target_is_not_the_live_dataset_repo():
+    raw = yaml.safe_load(RECOVERY_CONFIG.read_text(encoding="utf-8"))
+    assert raw["push"]["repo_id"] != LIVE_PUSH_REPO
+    cfg = load_build_config(RECOVERY_CONFIG, allow_unpinned=True)
+    live = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    harmony = load_build_config(HARMONY_CONFIG, allow_unpinned=True)
+    assert cfg.push.repo_id != live.push.repo_id
+    assert cfg.push.repo_id != LIVE_PUSH_REPO
+    assert live.push.repo_id == LIVE_PUSH_REPO
+    assert harmony.push.repo_id == LIVE_PUSH_REPO
+
+
+def test_require_pretreatment_manifest_must_be_a_yaml_boolean(tmp_path):
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_recovery"
+    doc["build"]["require_pretreatment_manifest"] = "true"
+    doc["build"]["pretreatment_manifest"] = "cohort.json"
+    with pytest.raises(ValueError, match="require_pretreatment_manifest"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+def test_a_recovery_config_that_points_at_the_live_workdir_is_refused(tmp_path):
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build"
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts_harmony"
+    doc["build"]["harmony_completions"] = True
+    with pytest.raises(ValueError, match="live workdir"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+def test_a_recovery_config_that_resolves_to_the_live_database_is_refused(tmp_path):
+    repo_root = Path(__file__).parent.parent.resolve()
+    doc = _base_doc()
+    doc["build"]["workdir"] = str(repo_root / "data" / "build")
+    doc["build"]["harmony_prefill"] = "I start from the facts. "
+    with pytest.raises(ValueError, match="live"):
+        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+
+
+def test_a_recovery_config_on_an_isolated_workdir_is_accepted(tmp_path):
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_recovery"
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts_harmony"
+    doc["build"]["harmony_completions"] = True
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_recovery"
+
+
+def _recovery_on(workdir: str) -> dict:
+    doc = _base_doc()
+    doc["build"]["workdir"] = workdir
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts_harmony"
+    doc["build"]["harmony_completions"] = True
+    return doc
+
+
+_LIVE_CONTROL_CHILDREN = (
+    "data/build/state",
+    "data/build/raw",
+    "data/build/corpus",
+    "data/build/gold",
+    "data/build/logs",
+    "data/build/streams",
+    "data/build/out",
+    "data/build/raw/gen",
+)
+
+
+@pytest.mark.parametrize("workdir", _LIVE_CONTROL_CHILDREN)
+def test_a_recovery_config_that_points_at_a_live_control_child_is_refused(
+    tmp_path, workdir
+):
+    with pytest.raises(ValueError, match="live"):
+        load_build_config(_write(tmp_path, _recovery_on(workdir)), allow_unpinned=True)
+
+
+@pytest.mark.parametrize(
+    "workdir",
+    [
+        "data/build/../build",
+        "data/build/./state",
+        "data/build/../build/state",
+        str(Path("data") / "build" / "state"),
+        *([r"data\build\state", r"data\build\raw", "DATA/BUILD", "data/BUILD/State"]
+          if os.name == "nt"
+          else []),
+    ],
+)
+def test_recovery_refuses_canonical_aliases_of_the_live_control(tmp_path, workdir):
+    with pytest.raises(ValueError, match="live"):
+        load_build_config(_write(tmp_path, _recovery_on(workdir)), allow_unpinned=True)
+
+
+@pytest.mark.parametrize("workdir", ["data/build/exp_recovery", "data/build/exp_harmony"])
+def test_isolated_experiment_siblings_are_not_treated_as_live_control(
+    tmp_path, workdir
+):
+    cfg = load_build_config(_write(tmp_path, _recovery_on(workdir)), allow_unpinned=True)
+    assert cfg.build.workdir == workdir
+
+
+def test_build_paths_resolves_relative_workdir_against_the_repo_not_cwd(
+    tmp_path, monkeypatch
+):
+    from tuned.data.paths import build_paths
+
+    repo_root = Path(__file__).resolve().parent.parent
+    monkeypatch.chdir(tmp_path)
+    paths = build_paths("data/build/exp_recovery")
+    expected = (repo_root / "data" / "build" / "exp_recovery").resolve()
+    assert paths.root.resolve() == expected
+    assert not (tmp_path / "data" / "build").exists()
+
+
+def test_build_paths_leaves_absolute_runtime_paths_alone(tmp_path):
+    from tuned.data.paths import build_paths
+
+    root = tmp_path / "build"
+    assert build_paths(root).root == root
+
+
+def test_refusal_and_build_paths_agree_on_a_relative_live_child(tmp_path, monkeypatch):
+    from tuned.data.paths import build_paths
+
+    repo_root = Path(__file__).resolve().parent.parent
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="live"):
+        load_build_config(
+            _write(tmp_path, _recovery_on("data/build/state")), allow_unpinned=True
+        )
+    # Same string the yaml would have used: BuildPaths must land on the live
+    # control tree under the repo, not cwd/data/build/state.
+    paths = build_paths("data/build/state")
+    live_state = repo_root / "data" / "build" / "state"
+    assert paths.root.resolve() == live_state.resolve()
+    assert not (tmp_path / "data" / "build").exists()
 
 
 # --- pin_dataset.py pure rewrite --------------------------------------------

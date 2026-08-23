@@ -31,6 +31,7 @@ build = [
     "semhash",
     "pymupdf4llm",
     "huggingface_hub",
+    "openai-harmony",
 ]
 train = [
     # Pinned: the resolver silently bumped unsloth 2026.8.3 -> 2026.8.4 between

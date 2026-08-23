@@ -9,6 +9,7 @@ from pipeline_fakes import (
     CLEAN_THINK,
     NOVEL_ANSWER,
     NOVEL_WITH_INDEX,
+    SEED_TEXT,
     FakeRouter,
     build_cfg,
     chat_response,
@@ -114,8 +115,9 @@ def test_a_clean_row_survives_the_rerun(tmp_path, paths, cfg, index_path):
         counts = rerun_gates(store, cfg, citation_index_path=index_path)
         assert counts == {
             "scanned": 1, "regated": 1, "clean": 1, "demoted": 0, "soft_fail": 0,
-            "missing_seed": 0, "slot_error": 0, "held_by_worker": 0,
-            "rebuilt_content": 0, "unverified": 0,
+            "diagnostic": 0, "missing_seed": 0, "slot_error": 0,
+            "input_ineligible": 0, "held_by_worker": 0, "rebuilt_content": 0,
+            "unverified": 0,
         }
         assert store.conn.execute("SELECT state FROM task").fetchone()[0] == "accepted"
         gen = store.latest_generation(task_id)
@@ -167,9 +169,9 @@ def test_content_falls_back_to_the_columns_when_the_raw_line_is_gone(tmp_path, p
 
 
 def test_soft_failures_are_logged_but_never_demoted(tmp_path, paths, cfg, index_path):
-    # A trace with no self-verification cue fails a SOFT (regenerate) gate.
-    # It is force-accepted here to stand for a row an earlier, looser pass
-    # let through - exactly the case where verify.py must not churn.
+    # A trace with no self-verification cue fails the diagnostic gate only.
+    # Task 2 made that miss observable, not a hard/soft disposition. Verify
+    # must still record and report it, and must not demote or churn the row.
     store, task_id = generated_store(
         tmp_path, paths, cfg, reasoning=CLEAN_THINK.replace("Let me check", "I note"),
         state="accepted",
@@ -178,10 +180,17 @@ def test_soft_failures_are_logged_but_never_demoted(tmp_path, paths, cfg, index_
         gen = store.latest_generation(task_id)
         assert store.gates_for(gen["gen_id"])["self_verification"] is False
         counts = rerun_gates(store, cfg, citation_index_path=index_path)
-        assert counts["soft_fail"] == 1
+        assert counts["regated"] == 1
+        assert counts["diagnostic"] == 1
+        assert counts["soft_fail"] == 0
+        assert counts["clean"] == 0
         assert counts["demoted"] == 0
         assert store.conn.execute("SELECT state FROM task").fetchone()[0] == "accepted"
-        assert store.events("verify_soft_fail")
+        assert store.gates_for(gen["gen_id"])["self_verification"] is False
+        event = json.loads(store.events("verify_diagnostic")[0]["detail_json"])
+        assert event["gates"] == ["self_verification"]
+        assert store.events("verify_soft_fail") == []
+        assert store.events("verify_demotion") == []
 
 
 def test_a_rejected_row_is_regated_but_not_re_demoted(tmp_path, paths, cfg, index_path):
@@ -309,6 +318,73 @@ def test_an_unrenderable_row_is_counted_apart_from_a_missing_seed(tmp_path, path
         assert counts["regated"] == 0
         event = json.loads(store.events("verify_skipped")[0]["detail_json"])
         assert event["reason"].startswith("SlotError")
+        assert counts.get("input_ineligible", 0) == 0
+
+
+def _legacy_ineligible_statute_qa(store, task_id, *, section_text=None):
+    meta = {} if section_text is None else {"section_text": section_text}
+    store.conn.execute(
+        "UPDATE task SET task_type = 'statute_qa' WHERE task_id = ?",
+        (task_id,),
+    )
+    store.conn.execute("UPDATE seed SET meta_json = ?", (json.dumps(meta),))
+    store.conn.commit()
+
+
+def test_legacy_ineligible_statute_qa_is_reported_not_regated(
+    tmp_path, paths, cfg, index_path
+):
+    store, task_id = generated_store(tmp_path, paths, cfg)
+    with store:
+        gen_before = store.latest_generation(task_id)
+        citations_before = gate_detail(store, gen_before["gen_id"], "citations")
+        _legacy_ineligible_statute_qa(store, task_id)
+        counts = rerun_gates(store, cfg, citation_index_path=index_path)
+        assert counts["scanned"] == 1
+        assert counts["input_ineligible"] == 1
+        assert counts["slot_error"] == 0
+        assert counts["regated"] == 0
+        assert counts["demoted"] == 0
+        assert counts["clean"] == 0
+        task = dict(store.conn.execute("SELECT * FROM task").fetchone())
+        assert task["state"] == "input_ineligible"
+        assert task["disposition"] == "input-ineligible:section_text"
+        event = json.loads(store.events("verify_input_ineligible")[0]["detail_json"])
+        assert event["task_id"] == task_id
+        assert event["from_state"] == "accepted"
+        assert store.events("verify_demotion") == []
+        citations_after = gate_detail(store, gen_before["gen_id"], "citations")
+        assert citations_after == citations_before
+
+
+def test_legacy_source_equal_statute_qa_is_not_treated_as_a_provision(
+    tmp_path, paths, cfg, index_path
+):
+    store, task_id = generated_store(tmp_path, paths, cfg)
+    with store:
+        _legacy_ineligible_statute_qa(store, task_id, section_text=SEED_TEXT)
+        counts = rerun_gates(store, cfg, citation_index_path=index_path)
+        assert counts["input_ineligible"] == 1
+        assert counts["regated"] == 0
+        assert store.conn.execute("SELECT state FROM task").fetchone()[0] == (
+            "input_ineligible"
+        )
+
+
+def test_legacy_ineligible_statute_qa_does_not_promote_a_rejected_row(
+    tmp_path, paths, cfg, index_path
+):
+    store, task_id = generated_store(tmp_path, paths, cfg, state="rejected")
+    with store:
+        store.set_task_state(task_id, "rejected", "reject:citations")
+        _legacy_ineligible_statute_qa(store, task_id)
+        counts = rerun_gates(store, cfg, citation_index_path=index_path)
+        assert counts["input_ineligible"] == 1
+        assert counts["regated"] == 0
+        assert counts["demoted"] == 0
+        task = dict(store.conn.execute("SELECT * FROM task").fetchone())
+        assert task["state"] == "rejected"
+        assert task["disposition"] == "reject:citations"
 
 
 def test_a_demotion_re_checks_the_lease_it_is_about_to_overwrite(tmp_path, paths, cfg, index_path):

@@ -1,0 +1,754 @@
+# law_v1 dataset-curation build config. This file is churn-heavy (API
+# providers/models/limits change weekly) so it lives separately from the
+# training config and only ever REFERENCES it (build.train_config) for
+# anything the trainer owns - think tags, tokenizer pin, dataset path.
+# Never duplicate those values here; src/tuned/data/config.py resolves them
+# from the referenced training config at load time.
+
+build:
+  train_config: configs/law_v1_8b_ddp.yaml
+  workdir: data/build/exp_harmony
+  target_total: 18000
+  mvp_total: 10300
+  mix: {grounded_synthesis: 0.60, curated: 0.16, replay: 0.24}
+  overgeneration: 2.0
+  held_out_frac: 0.10
+  length_band: {total_max: 8192, total_min: 300, think_min: 200, think_max: 3000, answer_min: 120}
+  difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
+  appointed_day: "2024-07-01"
+  harmony_completions: true
+  harmony_prefill: "I start from the facts. "
+  harmony_s1_continue: true
+  prompt_overlay: src/tuned/data/prompts_harmony
+
+# --------------------------------------------------------------------------
+# The assembly tail: split.py -> assemble.py -> stats.py.
+# --------------------------------------------------------------------------
+# Thresholds live here so those modules read them instead of carrying magic
+# numbers. What is ALREADY STATED - by `build:` above or by the training
+# config this file references - is deliberately NOT repeated:
+#
+#   the eval fraction         = build.held_out_frac (0.10)
+#   the v1.1-full mix targets = build.mix (60 / 16 / 24)
+#   the length bucket         = the train config's train.main.max_seq_length
+#
+# A second copy of any of those is a fence that can silently disagree with the
+# fencing, so split.py and stats.py read the originals through
+# cfg.build.held_out_frac, cfg.assembly.targets() and cfg.max_seq_length.
+assembly:
+  # Which mix targets stats.py grades against when --profile is not passed.
+  default_profile: v1.1-full
+
+  # Extra mix profiles. v1.1-full is build.mix and MUST NOT be restated here -
+  # config.py refuses a redefinition rather than letting two 60/16/24s drift.
+  #
+  # The MVP cut is synthesis-light BY CONSTRUCTION, not by preference: it ships
+  # every row that needs no teacher plus whatever synthesis exists at the cut,
+  # so its targets are DERIVED and not chosen -
+  #
+  #     replay    = target_total * build.mix.replay   = 4,320
+  #                 (and 4,320 is exactly sum(replay.DEFAULT_COUNTS))
+  #     curated   = target_total * build.mix.curated  = 2,880
+  #                 (curated.py's C1 1,700 + the curated_c2 rewrite slice)
+  #     synthesis = mvp_total - the two above         = 3,100
+  #                 (the transition stream's ~1,100 + the 2,000-row core)
+  #     ---------------------------------------------------------------
+  #                                                     10,300 = mvp_total
+  #
+  # The shares below are those counts over build.mvp_total to four places, and
+  # test_build_config recomputes them from build.mix/target_total/mvp_total so
+  # a hand-edit here fails rather than quietly regrading the corpus.
+  profiles:
+    v1.0-MVP: {grounded_synthesis: 0.3010, curated: 0.2796, replay: 0.4194}
+
+  # _prov.source -> the mix bucket the row counts toward. EXPLICIT, because
+  # substring-guessing a bucket is how a stream silently changes size: an
+  # unmapped source is a RED gate naming the source, never a default.
+  #
+  # A source is `dataset` or `dataset:subset` - replay.py builds
+  # "HuggingFaceTB/smoltalk2:{sub}" from the upstream row's own `source`
+  # column, so the subset half is open-ended and cannot be enumerated. The
+  # lookup takes the whole string first and the part before the first ":"
+  # second, so a subset CAN be mapped away from its dataset's bucket by naming
+  # it in full here.
+  #
+  # The three bare names are generated streams (tasks.STREAM_MIX): _prov.source
+  # for a generated row is the stream it was planned under. curated_c2 counts
+  # as CURATED and not as synthesis - the 16% bucket is "curated legal", which
+  # is what a teacher REWRITE of a real judgment is, and the plan sizes the
+  # bucket at 2,880 against curated.py's 1,700 for exactly that reason.
+  source_streams:
+    synthesis: grounded_synthesis
+    transition: grounded_synthesis
+    curated_c2: curated
+    L-NLProc/PredEx_Instruction-Tuning_Pred-Exp: curated
+    opennyaiorg/aalap_instruction_dataset: curated
+    169Pi/indian_law: curated
+    open-thoughts/OpenThoughts-114k: replay
+    nvidia/Nemotron-Post-Training-Dataset-v2: replay
+    HuggingFaceTB/smoltalk2: replay
+    GSMS-B/Indian-Legal-QA-BNS-BNSS-BSA: replay
+    allenai/WildChat-4.8M: replay
+
+  gates:
+    # Mix tolerance in PERCENTAGE POINTS, not a ratio: "60% +/- 2pp" is
+    # 58-62%, which is not what 2% of 60% would be.
+    mix_tolerance_pp: 2.0
+    # Reasoning-trace share, a hard floor from the plan.
+    trace_floor: 0.80
+    # The byte-exact empty-think band. Both ends are gates: too few and the
+    # model never learns to emit the empty scaffold, too many and it learns to
+    # skip reasoning. The ceiling is the trace floor's complement, not an
+    # independent number: over the rows assemble.py EMITS, a kept row is
+    # counted by exactly one of the two shares - `_prov.reasoning` true with a
+    # real think block, or the byte-exact empty scaffold with the flag off -
+    # because assemble.py drops the third shape as `reasoning_flag_mismatch`
+    # (ASSEMBLE_VERSION 2; before it, the identity held only because every row
+    # builder happened to keep the two in step). So the shares sum to 1 and a
+    # ceiling above 1 - trace_floor would admit a corpus the hard floor then
+    # rejects. The plan's 0.22 was ruled down to 0.20 for exactly that
+    # (2026-08-16). The drop rule is pinned in test_build_assemble.py, the
+    # identity end to end in test_build_stats.py, and config.py refuses a
+    # floor/band combination that is unsatisfiable or leaves a dead band of
+    # its own - so these three numbers cannot drift apart by hand-edit.
+    empty_think_min: 0.18
+    empty_think_max: 0.20
+    # A tripwire on the chain, not a re-dedupe: dedupe.py already ran.
+    dup_ceiling: 0.005
+    # Zero tolerance - special-token markup in message content survives the
+    # chat template and teaches the model to emit control tokens.
+    markup: true
+    # Every row must carry a non-empty _prov.license; push.py's card counts them.
+    require_license: true
+    # Rows in a new-code shape whose provenance is an old-code corpus. REPORT
+    # ONLY by default: the shape is a regex over prose and the false-positive
+    # direction costs real rows, so the number is published and the operator
+    # decides. Flip to true once the count has been read once.
+    cross_code_red: false
+    # Which provenances count as pre-transition for the gate above, beside any
+    # row carrying _prov.code_era == "ipc" outright.
+    old_code_sources: [169Pi/indian_law]
+    # The custody chain reaching all the way back to decontamination. stats.py
+    # is the terminal instrument, so a missing link is red rather than a note.
+    require_chain: true
+
+# --------------------------------------------------------------------------
+# transition.py - the s.358 grid.
+# --------------------------------------------------------------------------
+# The grid is NOT sized here and cannot be: it is one cell per
+# (verified mapping row x date posture x procedural posture x question form),
+# and the first factor is the operator's audit sheet
+# (resources/ipc_bns_map.jsonl, verified_by). When the operator signs off the
+# 17 rows that are still null the grid grows and nothing in this file changes.
+# What is a CHOICE is how much of it is drawn.
+#
+# sample 1,100 is the plan's transition-stream size and is what
+# assembly.profiles' derived v1.0-MVP synthesis share already counts
+# (1,100 + the 2,000-row core = 3,100). eval_reserve 150 cells are chosen
+# BEFORE the sample out of the same deterministic order, so the two sets are
+# disjoint by construction rather than by a filter that could be forgotten -
+# and reserved cells are marked held_out in the store, which is what keeps
+# tasks.py from ever planning a teacher generation against the eval.
+transition:
+  sample: 1100
+  eval_reserve: 150
+
+# --------------------------------------------------------------------------
+# calibrate.py - judge thresholds from human gold labels (P5).
+# --------------------------------------------------------------------------
+# GOLD LABELS ARE HUMAN-ONLY. Nothing in this block, and nothing in
+# calibrate.py, may produce one: a model-written gold label would calibrate
+# the judges against a judge, and the number that comes out would measure
+# agreement rather than accuracy.
+#
+# 180 exported, 40 of them held out entirely, the remaining 140 split into 5
+# folds of 28. min_recall/min_precision ARE the P5 gate from the plan:
+# maximise precision subject to recall >= 0.60, then disqualify any judge
+# whose holdout precision is under 0.75 and swap the next model in
+# routing.judge into its slot.
+calibration:
+  pilot_export: 180
+  holdout: 40
+  folds: 5
+  thresholds: [3, 4, 5]
+  rules: [min_axis, mean, both]
+  min_recall: 0.60
+  min_precision: 0.75
+
+# --------------------------------------------------------------------------
+# difficulty.py - probe-calibrated length proxy (P9).
+# --------------------------------------------------------------------------
+# probe_sample is a CEILING on rows that ever reach the probe model, not a
+# batch size. Per-row probing was costed at 32M tokens / 65 days on this
+# corpus, so the design is one 1,000-row calibration pass that fixes the
+# length bands and a pure length proxy for every row after it.
+#
+# The target mix is build.difficulty_target (0.34 / 0.50 / 0.16) and is NOT
+# restated here - one definition, the same rule the eval fraction and the mix
+# targets follow. mix_tolerance is how far the labelled corpus may sit from
+# it before difficulty.py refuses the bands it just fitted.
+difficulty:
+  probe_sample: 1000
+  mix_tolerance: 0.05
+
+# --------------------------------------------------------------------------
+# push.py: the HF dataset repo the training lane pins against (HubCfg.
+# dataset_repo in configs/law_v1_8b_ddp.yaml, via scripts/pin_dataset.py -
+# push.py's own job ends at "repo exists, revision printed").
+# --------------------------------------------------------------------------
+push:
+  repo_id: tantan01/tuned-law-v1-data
+  private: true
+
+providers:
+  # THE CEREBRAS max_context VALUES WERE WRONG BY 16x UNTIL 2026-08-19, and the
+  # cost was paid entirely by this build. Both models were pinned at 8192 - a
+  # figure nothing here ever measured. Its provenance is findable:
+  # docs/reports/2026-08-09-data-strategy-research.md tabulates cerebras as
+  # "ctx capped 8,192" and adds "8k ctx matches the bucket", which is the
+  # training sequence length of this build (8192) being read as the provider's
+  # context window. Two different 8192s, conflated once in a research note and
+  # then copied into the config as fact. The report is a dated record and is
+  # left as it is; this block is the correction. Two live probes, one call
+  # each, max_tokens 16, temperature 0:
+  #
+  #     2026-08-19  cerebras/gpt-oss-120b   prompt_tokens 13515   HTTP 200
+  #     2026-08-19  cerebras/gemma-4-31b    prompt_tokens 10252   HTTP 200
+  #
+  # Both served a prompt well past the pin without complaint; the operator
+  # console reports the real window as 131,072 for the pool.
+  #
+  # WHAT THE STALE PIN COST, so nobody re-tightens it on a hunch: with 8192 as
+  # the generator window, undersized_families excluded the ONLY generator
+  # family for any prompt over ~6.5k estimated tokens (the 8192 is compared
+  # against est x CONTEXT_SAFETY_MARGIN 1.25). The provider was never the
+  # constraint; the config was. The same pin on gemma closed the TIEBREAK route
+  # for long rows.
+  #
+  # THE "85%" HAS A DENOMINATOR AND IT IS WORTH STATING, because the figure was
+  # quoted for two commits without one. Counted over the statute_qa stream:
+  #
+  #     270  statute_qa tasks in total
+  #     142  parked gen_unroutable          52.6% of all statute_qa
+  #     123  disposition unroutable:generator  45.6% of all statute_qa
+  #
+  # The 85% was 123/145 - i.e. of the tasks that had REACHED a routing decision,
+  # excluding the 125 still sitting at stale_prompt. That is a real number and
+  # the right one for "of the rows we tried to route, how many did this pin
+  # eat", but it is not 85% of the stream and should not be quoted as if it
+  # were. Roughly 210 rows become newly routable; the rest were never blocked
+  # by this.
+  #
+  # ANYONE LOWERING THESE AGAIN MUST PROBE FIRST, exactly as above, and record
+  # the prompt_tokens and status here. A max_context in this file is a claim
+  # about someone else's server, and this one went three rounds of review
+  # without being checked.
+  #
+  # tpm STAYS 30,000, AND THE COMBINATION IS SAFE - checked rather than
+  # assumed, because a 131k window against a 30k/minute budget looks like a
+  # deadlock. providers.TokenBucket._need_tokens CLAMPS the charge to the
+  # bucket's capacity, so a single call bigger than a whole minute's budget
+  # degrades to "wait for a full bucket, then send" instead of waiting for a
+  # level the bucket can never reach. Measured on the real TokenBucket with an
+  # injected clock: est 131,072 against tpm 30,000 proceeds immediately on a
+  # full bucket and after exactly one 60s refill on an empty one - one sleep,
+  # no spin, no deadlock, and next_wait() agrees with acquire(). No per-call
+  # ceiling is needed and none was added; the provider's own 429 handling with
+  # backoff takes it from there.
+  - name: cerebras
+    base_url: https://api.cerebras.ai/v1
+    api_key_env: CEREBRAS_API_KEY
+    quirks: [cerebras]
+    models:
+      - id: gpt-oss-120b
+        family: gpt-oss
+        roles: [generator]
+        limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 131072, max_output: 4096}
+        params: {temperature: 0.7, top_p: 0.95, reasoning_effort: medium}
+      # zai-glm-4.7 (family glm, judge + tiebreak) IS GONE, and this comment is
+      # the fence against re-adding it: the model is ARCHIVED upstream and every
+      # call to it 404s -
+      #
+      #     {"type": "model_archived_error", "code": "model_archived",
+      #      "message": "Model zai-glm-4.7 is archived and unavailable for the ..."}
+      #
+      # - measured 2026-08-18 on 4 slot-B routes, each of which spent one
+      # eligible-model attempt on it before failing over (run_event
+      # judge_route_error, status 404). A dead ref in a routing list is not
+      # free: it is an attempt per route, on every route, forever. Anyone
+      # putting a glm model back must first check it answers `python -m
+      # tuned.data.providers --check --ref cerebras/<id>` with a 200.
+      # max_context raised 8192 -> 131072 on the probe recorded at the top of
+      # this provider block (prompt_tokens 10252, HTTP 200, 2026-08-19). This
+      # one is the TIEBREAK route: at 8192 no long row could reach a third
+      # family at all, so every tie on a full-length generation was undecidable
+      # by construction rather than by pool composition.
+      # PROMOTED TO JUDGE 2026-08-19, taking the seat mistral-small was
+      # disqualified from. It is the least-bad evidence available: the design
+      # review's hand-forensics found it the most accurate of the three judges
+      # (it caught three qwen false positives - 391, 441, 470 - that literal
+      # source comparison confirms), and calibration could not fit it only
+      # because all 9 of its gold-labelled judgements landed in the holdout
+      # fold, which is a sampling accident rather than a verdict on the model.
+      # It keeps its tiebreak seat too; family separation is what stops it
+      # breaking a tie it was party to, and that is enforced in judge.py, not
+      # here.
+      - id: gemma-4-31b
+        family: gemma
+        roles: [judge, tiebreak]
+        limits: {rpm: 5, tpm: 30000, tpd: 1000000, max_context: 131072, max_output: 4096}
+        params: {temperature: 0.2}
+  - name: groq
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    quirks: [groq]
+    models:
+      # REASONING OFF FOR THE JUDGE ROLE since 2026-08-18, because with it on
+      # this model cannot return a verdict at all inside its reply budget.
+      #
+      # Measured: 7 slot-B calls, 7 parse failures, 7,168 completion tokens =
+      # EXACTLY 1,024 each (judge.JUDGE_MAX_TOKENS), every reply cut mid-word
+      # still inside an unclosed `<think>` that opened "Here's a thinking
+      # process: 1. **Analyze User Input:** ...". Zero judgements, and the
+      # tokens were billed. The trace is not a little too long for the budget;
+      # it does not finish within it.
+      #
+      # `none` is Groq's documented value for this family (console.groq.com
+      # /docs/reasoning and the /docs/api-reference entry for reasoning_effort:
+      # "qwen3 models ... Set to 'none' to disable reasoning. Set to 'default'
+      # or null to let Qwen reason."), live-probed 2026-08-18: HTTP 200, no
+      # think tags anywhere in the reply, and the JSON verdict alone.
+      #
+      # WHY NOT KEEP THE REASONING AND RAISE THE CAP. Two independent reasons,
+      # both arithmetic:
+      #   * role_params CANNOT express a bigger cap. providers.build_payload
+      #     merges params < role_params < per-call params and only THEN assigns
+      #     `payload["max_tokens"] = req.max_tokens`, so judge.py's own cap
+      #     overwrites anything named here.
+      #   * tpm 6000 is below the call. The measured judge prompts on this row
+      #     size were 4,914-5,661 routing tokens; with a 1,024 reply that is
+      #     already 5,938-6,685 against a 6,000/minute bucket, which
+      #     TokenBucket._need_tokens can only serve by clamping and waiting for
+      #     a full bucket. A reply budget large enough to hold this model's
+      #     trace would put slot B under one call per minute and still overrun.
+      # `reasoning_format: hidden` and `parsed` (also documented for this
+      # family) are no help either: they change where the trace is REPORTED,
+      # not whether it is generated and billed against max_tokens.
+      #
+      # WHAT IT COSTS: a judge that does not deliberate before scoring. That is
+      # the condition slot A already runs under - mistral-small-latest's
+      # reasoning channel is opt-in and the judge role deliberately does not
+      # opt in - and its verdicts on this wave were 237-411 characters, i.e.
+      # ~59-103 tokens against the 1,024 cap. The rubric asks for three
+      # integers and one sentence, not an essay.
+      #
+      # ROLE-SCOPED ON PURPOSE, even though `judge` is the only role this model
+      # serves today. In `params` the same key would follow the model into a
+      # generator promotion and silently produce a traceless generator, which
+      # is exactly the pilot failure the mistral block above records.
+      - id: qwen/qwen3.6-27b
+        family: qwen
+        roles: [judge]
+        limits: {rpm: 30, tpm: 6000, tpd: 200000, rpd: 1000, max_context: 131072, max_output: 16384}
+        params: {temperature: 0.2}
+        role_params:
+          judge: {reasoning_effort: 'none'}
+      # Also the difficulty probe since 2026-08-17: Groq retired its llama chat
+      # lineup (llama-3.1-8b-instant 404s; live models endpoint carries only
+      # allam-2-7b, the gpt-oss pair and qwen3.6-27b). Calibration adapts its
+      # bands to whatever spread this model produces; the calibration report is
+      # the instrument that would expose solve-rate compression - revisit there,
+      # not here. Probing is not judging, so sharing the generator's family is
+      # not a separation concern.
+      - id: openai/gpt-oss-20b
+        family: gpt-oss
+        roles: [tiebreak, probe]
+        limits: {rpm: 30, tpm: 8000, tpd: 200000, rpd: 1000, max_context: 131072, max_output: 65536}
+        params: {temperature: 0.2}
+  - name: mistral
+    base_url: https://api.mistral.ai/v1
+    api_key_env: MISTRAL_API_KEY
+    quirks: [mistral]
+    models:
+      # MISTRAL-SMALL IS OUT OF THE JUDGE SEAT, AND THE FENCE IS ABOUT SMALL
+      # SPECIFICALLY. `mistral-small-latest` was DISQUALIFIED as a judge by
+      # human calibration on 2026-08-19, fitted on the operator's 46 gold
+      # labels (10 accept / 36 reject, base rate 21.7%) -
+      # data/build/gold/calibration_report.md:
+      #
+      #     fitted rule            mean>=3   (agreement 4/5 folds)
+      #     HOLDOUT  n=40          precision 0.237   recall 1.000   phi 0.124
+      #     cross-val n=6          precision 0.200   recall 1.000   phi 0.200
+      #
+      # The gate is precision >= 0.75. Precision 0.237 against a 21.7% base
+      # rate is no information: the rule it fitted passes essentially
+      # everything, which is exactly why recall is 1.000 and phi is 0.124.
+      #
+      # It corroborates the 2026-08-19 design review rather than repeating it:
+      # over 46 judgements that model never awarded validity >= 4 (values
+      # {2,3}, sd 0.48), emitted the single vector 5/3/4 on 59% of calls, and
+      # correlated with the other judge at r=+0.22 on the deciding axis. Its 0%
+      # pass rate was STRUCTURAL - the axis that decided its verdict could not
+      # reach the passing value. While it sat in slot A its borderline verdicts
+      # forced a wasted regeneration on 41% of rows and a paid tiebreak on 100%
+      # of accepts: 101 judge calls bought 46 scored generations.
+      #
+      # THE FENCE DOES NOT COVER mistral-large-latest, which is a different
+      # model on different weights and is UNPROVEN rather than disqualified.
+      # Nothing here claims it is good.
+      #
+      # WHAT THE TIEBREAK SEAT ACTUALLY BUYS, stated exactly, because the first
+      # version of this fence said it "will be measured the same way small was"
+      # and that is not what the arithmetic supports. The seat earns gold-label
+      # COVERAGE: it fires on 11 of 56 judged generations (20%), so its
+      # verdicts do land in front of the operator. FITTING is a further step
+      # and it needs labels OUTSIDE the holdout - and the seat's previous
+      # occupant is the counter-example: gemma earned 9 gold labels and all 9
+      # landed in the holdout fold, leaving ZERO fittable rows and a
+      # DISQUALIFIED-for-no-data verdict that says nothing about the model. At
+      # the current scale (46 labels, holdout 40) only 6 rows were fittable at
+      # all, for any judge. So a real fit on this seat is realistic at GOLD
+      # ROUND 2 SCALE (~180 labels), not before.
+      #
+      # Until then this is a bet with its evidence pending, and promoting it to
+      # a judge slot before that evidence exists is the mistake this fence
+      # records.
+      #
+      # LICENSING, recorded so the card's provenance story stays coherent:
+      # mistral-large weights are NOT Apache-2.0 (small and magistral are). It
+      # does not matter here and the reason is structural rather than a
+      # concession - a judge contributes SCORES to this build, never text. The
+      # open-weight requirement binds the GENERATOR, whose tokens are what ship
+      # in the dataset; the bench is measurement apparatus. What does bind is
+      # La Plateforme's output terms, which stay clean for this use (no
+      # distillation restriction on the outputs we keep, and we keep only
+      # integers and a rationale we never train on).
+      #
+      # THE PREDECESSOR NOTE, kept because it is why there is one block here:
+      # the magistral line was retired upstream on 2026-07-31 and
+      # `magistral-small-latest` no longer exists as a distinct model. The
+      # generator block was deleted rather than re-pointed so two roles cannot
+      # drift into two different aliases of the same weights again.
+      #
+      # THE FULL WORKSPACE BUCKET, and this is a restoration rather than an
+      # increase. The workspace limit is 50 rpm / 50k tpm and the ledger below
+      # records that BOTH mistral models drew on the ONE bucket; each was
+      # therefore given half, because providers.TokenBucket is per
+      # (provider, model) and two 50k buckets would have issued at twice the
+      # real refill rate. With one model there is one bucket, so it gets the
+      # whole workspace allowance.
+      #
+      # family stays `mistral` for both roles, which is what keeps
+      # family_separation from letting this model judge its own generations.
+      #
+      # JUDGE ONLY since 2026-08-18. This model was promoted to generator when
+      # the magistral line was retired, and the re-pilot measured the result:
+      # over 56 generations it produced ZERO rows that passed the gates, and
+      # 50 of the 56 (89%) failed irac_placement because it writes a NUMBERED
+      # IRAC OUTLINE inside its reasoning and then fills it in -
+      #
+      #     '1. **Issue**: The core issue seems to be whether a partnership...'
+      #     '2. **Rule**: The relevant legal provisions include:'
+      #
+      # - which is precisely the MSLR scripted-trace pathology this dataset is
+      # built to avoid, and which cost -33.8% quality in the evidence that
+      # bought the gate. The same run put cerebras/gpt-oss-120b at 9% on that
+      # gate, so this is the model and not the prompts.
+      #
+      # THE EFFORT KNOB CANNOT FIX IT, probed live 2026-08-18: the API accepts
+      # ONLY `reasoning_effort` of 'none' or 'high' (400 on 'medium'/'low',
+      # error naming the enum ReasoningEffort.none | ReasoningEffort.high). So
+      # the whole menu is outlining-at-high or traceless-at-none, and neither
+      # serves a reasoning stream. Demoted rather than tuned.
+      #
+      # WHAT DEMOTION COSTS: prompts too long for the cerebras window have no
+      # generator at all and park gen_unroutable, spending nothing. Measured at
+      # the time as 3 of 100 pilot prompts, against an alternative of 3 billed
+      # attempts each at an 89% failure rate - so the demotion was right.
+      #
+      # THAT 3% WAS AN ARTEFACT, and this is the correction rather than a
+      # re-argument: those three prompts were "too long" only against the
+      # stale 8192 pin, i.e. above 6,554 routing tokens. The probed window is
+      # 131,072 and the cliff is 104,858, which no pilot prompt came within
+      # two orders of magnitude of (measured range 1,445-2,799). The demotion
+      # now costs approximately nothing rather than 3%.
+      #
+      # SAMPLING IS STILL PER ROLE. config.py refuses a role_params key naming
+      # a role the model does not serve, so the key below tracks the role list
+      # above; the mechanism is what keeps one role from inheriting another's
+      # sampling if this model is ever given a second seat.
+      #
+      # LIMITS: ONE MEASUREMENT AND THREE FLOORS, labelled so nobody reads a
+      # floor as a fact. This is the defect 8778800 fixed for cerebras, where
+      # an unmeasured 8192 sat in this field for the life of the project and
+      # unroutable'd 85% of a stream.
+      #
+      #   max_context 52812 IS A MEASUREMENT, and it is a FLOOR rather than the
+      #   model's ceiling: probed 2026-08-19, one call, max_tokens 16,
+      #   temperature 0 -> HTTP 200, prompt_tokens 52812, finish_reason stop.
+      #   The vendor documents a larger window; this file records what was
+      #   probed. It only has to clear required_context(worst-case tiebreak) =
+      #   29,666, which it does by 78%.
+      #
+      #   rpm 2 / tpm 30000 / tpd 5000000 ARE FLOORS, NOT MEASUREMENTS. The
+      #   free "Experiment" tier publishes no per-key figures worth pinning, so
+      #   these are chosen for the ROLE's shape instead: the tiebreak fires on
+      #   ~20% of judged rows, so a low rpm costs nothing. tpm is set above one
+      #   whole tiebreak call (~24k prompt + 1k reply) on purpose - below it,
+      #   TokenBucket clamps the charge to capacity and every call waits a full
+      #   60s refill first, which is correct but needlessly slow.
+      #
+      #   tpd RAISED 500,000 -> 5,000,000, and the first value was a floor set
+      #   too low to do the job. At ~24k tokens a worst-case tiebreak call,
+      #   500k bought about 21 calls a day; draining the ~210 rows the cerebras
+      #   probe made newly routable implies roughly 42. A floor that throttles
+      #   the work it was sized for is not conservative, it is wrong in the
+      #   expensive direction - the row waits and the ledger says "budget",
+      #   which reads like a provider limit and is not one. 5,000,000 is still
+      #   far under the published free-tier scale (order 1B/month) and is still
+      #   a FLOOR, not a measurement.
+      - id: mistral-large-latest
+        family: mistral
+        roles: [tiebreak]
+        limits: {rpm: 2, tpm: 30000, tpd: 5000000, max_context: 52812, max_output: 8192}
+        params: {}
+        role_params:
+          tiebreak: {temperature: 0.2}
+  # LIGHTNING IS THE PAID OVERFLOW FOR THE GENERATOR, AND IT IS SECOND IN
+  # routing.generator ON PURPOSE - see the cost ruling there. Added 2026-08-19.
+  #
+  # THE REPLY SHAPE WAS CHECKED BEFORE THE BLOCK WAS WRITTEN, because a silent
+  # mismatch would park every Lightning generation as traceless and we would
+  # have paid to discover it. Probed 2026-08-19 on lightning-ai/gpt-oss-120b:
+  #
+  #     message keys   ['content', 'reasoning_content', 'role']
+  #     content            str, the answer
+  #     reasoning_content  str, the trace - a PLAIN STRING, not Mistral's
+  #                        typed-chunk list and not an inline <think> block
+  #
+  # providers._default_response_hook already reads exactly that field
+  # (`message.get("reasoning") or message.get("reasoning_content")`), so this
+  # provider needs NO quirk of its own and generate.assemble_content wraps the
+  # trace in the trainer's tags unchanged. That is why `quirks` is empty below
+  # rather than absent-by-oversight, and a test pins the shape.
+  #
+  # max_context 51274 IS A MEASURED FLOOR, on the same discipline the cerebras
+  # block records: probed 2026-08-19, one call, max_tokens 16, temperature 0 ->
+  # HTTP 200, prompt_tokens 51274, finish_reason stop. The catalog advertises
+  # 128K; this file records what was asked for and got a 200. It only has to
+  # clear the longest prompt this build makes (measured 1,445-2,799 routing
+  # tokens), which it does by more than an order of magnitude.
+  #
+  # rpm 60 / tpm 500000 / tpd 50000000 ARE INVENTED FLOORS, not measurements,
+  # and they are deliberately generous because this provider is PAID: the
+  # binding constraint on it is the operator's wallet and the cost ruling in
+  # routing.generator, not a rate limit. Nothing here probed them.
+  #
+  # LICENSING / ToS: lightning-ai/* are OPEN WEIGHTS (gpt-oss is Apache-2.0)
+  # SELF-HOSTED by Lightning, so the upstream vendor is not a party to this
+  # transaction and only Lightning's own terms apply. THOSE TERMS HAVE NOT BEEN
+  # VERIFIED HERE - the operator has been asked to skim them and had not
+  # reported back when this landed. Recorded as pending rather than clean,
+  # because the generator's output is what ships in the dataset and its terms
+  # are the ones that bind.
+  - name: lightning
+    base_url: https://lightning.ai/api/v1
+    api_key_env: LIGHTNING_API_KEY
+    quirks: []
+    models:
+      - id: lightning-ai/gpt-oss-120b
+        family: gpt-oss
+        roles: [generator]
+        limits: {rpm: 60, tpm: 500000, tpd: 50000000, max_context: 51274, max_output: 4096}
+        params: {temperature: 0.7, top_p: 0.95, reasoning_effort: medium}
+  - name: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    quirks: [openai]
+    models:
+      # Family is gpt-5, not gpt-oss: lumping them as gpt-oss made OPENAI_API_KEY
+      # unusable on gpt-oss-120b rows (family separation skipped every call).
+      # Operator 2026-08-21: OpenAI may judge those rows under a $2 TOTAL hard
+      # usd_cap shared by mini and nano. The cap is the spend brake; these
+      # refs still sit LAST in routing.judge / routing.tiebreak so every free
+      # judge is tried first.
+      #
+      # Neither block carries `temperature`: the gpt-5 family accepts the
+      # default and 400s on any other value (measured 2026-08-15). The
+      # `openai` quirk in providers.py drops it from the payload regardless,
+      # because judge.py sends its own per-call temperature and that would
+      # otherwise arrive here through build_payload.
+      - id: gpt-5-mini
+        family: gpt-5
+        roles: [judge, tiebreak]
+        limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
+                 usd_cap: 2.0, usd_per_1m_prompt: 0.25, usd_per_1m_completion: 2.0}
+        params: {}
+      - id: gpt-5-nano
+        family: gpt-5
+        roles: [judge, tiebreak]
+        # The cheaper sibling: ~5x mini. Shares the same $2 usd_cap wallet.
+        limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
+                 usd_cap: 2.0, usd_per_1m_prompt: 0.05, usd_per_1m_completion: 0.40}
+        params: {}
+
+# Mistral rpm/tpm are console+header-verified 2026-08-14 and are no longer
+# placeholders. The workspace limit is 50 rpm / 50k tpm and BOTH models draw
+# on the ONE bucket: the remaining-tokens header decremented continuously
+# across calls made with different models (50000 -> 49983 -> 49966), so the
+# bucket is per WORKSPACE, not per model. providers.TokenBucket is per
+# (provider, model), so each model is given half - two per-model buckets of
+# 50k would issue at twice the real refill rate and 429-storm at full load.
+# Cerebras is header-verified 2026-08-15 on a funded account ($5 credit):
+# all three models answered 200, and the limit headers read rpm 5, tpm
+# 30,000, 1,000,000 tokens/day and 2,400 requests/day PER MODEL. So the
+# per-model treatment above was right, and the "may be account-wide,
+# untested" caveat is retired rather than merely re-worded. Costing:
+# pay-per-token at $0.35/$0.75 per 1M in/out on gpt-oss-120b, so the
+# provider's own 1M tokens/day ceiling bounds the burn at roughly
+# $0.55-0.75/day and the $5 credit covers the whole generation phase; the
+# daily budget report is the instrument to watch it with. NOTE that the
+# measured rpd 2,400 is NOT declared in the limits above, so store._cap
+# reads requests/day as unlimited here and the tpd ceiling is the only thing
+# ledgered - fine while tpd binds first, which at these rates it does.
+# qwen/qwen3.6-27b is
+# a Groq PREVIEW model and may vanish without notice - never make it the sole
+# judge; the routing lists below always give fallbacks. Model refs in routing
+# are "provider/model-id" strings - note that "groq/qwen/qwen3.6-27b" contains
+# TWO slashes, so refs are split on the FIRST slash only (provider="groq",
+# model="qwen/qwen3.6-27b").
+#
+# CLOSED 2026-08-15. This block used to be a TODO(operator) demanding ONE
+# more judge model in a fourth family, which the fleet refused to start
+# without. That model is the openai provider above, and the gap is read as
+# closed out of the real preflight - generate.print_preflight over
+# providers.pool_gaps, every key present - rather than argued from the config:
+# with OPENAI_API_KEY set there are NO fatal gaps left, only the survivable
+# tiebreak warnings described at the bottom of this block. It went into BOTH
+# routing.judge and routing.tiebreak, LAST in each, because it is the paid
+# backstop: every free judge is preferred to it, so the ~$1/day cap is only
+# ever spent on rows nothing free can serve.
+#
+# What made it qualify, and the bar any replacement must clear:
+# max_context >= 29661. That is not a round number because it is not a
+# preference - it is required_context(worst-case judge call), and the
+# preflight prints the same number it enforces. In practice that means a 32k
+# model. A 16k model is NOT enough - and that is worth saying because most
+# free-tier candidates are 16k, and an under-sized judge does not fail
+# loudly: the fleet starts, long rows pass the length gate, judge A is paid
+# for, and the row parks. gpt-5-mini and gpt-5-nano declare 400k.
+#
+# Where the number comes from. The length gate passes a row whose prompt +
+# trace + answer is at most 8192 chars/4 tokens, i.e. 32,768 characters, and
+# the judge is shown a subset of that plus its own rubric. Sized in the
+# ROUTING currency (providers.context_estimate: per-turn template overhead,
+# and Indic script at 1.5 chars/token rather than 4) the largest judge call
+# this build can produce is 23,729 tokens, and CONTEXT_SAFETY_MARGIN turns
+# that into 29,661 of declared window. Devanagari is what makes it large,
+# and this corpus is largely Devanagari.
+#
+# What the fatal gap WAS, kept because any future edit to routing.judge can
+# re-open it. A long prompt is routed past the cerebras generator to
+# mistral/mistral-small-latest (32k). Family separation then removes mistral
+# from the judge pool; the 8k zai-glm-4.7 was removed on context length (that
+# model has since been retired outright - archived upstream, see the cerebras
+# block); slot A takes groq/qwen; and slot B had NOTHING LEFT. The row parked in
+# judge_unroutable having ALREADY PAID for judge A. The arithmetic made this
+# the rule and not an edge case: the generator diverted to mistral at 2,555
+# routing tokens of prompt, and slot B died at 5,531 routing tokens of judge
+# prompt - which grounding plus a trace near think_max (3000) clears
+# routinely. Slot B is now openai/gpt-5-mini.
+#
+# THE DIVERT POINT IN THAT PARAGRAPH IS HISTORY, NOT CURRENT BEHAVIOUR. It was
+# computed against the stale cerebras max_context of 8192; with the probed
+# 131,072 the generator does not divert at 2,555 routing tokens, or at 20,000.
+# Measured against undersized_families on the real config: the gpt-oss family
+# is excluded only above 104,858 routing tokens (131,072 / CONTEXT_SAFETY_
+# MARGIN), where before it was excluded above 6,554. Pilot prompts ran
+# 1,445-2,799, so the cliff is now two orders of magnitude away. The judge-gap
+# reasoning above still holds for any FUTURE pool where a divert is real.
+#
+# THE FALLBACK GENERATOR IS HISTORY - THERE IS NO SECOND GENERATOR FAMILY.
+# This paragraph described mistral-small-latest as the long-prompt fallback and
+# reasoned about its 32k ceiling (21,600 routing tokens of prompt against
+# magistral's 28,000). Both premises are gone: mistral-small stopped generating
+# on 2026-08-18 and left the build entirely on 2026-08-19, and since then
+# routing.generator has been cerebras first, lightning second - one FAMILY,
+# gpt-oss, on two providers. A prompt too long for it therefore has nowhere to
+# divert and parks in gen_unroutable, recoverably, rather than being silently
+# truncated - undersized_families excludes the family before any call is made.
+# Kept as history because the divert MACHINERY is intact and any future
+# second-family generator brings this arithmetic straight back.
+#
+# Recovery for rows that parked before this landed: `python -m
+# tuned.data.tasks --reopen judge_unroutable` (every stream by default;
+# --reopen-stream narrows it). A re-opened row re-pays only the slot it never
+# bought, and comes back with its attempt budget restored.
+#
+# WHAT WAS LEFT IS NOW CLOSED, and it was closed by the max_context probe
+# rather than by adding a model. The standing warning read: for a gpt-oss
+# generation, separation removes every gpt-oss tiebreak (the groq 20b and both
+# openai models, lumped into that family on purpose) and THE CONTEXT CHECK
+# REMOVED GEMMA, which since the glm retirement was the only tiebreak family
+# separation had left - so judge.py decided on two judges and rejected the
+# unresolved disagreement (run_event tiebreak_unroutable_two_judge_decision).
+#
+# The context check removed gemma because gemma was pinned at 8192. It is not:
+# probed 2026-08-19 at 10,252 prompt tokens, HTTP 200, and the pin is now
+# 131,072. Measured on the real preflight, generate.preflight_messages over
+# all three roles with every key present:
+#
+#     cerebras pinned 8192   0 refusals, 1 warning   (the tiebreak gap above)
+#     cerebras at 131072     0 refusals, 0 warnings
+#
+# So the pool has no gaps at any row size this build can produce. The warning
+# was never about pool composition - it was the stale pin, and it had been
+# read as a fact about the fleet for three review rounds.
+#
+# IF IT COMES BACK - any edit to routing.tiebreak, or a model retirement -
+# closing it takes one more tiebreak in a family that is none of
+# gpt-oss/mistral/qwen/gemma, with max_context >= 29666. The five over
+# the judge threshold are real and not a typo: the tiebreak prompt is a
+# little longer than the judge prompt and the preflight sizes the two
+# separately, so 29,661 buys a judge and 29,666 buys a tiebreak.
+#
+# NOT an option: letting a judge share the generator's family when the pool
+# runs out. Family separation is a data-quality invariant, not a preference.
+routing:
+  # ONE generator since 2026-08-18 - see the mistral block for the measurement
+  # that removed the second. A prompt too long for this model's window has
+  # nowhere to go and parks gen_unroutable without spending, which is why the
+  # window's declared value is load-bearing and why it is now probed rather
+  # than assumed: at the stale 8192 pin that cliff sat at 6,554 routing tokens
+  # and swallowed 85% of the statute_qa stream; at the probed 131,072 it sits
+  # at 104,858, against pilot prompts of 1,445-2,799. See the cerebras block.
+  # COST FIRST, AND THE ORDER IS THE POLICY. cerebras is a free tier and
+  # lightning is paid, so the free budget drains before the paid provider takes
+  # over: Router.pick walks this list in order and only moves on when a ref is
+  # ineligible - cooling, over its daily budget, or unkeyed - so putting
+  # cerebras first IS the cost control. Reversing these two lines would spend
+  # money while a free quota sat unused, and nothing else in the build would
+  # notice. A test pins the order and the failover.
+  #
+  # Both entries are family gpt-oss, so this is one generator FAMILY on two
+  # providers rather than a second family: family separation still removes
+  # gpt-oss from the judge pool for every row, and undersized_families still
+  # takes the family's largest window.
+  generator: [cerebras/gpt-oss-120b]
+  # JUDGE: qwen then gemma, the two free families, then the paid backstops -
+  # which is the standing "every free judge is preferred to the paid one" rule.
+  # On a gpt-oss generation family separation removes both openai models, so
+  # the two slots really are qwen (A) and gemma (B).
+  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,
+          openai/gpt-5-mini, openai/gpt-5-nano]
+  # TIEBREAK: mistral sits third, ahead of the paid backstops and behind the
+  # two free families that separation will usually have spent already. On a
+  # gpt-oss row judged by qwen and gemma the exclusion set is
+  # {gpt-oss, qwen, gemma} and mistral is the ONE family left - which is what
+  # keeps the third opinion free rather than paid.
+  tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b,
+             mistral/mistral-large-latest,
+             openai/gpt-5-mini, openai/gpt-5-nano]
+  probe: [groq/openai/gpt-oss-20b]
+  family_separation: true
+  judge_mode: dual        # dual | audit

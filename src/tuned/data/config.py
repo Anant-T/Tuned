@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 
+from tuned.data.paths import is_live_control_workdir, package_repo_root
 from tuned.train.config import load_config
 
 _ROLES = ("generator", "judge", "tiebreak", "probe")
@@ -38,6 +39,22 @@ class BuildCfg:
     length_band: LengthBand
     difficulty_target: dict[str, float]
     appointed_day: str
+    # Completions-path Harmony analysis prefill (gpt-oss). Off on the live
+    # wave. Isolated experiment yaml sets both; generate.py then posts to
+    # /v1/completions instead of chat/completions.
+    harmony_prefill: str | None = None
+    harmony_completions: bool = False
+    # Second Completions call appending s1's " Wait" when the first analysis
+    # continuation has no verification cue. Off on the live wave.
+    harmony_s1_continue: bool = False
+    # Optional directory of *.md templates that override `prompts/` by stem.
+    # Live SHAs stay pinned; experiment yaml points here. Relative to repo root.
+    prompt_overlay: str | None = None
+    # Opt-in generate.main gate: a complete persisted 80-pair pre-treatment
+    # manifest must exist before the recovery workdir is created. Off unless
+    # a yaml sets the flag; Harmony stays off until it opts in.
+    require_pretreatment_manifest: bool = False
+    pretreatment_manifest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,7 +92,6 @@ FULL_PROFILE = "v1.1-full"
 # threshold anyone would write and far above the noise; the same reasoning,
 # and the same number, as stats.gate_mix's rounding.
 _SHARE_EPS = 1e-9
-
 
 @dataclass(frozen=True)
 class AssemblyCfg:
@@ -822,12 +838,68 @@ def _difficulty_of(raw: dict) -> DifficultyCfg | None:
     return DifficultyCfg(probe_sample=probe_sample, mix_tolerance=float(tolerance))
 
 
+def _is_recovery_experiment(build: BuildCfg) -> bool:
+    return bool(
+        build.prompt_overlay
+        or build.harmony_completions
+        or build.harmony_prefill
+        or build.harmony_s1_continue
+    )
+
+
+def _refuse_recovery_on_live_store(build: BuildCfg, repo_root: Path) -> None:
+    """Recovery/Harmony knobs may not target the frozen live workdir or DB.
+
+    Checked before the train-config pin so a recovery-capable CLI refuses
+    the live store even when the referenced trainer yaml is unpinned.
+    Uses the same repository-root resolution as BuildPaths.
+    """
+    if not _is_recovery_experiment(build):
+        return
+    if is_live_control_workdir(build.workdir, repo_root=repo_root):
+        raise ValueError(
+            "recovery configuration must not point at the live workdir or "
+            f"database (data/build / data/build/state/law_v1.sqlite3); "
+            f"got workdir {build.workdir!r}"
+        )
+
+
 def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> BuildConfig:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
     build_raw = dict(raw["build"])
     length_band = LengthBand(**build_raw.pop("length_band"))
-    build = BuildCfg(length_band=length_band, **build_raw)
+    require_manifest = build_raw.pop("require_pretreatment_manifest", False)
+    if not isinstance(require_manifest, bool):
+        raise ValueError(
+            "build.require_pretreatment_manifest must be a YAML boolean "
+            f"(true/false), got {require_manifest!r}. Not coerced."
+        )
+    pretreatment_manifest = build_raw.pop("pretreatment_manifest", None)
+    if pretreatment_manifest is not None:
+        if not isinstance(pretreatment_manifest, str) or not pretreatment_manifest.strip():
+            raise ValueError(
+                "build.pretreatment_manifest must be a non-empty string path, "
+                f"got {pretreatment_manifest!r}"
+            )
+        pretreatment_manifest = pretreatment_manifest.strip()
+    if require_manifest and not pretreatment_manifest:
+        raise ValueError(
+            "build.pretreatment_manifest is required when "
+            "require_pretreatment_manifest is true"
+        )
+    build = BuildCfg(
+        length_band=length_band,
+        require_pretreatment_manifest=require_manifest,
+        pretreatment_manifest=pretreatment_manifest,
+        **build_raw,
+    )
+
+    # Same repo-root convention as the train_config resolve below. Isolation
+    # is checked here, before any provider/train work, so a recovery yaml
+    # aimed at data/build never opens the live SQLite file.
+    repo_root = package_repo_root()
+    _refuse_recovery_on_live_store(build, repo_root)
 
     providers = tuple(
         ProviderCfg(
@@ -866,7 +938,6 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
     # use - resolve against this module's own location (src/tuned/data/),
     # not against `path`, so a fixture yaml living anywhere can still point
     # at the real shared training config.
-    repo_root = Path(__file__).resolve().parents[3]
     train_cfg = load_config(repo_root / build.train_config, allow_unpinned=allow_unpinned)
 
     cfg = BuildConfig(
@@ -888,4 +959,10 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
         difficulty=_difficulty_of(raw),
     )
     _validate(cfg)
+    from tuned.data.prompt_registry import set_overlay
+
+    if cfg.build.prompt_overlay:
+        set_overlay(repo_root / cfg.build.prompt_overlay)
+    else:
+        set_overlay(None)
     return cfg

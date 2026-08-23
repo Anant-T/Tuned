@@ -120,7 +120,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from tuned.data import prompt_registry
-from tuned.data.config import ModelRef
+from tuned.data.calibrate import Candidate, decides_pass
+from tuned.data.config import CALIBRATION_RULES, ModelRef
 from tuned.data.generate import (
     JUDGE_PROMPT_ID,
     ROW_SHAPED_SKIPS,
@@ -137,6 +138,14 @@ from tuned.data.generate import (
     worker_name,
 )
 from tuned.data.jsonl import append_ndjson
+from tuned.data.judge_policy import (
+    BORDERLINE,
+    FAIL,
+    FAIL_MAX,
+    PASS,
+    PASS_MIN,
+    decide,
+)
 from tuned.data.providers import (
     DEFAULT_JUDGE_REPLY_TOKENS,
     ProviderError,
@@ -206,16 +215,12 @@ TIEBREAK_SLOT = "tiebreak"
 #     prompts 4,914-5,661 routing tokens).
 JUDGE_MAX_TOKENS = DEFAULT_JUDGE_REPLY_TOKENS
 
-# Provisional thresholds until P5 calibration writes judge_threshold rows.
-PASS_MIN = 4
-FAIL_MAX = 2
+# Provisional bands live in judge_policy so the matched evaluator cannot drift.
 SCORE_RANGE = (1, 5)
 
 # Used only when the harshest judge returned no rationale at all - the
 # teacher still has to be told what to fix, and silence is not a note.
 DEFAULT_REVIEWER_NOTE = "the reasoning did not carry the conclusion it announced"
-
-PASS, BORDERLINE, FAIL = "pass", "borderline", "fail"
 
 # Streams whose rows are teacher-generated and therefore judgeable. replay
 # (empty-think) rows never enter the task table at all; this is a tripwire.
@@ -282,6 +287,146 @@ class JudgeScores:
             "coverage": self.coverage,
             "rationale": self.rationale,
         }
+
+
+@dataclass(frozen=True)
+class SlotDecision:
+    """One slot's verdict under the fleet's active rule, or the provisional bands."""
+
+    verdict: str
+    rule: str | None = None
+    threshold: int | None = None
+    fitted: bool = False
+    unfitted: bool = False
+    provisional: bool = False
+    coerced: bool = False
+    valid: bool = True
+    reason: str | None = None
+    model: str | None = None
+
+    def as_event(self) -> dict:
+        return {
+            "model": self.model,
+            "rule": self.rule,
+            "threshold": self.threshold,
+            "fitted": self.fitted,
+            "unfitted": self.unfitted,
+            "provisional": self.provisional,
+            "coerced": self.coerced,
+            "valid": self.valid,
+            "reason": self.reason,
+            "verdict": self.verdict,
+        }
+
+
+def active_rules_by_model(store) -> dict[str, dict]:
+    """Exact model id -> its active threshold row.
+
+    A model with two active rows is invalid rather than last-write-wins: the
+    fleet must fail closed, not pick a rule by accident.
+    """
+    out: dict[str, dict] = {}
+    for row in store.judge_thresholds(active_only=True):
+        model = str(row.get("model") or "").strip()
+        if not model:
+            continue
+        packed = dict(row)
+        if model in out:
+            packed["_invalid"] = True
+            packed["reason"] = "ambiguous-active-rows"
+        out[model] = packed
+    return out
+
+
+def _parse_threshold(row: Mapping) -> tuple[str, int] | str:
+    """`(rule, threshold)` or an error reason. Unknown names fail closed."""
+    if row.get("_invalid"):
+        return str(row.get("reason") or "invalid-active-row")
+    rule = row.get("rule")
+    if rule not in CALIBRATION_RULES:
+        return f"unknown-rule:{rule}"
+    raw = row.get("threshold")
+    if isinstance(raw, bool) or raw is None:
+        return f"malformed-threshold:{raw!r}"
+    try:
+        threshold = int(raw)
+    except (TypeError, ValueError):
+        return f"malformed-threshold:{raw!r}"
+    if isinstance(raw, float) and raw != threshold:
+        return f"malformed-threshold:{raw!r}"
+    if not (SCORE_RANGE[0] <= threshold <= SCORE_RANGE[1]):
+        return f"malformed-threshold:{threshold!r}"
+    return str(rule), threshold
+
+
+def rule_passes(rule: str, threshold: int, scored: JudgeScores) -> bool:
+    """The same predicate calibrate.decides_pass fitted. Do not restate it."""
+    return decides_pass(
+        Candidate(rule, threshold),
+        (scored.grounding, scored.validity, scored.coverage),
+    )
+
+
+def resolve_slot(
+    scored: JudgeScores,
+    *,
+    model: str | None,
+    rules: Mapping[str, Mapping],
+    fleet_active: bool,
+) -> SlotDecision:
+    """Apply the exact model's active rule, or the safe unfitted / provisional path.
+
+    No active rows anywhere: the shipped min_axis>=4 / <=2 bands, marked
+    provisional. Active rows exist but this model has none: a would-be
+    provisional pass is coerced to borderline so an unfitted seat cannot mint
+    an accept; fail evidence stays fail. A present but unknown or malformed
+    rule is FAIL, never a silent fallback to the provisional pass band.
+    """
+    model_key = (model or "").strip() or None
+    if not fleet_active:
+        return SlotDecision(
+            verdict=scored.verdict,
+            rule="min_axis",
+            threshold=PASS_MIN,
+            provisional=True,
+            model=model_key,
+        )
+    row = rules.get(model_key) if model_key else None
+    if row is None:
+        coerced = scored.verdict == PASS
+        return SlotDecision(
+            verdict=BORDERLINE if coerced else scored.verdict,
+            unfitted=True,
+            provisional=True,
+            coerced=coerced,
+            reason="unfitted-model",
+            model=model_key,
+        )
+    parsed = _parse_threshold(row)
+    if isinstance(parsed, str):
+        return SlotDecision(
+            verdict=FAIL,
+            rule=row.get("rule") if isinstance(row, Mapping) else None,
+            threshold=row.get("threshold") if isinstance(row, Mapping) else None,
+            fitted=True,
+            valid=False,
+            reason=parsed,
+            model=model_key,
+        )
+    rule, threshold = parsed
+    if rule_passes(rule, threshold, scored):
+        verdict = PASS
+    elif scored.min_axis <= FAIL_MAX:
+        verdict = FAIL
+    else:
+        verdict = BORDERLINE
+    return SlotDecision(
+        verdict=verdict,
+        rule=rule,
+        threshold=threshold,
+        fitted=True,
+        model=model_key,
+    )
 
 
 @dataclass
@@ -536,43 +681,6 @@ def generation_family(cfg, gen: Mapping) -> str | None:
 # --------------------------------------------------------------------------
 # The decision matrix.
 # --------------------------------------------------------------------------
-
-def decide(verdicts: Sequence[str], *, already_regenerated: bool) -> str:
-    """What to do with a set of judge verdicts. Pure; the whole matrix.
-
-    Two judges:
-      pass  + pass              -> accept
-      fail  + fail              -> reject
-      exactly one pass          -> tiebreak (a third family scores it blind)
-      no pass, some borderline  -> ONE regeneration, then reject
-
-    Three (a tiebreak was run): the tiebreak decides, because it is the only
-    judge that saw the work without a disagreement to split. Its own
-    borderline goes down the same one-regeneration path.
-
-    The one-regeneration cap is what stops a genuinely middling seed from
-    cycling forever: a 3 means the work is repairable, and one repair attempt
-    is the budget. A second 3 is a reject.
-    """
-    if not verdicts:
-        raise ValueError("decide() needs at least one verdict")
-    if len(verdicts) >= 3:
-        final = verdicts[2]
-        if final == PASS:
-            return "accept"
-        if final == FAIL:
-            return "reject"
-        return "reject" if already_regenerated else "regenerate"
-
-    passes = sum(1 for v in verdicts if v == PASS)
-    if passes == len(verdicts):
-        return "accept"
-    if all(v == FAIL for v in verdicts):
-        return "reject"
-    if passes:
-        return "tiebreak"
-    return "reject" if already_regenerated else "regenerate"
-
 
 def thresholds_active(store) -> int:
     """How many calibrated judge thresholds exist (P5 writes them).
@@ -1142,7 +1250,44 @@ async def judge_task(
                 return LOST_LEASE
             return JUDGE_STATE_FROM
 
-    verdicts = [o.scores.verdict for o in outcomes]
+    fleet_active = thresholds_active(store) > 0
+    rules = active_rules_by_model(store)
+    slot_decisions: list[SlotDecision] = []
+
+    def _apply_slot(outcome: SlotOutcome) -> SlotDecision:
+        model = outcome.ref.model if outcome.ref else None
+        decision = resolve_slot(
+            outcome.scores, model=model, rules=rules, fleet_active=fleet_active
+        )
+        if decision.coerced:
+            store.log_event(
+                "judge_unfitted_coerced",
+                {
+                    "task_id": task_id,
+                    "slot": outcome.slot,
+                    "model": model,
+                    "would_be": PASS,
+                    "verdict": decision.verdict,
+                    "reason": decision.reason,
+                },
+            )
+        if not decision.valid:
+            store.log_event(
+                "judge_threshold_invalid",
+                {
+                    "task_id": task_id,
+                    "slot": outcome.slot,
+                    "model": model,
+                    "rule": decision.rule,
+                    "threshold": decision.threshold,
+                    "reason": decision.reason,
+                    "verdict": decision.verdict,
+                },
+            )
+        return decision
+
+    slot_decisions = [_apply_slot(o) for o in outcomes]
+    verdicts = [d.verdict for d in slot_decisions]
     already = _regenerating or has_regenerated(store, task_id)
     action = decide(verdicts, already_regenerated=already)
     tiebreak_unroutable = False
@@ -1201,7 +1346,9 @@ async def judge_task(
                 },
             )
         else:
-            verdicts.append(tiebreak.scores.verdict)
+            tiebreak_decision = _apply_slot(tiebreak)
+            slot_decisions.append(tiebreak_decision)
+            verdicts.append(tiebreak_decision.verdict)
             action = decide(verdicts, already_regenerated=already)
 
     # Fenced BEFORE the decision is logged, not only before it is written: a
@@ -1212,7 +1359,19 @@ async def judge_task(
     if not holds_lease(store, task_id, worker_id):
         return _lost_lease(store, task_id, worker_id, stats, "judge-decision")
 
-    provisional = thresholds_active(store) == 0
+    provisional = not fleet_active
+    if provisional:
+        rule_used = f"min-axis>={PASS_MIN} pass, <={FAIL_MAX} fail"
+    else:
+        parts = []
+        for decision in slot_decisions:
+            if decision.fitted and decision.valid:
+                parts.append(f"{decision.model}:{decision.rule}>={decision.threshold}")
+            elif not decision.valid:
+                parts.append(f"{decision.model}:invalid:{decision.reason}")
+            else:
+                parts.append(f"{decision.model}:unfitted")
+        rule_used = "; ".join(parts)
     store.log_event(
         "judge_decision",
         {
@@ -1221,7 +1380,12 @@ async def judge_task(
             "attempt": int(gen["attempt"]),
             "action": action,
             "provisional": provisional,
-            "rule": f"min-axis>={PASS_MIN} pass, <={FAIL_MAX} fail",
+            "any_unfitted": any(d.unfitted for d in slot_decisions),
+            "rule": rule_used,
+            "slot_rules": [
+                {"slot": outcome.slot, **decision.as_event()}
+                for outcome, decision in zip(outcomes, slot_decisions)
+            ],
             "generator_family": gen_family,
             "verdicts": verdicts,
             "tiebreak_unroutable": tiebreak_unroutable,

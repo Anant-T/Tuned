@@ -45,6 +45,14 @@ SEED_TEXT = (
     "accused and on one eye witness who deposed four days later."
 )
 
+# Distinct from SEED_TEXT so default test seeds remain statute-QA eligible
+# after the section_text=source fallback is removed.
+STATUTE_SECTION_TEXT = (
+    "Section 34. When a criminal act is done by several persons in furtherance "
+    "of the common intention of all, each of such persons is liable for that act "
+    "in the same manner as if it were done by him alone."
+)
+
 # ~3,000 chars of trace: over think_min (500 est tokens), under think_max,
 # carrying a VERIFICATION_CUES phrase and no IRAC heading, and sharing no
 # 30-char run with SEED_TEXT (the verbatim gate).
@@ -228,6 +236,7 @@ class FakeRouter:
         est_tokens=0,
         exclude_families=frozenset(),
         on_attempt=None,
+        prompt=None,
     ):
         skipped: set[str] = set()
         picked = self._eligible(role, exclude_families, skipped)
@@ -248,6 +257,7 @@ class FakeRouter:
                 "est_tokens": est_tokens,
                 "exclude_families": frozenset(exclude_families or ()),
                 "ref": picked.ref if picked else None,
+                "prompt": prompt,
             }
         )
         if picked is None:
@@ -290,6 +300,9 @@ SOURCE_ID = "test/seeds"
 
 
 def seed_rows(n: int, *, text: str = SEED_TEXT, meta=None, case_type="criminal") -> list[dict]:
+    payload = {"section_text": STATUTE_SECTION_TEXT}
+    if meta is not None:
+        payload.update(meta)
     return [
         {
             "seed_id": f"seed{i:03d}",
@@ -299,7 +312,7 @@ def seed_rows(n: int, *, text: str = SEED_TEXT, meta=None, case_type="criminal")
             "code_era": "ipc",
             "text": text,
             "token_count": len(text) // 4,
-            "meta_json": meta,
+            "meta_json": payload,
         }
         for i in range(n)
     ]

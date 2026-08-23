@@ -35,6 +35,13 @@ def store(tmp_path):
         yield s
 
 
+def _fit_cfg(cfg, *, pilot_export: int):
+    """Shrink the protocol target for a fixture that is intentionally fitting."""
+    return dataclasses.replace(
+        cfg, calibration=dataclasses.replace(cfg.calibration, pilot_export=pilot_export)
+    )
+
+
 PASSING = (5, 5, 5)
 FAILING = (1, 1, 1)
 
@@ -620,7 +627,7 @@ def test_a_later_calibration_supersedes_the_earlier_one_without_losing_it(store,
     """
     labels = _seed_store(store, n=60)
     store.upsert_gold_labels(C.assign_folds(labels, folds=cfg.calibration.folds, holdout=12))
-    calibration = C.calibrate(store, cfg)
+    calibration = C.calibrate(store, _fit_cfg(cfg, pilot_export=60))
 
     first = C.threshold_rows(calibration, fitted_at="2026-08-17T09:00:00.000000Z")
     second = C.threshold_rows(calibration, fitted_at="2026-08-17T10:00:00.000000Z")
@@ -642,7 +649,7 @@ def test_the_same_fit_at_the_same_instant_is_one_row_not_two(store, cfg):
     # byte-identical fits stamped the same, because there is only one fit.
     labels = _seed_store(store, n=60)
     store.upsert_gold_labels(C.assign_folds(labels, folds=cfg.calibration.folds, holdout=12))
-    calibration = C.calibrate(store, cfg)
+    calibration = C.calibrate(store, _fit_cfg(cfg, pilot_export=60))
     rows = C.threshold_rows(calibration, fitted_at="2026-08-17T09:00:00.000000Z")
     store.record_judge_thresholds(rows)
     store.record_judge_thresholds(rows)
@@ -730,7 +737,7 @@ def test_kappa_is_measured_and_reads_both_extremes():
 def test_kappa_is_reported_over_the_generations_two_fitted_judges_both_scored(store, cfg):
     labels = _seed_store(store, n=90, bad_mode="nearly_good")
     store.upsert_gold_labels(C.assign_folds(labels, folds=cfg.calibration.folds, holdout=20))
-    calibration = C.calibrate(store, cfg)
+    calibration = C.calibrate(store, _fit_cfg(cfg, pilot_export=90))
     assert len(calibration.active) == 2
     key = f"{JUDGE_BAD} vs {JUDGE_GOOD}"
     assert key in calibration.kappa
@@ -744,7 +751,7 @@ def test_kappa_is_reported_over_the_generations_two_fitted_judges_both_scored(st
 def test_a_judge_pair_is_only_reported_once_and_never_against_itself(store, cfg):
     labels = _seed_store(store, n=90, bad_mode="nearly_good")
     store.upsert_gold_labels(C.assign_folds(labels, folds=cfg.calibration.folds, holdout=20))
-    calibration = C.calibrate(store, cfg)
+    calibration = C.calibrate(store, _fit_cfg(cfg, pilot_export=90))
     assert len(calibration.kappa) == 1
     (pair,) = calibration.kappa
     assert pair.split(" vs ")[0] != pair.split(" vs ")[1]
@@ -851,3 +858,118 @@ def test_the_report_does_not_claim_a_replacement_for_a_seatless_model(cfg):
     assert "tiebreak/only" in report and "DISQUALIFIED" in report
     assert "named replacement" not in report
     assert "no replacement named" in report and "routing.tiebreak" in report
+
+
+def test_calibrate_has_no_sanity_fit_that_activates_the_locked_labels():
+    """The 46-label lockbox is not a fitting set. No shortcut writes rows from it."""
+    src = CALIBRATE_SRC.read_text(encoding="utf-8")
+    assert "sanity" not in src.lower()
+    tree = ast.parse(src)
+    names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert "sanity_fit" not in names
+    assert "fit_lockbox" not in names
+    assert "activate_from_labels" not in names
+
+
+def test_the_180_label_protocol_is_still_the_only_activation_path(cfg):
+    assert cfg.calibration.pilot_export == 180
+    assert cfg.calibration.holdout >= 1
+    assert cfg.calibration.folds >= 2
+    from tuned.data.config import load_build_config
+
+    recovery = load_build_config(
+        Path(__file__).parent.parent / "configs" / "data_law_v1_exp_recovery.yaml",
+        allow_unpinned=True,
+    )
+    assert recovery.calibration.pilot_export == 180
+
+
+def test_forty_six_gold_labels_are_not_rewritten_or_used_to_activate_rows(store, cfg):
+    """calibrate() on labels with no judgements writes nothing and leaves labels alone."""
+    gen_ids = _bare_generations(store, 46)
+    labels = [
+        {
+            "gen_id": gid,
+            "verdict": C.ACCEPT if i % 5 else C.REJECT,
+            "grounding": 4,
+            "validity": 4,
+            "coverage": 4,
+            "notes": f"lockbox-{i}",
+            "fold": i % 6,
+        }
+        for i, gid in enumerate(gen_ids)
+    ]
+    store.upsert_gold_labels(labels)
+    before = store.gold_labels()
+    assert store.gold_label_count() == 46
+
+    calibration, report = C.run_calibration(store, cfg)
+    assert calibration.n_gold == 46
+    assert calibration.fits == []
+    assert C.threshold_rows(calibration) == []
+    assert store.judge_thresholds(active_only=False) == []
+    after = store.gold_labels()
+    assert after == before
+    assert "sanity" not in report.lower()
+
+
+def test_judge_module_cannot_fit_or_relabel_the_lockbox():
+    from tuned.data import judge as J
+
+    src = Path(J.__file__).read_text(encoding="utf-8")
+    for forbidden in (
+        "upsert_gold_labels",
+        "record_judge_thresholds",
+        "run_calibration",
+        "sanity_fit",
+    ):
+        assert forbidden not in src, forbidden
+
+
+def test_an_undersized_labelled_and_judged_store_does_not_activate_thresholds(store, cfg):
+    """The dangerous lockbox shape: fewer labels than pilot_export, with judgements.
+
+    Forty-six labels and no judgements already produce no fits. The hole is
+    the same 46 once each generation has been judged: calibrate() would fit
+    and run_calibration would write active rows against the shipped 180
+    target. The guard is the configured target, not the number 46.
+    """
+    assert cfg.calibration.pilot_export == 180
+    labels = _seed_store(store, n=46)
+    store.upsert_gold_labels(C.assign_folds(labels, folds=cfg.calibration.folds, holdout=8))
+    assert store.gold_label_count() == 46
+    store.record_judge_thresholds(
+        [{"calib_id": "pre-existing", "model": "planted-model", "rule": "min_axis", "threshold": 4}]
+    )
+    before_labels = store.gold_labels()
+    before_thresholds = store.judge_thresholds(active_only=False)
+    labelled_ids = [row["gen_id"] for row in before_labels]
+    before_judgements = store.judgements_by_gen(labelled_ids)
+
+    calibration, report = C.run_calibration(store, cfg)
+
+    assert calibration.n_gold == 46
+    assert calibration.fits == []
+    assert getattr(calibration, "blocked", None) == "insufficient-labels"
+    assert C.threshold_rows(calibration) == []
+    assert store.gold_labels() == before_labels
+    assert store.judge_thresholds(active_only=False) == before_thresholds
+    assert store.judgements_by_gen(labelled_ids) == before_judgements
+    assert "insufficient" in report.lower()
+    assert str(cfg.calibration.pilot_export) in report
+    blocked = json.loads(store.events("judges_calibration_blocked")[0]["detail_json"])
+    assert blocked["reason"] == "insufficient-labels"
+    assert blocked["n_gold"] == 46
+    assert blocked["required"] == cfg.calibration.pilot_export
+    assert store.events("judges_calibrated") == []
+
+
+def test_an_explicit_smaller_pilot_target_still_fits(store, cfg):
+    """Fixtures that intend to fit must name a smaller target; 180 is not relaxed."""
+    assert cfg.calibration.pilot_export == 180
+    labels = _seed_store(store, n=60)
+    store.upsert_gold_labels(C.assign_folds(labels, folds=cfg.calibration.folds, holdout=12))
+    calibration = C.calibrate(store, _fit_cfg(cfg, pilot_export=60))
+    assert calibration.n_gold == 60
+    assert getattr(calibration, "blocked", None) in (None, "")
+    assert calibration.fits

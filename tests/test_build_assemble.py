@@ -5,6 +5,7 @@ text appears anywhere here.
 """
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -706,7 +707,8 @@ def test_the_real_template_renders_what_the_fake_pretends_to():
     response = text[text.index(cfg.response_part):]
     assert response.count(cfg.think_open) == 1 and response.count(cfg.think_close) == 1
     direct = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
-    assert token_length(tok, messages) == len(direct)
+    direct_ids = direct["input_ids"] if isinstance(direct, Mapping) else direct
+    assert token_length(tok, messages) == len(direct_ids)
 
 
 # --------------------------------------------------------------------------

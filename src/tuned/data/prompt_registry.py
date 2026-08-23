@@ -123,6 +123,31 @@ def _prompts_dir() -> Path:
 
 
 PROMPTS_DIR = _prompts_dir()
+# Optional per-process overlay. Isolated experiment configs point this at a
+# directory of replacement templates; the live golden SHAs stay on PROMPTS_DIR.
+_overlay_dir: Path | None = None
+
+
+def set_overlay(path: str | Path | None) -> None:
+    """Prefer templates in `path` when present; None restores the package dir.
+
+    Clears the load cache so a SHA stamped at plan time cannot silently
+    disagree with a later render in the same process.
+    """
+    global _overlay_dir
+    _overlay_dir = Path(path) if path else None
+    load.cache_clear()
+    all_ids.cache_clear()
+    _variants_by_task.cache_clear()
+
+
+def _template_path(prompt_id: str) -> Path:
+    name = f"{prompt_id}.md"
+    if _overlay_dir is not None:
+        over = _overlay_dir / name
+        if over.is_file():
+            return over
+    return PROMPTS_DIR / name
 
 
 @dataclass(frozen=True)
@@ -182,7 +207,7 @@ def all_ids() -> tuple[str, ...]:
 
 @lru_cache(maxsize=None)
 def load(prompt_id: str) -> Template:
-    path = PROMPTS_DIR / f"{prompt_id}.md"
+    path = _template_path(prompt_id)
     try:
         raw = path.read_bytes()
     except OSError:

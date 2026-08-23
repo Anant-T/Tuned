@@ -59,6 +59,8 @@ TASK_STATES = (
     "judge_skipped",
     "judge_error",
     "judge_unroutable",
+    "format_parked",
+    "input_ineligible",
 )
 
 # ORDER IS LOAD-BEARING: busy_timeout must be armed BEFORE journal_mode=WAL.
@@ -1039,6 +1041,25 @@ class Store:
                 "SELECT gate, passed FROM gate_result WHERE gen_id = ?", (gen_id,)
             ).fetchall()
         }
+
+    def gates_by_gen(self, gen_ids: Iterable[int]) -> dict[int, dict[str, bool]]:
+        """gen_id -> {gate: passed}, for many generations at once.
+
+        Chunked at 500 for SQLITE_MAX_VARIABLE_NUMBER, matching judgements_by_gen.
+        A generation with no gate rows comes back as {} rather than missing.
+        """
+        ids = list(dict.fromkeys(int(gen_id) for gen_id in gen_ids))
+        out: dict[int, dict[str, bool]] = {gen_id: {} for gen_id in ids}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start : start + 500]
+            rows = self._conn.execute(
+                f"SELECT gen_id, gate, passed FROM gate_result "
+                f"WHERE gen_id IN ({', '.join('?' * len(chunk))})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                out[row["gen_id"]][row["gate"]] = bool(row["passed"])
+        return out
 
     def record_judgement(
         self,

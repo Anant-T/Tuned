@@ -82,6 +82,20 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def _reset_prompt_overlay():
+    """Harmony/recovery configs arm a process-global prompt overlay.
+
+    Without a reset, loading an experiment yaml leaks overlay SHAs into later
+    live prompt tests (42 contract failures when harmony runs first).
+    """
+    from tuned.data.prompt_registry import set_overlay
+
+    set_overlay(None)
+    yield
+    set_overlay(None)
+
+
+@pytest.fixture(autouse=True)
 def _the_semantic_layer_is_opt_in(monkeypatch):
     """No test runs the REAL semhash unless it says so. See the module
     docstring - this is suite-wide on purpose."""

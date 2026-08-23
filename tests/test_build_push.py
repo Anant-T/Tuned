@@ -171,6 +171,18 @@ def test_the_shipped_config_carries_a_real_push_target():
     assert cfg.push == PushCfg(repo_id="tantan01/tuned-law-v1-data", private=True, card_extra=None)
 
 
+def test_recovery_push_target_is_not_the_live_dataset_repo():
+    recovery = Path(__file__).parent.parent / "configs" / "data_law_v1_exp_recovery.yaml"
+    harmony = Path(__file__).parent.parent / "configs" / "data_law_v1_exp_harmony.yaml"
+    rec = load_build_config(recovery, allow_unpinned=True)
+    live = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    har = load_build_config(harmony, allow_unpinned=True)
+    assert rec.push.repo_id != "tantan01/tuned-law-v1-data"
+    assert rec.push.repo_id != live.push.repo_id
+    assert live.push.repo_id == "tantan01/tuned-law-v1-data"
+    assert har.push.repo_id == "tantan01/tuned-law-v1-data"
+
+
 def test_the_train_configs_pin_target_matches_pushs_own_repo():
     """M5: closes the loop task 15 exists to make real. pin_dataset.py reads
     hub.dataset_repo from the SAME train config data_law_v1.yaml points at

@@ -10,11 +10,12 @@ out the other side (see `disposition`):
               These are content errors: the example is wrong about the law,
               and rewriting the prose cannot make it right. Never repaired,
               never regenerated - the seed is burned. PERMANENT_GATES.
-  regenerate  format, length, missing self-verification, scripted IRAC in the
-              think trace, verbatim copying, meta-references to "the provided
-              text", a section/article/entry number the materials never showed
-              the teacher. The teacher was asked the right question and
-              answered it badly; ask again (<=2 attempts).
+  regenerate  format, length, scripted IRAC in the think trace, verbatim
+              copying, meta-references to "the provided text", a
+              section/article/entry number the materials never showed the
+              teacher. The teacher was asked the right question and answered
+              it badly; ask again (<=2 attempts). self_verification is
+              recorded but diagnostic: it does not choose this disposition.
 
 Nothing here re-implements the hard primitives. Citation existence lives in
 citations.py (`novel_citations` + the `suspect_citations` second channel),
@@ -96,12 +97,23 @@ GATE_ORDER = (
     "verbatim_overlap",
     "statutory_quotation",
     "banned_meta",
+    "prompt_echo",
     "answer_key",
 )
 
 # Failing one of these means the example states something false about the
 # law. Reject-never-repair.
 PERMANENT_GATES = frozenset({"citations", "temporal", "answer_key"})
+
+# Recorded on every row and visible in gate_result, but ignored when
+# computing disposition. A missing self-check is a style signal, not a
+# reason to reject or blindly reroll a legally usable answer.
+DIAGNOSTIC_GATES = frozenset({"self_verification"})
+
+# Task types whose ANSWER still owes Issue + Conclusion. drafting and
+# summarization keep the think-side IRAC tripwire and drop the answer
+# heading requirement. None (legacy callers) keeps the old contract.
+IRAC_ANSWER_TASK_TYPES = frozenset({"irac_analysis", "statute_qa", "transition"})
 
 # A trace that never doubts itself is a trace that teaches confident
 # hallucination. Extendable - callers may append, the list is not a closed
@@ -237,6 +249,31 @@ BANNED_META = (
     "the excerpt",
     "the material provided",
     "in the given text",
+)
+
+# Openings of an instruction-packet restatement. Shared with harmony.parse
+# so token-1 restatement and the stored-think gate cannot drift.
+RESTATEMENT_OPENINGS = (
+    "we need to produce",
+    "we need to write",
+    "we need to generate",
+    "the user wants",
+    "the user asked",
+    "the user requested",
+    "the instructions say",
+    "the instructions want",
+    "450-700",
+    "450–700",
+)
+
+# Unique instruction-packet spans. Conservative: ordinary discussion of the
+# case, the source of a right, or a date check must not trip this list.
+INSTRUCTION_ECHO_SPANS = (
+    "never write as though the matter had been handed to you as a text",
+    "those headings belong to the answer and never inside your reasoning",
+    "450 to 700 words of deliberation is normal",
+    "let me check this, or actually, that does not follow, is a real thought",
+    "work it out before you commit to anything",
 )
 
 IRAC_SECTIONS = ("issue", "rule", "application", "conclusion")
@@ -784,6 +821,7 @@ class GateContext:
     stream: str
     expect_reasoning: bool
     answer_key: dict | None = None
+    task_type: str | None = None
 
     @property
     def kind_dates(self) -> dict:
@@ -1390,13 +1428,15 @@ def check_irac_placement(think: str | None, answer: str, ctx: GateContext) -> Ga
 
     in_answer = irac_headings(answer)
     in_think = irac_headings(think)
-    missing = [name for name in IRAC_REQUIRED if name not in in_answer]
+    require_answer = ctx.task_type is None or ctx.task_type in IRAC_ANSWER_TASK_TYPES
+    required = list(IRAC_REQUIRED) if require_answer else []
+    missing = [name for name in required if name not in in_answer]
 
     detail = {
         "answer_headings": sorted(in_answer),
         "think_headings": sorted(in_think),
         "missing_in_answer": missing,
-        "required": list(IRAC_REQUIRED),
+        "required": required,
     }
     return GateResult("irac_placement", not missing and not in_think, detail)
 
@@ -1491,6 +1531,34 @@ def check_banned_meta(think: str | None, ctx: GateContext) -> GateResult:
     text = _norm_ws(think).lower()
     hits = [phrase for phrase in BANNED_META if phrase in text]
     return GateResult("banned_meta", not hits, {"hits": hits})
+
+
+def restated_opening(text: str) -> bool:
+    """True when the first tokens of `text` echo the instruction packet."""
+    opening = _norm_ws(text).lower()
+    return any(opening.startswith(prefix) for prefix in RESTATEMENT_OPENINGS)
+
+
+def check_prompt_echo(think: str | None, ctx: GateContext) -> GateResult:
+    """Repairable format gate: stored think restates the instruction packet.
+
+    Detects known restatement openings and unique instruction-packet spans.
+    Ordinary legal reasoning — dates, the source of an obligation, a genuine
+    self-check — does not fail.
+    """
+    if not ctx.expect_reasoning:
+        return GateResult("prompt_echo", True, {"skipped": "no-reasoning-expected"})
+    if think is None:
+        return GateResult("prompt_echo", True, {"skipped": "no-think"})
+
+    opening = restated_opening(think)
+    lowered = _norm_ws(think).lower()
+    spans = [span for span in INSTRUCTION_ECHO_SPANS if span in lowered]
+    return GateResult(
+        "prompt_echo",
+        not opening and not spans,
+        {"restated_opening": opening, "spans": spans},
+    )
 
 
 def _wanted_sections(entries) -> tuple[list[tuple[str, str]], list[str]]:
@@ -1784,14 +1852,25 @@ def run_all(content: str, prompt_est_tokens: int, ctx: GateContext) -> list[Gate
         check_verbatim_overlap(think, ctx),
         check_statutory_quotation(text, ctx),
         check_banned_meta(think, ctx),
+        check_prompt_echo(think, ctx),
         check_answer_key(answer, ctx, think=think),
     ]
 
 
 def disposition(results: list[GateResult]) -> str | None:
     """None = clean. "reject" = wrong about the law, burn the seed.
-    "regenerate" = badly written, ask again."""
-    failed = [result.gate for result in results if not result.passed]
+    "regenerate" = badly written, ask again.
+
+    Diagnostic gates stay in the result list (and therefore in gate_result)
+    but do not choose the disposition: a self-verification miss alone is
+    clean; a self-verification miss beside a real failure follows the real
+    failure only.
+    """
+    failed = [
+        result.gate
+        for result in results
+        if not result.passed and result.gate not in DIAGNOSTIC_GATES
+    ]
     if not failed:
         return None
     return "reject" if any(gate in PERMANENT_GATES for gate in failed) else "regenerate"

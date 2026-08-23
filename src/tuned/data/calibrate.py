@@ -722,6 +722,9 @@ class Calibration:
     n_gold: int = 0
     swaps: list[dict] = field(default_factory=list)
     unlabelled_models: list[str] = field(default_factory=list)
+    # Set when the labelled store is smaller than calibration.pilot_export.
+    # The fit must not run and no threshold row may be written.
+    blocked: str | None = None
 
     @property
     def active(self) -> list[JudgeFit]:
@@ -792,6 +795,10 @@ def calibrate(store, cfg) -> Calibration:
     labels = {row["gen_id"]: row for row in store.gold_labels()}
     calibration = Calibration(n_gold=len(labels))
     if not labels:
+        return calibration
+    required = cfg.calibration.pilot_export
+    if len(labels) < required:
+        calibration.blocked = "insufficient-labels"
         return calibration
 
     judgements = store.judgements_by_gen(labels)
@@ -912,6 +919,16 @@ def calibration_report(calibration: Calibration, cfg) -> str:
         f"chosen to maximise precision subject to recall >= {cfg.calibration.min_recall:.2f}",
         f"- folds: 0-{cfg.calibration.folds - 1} for selection, "
         f"fold {cfg.calibration.folds} held out and read once",
+    ]
+    if calibration.blocked == "insufficient-labels":
+        lines += [
+            f"- BLOCKED: insufficient labels ({calibration.n_gold} < "
+            f"{cfg.calibration.pilot_export} required by calibration.pilot_export); "
+            f"no fit was run and no judge_threshold row was written",
+            "",
+        ]
+        return "\n".join(lines) + "\n"
+    lines += [
         "",
         "## Per judge",
         "",
@@ -981,6 +998,16 @@ def calibration_report(calibration: Calibration, cfg) -> str:
 def run_calibration(store, cfg) -> tuple[Calibration, str]:
     """Fit, write the active thresholds, return the report."""
     calibration = calibrate(store, cfg)
+    if calibration.blocked:
+        store.log_event(
+            "judges_calibration_blocked",
+            {
+                "reason": calibration.blocked,
+                "n_gold": calibration.n_gold,
+                "required": cfg.calibration.pilot_export,
+            },
+        )
+        return calibration, calibration_report(calibration, cfg)
     rows = threshold_rows(calibration)
     if rows:
         store.record_judge_thresholds(rows)

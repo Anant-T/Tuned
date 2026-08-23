@@ -118,6 +118,12 @@ REOPEN_STATES = {
     # re-park if it was not: generate.py's guard fires before any render or
     # provider call.
     "stale_prompt": "pending",
+    # Exhausted format/soft failures. Re-openable after a format or policy
+    # change; not a legal reject.
+    "format_parked": "pending",
+    # Statute-QA planned without a genuine distinct provision. Re-openable
+    # after the operator supplies section metadata; not a quality reject.
+    "input_ineligible": "pending",
 }
 
 # States a row can never leave under its own power, so they do NOT occupy
@@ -126,7 +132,10 @@ REOPEN_STATES = {
 #   rejected      a decision: the gates or the judges said this is wrong.
 #   stale_prompt  planned against template bytes that no longer exist; only a
 #                 re-plan can produce a usable row for that seed.
-TERMINALLY_DEAD = frozenset({"rejected", "stale_prompt"})
+#   input_ineligible  planned against statute input that is not a provision;
+#                     a re-plan or a reopen after metadata is supplied can
+#                     produce a usable row, so this must not fill the wave.
+TERMINALLY_DEAD = frozenset({"rejected", "stale_prompt", "input_ineligible"})
 
 # Parked dispositions whose ATTEMPTS WERE NEVER SPENT ON AN ANSWER, and which
 # therefore get their budget back on re-open. Everything else keeps whatever it
@@ -150,9 +159,11 @@ TERMINALLY_DEAD = frozenset({"rejected", "stale_prompt"})
 FREE_PARK_DISPOSITIONS = frozenset({"unroutable:generator", "exhausted:provider-fault"})
 FREE_PARK_PREFIXES = (
     "exhausted:unroutable:",
+    "exhausted:format:",
     "reopened:from-",
     "judge-",
     "tiebreak:",
+    "input-ineligible:",
 )
 
 
@@ -229,9 +240,13 @@ def _existing_in_queue(store, stream: str, arm: str | None) -> int:
     pool had a bad afternoon.
 
     The bound on replacement is the per-seed cap, not this count:
-    _candidate_seeds counts a seed's tasks regardless of state, so a seed
-    whose PER_SEED_CAP tasks were all rejected is never offered again. A
-    genuinely bad seed therefore costs at most PER_SEED_CAP tasks, once.
+    _candidate_seeds counts a seed's tasks regardless of state except
+    `input_ineligible` and legacy ineligible statute-QA (`task_type =
+    statute_qa` AND `disposition = skip:slots`). A seed whose
+    PER_SEED_CAP tasks were all quality-rejected, or whose slots could
+    not render for a non-statute reason, is never offered again. Other
+    `skip:slots` rows still spend the cap so a generate-and-replan loop
+    on empty source or missing transition dates cannot run forever.
     """
     placeholders = ", ".join("?" * len(TERMINALLY_DEAD))
     clauses = ["stream = ?", f"state NOT IN ({placeholders})"]
@@ -318,7 +333,11 @@ def _candidate_seeds(
     params.append(limit)
     rows = store.conn.execute(
         "SELECT s.seed_id, COALESCE(t.n, 0) AS n_tasks FROM seed s "
-        "LEFT JOIN (SELECT seed_id, COUNT(*) AS n FROM task GROUP BY seed_id) t "
+        "LEFT JOIN (SELECT seed_id, COUNT(*) AS n FROM task "
+        "           WHERE state != 'input_ineligible' "
+        "             AND NOT (task_type = 'statute_qa' "
+        "                      AND COALESCE(disposition, '') = 'skip:slots') "
+        "           GROUP BY seed_id) t "
         "  ON t.seed_id = s.seed_id "
         f"WHERE {' AND '.join(clauses)} "
         "ORDER BY n_tasks ASC, s.seed_id ASC LIMIT ?",
@@ -385,6 +404,19 @@ def plan_rows(
     pair_counts = _sample_counts(store, [seed_id for seed_id, _ in candidates])
     used = {seed_id: n_tasks for seed_id, n_tasks in candidates}
     order = [seed_id for seed_id, _ in candidates]
+    statute_ok: set[str] | None = None
+    if "statute_qa" in quota:
+        from tuned.data.generate import seed_meta, statute_qa_section_eligible
+
+        statute_ok = set()
+        for seed_id, _ in candidates:
+            seed = store.get_seed(seed_id)
+            if seed is None:
+                continue
+            if statute_qa_section_eligible(
+                seed.get("text") or "", seed_meta(seed).get("section_text")
+            ):
+                statute_ok.add(seed_id)
 
     rows: list[dict] = []
     cursor = 0
@@ -396,10 +428,15 @@ def plan_rows(
             for _probe in range(len(order)):
                 candidate = order[cursor % len(order)]
                 cursor += 1
-                if used[candidate] < PER_SEED_CAP:
-                    seed_id = candidate
-                    break
+                if used[candidate] >= PER_SEED_CAP:
+                    continue
+                if task_type == "statute_qa" and statute_ok is not None and candidate not in statute_ok:
+                    continue
+                seed_id = candidate
+                break
             if seed_id is None:
+                if task_type == "statute_qa":
+                    break
                 return rows
             used[seed_id] += 1
             sample_ix = pair_counts.get((seed_id, task_type), 0)
