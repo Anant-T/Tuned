@@ -1356,6 +1356,13 @@ class Extraction:
     author_hint: float | None = None
     cleanup: dict = field(default_factory=dict)
 
+    def __post_init__(self):
+        # QUARANTINE_REASONS is the closed set of refusals this module may
+        # record. A reason that is not a member would land in the document row
+        # and read as a category nothing downstream counts.
+        if not self.ok and self.reason not in QUARANTINE_REASONS:
+            raise ValueError(f"unknown quarantine reason {self.reason!r}")
+
     def meta(self) -> dict:
         return {
             "signals": list(self.signals),

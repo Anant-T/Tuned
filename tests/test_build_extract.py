@@ -3604,3 +3604,24 @@ def test_cli_says_what_to_run_when_the_selection_is_missing(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 2
     assert "tuned.data.select" in out
+
+
+def test_a_refusal_cannot_carry_a_reason_the_quarantine_set_does_not_name():
+    from tuned.data import extract as ex
+
+    with pytest.raises(ValueError, match="unknown quarantine reason"):
+        ex.Extraction(False, "not_a_real_reason")
+
+
+def test_every_reason_the_module_can_emit_constructs():
+    from tuned.data import extract as ex
+
+    for reason in ex.QUARANTINE_REASONS:
+        assert ex.Extraction(False, reason).reason == reason
+
+
+def test_a_successful_extraction_still_needs_no_reason():
+    from tuned.data import extract as ex
+
+    assert ex.Extraction(True, None, text="a judgment").ok
+    assert ex.Extraction(True).reason is None
