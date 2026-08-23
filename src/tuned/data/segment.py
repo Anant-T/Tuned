@@ -173,6 +173,12 @@ class SegmentationResult:
     # measured that as the expected case, not a degradation of one.
     degradation: dict | None = None
 
+    def __post_init__(self):
+        # TIERS is the whole tier vocabulary. A result carrying anything else
+        # would be counted under a tier no downstream report knows about.
+        if self.tier not in TIERS:
+            raise ValueError(f"unknown tier {self.tier!r}")
+
 
 # --------------------------------------------------------------------------
 # Footnote tail.

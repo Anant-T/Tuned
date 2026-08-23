@@ -786,3 +786,18 @@ def test_segment_rejects_end_before_start():
 
 def test_segment_allows_a_zero_length_span():
     Segment(5, 5, None)  # must not raise
+
+
+def test_a_result_cannot_claim_a_tier_the_contract_does_not_name():
+    from tuned.data import segment as seg
+
+    with pytest.raises(ValueError, match="unknown tier"):
+        seg.SegmentationResult(tier="ocr", why="fallback", segments=())
+
+
+def test_each_named_tier_constructs():
+    from tuned.data import segment as seg
+
+    for tier in seg.TIERS:
+        result = seg.SegmentationResult(tier=tier, why="under test", segments=())
+        assert result.tier == tier
