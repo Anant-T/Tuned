@@ -177,9 +177,9 @@ def test_pad_token_is_pinned_before_the_trainer_captures_it():
 
 
 def test_rslora_flag_reaches_get_peft_model():
-    # The rsLoRA A/B lane is config-driven: the flag must flow from the yaml
-    # into FastModel.get_peft_model, not be hardcoded - the production lane
-    # keeps the default False, only law_v1_8b_ddp_rslora.yaml flips it.
+    # rsLoRA is config-driven: the flag must flow from the yaml into
+    # FastModel.get_peft_model, not be hardcoded - the production lane keeps
+    # the default False; an experiment yaml can flip it without code changes.
     src = SFT.read_text(encoding="utf-8")
     peft_ctor = src.find("FastModel.get_peft_model(")
     flag = src.find("use_rslora=cfg.lora.use_rslora", peft_ctor)
