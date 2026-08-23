@@ -1,4 +1,4 @@
-# cursor.md — law_v1 synthesis error reduction
+# law_v1 synthesis error reduction
 
 **Date:** 21 Aug 2026  
 **Workspace:** `C:\Users\Anant\Desktop\projects\tuned`  
