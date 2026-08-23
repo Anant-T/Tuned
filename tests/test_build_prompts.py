@@ -764,10 +764,14 @@ def test_live_judge_sha_stays_put_when_recovery_overlay_is_armed():
         assert reg.load(prompt_id).sha == EXPECTED_SHAS[prompt_id]
 
 
-# Overlay drift. The overlay is sixteen near-copies of prompts/ and must stay
-# copies: prompt_sha is sha256 of RAW FILE BYTES, so a generated overlay would
-# have no bytes to hash and the exp_harmony rows would stop being comparable.
-# What these pin is that the copies stay in step with what they copied.
+# Overlay drift. An ACCIDENTAL base edit is already caught above by
+# test_template_sha_is_pinned - the pin stops matching and forces a look.
+# What these tests catch is narrower: a DELIBERATE base edit, where the
+# author moves the sha pin on purpose and forgets to carry the same change
+# into the overlay copy. The overlay is sixteen near-copies of prompts/ and
+# must stay copies: prompt_sha is sha256 of RAW FILE BYTES, so a generated
+# overlay would have no bytes to hash and the exp_harmony rows would stop
+# being comparable.
 
 _PACKET_MARKERS = ("450 to 700 words", "Let me check this, or actually")
 
@@ -796,6 +800,22 @@ def test_every_overlay_file_has_a_pinned_sha():
     assert on_disk == set(_EXPECTED_OVERLAY_SHAS)
 
 
+def test_every_base_gen_prompt_has_an_overlay_counterpart():
+    # test_every_overlay_file_has_a_pinned_sha (above) only walks the overlay
+    # side: it would catch a stray addition to prompts_harmony/, but not a
+    # stray addition to prompts/. And prompt_registry._template_path() falls
+    # back to the base file whenever the overlay has none for that id -
+    # silently, no error, no test failure at the registry level. So a new
+    # gen_*.md dropped into prompts/ with no overlay counterpart would ship
+    # rendered under exp_harmony with the recovery-packet markers still in
+    # it, and every drift test in this section (all keyed off
+    # _EXPECTED_OVERLAY_SHAS) would keep passing regardless. This pins the
+    # base and overlay gen_* id sets equal so that gap cannot open unnoticed.
+    base_gen_ids = {p.stem for p in reg.PROMPTS_DIR.glob("gen_*.md")}
+    overlay_gen_ids = {p for p in _EXPECTED_OVERLAY_SHAS if p.startswith("gen_")}
+    assert base_gen_ids == overlay_gen_ids
+
+
 def test_overlay_bytes_are_pinned_like_the_live_bytes_are():
     for prompt_id, expected in sorted(_EXPECTED_OVERLAY_SHAS.items()):
         raw = (_OVERLAY_DIR / f"{prompt_id}.md").read_bytes()
@@ -815,9 +835,11 @@ def test_generator_overlays_differ_from_their_base_in_exactly_two_lines():
         assert len(base) == len(over), f"{prompt_id}: overlay changed line count"
         changed = [i for i, (b, o) in enumerate(zip(base, over)) if b != o]
         assert len(changed) == 2, (
-            f"{prompt_id}: {len(changed)} lines differ from the base, expected 2. "
-            f"Editing a base prompt without carrying the packet strip across is "
-            f"what this catches."
+            f"{prompt_id}: {len(changed)} lines differ from the base, expected 2 "
+            f"(the two packet-marker lines). This only counts changed lines - it "
+            f"does not by itself prove the packet markers are gone; "
+            f"test_the_packet_is_in_every_base_and_in_no_generator_overlay checks "
+            f"that."
         )
 
 

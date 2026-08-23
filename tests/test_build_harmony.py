@@ -796,7 +796,6 @@ def test_recovery_s1_flag_does_not_force_a_second_call(tmp_path):
     assert len(router.calls_for("generator")) == 1
 
 
-
 def test_the_analysis_header_literal_survives_in_the_leading_tuple():
     # _ANALYSIS_HEADER was a second, unread copy of this exact string. Deleting
     # it must not take the copy _strip_leading_analysis_header actually reads.
