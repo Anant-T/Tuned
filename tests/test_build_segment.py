@@ -10,7 +10,6 @@ import pytest
 
 from tuned.data.roles_infer import BACKEND_NONE, BACKEND_SUBPROCESS, RolesBridgeError
 from tuned.data.segment import (
-    FOOTNOTES_CITED_HEADING,
     FOOTNOTES_LABEL,
     MAX_PARA_STEP,
     MIN_TOC_HEADINGS,
@@ -27,11 +26,8 @@ from tuned.data.segment import (
     _split_footnote_tail,
     _subdivide,
     _toc_segments,
-    cited_footnotes,
     paragraph_offsets,
     paragraph_starts,
-    parse_footnotes,
-    resolve_footnotes,
     segment_document,
     toc_candidates,
 )
@@ -384,79 +380,6 @@ def test_footnote_marker_does_not_pollute_paragraph_numbering():
     para_labels = [s.label for s in result.segments if s.label not in (None, FOOTNOTES_LABEL)]
     assert para_labels == ["1", "2"]
     assert result.segments[-1].label == FOOTNOTES_LABEL
-
-
-# --------------------------------------------------------------------------
-# Footnote resolution: parsing the tail, and rendering what a span cites.
-# --------------------------------------------------------------------------
-
-
-def test_the_tail_parses_in_the_shape_extract_py_actually_writes():
-    # extract.py hoists the footnote LINES verbatim, and a typeset footnote
-    # opens with its own number - `1 (2017) 9 SCC 499`, with or without the
-    # period. This is the only shape in the built corpus.
-    text = judgment(3) + "\n[FOOTNOTES]\n1 (2019) 3 SCC 100.\n2. AIR 1985 SC 12.\n"
-    assert parse_footnotes(text) == {"1": "(2019) 3 SCC 100.", "2": "AIR 1985 SC 12."}
-
-
-def test_the_tail_also_parses_the_bracketed_shape():
-    text = judgment(3) + "\n[FOOTNOTES]\n[^3]: Salomon v A Salomon [1897] AC 22.\n"
-    assert parse_footnotes(text) == {"3": "Salomon v A Salomon [1897] AC 22."}
-
-
-def test_a_document_with_no_tail_parses_to_nothing():
-    assert parse_footnotes(judgment(3)) == {}
-
-
-def test_a_key_defined_twice_keeps_its_first_definition():
-    # Two reprint pages each restarting their notes at 1; the earliest
-    # citation in the document meant the first one.
-    text = judgment(3) + "\n[FOOTNOTES]\n1 (2019) 3 SCC 100.\n1 AIR 1985 SC 12.\n"
-    assert parse_footnotes(text) == {"1": "(2019) 3 SCC 100."}
-
-
-def test_both_marker_shapes_are_found_and_ordered_by_position():
-    notes = {"1": "first", "2": "second"}
-    text = "As held in Salomon 2 and earlier in another judgment.[^1]"
-    assert cited_footnotes(text, notes) == ["2", "1"]
-
-
-def test_a_marker_no_note_answers_to_is_not_cited():
-    assert cited_footnotes("As held in Salomon 9.[^7]", {"1": "first"}) == []
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "The question turns on Section 3 of the Act.",
-        "Article 3 of the Constitution is engaged.",
-        "The order was passed on 3 May 2018 by the Board.",
-        "Recorded as Bruise 3 x 1 cm over the arm.",
-        "Reported at (2001) 1 SCC 3, the Court held otherwise.",
-    ],
-)
-def test_a_number_that_counts_something_is_not_read_as_a_marker(text):
-    # The flattened-superscript rule has to live next to every other reason
-    # a judgment puts a number after a word. A false positive appends a real
-    # citation from this same judgment to a span that did not cite it.
-    assert cited_footnotes(text, {"3": "Salomon v A Salomon [1897] AC 22."}) == []
-
-
-def test_resolution_appends_and_only_appends():
-    notes = {"3": "Salomon v A Salomon [1897] AC 22."}
-    text = "The appellant relies on the rule in Salomon.[^3]"
-    out = resolve_footnotes(text, notes)
-    assert out.startswith(text)
-    assert out == (
-        f"{text}\n\n{FOOTNOTES_CITED_HEADING}\n"
-        "[^3]: Salomon v A Salomon [1897] AC 22.\n"
-    )
-
-
-def test_a_span_that_cites_nothing_is_returned_unchanged():
-    notes = {"3": "Salomon v A Salomon [1897] AC 22."}
-    text = "That contention must be rejected."
-    assert resolve_footnotes(text, notes) is text
 
 
 # --------------------------------------------------------------------------

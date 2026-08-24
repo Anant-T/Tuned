@@ -30,13 +30,6 @@ produces tier-selected segments, pack_chunks bins them into the token band
 without ever splitting one, and chunk_seed_row shapes the result into the
 `seed` table's existing schema - no parallel store, per the brief.
 
-A chunk's TEXT is its source span PLUS the footnotes that span cites
-(segment.py's parse_footnotes/resolve_footnotes), because extract.py hoists
-every note to one document-tail block and chunking would otherwise hand the
-teacher a fragment whose authorities are in a different chunk. The addition
-is a suffix and only a suffix - `text[start:end]` is still a prefix of
-`chunk.text` - so no boundary, and therefore no seed_id, moves.
-
 CONTENT-DERIVED IDS. A chunk's seed_id is seed_id_for(source_id,
 "{object_key}:{start}:{end}") - the SAME derivation seeds.py already uses
 for its own rows, not a second hashing scheme. Because start/end are a pure
@@ -68,18 +61,10 @@ from pathlib import Path
 
 from tuned.data import roles_infer
 from tuned.data.acquire import SC_SOURCE_ID
-from tuned.data.extract import FOOTNOTE_HEADING
 from tuned.data.extract import STATUS_OK as DOC_STATUS_OK
 from tuned.data.roles_infer import ROLES_VERSION
 from tuned.data.seeds import INJUDGEMENTS_SOURCE_ID, classify_case_type, seed_id_for
-from tuned.data.segment import (
-    SEGMENT_VERSION,
-    TIER_ROLES,
-    Segment,
-    parse_footnotes,
-    resolve_footnotes,
-    segment_document,
-)
+from tuned.data.segment import SEGMENT_VERSION, TIER_ROLES, Segment, segment_document
 
 # Bump when the packing rule itself changes what a chunk's boundaries are -
 # independent of SEGMENT_VERSION, which governs the segments a chunk is
@@ -92,15 +77,7 @@ from tuned.data.segment import (
 #      removed before shipping - proved mathematically (and by 200,000
 #      randomised trials, zero counterexamples) unreachable given this same
 #      greedy algorithm's own flush condition; see pack_chunks' docstring.
-#   2  each chunk now RENDERS the footnotes it cites (segment.py's
-#      resolve_footnotes). extract.py hoists every note to one document-tail
-#      block, so 96.2% of inline markers pointed at a block in a different
-#      chunk and the teacher - prompted with a closed world - was handed
-#      authorities it could not see. Strictly append-only: start/end and
-#      therefore every seed_id are bit-identical to version 1, and the only
-#      thing that moved is the TEXT a chunk carries, which is exactly what
-#      this constant governs for the manifest.
-CHUNK_VERSION = 2
+CHUNK_VERSION = 1
 
 MIN_CHUNK_TOKENS = 800
 MAX_CHUNK_TOKENS = 1500
@@ -117,11 +94,6 @@ CHUNK_KIND = "chunk"
 
 @dataclass(frozen=True)
 class Chunk:
-    # `text` is text[start:end] when nothing was resolved into it, and
-    # text[start:end] + a rendered `[FOOTNOTES CITED ABOVE]` block when the
-    # span cited notes that live in the document's hoisted tail. It is
-    # therefore always a SUPERSET of the span and always starts with it -
-    # start/end name the source bytes, never the rendered length.
     start: int
     end: int
     text: str
@@ -140,7 +112,6 @@ def pack_chunks(
     tokenizer,
     *,
     max_tokens: int = MAX_CHUNK_TOKENS,
-    footnotes: dict[str, str] | None = None,
 ) -> list[Chunk]:
     """Whole segments, greedily binned into chunks of AT MOST max_tokens
     under `tokenizer`. NEVER splits inside a segment: a segment whose own
@@ -177,22 +148,6 @@ def pack_chunks(
     segment-size combinations, zero counterexamples). The mathematics say
     the same thing the search does, so the branch is gone rather than kept
     as code nothing can reach.
-
-    `footnotes` (segment.py's parse_footnotes over the SAME `text`) makes
-    each chunk carry the notes it cites - None or {} leaves every chunk's
-    text exactly the source span, which is what every caller that is not one
-    of this module's two drivers wants. It is a parameter rather than
-    something this function derives for itself so that the resolution can be
-    switched OFF and the two runs compared boundary for boundary, which is
-    the test that guards the pre-registration.
-
-    RESOLUTION NEVER REACHES THE PACKING DECISION. `sized` above is measured
-    on the raw source spans, so which segments share a chunk - and therefore
-    every start, end and seed_id - is bit-identical whether footnotes are
-    passed or not. Only the rendered `text` and its `token_count` differ,
-    and token_count is deliberately the count of what a prompt will actually
-    carry rather than of the span alone, so a chunk that gained 40 tokens of
-    authority is not budgeted as though it had not.
     """
     if not segments:
         return []
@@ -205,18 +160,11 @@ def pack_chunks(
     def flush(items: list[tuple[Segment, int]], *, oversize: bool) -> None:
         start = items[0][0].start
         end = items[-1][0].end
-        rendered = text[start:end]
-        # The hoisted `[FOOTNOTES]` block is ONE segment, so the chunk that
-        # absorbed it already holds every note this document has and does
-        # not need a second copy of the ones it cites. Every OTHER chunk is
-        # the amputated case this exists for.
-        if footnotes and FOOTNOTE_HEADING not in rendered:
-            rendered = resolve_footnotes(rendered, footnotes)
         chunks.append(
             Chunk(
                 start=start,
                 end=end,
-                text=rendered,
+                text=text[start:end],
                 # The JOINED span, not the sum of the parts. The two differ
                 # whenever a segment boundary is not also a token boundary,
                 # which never happens on the packing tier (every paragraph
@@ -228,9 +176,7 @@ def pack_chunks(
                 # PACKING decision below still uses per-segment sizes, so
                 # this function encodes each segment once and each chunk
                 # once rather than re-encoding the whole chunk per candidate.
-                # It is the RENDERED text, footnotes included, because that
-                # is what a prompt built from this chunk actually costs.
-                token_count=_token_count(tokenizer, rendered),
+                token_count=_token_count(tokenizer, text[start:end]),
                 # First-seen order, deduplicated: on the packing tier the
                 # labels are distinct paragraph numbers and this is a no-op,
                 # while on the ToC and roles tiers every piece of one
@@ -486,9 +432,7 @@ def chunk_documents(
                 roles_timeout=roles_timeout,
                 roles_spawn=roles_spawn,
             )
-            chunks = pack_chunks(
-                text, result.segments, tokenizer, footnotes=parse_footnotes(text)
-            )
+            chunks = pack_chunks(text, result.segments, tokenizer)
             rows = [
                 chunk_seed_row(
                     source_id=source_id,
@@ -501,13 +445,7 @@ def chunk_documents(
                     doc_sha256=doc.get("sha256"),
                     text_path=doc.get("text_path"),
                     court=DOCUMENT_COURT,
-                    # The SOURCE SPAN, not the rendered chunk. case_type is a
-                    # fact about the judgment's own words and it steers wave
-                    # planning; letting an appended authority ("... Railway
-                    # Company v. Normandin") flip a civil chunk to commercial
-                    # would re-classify rows for a reason that has nothing to
-                    # do with what they are about.
-                    case_type=classify_case_type(text[chunk.start : chunk.end]),
+                    case_type=classify_case_type(chunk.text),
                     code_era=None,
                     provenance={
                         "case_id": doc.get("case_id"),
@@ -647,9 +585,7 @@ def chunk_seed_rows(
                 roles_timeout=roles_timeout,
                 roles_spawn=roles_spawn,
             )
-            chunks = pack_chunks(
-                text, result.segments, tokenizer, footnotes=parse_footnotes(text)
-            )
+            chunks = pack_chunks(text, result.segments, tokenizer)
             rows = [
                 chunk_seed_row(
                     source_id=source_id,
@@ -662,9 +598,7 @@ def chunk_seed_rows(
                     doc_sha256=None,
                     text_path=None,
                     court=row.get("court"),
-                    # The source span, for the reason chunk_documents gives.
-                    case_type=row.get("case_type")
-                    or classify_case_type(text[chunk.start : chunk.end]),
+                    case_type=row.get("case_type") or classify_case_type(chunk.text),
                     code_era=row.get("code_era"),
                     decision_date=row.get("decision_date"),
                     provenance={"parent_seed_id": parent_id, "native_id": row.get("native_id")},

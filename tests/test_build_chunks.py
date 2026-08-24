@@ -30,14 +30,12 @@ from tuned.data.chunks import (
 from tuned.data.roles_infer import BACKEND_SUBPROCESS, ROLES_VERSION
 from tuned.data.seeds import INJUDGEMENTS_SOURCE_ID
 from tuned.data.segment import (
-    FOOTNOTES_CITED_HEADING,
     MAX_PARA_STEP,
     SEGMENT_VERSION,
     TIER_PACKING,
     TIER_ROLES,
     TIER_TOC,
     Segment,
-    parse_footnotes,
     segment_document,
 )
 from tuned.data.config import load_build_config
@@ -185,179 +183,6 @@ def test_packing_is_deterministic_regardless_of_repeated_calls():
     first = pack_chunks(text, segments, tok)
     second = pack_chunks(text, segments, tok)
     assert [(c.start, c.end) for c in first] == [(c.start, c.end) for c in second]
-
-
-# --------------------------------------------------------------------------
-# Footnote resolution: the chunk that cites a note carries it, and no
-# boundary moves while it happens.
-# --------------------------------------------------------------------------
-
-
-def _footnote_document(marker: str, definition: str) -> str:
-    """Two paragraphs too large to share a chunk, the first citing a note,
-    and the hoisted `[FOOTNOTES]` tail extract.py leaves at the foot of the
-    file.
-
-    THE SIZE IS THE POINT. A three-line fixture packs into ONE chunk, which
-    holds the tail as well - so "the citing chunk contains the note" would
-    be true before any resolution existed and the test would assert nothing.
-    1,400 words a paragraph forces the citation and the apparatus apart,
-    which is the shape 96.2% of the real corpus's markers are in.
-
-    THREE paragraphs, not two, so the fixture has all three cases a document
-    has: the chunk that cites (1), a chunk that cites nothing at all (2),
-    and the chunk that swallowed the hoisted block (3).
-    """
-    return (
-        f"1. The appellant relies on the rule in Salomon{marker} " + words(1400) + ".\n\n"
-        "2. That contention must be rejected. " + words(1400) + ".\n\n"
-        "3. The appeal is disposed of in those terms. " + words(1400) + ".\n\n"
-        "[FOOTNOTES]\n"
-        f"{definition}\n"
-    )
-
-
-def _chunks_of(doc: str, *, resolve_footnotes: bool = True) -> list[Chunk]:
-    """This file's standard construction - segment_document then pack_chunks
-    - with the one switch the boundary test needs."""
-    return pack_chunks(
-        doc,
-        segment_document(doc).segments,
-        FakeTokenizer(),
-        footnotes=parse_footnotes(doc) if resolve_footnotes else None,
-    )
-
-
-def test_footnote_markers_resolve_into_their_citing_chunk():
-    """A chunk that cites footnote 3 must contain footnote 3's text.
-
-    extract.py hoists all footnotes to a document-tail block; 96.2% of
-    inline markers (1,909/1,984) therefore point outside the chunk that
-    cites them. The teacher is prompted with a closed world, so an amputated
-    authority reads to the judge as invented.
-    """
-    doc = _footnote_document("[^3]", "[^3]: Salomon v A Salomon & Co Ltd [1897] AC 22.")
-    chunks = _chunks_of(doc)
-    citing = next(c for c in chunks if "[^3]" in c.text)
-    assert "[FOOTNOTES]" not in doc[citing.start : citing.end], (
-        "fixture stopped separating the citing chunk from the hoisted block"
-    )
-    assert "Salomon v A Salomon" in citing.text, (
-        "chunk cites footnote 3 but does not carry its text"
-    )
-
-
-def test_a_flattened_superscript_marker_resolves_the_way_a_bracketed_one_does():
-    """The shape the REAL corpus has.
-
-    `[^3]` appears in 1 of 5,471 extracted S.C.R. files. What pdftotext
-    actually leaves where a typeset superscript was is a bare digit in the
-    line - `... v. Union of India 12 , that a dedicated ...` - so a resolver
-    that only understood the bracketed form would be a no-op on every
-    document this pipeline builds from.
-    """
-    doc = _footnote_document(" 3", "3 Salomon v A Salomon & Co Ltd [1897] AC 22.")
-    citing = _chunks_of(doc)[0]
-    assert "[FOOTNOTES]" not in doc[citing.start : citing.end]
-    assert "Salomon v A Salomon" in citing.text
-    # Rendered in the bracketed shape whatever shape it was found in, so the
-    # appended block cannot be read as one more numbered paragraph.
-    assert "[^3]: Salomon v A Salomon" in citing.text
-
-
-def test_footnote_resolution_does_not_move_chunk_boundaries():
-    """seed_id is hash(object_key:start:end) - resolution must not re-key.
-
-    A frozen control store holds a 60-pair pre-registration keyed to current
-    seed_ids, and re-chunking would orphan 1,060 tasks / 1,396 generations /
-    46 gold labels behind a swallowed IntegrityError.
-    """
-    doc = _footnote_document("[^3]", "[^3]: Salomon v A Salomon & Co Ltd [1897] AC 22.")
-    plain = _chunks_of(doc, resolve_footnotes=False)
-    resolved = _chunks_of(doc, resolve_footnotes=True)
-    before = [(c.start, c.end) for c in plain]
-    after = [(c.start, c.end) for c in resolved]
-    assert before == after
-    # The offsets are only the derivation's INPUT; assert the ids themselves,
-    # because that is what the pre-registration's foreign key holds.
-    key = "year=2020/salomon.pdf"
-    assert [chunk_id_for(SC_SOURCE_ID, key, c) for c in plain] == [
-        chunk_id_for(SC_SOURCE_ID, key, c) for c in resolved
-    ]
-    # And the resolution really did fire, so the equality above is a result
-    # and not an artefact of nothing having happened.
-    assert any(FOOTNOTES_CITED_HEADING in c.text for c in resolved)
-
-
-def test_resolution_only_ever_appends_never_rewrites_the_source_span():
-    """`text[start:end]` stays a PREFIX of every chunk's text.
-
-    The byte-for-byte reconstruction elsewhere in this file is the invariant
-    this module's docstring calls "nothing here ever drops a byte"; append-
-    only is what keeps it true once a chunk can carry more than its span.
-    """
-    doc = _footnote_document("[^3]", "[^3]: Salomon v A Salomon & Co Ltd [1897] AC 22.")
-    for chunk in _chunks_of(doc):
-        assert chunk.text.startswith(doc[chunk.start : chunk.end])
-
-
-def test_a_chunk_that_cites_nothing_is_left_exactly_as_it_was():
-    doc = _footnote_document("[^3]", "[^3]: Salomon v A Salomon & Co Ltd [1897] AC 22.")
-    silent = [c for c in _chunks_of(doc) if "[^3]" not in doc[c.start : c.end]]
-    assert silent, "fixture no longer has a chunk that cites nothing"
-    for chunk in silent:
-        assert chunk.text == doc[chunk.start : chunk.end]
-
-
-def test_the_chunk_holding_the_hoisted_block_is_not_given_a_second_copy():
-    """The tail is ONE segment, so whichever chunk absorbed it already has
-    every note the document has - appending the cited ones again would spend
-    prompt budget on a duplicate."""
-    doc = _footnote_document("[^3]", "[^3]: Salomon v A Salomon & Co Ltd [1897] AC 22.")
-    holding = [c for c in _chunks_of(doc) if "[FOOTNOTES]" in doc[c.start : c.end]]
-    assert len(holding) == 1
-    assert FOOTNOTES_CITED_HEADING not in holding[0].text
-
-
-def test_token_count_covers_the_footnotes_the_chunk_gained():
-    """Otherwise the prompt budget is computed against a chunk smaller than
-    the one the teacher is actually sent."""
-    doc = _footnote_document("[^3]", "[^3]: Salomon v A Salomon & Co Ltd [1897] AC 22.")
-    tok = FakeTokenizer()
-    citing = _chunks_of(doc)[0]
-    plain = _chunks_of(doc, resolve_footnotes=False)[0]
-    assert citing.token_count == len(tok.encode(citing.text, add_special_tokens=False))
-    assert citing.token_count > plain.token_count
-
-
-def test_a_counter_noun_followed_by_a_number_is_not_read_as_a_marker():
-    """`Section 3`, `Article 3`, `Rule 3` are the shape a flattened
-    superscript has and none of them is one. A false positive appends a real
-    citation from this same judgment to a chunk that did not cite it - mild,
-    but not free, so the rule is kept narrow."""
-    doc = (
-        "1. The question turns on Section 3 of the Act. " + words(1400) + ".\n\n"
-        "2. That contention must be rejected. " + words(1400) + ".\n\n"
-        "[FOOTNOTES]\n"
-        "3 Salomon v A Salomon & Co Ltd [1897] AC 22.\n"
-    )
-    assert parse_footnotes(doc) == {"3": "Salomon v A Salomon & Co Ltd [1897] AC 22."}
-    citing = _chunks_of(doc)[0]
-    assert FOOTNOTES_CITED_HEADING not in citing.text
-
-
-def test_the_drivers_resolve_footnotes_end_to_end(doc_store):
-    """Wiring, not just the helper: a document chunked through the real
-    driver lands `seed` rows whose text carries the authorities."""
-    store, tmp_path = doc_store
-    doc = _footnote_document(" 3", "3 Salomon v A Salomon & Co Ltd [1897] AC 22.")
-    _write_doc(store, tmp_path, "k1", doc)
-    chunk_documents(store, tokenizer=FakeTokenizer())
-    rows = list(store.iter_seeds_by_source(SC_SOURCE_ID))
-    carrying = [r for r in rows if "Salomon v A Salomon" in r["text"]]
-    # The citing chunk AND the chunk that swallowed the hoisted block.
-    assert len(carrying) == 2
-    assert any(FOOTNOTES_CITED_HEADING in r["text"] for r in rows)
 
 
 # --------------------------------------------------------------------------
