@@ -1,0 +1,454 @@
+{
+  "control_fingerprint": "09e1367b60146b69bef981e896963d5cc4935be7b9b5e57b3e828f707579609b",
+  "gate_contract": [
+    "think_format",
+    "length_band",
+    "citations",
+    "statutory_grounding",
+    "temporal",
+    "self_verification",
+    "irac_placement",
+    "verbatim_overlap",
+    "statutory_quotation",
+    "banned_meta",
+    "prompt_echo",
+    "answer_key"
+  ],
+  "n": 60,
+  "n_per_stratum": 20,
+  "pairs": [
+    {
+      "control_attempt": 4,
+      "control_gen_id": 635,
+      "control_task_id": "03d404a16b11971f",
+      "seed_id": "02ad2529fb86f3fa",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 1,
+      "control_gen_id": 1193,
+      "control_task_id": "c5d2efce893d75b3",
+      "seed_id": "03abb448f282f57d",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 555,
+      "control_task_id": "a2df2eeba7372359",
+      "seed_id": "04867eabb059dbe8",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 651,
+      "control_task_id": "e881784e18334a9c",
+      "seed_id": "02b152f2206ab1cd",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1256,
+      "control_task_id": "41b839bfed0aab8c",
+      "seed_id": "03c38a6d2f3de4cf",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 404,
+      "control_task_id": "a69da89401aabf34",
+      "seed_id": "026b0fbe78ed93ec",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 436,
+      "control_task_id": "e52e9c1afdf227a4",
+      "seed_id": "027bda37692519c0",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 466,
+      "control_task_id": "fee3a5824e3a2776",
+      "seed_id": "02903889a180401a",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 1,
+      "control_gen_id": 608,
+      "control_task_id": "f051df86364a4673",
+      "seed_id": "027da3173723744f",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 2,
+      "control_gen_id": 1217,
+      "control_task_id": "a968246b8fccb724",
+      "seed_id": "03b3b1b5f8146a5d",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 784,
+      "control_task_id": "f40ad1c9cfce0732",
+      "seed_id": "02eeb82cfd749807",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 800,
+      "control_task_id": "61051af380f80aa6",
+      "seed_id": "02f2ce944eb9ed73",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 166,
+      "control_task_id": "86f2ded4d38ec52a",
+      "seed_id": "004a6a8858f9ea76",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 687,
+      "control_task_id": "fed7dd61e0912fed",
+      "seed_id": "02c2d9a920834ba2",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 2,
+      "control_gen_id": 673,
+      "control_task_id": "b11bede1d10bac01",
+      "seed_id": "02be53188e9d191c",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 188,
+      "control_task_id": "16e5602ddfc836fb",
+      "seed_id": "004eee591d6ce19c",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 652,
+      "control_task_id": "a6554b34f126235c",
+      "seed_id": "02b1de43ef2a80d1",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1192,
+      "control_task_id": "a33d889d6217a16d",
+      "seed_id": "03a6566c35071016",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 552,
+      "control_task_id": "fb91f995461a2bad",
+      "seed_id": "0485fa48e1589c7b",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1240,
+      "control_task_id": "1ad00400b04540e7",
+      "seed_id": "03c04c38e901aa67",
+      "task_type": "irac_analysis"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1160,
+      "control_task_id": "53d9a99f90b62de6",
+      "seed_id": "03a0ec4c4b1858a5",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 47,
+      "control_task_id": "328a02386dd985dd",
+      "seed_id": "0012f9d8310d3396",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 91,
+      "control_task_id": "b5e2dbfa3ebb26a0",
+      "seed_id": "001bc43bcbdee1d6",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 298,
+      "control_task_id": "53cd2a94e03021a5",
+      "seed_id": "022bacafa80bdb8f",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 1,
+      "control_gen_id": 1385,
+      "control_task_id": "1707652acc8092cd",
+      "seed_id": "03f4e7d8a890f803",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 106,
+      "control_task_id": "c2ecac8c7b367fb0",
+      "seed_id": "002d71ac3431d885",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 1,
+      "control_gen_id": 1132,
+      "control_task_id": "f6f6d9d1470b397a",
+      "seed_id": "039c759bc3b5b56c",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 20,
+      "control_task_id": "12bea39798131753",
+      "seed_id": "00023c79731326c9",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 117,
+      "control_task_id": "4c4f01397025ca95",
+      "seed_id": "00328e917465249c",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 24,
+      "control_task_id": "d504c88946f6953c",
+      "seed_id": "00010ffcd0035f9d",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 42,
+      "control_task_id": "ffd508c7b96ea55e",
+      "seed_id": "000bbff86a676d32",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 304,
+      "control_task_id": "1ff8988371ca5420",
+      "seed_id": "022cc41d6825b411",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 359,
+      "control_task_id": "8f5477f81270dbf3",
+      "seed_id": "024ece92d00fef1e",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 155,
+      "control_task_id": "17840e3c70674ff5",
+      "seed_id": "00411e6386a1ffdc",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 19,
+      "control_task_id": "779091b24103307f",
+      "seed_id": "000214caa230ca06",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 1,
+      "control_gen_id": 1157,
+      "control_task_id": "e2e230240201db29",
+      "seed_id": "03a1c57c58313406",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 41,
+      "control_task_id": "493246ea7e520847",
+      "seed_id": "0007f35165311981",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 305,
+      "control_task_id": "1acfc7c843460572",
+      "seed_id": "022dcb25b246c461",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 94,
+      "control_task_id": "0e870fc9e61fed47",
+      "seed_id": "0020e17518116cbc",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 69,
+      "control_task_id": "1f3cf8630b210ff5",
+      "seed_id": "00170c00e3d35db0",
+      "task_type": "drafting"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1031,
+      "control_task_id": "6fecf318c097179a",
+      "seed_id": "036a80f11925e9a8",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 2,
+      "control_gen_id": 1051,
+      "control_task_id": "0109f85928fa7b6b",
+      "seed_id": "037810ea0a927252",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 4,
+      "control_gen_id": 586,
+      "control_task_id": "9b90ba9612b7afb4",
+      "seed_id": "04acf0f3b64cc1a9",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1364,
+      "control_task_id": "47f23530c078e457",
+      "seed_id": "03eadb6b58555ea2",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1011,
+      "control_task_id": "a1624240f264900a",
+      "seed_id": "0363b6fb49a4bca8",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1115,
+      "control_task_id": "b7a67a90c215f9e0",
+      "seed_id": "03940f924898fdee",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1103,
+      "control_task_id": "7e48fa8ce9410672",
+      "seed_id": "038c8e7e3045edd1",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1023,
+      "control_task_id": "096fee16c4cb2e19",
+      "seed_id": "0369c81f8609d28a",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 1,
+      "control_gen_id": 1082,
+      "control_task_id": "43187bcdf43983a1",
+      "seed_id": "03868cb9633ce810",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1330,
+      "control_task_id": "c9b5c09a431ba922",
+      "seed_id": "03dfbaaf76b3c21d",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1075,
+      "control_task_id": "f4481bf65bbb599e",
+      "seed_id": "0382ed0f51d82d99",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1343,
+      "control_task_id": "1cdac1f34498607f",
+      "seed_id": "03e1101b90297e0c",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 581,
+      "control_task_id": "b39b7b4da3c4c7ad",
+      "seed_id": "04b01b21e204c9b1",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1366,
+      "control_task_id": "43b870ab53eabc80",
+      "seed_id": "03ec54c8985e40c6",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 4,
+      "control_gen_id": 1129,
+      "control_task_id": "9727103cc48dd6ad",
+      "seed_id": "038a944be6272f04",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1365,
+      "control_task_id": "66ea21e55a910d37",
+      "seed_id": "03eac41a5579b5bc",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1019,
+      "control_task_id": "1016efebc0adc5f1",
+      "seed_id": "036561c0c172f608",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1055,
+      "control_task_id": "c1ee8e8c76bf3011",
+      "seed_id": "037a49b827610661",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1007,
+      "control_task_id": "9de51c9aabe9c180",
+      "seed_id": "036169d8e17a9c6f",
+      "task_type": "summarization"
+    },
+    {
+      "control_attempt": 3,
+      "control_gen_id": 1043,
+      "control_task_id": "dd9978db785565b0",
+      "seed_id": "036dcd1aba9f1ed3",
+      "task_type": "summarization"
+    }
+  ],
+  "strata": [
+    "irac_analysis",
+    "drafting",
+    "summarization"
+  ],
+  "task_types": [
+    "irac_analysis",
+    "drafting",
+    "summarization"
+  ],
+  "teacher_family": "gpt-oss",
+  "teacher_model": "gpt-oss-120b",
+  "think_min": 500
+}

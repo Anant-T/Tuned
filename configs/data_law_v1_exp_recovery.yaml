@@ -27,7 +27,7 @@ build:
   harmony_s1_continue: false
   prompt_overlay: src/tuned/data/prompts_harmony
   require_pretreatment_manifest: true
-  pretreatment_manifest: .superpowers/sdd/law-v1-recovery_893eff3d/cohort-manifest.json
+  pretreatment_manifest: configs/pre-registration/law-v1-recovery-cohort-manifest.json
 
   # THREE STRATA, NOT FOUR, AND THE MISSING ONE IS A DATA FACT NOT A CHOICE.
   # eval_matched.statute_section_eligible requires a seed whose
