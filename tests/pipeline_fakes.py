@@ -15,6 +15,7 @@ a shape the config no longer carries has to supply it or it stops measuring
 anything. See cfg_with_extra_judge.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -492,6 +493,52 @@ def cfg_with_split_pools(cfg: BuildConfig, *, judge_context: int, tiebreak_conte
             tiebreak=cfg.routing.tiebreak + ("groq/fifth-tiebreak",),
         ),
     )
+
+
+@contextmanager
+def judge_prompt_overlay_with_pinned_tiebreak_gap(*, tiebreak_extra_chars: int = 4000):
+    """Arms a temporary prompt overlay in which judge_tiebreak_v1 renders
+    ``tiebreak_extra_chars`` of inert filler LARGER than judge_pointwise_v1,
+    and judge_pointwise_v1 is otherwise byte-identical to the shipped
+    template.
+
+    Several preflight/pool_gaps tests need the tiebreak prompt to size larger
+    than the pointwise judge prompt - that is what lets one synthetic model
+    sit between the two thresholds and prove the plumbing sizes the tiebreak
+    slot from its OWN prompt rather than reusing the judge's. Until Task 2 of
+    the 2026-08-24 judge-calibration plan that gap was a four-token ACCIDENT
+    of the shipped prose (judge_tiebreak_v1 happened to render a few tokens
+    longer than judge_pointwise_v1). Splitting the grounding rubric's bands
+    lengthened judge_pointwise_v1 and inverted that ordering PERMANENTLY:
+    providers.required_context is needed_tokens * CONTEXT_SAFETY_MARGIN with
+    no rounding to absorb a content edit, so nothing about the next prompt
+    edit restores it either way by accident.
+
+    This overlay makes the direction and size of the gap an explicit,
+    test-controlled fact instead of prose the two templates happen to carry:
+    the default padding is ~1,000 tokens, dwarfing anything a plausible rubric
+    edit could move either template by. Everything else stays real - the
+    renderer, the token estimator, and the per-generator-window narrowing in
+    generate.judge_tokens_for_generator_window all run unmodified, reading
+    these bytes exactly as they would read the shipped ones.
+    """
+    import tempfile
+
+    from tuned.data import prompt_registry as reg
+
+    with tempfile.TemporaryDirectory() as tmp:
+        overlay = Path(tmp)
+        for prompt_id in ("judge_pointwise_v1", "judge_tiebreak_v1"):
+            text = (reg.PROMPTS_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
+            if prompt_id == "judge_tiebreak_v1":
+                filler = " Filler." * (tiebreak_extra_chars // 8)
+                text = text.rstrip("\n") + "\n" + filler + "\n"
+            (overlay / f"{prompt_id}.md").write_text(text, encoding="utf-8", newline="\n")
+        reg.set_overlay(overlay)
+        try:
+            yield overlay
+        finally:
+            reg.set_overlay(None)
 
 
 def cfg_with_extra_judge(

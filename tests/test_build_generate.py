@@ -23,6 +23,7 @@ from pipeline_fakes import (
     cfg_with_two_generator_families,
     cfg_with_split_pools,
     chat_response,
+    judge_prompt_overlay_with_pinned_tiebreak_gap,
     open_store,
     paths_for,
     seed_rows,
@@ -2103,28 +2104,33 @@ def test_a_two_generator_judge_gap_is_a_key_the_override_cannot_cover(cfg, monke
 
 def test_the_preflight_advises_one_model_that_closes_every_gap_it_reports(cfg, monkeypatch):
     """The advice is what the operator is choosing a model against right now.
-    It was judge-only: the preflight sizes the tiebreak separately (23,733 vs
-    23,729), so a model of EXACTLY the advised size closed the judge gap and
-    opened a tiebreak warning. Driven through preflight_messages, which is the
-    production call - the old pinning test called pool_gaps WITHOUT
-    tiebreak_needed_tokens and could not see it."""
+    It was judge-only: the preflight sizes the tiebreak separately, so a model
+    of EXACTLY the advised size closed the judge gap and opened a tiebreak
+    warning. Driven through preflight_messages, which is the production call -
+    the old pinning test called pool_gaps WITHOUT tiebreak_needed_tokens and
+    could not see it. Run under judge_prompt_overlay_with_pinned_tiebreak_gap
+    so the tiebreak-vs-judge sizing that "judge-only" depends on is pinned
+    rather than read off the shipped templates' incidental relative sizes -
+    those inverted permanently when the grounding rubric's bands were split
+    (2026-08-24 judge-calibration Task 2)."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
     cfg = cfg_with_two_generator_families(cfg)
     for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
-    refusals, warnings = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
-    advised = {
-        int(line.split("max_context >= ")[1].split()[0]) for line in refusals + warnings
-    }
-    assert len(advised) == 1, "the operator adds ONE model; it needs ONE number"
-    advice = advised.pop()
+    with judge_prompt_overlay_with_pinned_tiebreak_gap():
+        refusals, warnings = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
+        advised = {
+            int(line.split("max_context >= ")[1].split()[0]) for line in refusals + warnings
+        }
+        assert len(advised) == 1, "the operator adds ONE model; it needs ONE number"
+        advice = advised.pop()
 
-    exact = cfg_with_fourth_judge_family(cfg, max_context=advice)
-    assert preflight_messages(exact, GENERATOR_PREFLIGHT_ROLES) == ([], [])
-    short = cfg_with_fourth_judge_family(cfg, max_context=advice - 1)
-    assert preflight_messages(short, GENERATOR_PREFLIGHT_ROLES) != ([], [])
+        exact = cfg_with_fourth_judge_family(cfg, max_context=advice)
+        assert preflight_messages(exact, GENERATOR_PREFLIGHT_ROLES) == ([], [])
+        short = cfg_with_fourth_judge_family(cfg, max_context=advice - 1)
+        assert preflight_messages(short, GENERATOR_PREFLIGHT_ROLES) != ([], [])
 
 
 def test_the_preflight_checks_each_generator_family_at_its_own_window(cfg, monkeypatch):
@@ -2162,30 +2168,36 @@ def test_the_preflight_sizes_the_tiebreak_with_the_tiebreak_prompt(
 ):
     """The judge and the tiebreak are different prompts and the preflight
     passes both sizes - the flat worst case AND the per-window hook. Drop
-    either and the tiebreak is checked against a prompt nobody sends. They are
-    four tokens apart on this config, so the pin is a model that sits between
-    the two requirements; the parameters put the generator on each side of the
-    band, because the flat number only reaches a family whose window does not
-    cap it."""
+    either and the tiebreak is checked against a prompt nobody sends. Pinned
+    via judge_prompt_overlay_with_pinned_tiebreak_gap rather than read off the
+    shipped templates - that gap used to be a few tokens apart on this config
+    incidentally and inverted permanently when the grounding rubric's bands
+    were split (2026-08-24 judge-calibration Task 2) - so the pin is a model
+    that sits between the two requirements; the parameters put the generator
+    on each side of the band, because the flat number only reaches a family
+    whose window does not cap it."""
     for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     base = cfg_with_context(
         cfg, family="gpt-oss", role="generator", max_context=generator_window
     )
-    sizer = judge_sizer(base)
-    judge_required = required_context(sizer(generator_window, "judge"))
-    tiebreak_required = required_context(sizer(generator_window, "tiebreak"))
-    assert judge_required < tiebreak_required
+    with judge_prompt_overlay_with_pinned_tiebreak_gap():
+        sizer = judge_sizer(base)
+        judge_required = required_context(sizer(generator_window, "judge"))
+        tiebreak_required = required_context(sizer(generator_window, "tiebreak"))
+        assert judge_required < tiebreak_required
 
-    tight = cfg_with_split_pools(
-        base, judge_context=131072, tiebreak_context=tiebreak_required - 1
-    )
-    refusals, warnings = preflight_messages(tight, GENERATOR_PREFLIGHT_ROLES)
-    assert refusals == []
-    assert any("routing.tiebreak" in line for line in warnings)
+        tight = cfg_with_split_pools(
+            base, judge_context=131072, tiebreak_context=tiebreak_required - 1
+        )
+        refusals, warnings = preflight_messages(tight, GENERATOR_PREFLIGHT_ROLES)
+        assert refusals == []
+        assert any("routing.tiebreak" in line for line in warnings)
 
-    opened = cfg_with_split_pools(base, judge_context=131072, tiebreak_context=tiebreak_required)
-    assert preflight_messages(opened, GENERATOR_PREFLIGHT_ROLES) == ([], [])
+        opened = cfg_with_split_pools(
+            base, judge_context=131072, tiebreak_context=tiebreak_required
+        )
+        assert preflight_messages(opened, GENERATOR_PREFLIGHT_ROLES) == ([], [])
 
 
 def test_the_preflight_refuses_a_judge_slot_that_is_only_missing_a_key(cfg, monkeypatch):

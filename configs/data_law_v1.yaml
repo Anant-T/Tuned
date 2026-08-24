@@ -637,7 +637,7 @@ providers:
 # ever spent on rows nothing free can serve.
 #
 # What made it qualify, and the bar any replacement must clear:
-# max_context >= 29661. That is not a round number because it is not a
+# max_context >= 29708. That is not a round number because it is not a
 # preference - it is required_context(worst-case judge call), and the
 # preflight prints the same number it enforces. In practice that means a 32k
 # model. A 16k model is NOT enough - and that is worth saying because most
@@ -650,9 +650,15 @@ providers:
 # the judge is shown a subset of that plus its own rubric. Sized in the
 # ROUTING currency (providers.context_estimate: per-turn template overhead,
 # and Indic script at 1.5 chars/token rather than 4) the largest judge call
-# this build can produce is 23,729 tokens, and CONTEXT_SAFETY_MARGIN turns
-# that into 29,661 of declared window. Devanagari is what makes it large,
+# this build can produce is 23,767 tokens, and CONTEXT_SAFETY_MARGIN turns
+# that into 29,708 of declared window. Devanagari is what makes it large,
 # and this corpus is largely Devanagari.
+#
+# THIS NUMBER MOVED 29,661 -> 29,708 ON 2026-08-24 (judge-calibration Task 2),
+# when the grounding_faithfulness rubric's bands were split to stop band 2
+# swallowing band 3's territory - a prose-only change to judge_pointwise_v1
+# that lengthened its longest axis line. Nothing about the judge pool or the
+# length band moved; only the prompt got longer.
 #
 # What the fatal gap WAS, kept because any future edit to routing.judge can
 # re-open it. A long prompt is routed past the cerebras generator to
@@ -714,10 +720,14 @@ providers:
 #
 # IF IT COMES BACK - any edit to routing.tiebreak, or a model retirement -
 # closing it takes one more tiebreak in a family that is none of
-# gpt-oss/mistral/qwen/gemma, with max_context >= 29666. The five over
-# the judge threshold are real and not a typo: the tiebreak prompt is a
-# little longer than the judge prompt and the preflight sizes the two
-# separately, so 29,661 buys a judge and 29,666 buys a tiebreak.
+# gpt-oss/mistral/qwen/gemma, with max_context >= 29666. That number is
+# UNCHANGED since the judge threshold above moved: this file never touched
+# judge_tiebreak_v1, only judge_pointwise_v1. The two used to differ the
+# other way - the tiebreak prompt a few tokens longer than the judge prompt,
+# so 29,661 bought a judge and 29,666 a tiebreak - and the 2026-08-24
+# grounding-band split reversed which one leads: 29,708 now buys a judge and
+# 29,666 still buys a tiebreak, the preflight sizing the two separately
+# either way.
 #
 # NOT an option: letting a judge share the generator's family when the pool
 # runs out. Family separation is a data-quality invariant, not a preference.

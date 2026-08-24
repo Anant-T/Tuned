@@ -25,6 +25,7 @@ from pipeline_fakes import (  # noqa: E402
     cfg_with_two_generator_families,
     cfg_with_split_pools,
     cfg_without_the_paid_judges,
+    judge_prompt_overlay_with_pinned_tiebreak_gap,
 )
 
 from tuned.data.config import (  # noqa: E402
@@ -2139,7 +2140,9 @@ def test_the_advice_the_preflight_prints_is_the_threshold_it_enforces(cfg, keys)
     is a preflight that tells the operator to buy the wrong model - and the
     number is judge-only if the tiebreak is sized apart from it, so a model of
     exactly the advised size closed the judge gap and opened a tiebreak
-    warning."""
+    warning. Run under judge_prompt_overlay_with_pinned_tiebreak_gap so that
+    "the tiebreak is sized apart from it" is a fact this test controls rather
+    than one it reads off the shipped templates' incidental relative sizes."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
@@ -2149,27 +2152,30 @@ def test_the_advice_the_preflight_prints_is_the_threshold_it_enforces(cfg, keys)
     # needs a gap. It is also the honest fixture: this is the exact pool the
     # advice was designed against.
     cfg = cfg_without_the_free_tiebreak(cfg_with_two_generator_families(cfg))
-    gaps = pool_gaps(
-        cfg,
-        needed_tokens=worst_case_judge_tokens(cfg),
-        tiebreak_needed_tokens=worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID),
-        needed_for_window=judge_sizer(cfg),
-    )
-    advised = {int(g.detail.split("max_context >= ")[1].split()[0]) for g in gaps}
-    assert len(advised) == 1, "one gap, one number: the operator buys one model"
-    advice = advised.pop()
-
-    def remaining(max_context: int) -> list[PoolGap]:
-        patched = _with_fourth_judge(cfg, max_context=max_context)
-        return pool_gaps(
-            patched,
-            needed_tokens=worst_case_judge_tokens(patched),
-            tiebreak_needed_tokens=worst_case_judge_tokens(patched, prompt_id=TIEBREAK_PROMPT_ID),
-            needed_for_window=judge_sizer(patched),
+    with judge_prompt_overlay_with_pinned_tiebreak_gap():
+        gaps = pool_gaps(
+            cfg,
+            needed_tokens=worst_case_judge_tokens(cfg),
+            tiebreak_needed_tokens=worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID),
+            needed_for_window=judge_sizer(cfg),
         )
+        advised = {int(g.detail.split("max_context >= ")[1].split()[0]) for g in gaps}
+        assert len(advised) == 1, "one gap, one number: the operator buys one model"
+        advice = advised.pop()
 
-    assert remaining(advice) == []  # every gap, including the tiebreak warning
-    assert remaining(advice - 1) != []
+        def remaining(max_context: int) -> list[PoolGap]:
+            patched = _with_fourth_judge(cfg, max_context=max_context)
+            return pool_gaps(
+                patched,
+                needed_tokens=worst_case_judge_tokens(patched),
+                tiebreak_needed_tokens=worst_case_judge_tokens(
+                    patched, prompt_id=TIEBREAK_PROMPT_ID
+                ),
+                needed_for_window=judge_sizer(patched),
+            )
+
+        assert remaining(advice) == []  # every gap, including the tiebreak warning
+        assert remaining(advice - 1) != []
 
 
 def _advice(config, **kw):
@@ -2506,9 +2512,14 @@ def test_the_family_window_bound_never_sizes_above_the_flat_worst_case(cfg, keys
 
 def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     """`tiebreak_needed_tokens` defaults to the judge's number, and the two
-    prompts are not the same prompt. The difference is four tokens on this
-    config, so the only way to pin the plumbing is a model that sits between
-    them: it must clear the judge's requirement and fail the tiebreak's."""
+    prompts are not the same prompt. Pinned via
+    judge_prompt_overlay_with_pinned_tiebreak_gap rather than read off the
+    shipped templates: the gap used to be a four-token ACCIDENT of the
+    shipped prose, and splitting the grounding rubric's bands (2026-08-24
+    judge-calibration Task 2) permanently inverted it. With the gap pinned,
+    the only way to pin the plumbing is still a model that sits between the
+    two requirements: it must clear the judge's requirement and fail the
+    tiebreak's."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
@@ -2516,33 +2527,35 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     # 2026-08-19, so slot B fills at every size and the gap under test here
     # cannot occur. See cfg_without_the_promoted_judge.
     cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
-    judge_needed = worst_case_judge_tokens(cfg)
-    tiebreak_needed = worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
-    assert required_context(judge_needed) < required_context(tiebreak_needed)
+    with judge_prompt_overlay_with_pinned_tiebreak_gap():
+        judge_needed = worst_case_judge_tokens(cfg)
+        tiebreak_needed = worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
+        assert required_context(judge_needed) < required_context(tiebreak_needed)
 
-    patched = cfg_with_split_pools(
-        cfg, judge_context=131072, tiebreak_context=required_context(tiebreak_needed) - 1
-    )
-    sized = pool_gaps(
-        patched, needed_tokens=judge_needed, tiebreak_needed_tokens=tiebreak_needed
-    )
-    # Both generator families, because the paid backstop is spent on judge slot
-    # B for a mistral row and is therefore gone from its tiebreak too. What the
-    # test turns on is unchanged: every one of these flips on the four tokens
-    # between the judge prompt and the tiebreak prompt.
-    assert [(g.role, g.generator_family) for g in sized] == [
-        ("tiebreak", "gpt-oss"),
-        ("tiebreak", "secondgen"),
-    ]
-    # Sized by the JUDGE's number instead, that same model reads as big enough.
-    assert pool_gaps(patched, needed_tokens=judge_needed) == []
-    # ...and one token more really does close it.
-    opened = cfg_with_split_pools(
-        cfg, judge_context=131072, tiebreak_context=required_context(tiebreak_needed)
-    )
-    assert pool_gaps(
-        opened, needed_tokens=judge_needed, tiebreak_needed_tokens=tiebreak_needed
-    ) == []
+        patched = cfg_with_split_pools(
+            cfg, judge_context=131072, tiebreak_context=required_context(tiebreak_needed) - 1
+        )
+        sized = pool_gaps(
+            patched, needed_tokens=judge_needed, tiebreak_needed_tokens=tiebreak_needed
+        )
+        # Both generator families, because the paid backstop is spent on judge
+        # slot B for a mistral row and is therefore gone from its tiebreak too.
+        # What the test turns on is unchanged: every one of these flips on the
+        # pinned gap between the judge prompt and the tiebreak prompt.
+        assert [(g.role, g.generator_family) for g in sized] == [
+            ("tiebreak", "gpt-oss"),
+            ("tiebreak", "secondgen"),
+        ]
+        # Sized by the JUDGE's number instead, that same model reads as big
+        # enough.
+        assert pool_gaps(patched, needed_tokens=judge_needed) == []
+        # ...and one token more really does close it.
+        opened = cfg_with_split_pools(
+            cfg, judge_context=131072, tiebreak_context=required_context(tiebreak_needed)
+        )
+        assert pool_gaps(
+            opened, needed_tokens=judge_needed, tiebreak_needed_tokens=tiebreak_needed
+        ) == []
 
 
 def test_blocking_key_envs_names_only_keys_that_would_change_something(cfg, keys, monkeypatch):
