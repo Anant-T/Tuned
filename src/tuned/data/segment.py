@@ -85,6 +85,14 @@ otherwise look exactly like this module's idea of a new paragraph. The tail
 becomes its own segment (label "footnotes"), never dropped, never merged
 into the numbered body.
 
+That leaves the apparatus in ONE chunk while the citations to it are spread
+across all the others, which is a correctness problem for a teacher prompted
+with a closed world rather than a tidiness one - see the footnote-resolution
+section below, which parses the tail into {key: note} (parse_footnotes) and
+lets chunks.py append to each chunk the notes that chunk actually cites
+(resolve_footnotes). That pass is APPEND-ONLY: it never moves a boundary,
+because seed_ids are a hash of the boundaries.
+
 TIER PRECEDENCE IS ABOUT BOUNDARIES, NEVER ABOUT THE TOKEN BAND. A ToC
 section and a rhetorical role are both DOCUMENT-SCALE spans - one section of
 a real judgment ran to 23,560 tokens - so a tier that emitted them as
@@ -215,6 +223,177 @@ def _split_footnote_tail(text: str) -> tuple[str, int | None]:
             return "", 0
         return text, None
     return text[: match.start(1)], match.start(1)
+
+
+# --------------------------------------------------------------------------
+# Footnote resolution: the chunk that CITES a note carries the note.
+# --------------------------------------------------------------------------
+
+# WHY THIS EXISTS. extract.py hoists every footnote it finds to ONE
+# document-tail block (extract.py:1515) and _split_footnote_tail above makes
+# that block ONE segment, so chunks.py packs the whole apparatus into
+# whichever chunk the end of the document happens to fall in. Measured on
+# the staged corpus: 96.2% of inline footnote markers (1,909 of 1,984) point
+# at a block sitting in a DIFFERENT chunk, and 29.9% of chunks name a case
+# authority whose citation is physically elsewhere. The teacher is prompted
+# with a CLOSED WORLD - "answer only from the passage" - so an authority
+# whose citation was amputated by chunking reads to the judge as invented,
+# and one grounding-1 rationale says so in as many words.
+#
+# THE REPAIR IS APPEND-ONLY, AND THAT IS NOT A STYLE CHOICE. A chunk's
+# seed_id is a hash of "object_key:start:end" (chunks.py's chunk_id_for), and
+# a frozen control store holds a pre-registration keyed to the CURRENT ids.
+# Moving a boundary by one byte re-keys every chunk of that document and
+# orphans the tasks, generations and gold labels that point at the old ids.
+# So nothing here rewrites, reflows or relocates a byte: the notes a chunk
+# cites are rendered AFTER the chunk's own bytes, start/end untouched.
+
+FOOTNOTES_CITED_HEADING = "[FOOTNOTES CITED ABOVE]"
+
+# TWO MARKER SHAPES, because the corpus has two and only one of them is the
+# tidy one.
+#
+#   MARKDOWN   `[^3]` in the body, `[^3]: <note>` in the tail. Unambiguous,
+#              and the shape the repair was specified against - but MEASURED
+#              ABSENT from the S.C.R. corpus this pipeline actually builds
+#              from: 1 of 5,471 extracted files contains the sequence "[^"
+#              at all, and that one is incidental. Supported because it is
+#              the shape any future marker-preserving extractor would emit,
+#              and because it is what the tail parser writes back out.
+#   SUPERSCRIPT  what pdftotext leaves behind when a typeset superscript is
+#              flattened into the line: `... v. Union of India 12 , that a
+#              dedicated ...`. This is the ONLY shape the real corpus has,
+#              so a resolver that handled markdown alone would be a no-op on
+#              every document in the build.
+FOOTNOTE_MARKER = re.compile(r"\[\^([^\]]+)\]")
+
+# A flattened superscript: a capitalised word, ONE space, one to three
+# digits, and then whitespace or the punctuation that ends a clause. It is
+# deliberately narrow, because the shape it is trying to find is also the
+# shape of "Section 6", "3 and 5 May 2018" and "33.5 percent":
+#
+#   the digits must be a KEY of this document's own footnote block (the
+#     caller enforces that - a number no note answers to is not a marker),
+#   the preceding token must be a capitalised word (a case name's last word,
+#     the way every real marker in the sample attaches), never a digit and
+#     never a bare initial,
+#   a '.' immediately after the digits disqualifies the match, which is what
+#     separates a marker from a paragraph number ("J. 1. Leave granted") and
+#     from a date ("On 14.03.2019"),
+#   and the preceding token must not be one of the counter nouns, reporters,
+#     months and determiners below, which is what the remaining false
+#     positives all had in common.
+#
+# MEASURED, on 321 sampled documents carrying 2,696 parsed footnote keys:
+# 51.2% of keys are located inline (1,758 marker hits), and hand-scoring 30
+# random hits put precision near 87%. Both numbers are honest rather than
+# flattering - see the report for this task. The failure mode of a false
+# positive is mild and bounded: the chunk is appended a REAL citation from
+# THIS judgment's own footnote block that it may not have cited, never a
+# fabricated one, and never at the cost of a byte of judgment text.
+#
+# NO ORDERING RULE, deliberately. Real markers do ascend through a document,
+# and an ascending-run filter would raise precision - but that is exactly
+# the "strictly increasing" premise this module's own paragraph scanner
+# adopted, measured false on 5 of 15 documents, and had to replace (see the
+# module docstring). One number out of order early in the file would park
+# the rule and reject every genuine marker after it. Not repeated here.
+_SUPERSCRIPT_MARKER = re.compile(
+    r"(?<![\w\d.])([A-Z][A-Za-z’'\-]*[A-Za-z]\.?) (\d{1,3})(?=[\s,;:)\]]|$)"
+)
+
+# Words that take a number after them for reasons that are not a footnote.
+# Every entry earned its place by appearing in a hand-scored false positive:
+# counter nouns ("Section 6"), law-report abbreviations ("(2001) 1 SCC 4"),
+# months ("July 15, 1972"), determiners ("The 6 th ACJM") and the units a
+# judgment enumerates ("Bruise 6 x 1 cm").
+_NOT_A_MARKER = frozenset(
+    """
+    section sections article articles rule rules order orders no nos para paras
+    paragraph paragraphs clause clauses item items part parts schedule chapter
+    chapters entry entries list form forms table tables volume vol vols vo page
+    pages act annexure annexures annex appendix exhibit exhibits ext ground
+    grounds issue issues appeal appeals petition petitions case cases explanation
+    explanations illustration proviso note notes figure rs serial column point
+    phase stage step type category class grade regulation regulations heading
+    headings direction directions sub-section subsection unit units
+    on dated from to and or of in at by for under vide witness question answer
+    chart the a an this that these those
+    scc scr air supp all cal mad bom del ker guj ori raj mlj nswlr wlr qb ac ch
+    kb er ltd p pp pt sr ed edn ors anr etc supra ibid id
+    accused respondent respondents appellant appellants defendant plaintiff
+    bruise bruises injury injuries wound wounds
+    january february march april may june july august september october november
+    december jan feb mar apr jun jul aug sep sept oct nov dec
+    """.split()
+)
+
+# `[^3]: <note>` and `3 <note>` / `3. <note>` - the two definition shapes,
+# matching the two marker shapes above. The numbered one is what extract.py
+# actually writes, because it hoists the footnote LINES verbatim and a
+# typeset footnote opens with its own number.
+_FOOTNOTE_DEF_MARKDOWN = re.compile(r"^[ \t]{0,3}\[\^([^\]]+)\]:[ \t]*(\S.*)$")
+_FOOTNOTE_DEF_NUMBERED = re.compile(r"^[ \t]{0,3}(\d{1,3})[.)]?[ \t]+(\S.*)$")
+
+
+def parse_footnotes(text: str) -> dict[str, str]:
+    """The document-tail `[FOOTNOTES]` block as {key: note text}.
+
+    `{}` when the document has no tail at all, which is the common case and
+    the one that makes resolution a total no-op rather than a special case
+    the callers have to branch on.
+
+    FIRST DEFINITION WINS for a repeated key. A footnote block that names
+    the same number twice is a page-numbering artefact of the reprint (two
+    pages each restarting their notes at 1), and the first is the one the
+    earliest citation in the document meant.
+    """
+    _body, footnote_start = _split_footnote_tail(text)
+    if footnote_start is None:
+        return {}
+    notes: dict[str, str] = {}
+    # [1:] skips the `[FOOTNOTES]` heading line itself.
+    for line in text[footnote_start:].splitlines()[1:]:
+        match = _FOOTNOTE_DEF_MARKDOWN.match(line) or _FOOTNOTE_DEF_NUMBERED.match(line)
+        if match:
+            notes.setdefault(match.group(1), match.group(2).strip())
+    return notes
+
+
+def cited_footnotes(text: str, footnotes: dict[str, str]) -> list[str]:
+    """Keys of `footnotes` that `text` actually cites, in first-citation
+    order - both marker shapes, merged by POSITION so the order is the
+    document's and not the order the two regexes happened to run in."""
+    hits: list[tuple[int, str]] = [
+        (match.start(), match.group(1)) for match in FOOTNOTE_MARKER.finditer(text)
+    ]
+    for match in _SUPERSCRIPT_MARKER.finditer(text):
+        if match.group(1).lower().rstrip(".") in _NOT_A_MARKER:
+            continue
+        hits.append((match.start(2), match.group(2)))
+    hits.sort()
+    return [key for key in dict.fromkeys(key for _at, key in hits) if key in footnotes]
+
+
+def resolve_footnotes(text: str, footnotes: dict[str, str]) -> str:
+    """Append the footnotes this text cites, so the chunk is self-contained.
+
+    Boundaries are NOT touched: seed_id hashes object_key:start:end, and a
+    frozen pre-registration is keyed to the current ids. The return value is
+    always `text` plus a suffix, never a rewrite of it, so
+    `resolve_footnotes(t, f).startswith(t)` holds for every input - the
+    property chunks.py's byte-for-byte reconstruction rests on.
+
+    Rendered in the MARKDOWN shape whatever shape the citation was found in,
+    because the block is being written for a reader (the teacher model) and
+    `[^3]: <authority>` says "this is note 3" where a bare leading `3` in a
+    corpus full of numbered paragraphs does not.
+    """
+    cited = cited_footnotes(text, footnotes)
+    if not cited:
+        return text
+    lines = "\n".join(f"[^{key}]: {footnotes[key]}" for key in cited)
+    return f"{text}\n\n{FOOTNOTES_CITED_HEADING}\n{lines}\n"
 
 
 # --------------------------------------------------------------------------
