@@ -54,7 +54,7 @@ def test_allocate_parts_sum_to_n():
 
 def test_allocate_follows_the_weights():
     counts = allocate(SYNTHESIS_MIX, 100)
-    assert counts == {"irac_analysis": 40, "statute_qa": 25, "drafting": 18, "summarization": 17}
+    assert counts == {"irac_analysis": 40, "statute_qa": 25, "summarization": 35}
 
 
 def test_allocate_is_independent_of_dict_order():
@@ -81,6 +81,20 @@ def test_default_mix_per_stream():
     assert default_mix("transition") == {"transition": 1.0}
     with pytest.raises(KeyError):
         default_mix("replay")
+
+
+def test_drafting_is_parked_and_mix_still_sums_to_one():
+    """Drafting is parked until its seeds carry the fields it needs.
+
+    document_kind / party_context / focus_issue / question are empty on all
+    60,603 seeds, so a drafting prompt renders placeholders against a
+    judgment that already disposed of the matter. 66,666 tok/accepted row
+    against summarization's 18,028. Park, do not delete: the retarget to a
+    downstream instrument has a 14,225-seed eligible pool.
+    """
+    assert SYNTHESIS_MIX["drafting"] == 0.0
+    assert abs(sum(SYNTHESIS_MIX.values()) - 1.0) < 1e-9
+    assert set(SYNTHESIS_MIX) == {"irac_analysis", "statute_qa", "drafting", "summarization"}
 
 
 def test_parse_mix():

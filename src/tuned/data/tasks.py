@@ -73,11 +73,20 @@ TASK_ID_LEN = 16
 # synthesis: the pilot mix from the plan - IRAC analysis carries the stream,
 # statute_qa is the construction workhorse, drafting and summarization keep
 # the dataset from being one task in four costumes.
+#
+# drafting is PARKED at 0.0, not removed (2026-08-24). Every drafting prompt
+# renders placeholder slots - document_kind / party_context / focus_issue /
+# question are empty on all 60,603 seeds - so the teacher is asked to draft
+# for "the party whose papers these are" against a judgment that already
+# disposed of the matter. 4/20 accepts vs summarization's 13/20 (p=0.0095)
+# and 66,666 tok per accepted row vs 18,028. Its 0.18 goes to summarization,
+# the cheapest converter. Restore it when seeds carry the fields, or when the
+# stream is retargeted as a downstream instrument (~14,225 eligible seeds).
 SYNTHESIS_MIX = {
     "irac_analysis": 0.40,
     "statute_qa": 0.25,
-    "drafting": 0.18,
-    "summarization": 0.17,
+    "drafting": 0.00,
+    "summarization": 0.35,
 }
 
 # curated_c2 is the teacher-REWRITE slice (PredEx-style rows re-expressed as
