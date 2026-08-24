@@ -68,7 +68,7 @@ EXPECTED_SHAS = {
     'gen_summarization_v2': '651dca540f34',
     'gen_transition_v1': '113813116cfb',
     'gen_transition_v2': '2f28a53e5259',
-    'judge_pointwise_v1': '591d080c5b77',
+    'judge_pointwise_v1': 'cd552205602e',
     'judge_tiebreak_v1': 'a34456f4918b',
     'probe_answer_v1': '8370e47920ee',
 }
@@ -204,6 +204,12 @@ _NUMBERED_OUTLINE_RE = re.compile(r"^[ \t]*(?:step[ \t]*)?\d+[.)]", re.IGNORECAS
 # Anything a judge must not be told. It scores what is in front of it; a hint
 # that a known-good outcome exists turns the rubric into a matching exercise.
 JUDGE_LEAKS = ("correct answer", "gold", "expected outcome")
+
+# The two prompt roots the grounding-band test below reads directly (not
+# through the registry, since it inspects source text rather than rendered
+# output).
+PROMPTS = reg.PROMPTS_DIR
+HARMONY = Path(__file__).parent.parent / "src" / "tuned" / "data" / "prompts_harmony"
 
 
 def _slot_values(prompt_id: str) -> dict:
@@ -621,6 +627,28 @@ def test_tiebreak_arbitrates_blind():
     assert "split the difference" in rendered
 
 
+def test_grounding_bands_are_mutually_exclusive():
+    """Band 2 must not claim the territory band 3 describes.
+
+    Band 2 read "provision, case or rule that is not in the materials" while
+    band 3 read "at least one proposition of substance rests on nothing
+    given" — the same event. Band 2 is the only band that hard-fails
+    (judge_policy.FAIL_MAX = 2), so the collision funnelled 41 of 101
+    judgements into a failing band. Band 2 must now require a MISSTATEMENT,
+    not mere absence.
+    """
+    for root in (PROMPTS, HARMONY):
+        text = (root / "judge_pointwise_v1.md").read_text(encoding="utf-8")
+        line = next(ln for ln in text.splitlines() if ln.startswith("grounding_faithfulness"))
+        band2 = line.split("2:")[1].split("1:")[0]
+        assert "misstates" in band2 or "contradict" in band2, (
+            "band 2 must turn on misstatement, not absence"
+        )
+        assert "or rule that is not in the materials" not in band2, (
+            "band 2 still swallows band 3's territory"
+        )
+
+
 # --------------------------------------------------------------------------
 # Probe template.
 # --------------------------------------------------------------------------
@@ -794,7 +822,7 @@ _EXPECTED_OVERLAY_SHAS = {
     "gen_summarization_v2": "84e8a00c5425",
     "gen_transition_v1": "717e0c99aea7",
     "gen_transition_v2": "73a97936afa1",
-    "judge_pointwise_v1": "e2798dd5c81c",
+    "judge_pointwise_v1": "dec02ad95f7b",
     "judge_tiebreak_v1": "09100c3f704f",
 }
 

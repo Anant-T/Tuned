@@ -585,7 +585,7 @@ EXPECTED_OVERLAY_SHAS = {
 # saturated the tiebreak arbiter to 18/18 accepts. judge_pointwise_v1 is
 # unaffected and keeps dropping its example verdict.
 EXPECTED_OVERLAY_JUDGE_SHAS = {
-    "judge_pointwise_v1": "e2798dd5c81c",
+    "judge_pointwise_v1": "dec02ad95f7b",
     "judge_tiebreak_v1": "09100c3f704f",
 }
 
