@@ -775,6 +775,10 @@ def test_live_judge_sha_stays_put_when_recovery_overlay_is_armed():
 
 _PACKET_MARKERS = ("450 to 700 words", "Let me check this, or actually")
 
+# RE-PINNED 2026-08-24 (task 1, judge calibration): judge_tiebreak_v1 overlay
+# had its worked exemplar (validity 2) restored - the earlier removal is what
+# saturated the tiebreak arbiter to 18/18 accepts. judge_pointwise_v1 is
+# unaffected and keeps dropping its example verdict.
 _EXPECTED_OVERLAY_SHAS = {
     "gen_drafting_v1": "609834efa759",
     "gen_drafting_v2": "ea66b7bba577",
@@ -791,7 +795,7 @@ _EXPECTED_OVERLAY_SHAS = {
     "gen_transition_v1": "717e0c99aea7",
     "gen_transition_v2": "73a97936afa1",
     "judge_pointwise_v1": "e2798dd5c81c",
-    "judge_tiebreak_v1": "85a0c7f8da47",
+    "judge_tiebreak_v1": "09100c3f704f",
 }
 
 
@@ -856,8 +860,26 @@ def test_the_packet_is_in_every_base_and_in_no_generator_overlay():
             )
 
 
+def test_tiebreak_templates_carry_a_low_score_anchor():
+    """Both tiebreak overlays must show the model a failing exemplar.
+
+    Removing the worked example that contained `"validity": 2` saturated
+    mistral-large to 18/18 accepts at validity 5.00, against 2.75 for the
+    same model in the same seat on the frozen store. An arbiter that has
+    never seen a low score does not produce one.
+    """
+    for root in (reg.PROMPTS_DIR, _OVERLAY_DIR):
+        text = (root / "judge_tiebreak_v1.md").read_text(encoding="utf-8")
+        scores = [int(n) for n in re.findall(r'"(?:grounding|validity|coverage)":\s*(\d)', text)]
+        assert scores, f"{root.name}: tiebreak template has no exemplar verdict at all"
+        assert min(scores) <= 2, (
+            f"{root.name}: lowest exemplar score is {min(scores)}; "
+            "the arbiter needs a failing anchor or it saturates upward"
+        )
+
+
 def test_judge_overlays_drop_the_example_verdict():
-    for prompt_id in JUDGE_IDS:
+    for prompt_id in ("judge_pointwise_v1",):
         base = (reg.PROMPTS_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
         over = (_OVERLAY_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
         assert '"grounding": 4' in base
