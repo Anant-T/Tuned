@@ -2827,8 +2827,12 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
 
     Two numbers, not one, and the difference is easy to get wrong. Both
     thresholds are quoted: the judge's is the bar any replacement judge must
-    clear, and the tiebreak's is a little higher because its prompt is longer
-    and the preflight sizes the two separately.
+    clear, and the tiebreak's is the bar any replacement tiebreak must clear.
+    Which one is larger is NOT a design requirement, only a fact about which
+    of the two prompts currently renders longer - the preflight sizes the two
+    separately regardless of which way that falls, and a prompt edit to
+    either template can flip it (judge-calibration Task 2, 2026-08-24, did
+    exactly that).
 
     THE GENERATOR NUMBERS ARE THE 2026-08-19 CORRECTION, and they are pinned
     here because this test is the only thing standing between that block and
@@ -2880,21 +2884,38 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
     assert f"max_context >= {required}" in text
     assert f"{required:,}" in text
     # The tiebreak threshold is no longer ADVISED, but the block still has to
-    # quote it: it is the bar a tiebreak replacement must clear, and it is the
-    # larger of the two because the tiebreak prompt is longer than the judge's.
+    # quote it: it is the bar a tiebreak replacement must clear. It is NOT
+    # reliably the larger of the two - that used to be true because the
+    # tiebreak prompt rendered longer, but judge-calibration Task 2
+    # (2026-08-24) split the grounding_faithfulness rubric's bands so that
+    # absence of authority scores 3 and misstatement scores 2, which
+    # lengthened judge_pointwise_v1 past judge_tiebreak_v1 and made the JUDGE
+    # threshold the larger one instead. That was a deliberate consequence of
+    # the rubric edit, not drift, and it is exactly the kind of thing a future
+    # prompt edit can flip again - so this only asserts the two numbers are
+    # DIFFERENT, never which one leads.
     tiebreak_required = required_context(
         worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
     )
-    assert tiebreak_required > judge_required
+    assert tiebreak_required != judge_required
     assert f"max_context >= {tiebreak_required}" in text
     assert f"{tiebreak_required:,}" in text
     # ...and it really is what a TIEBREAK gap prints, not just a number in the
     # block: take mistral-large-latest back out of the tiebreak seat and the
-    # preflight asks for exactly this.
+    # preflight asks for exactly what pool_gaps computes. That is NOT always
+    # tiebreak_required in isolation - pool_gaps' own floor rule ("never falls
+    # below required_context(needed_tokens)", i.e. the judge's flat number)
+    # means a tiebreak-only gap is advised at max(judge_required,
+    # tiebreak_required). Today that floor is judge_required (29,708 >
+    # 29,666), so the number actually printed is the judge's, not the
+    # tiebreak's own - the same rubric-split consequence as above, not a
+    # second bug. The invariant this line checks - the preflight prints
+    # exactly what the config block claims - holds regardless of which of the
+    # two is larger.
     _, tiebreak_warnings = preflight_messages(
         cfg_without_the_free_tiebreak(cfg), ("generator",)
     )
-    assert advice_from(tiebreak_warnings) == tiebreak_required
+    assert advice_from(tiebreak_warnings) == max(judge_required, tiebreak_required)
 
     # --- the generator cliffs, both of them ---------------------------------
     reply = max_output_tokens(cfg)
