@@ -816,7 +816,10 @@ def test_recovery_refuses_canonical_aliases_of_the_live_control(tmp_path, workdi
         load_build_config(_write(tmp_path, _recovery_on(workdir)), allow_unpinned=True)
 
 
-@pytest.mark.parametrize("workdir", ["data/build/exp_recovery", "data/build/exp_harmony"])
+@pytest.mark.parametrize(
+    "workdir",
+    ["data/build/exp_recovery", "data/build/exp_harmony", "data/build/exp_s1"],
+)
 def test_isolated_experiment_siblings_are_not_treated_as_live_control(
     tmp_path, workdir
 ):
