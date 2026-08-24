@@ -580,9 +580,13 @@ EXPECTED_OVERLAY_SHAS = {
     "gen_transition_v1": "717e0c99aea7",
     "gen_transition_v2": "73a97936afa1",
 }
+# RE-PINNED 2026-08-24 (task 1, judge calibration): judge_tiebreak_v1 overlay
+# had its worked exemplar (validity 2) restored - the earlier removal is what
+# saturated the tiebreak arbiter to 18/18 accepts. judge_pointwise_v1 is
+# unaffected and keeps dropping its example verdict.
 EXPECTED_OVERLAY_JUDGE_SHAS = {
     "judge_pointwise_v1": "e2798dd5c81c",
-    "judge_tiebreak_v1": "85a0c7f8da47",
+    "judge_tiebreak_v1": "09100c3f704f",
 }
 
 
@@ -719,7 +723,24 @@ COPYABLE_SCORE_OBJECT = (
 )
 
 
-def test_recovery_judge_overlay_has_no_copyable_score_exemplar():
+def test_recovery_judge_overlay_drops_the_exemplar_except_on_the_repaired_tiebreak():
+    """judge_pointwise_v1 stays exemplar-free; judge_tiebreak_v1 no longer does.
+
+    The four exemplar assertions below (COPYABLE_SCORE_OBJECT, "4/2/3",
+    '"grounding": 4', '"validity": 2', '"coverage": 3') encode only the
+    anti-anchoring intent behind the original overlay change, not a safety
+    property - and measurement showed that intent backfired for the
+    tiebreak specifically. Removing its sole low-scoring exemplar saturated
+    mistral-large to 18/18 accepts at validity 5.00, against 2.75 for the
+    same model in the same seat on the frozen store (cross-arm inflation:
+    mistral +2.25, gemma +0.88, qwen +0.22). Task 1 of the 2026-08-24 judge
+    calibration plan restored a low-scoring exemplar (validity 2) to the
+    tiebreak overlay on purpose, with the anti-copying warning kept
+    alongside it, so the tiebreak is deliberately exempt from the exemplar
+    ban below. judge_pointwise_v1 was never shown to have this failure mode
+    and keeps the original no-exemplar contract, including these four
+    checks and every other assertion in this loop.
+    """
     import re
 
     from test_build_prompts import EXPECTED_SHAS, JUDGE_LEAKS
@@ -728,11 +749,12 @@ def test_recovery_judge_overlay_has_no_copyable_score_exemplar():
         path = OVERLAY_DIR / f"{prompt_id}.md"
         assert path.is_file(), path
         raw = path.read_text(encoding="utf-8")
-        assert re.search(COPYABLE_SCORE_OBJECT, raw) is None, prompt_id
-        assert "4/2/3" not in raw
-        assert '"grounding": 4' not in raw
-        assert '"validity": 2' not in raw
-        assert '"coverage": 3' not in raw
+        if prompt_id == "judge_pointwise_v1":
+            assert re.search(COPYABLE_SCORE_OBJECT, raw) is None, prompt_id
+            assert "4/2/3" not in raw
+            assert '"grounding": 4' not in raw
+            assert '"validity": 2' not in raw
+            assert '"coverage": 3' not in raw
         lowered = raw.lower()
         for leak in JUDGE_LEAKS:
             assert leak not in lowered, (prompt_id, leak)
