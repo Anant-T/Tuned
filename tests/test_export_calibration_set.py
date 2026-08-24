@@ -14,12 +14,24 @@ from scripts.export_calibration_set import build_rows
 
 def _make_fake_store():
     """An in-memory store shaped like the real one, with a judge rationale on
-    every row - the assertions below prove build_rows never carries it out."""
+    every row - the assertions below prove build_rows never carries it out.
+
+    task.prompt_id points at real generator templates (gen_summarization_v1,
+    gen_drafting_v1, gen_irac_analysis_v2) rather than a fabricated overlay,
+    so build_rows exercises the real generate.build_slots + prompt_registry
+    render path end to end. Their SHAs are pinned by test_build_prompts.py,
+    so depending on their existence (never their exact wording) is safe.
+    """
     conn = sqlite3.connect(":memory:")
     conn.executescript(
         """
-        create table seed (seed_id text primary key, text text);
-        create table task (task_id text primary key, seed_id text, task_type text, state text);
+        create table seed (
+            seed_id text primary key, text text, case_type text, meta_json text
+        );
+        create table task (
+            task_id text primary key, seed_id text, task_type text, state text,
+            prompt_id text
+        );
         create table generation (
             gen_id integer primary key, task_id text, think text, answer text
         );
@@ -29,18 +41,19 @@ def _make_fake_store():
         """
     )
     conn.executemany(
-        "insert into seed (seed_id, text) values (?, ?)",
+        "insert into seed (seed_id, text, case_type, meta_json) values (?, ?, ?, ?)",
         [
-            ("seed-1", "Facts of the first matter."),
-            ("seed-2", "Facts of the second matter."),
+            ("seed-1", "Facts of the first matter.", "civil", None),
+            ("seed-2", "Facts of the second matter.", None, None),
         ],
     )
     conn.executemany(
-        "insert into task (task_id, seed_id, task_type, state) values (?, ?, ?, ?)",
+        "insert into task (task_id, seed_id, task_type, state, prompt_id) "
+        "values (?, ?, ?, ?, ?)",
         [
-            ("task-1", "seed-1", "issue_spotting", "done"),
-            ("task-2", "seed-2", "statute_lookup", "done"),
-            ("task-3", "seed-1", "issue_spotting", "done"),
+            ("task-1", "seed-1", "summarization", "done", "gen_summarization_v1"),
+            ("task-2", "seed-2", "drafting", "done", "gen_drafting_v1"),
+            ("task-3", "seed-1", "irac_analysis", "done", "gen_irac_analysis_v2"),
         ],
     )
     conn.executemany(
@@ -83,3 +96,20 @@ def test_export_withholds_judge_rationales_and_leaves_labels_empty():
         blob = json.dumps(row)
         assert "rationale" not in blob
         assert "grounding" not in blob
+
+
+def test_task_instruction_is_the_real_ask_not_task_type_again():
+    """task_instruction must carry the generator's rendered instruction.
+
+    A fix-round finding: the field used to be set to task[0] (task_type),
+    so it carried zero information beyond the column already next to it.
+    This pins the fix - the instruction must differ from task_type, must be
+    non-empty, and must not just be a second copy of seed_text (the point
+    is the ask, not the materials, which are already their own key).
+    """
+    rows = build_rows(FAKE_STORE, limit=40)
+    assert rows
+    for row in rows:
+        assert row["task_instruction"] != row["task_type"]
+        assert row["task_instruction"].strip() != ""
+        assert row["seed_text"] not in row["task_instruction"]
