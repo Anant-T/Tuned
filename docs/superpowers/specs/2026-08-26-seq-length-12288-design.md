@@ -75,14 +75,28 @@ This is the single largest false-green risk in the change. `probe.py`'s own docs
 
 ## Gate plan
 
-**PROBE -> SAVETEST.** Not the full four-gate ladder.
+**One session, clearing PROBE and SAVETEST together.** Not the full four-gate ladder, and not two sessions.
 
 PROBE is the only run that measures anything new — it is the only one fed rows that reach 12,288. SMOKE runs `data/smoke_v1.jsonl`, whose rows top out well under 8192; at a 12,288 cap it exercises a byte-identical memory shape to the qualified 8192 SMOKE and would spend ~1.2 h of quota to reproduce known numbers. RESUME exercises scheduler and scaler restoration, neither of which this change touches.
 
+SAVETEST proves the checkpoint push path, which does not depend on row length — so it can ride along on the probe dataset instead of costing a second model load. Merge the two `ARGS` entries into one:
+
+```
+"PROBE": ["--max-steps", "2", "--save-steps", "1",
+          "--dataset", "data/probe_long.jsonl"]
+         + (["--max-seq-length", str(PROBE_SEQ)] if PROBE_SEQ else []),
+```
+
+`--no-hub` is dropped so the run pushes. This additionally proves a checkpoint push succeeds *at the new sequence length*, which the split plan never tested.
+
+**Precondition: the staged-model input must be attached.** `stage_model.ipynb`'s output mounted under `/kaggle/input/.../qwen3-8b-staged/` is auto-detected via `TUNED_MODEL_PATH` and skips the ~7 GB hub download. Wall clock here is dominated by model load, not by stepping — 2 steps at ga=2 is ~4 micro-batches, roughly 4 minutes.
+
 | gate | green means |
 |---|---|
-| PROBE (`PROBE_SEQ=12288`, 2 steps, no Hub) | finite loss; `peak_vram_reserved_gb_dev0/1` below 13.5 GiB with >= 1 GiB margin on the worst rank; `label_coverage=` nonzero. `eos_in_labels=` near-zero is the expected artifact of truncating probe rows (`sft.py:150`), not a failure. |
-| SAVETEST (4 steps) | `last-checkpoint/` visible in the checkpoint repo. |
+| ceiling (`PROBE_SEQ=12288`) | finite loss; `peak_vram_reserved_gb_dev0/1` below 13.5 GiB with >= 1 GiB margin on the worst rank; `label_coverage=` nonzero. `eos_in_labels=` near-zero is the expected artifact of truncating probe rows (`sft.py:150`), not a failure. |
+| save path (same run) | `last-checkpoint/` visible in the checkpoint repo. |
+
+**Rejected: probing at `ga=1`.** Halving the micro-batches would save ~2 minutes and cost measurement fidelity. Under `ga=2`, micro-batch 2's forward runs while micro-batch 1's LoRA gradients are still resident; under `ga=1` with `set_to_none` they are freed first, so the measured ceiling comes in ~0.15 GiB low — about 15% of the margin being gated on. Keep `ga=2`; do not add a `--gradient-accumulation-steps` override for this.
 
 Before any MAIN run: the 2-step `--no-hub` probe on the real dataset, confirming `post_filter_rows=` is **unchanged**. `config.py:987` feeds `train.main.max_seq_length` into `assemble.py`'s drop gate, so this change does relax that cap to 12,288 — but the 24,000-char proxy in `curated.py` clips first, so the corpus is expected to be identical. If `post_filter_rows` moves, `max_steps` must be re-derived and committed before MAIN; `check_resume_schedule` freezes it, and a mid-stream change breaks resume.
 
@@ -100,8 +114,8 @@ Stated explicitly so they are not re-investigated:
 
 1. Both `max_seq_length` fields read `12288`; no other config field changed.
 2. `data/probe_long.jsonl` rebuilt at `--target-tokens 12288`.
-3. PROBE green at `PROBE_SEQ=12288`: finite loss, worst-rank reserved peak below 13.5 GiB with >= 1 GiB margin, `label_coverage=` nonzero.
-4. SAVETEST green: checkpoint visible in the Hub repo.
+3. Merged gate green at `PROBE_SEQ=12288` in a single session: finite loss, worst-rank reserved peak below 13.5 GiB with >= 1 GiB margin, `label_coverage=` nonzero, and `last-checkpoint/` visible in the Hub repo.
+4. The `PROBE` `ARGS` entry carries `--save-steps 1` and no longer carries `--no-hub`; `SAVETEST` is retired as a separate mode.
 5. `_ReservedCeiling` checks every step; docstring reflects the variable-bucket rationale.
 6. Both remediation-ladder strings include the `seq 8192` rung.
 7. `post_filter_rows=` verified unchanged on the real dataset before MAIN.
