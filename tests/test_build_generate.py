@@ -2,6 +2,9 @@ import asyncio
 import json
 
 import pytest
+
+httpx = pytest.importorskip("httpx")
+
 from pipeline_fakes import (
     CLEAN_ANSWER,
     DATA_CONFIG,
@@ -74,6 +77,7 @@ from tuned.data.providers import (
     QUOTA_OBSERVATION_TTL_S,
     ProviderError,
     QuotaLedger,
+    Router,
     parse_quota_headers,
     required_context,
 )
@@ -1121,6 +1125,79 @@ def test_provider_failure_returns_the_task_to_the_queue(tmp_path, cfg, paths):
         assert task["state"] == "pending"
         assert store.usage_today("cerebras", "gpt-oss-120b")["errors_429"] == 1
         assert store.events("generation_error")
+
+
+def test_bais_truncated_empty_reply_returns_the_task_to_the_queue(
+    tmp_path, cfg, paths, monkeypatch
+):
+    """PIPELINE-LEVEL, through the REAL bai quirk - not FakeRouter (which
+    never touches providers.py) and not a manufactured ProviderError (which
+    only proves generate_once reacts correctly to SOME retryable error, not
+    that bai's own hook actually produces one).
+
+    bai answers 100% of production generations since 2026-08-25, and until
+    now nothing above the ChatClient layer exercised what happens when
+    _bai_response_hook's retryable ProviderError reaches generate_once (see
+    test_bai_quirk_rejects_the_truncated_empty_reply in
+    test_build_providers.py for the ChatClient-only version). deepseek-v4-flash
+    bills reasoning against max_tokens and emits it FIRST, so a call whose
+    budget runs out mid-thought returns a well-formed HTTP 200 with an empty
+    content string and finish_reason="length" - measured empty on every
+    observed call that shape, at every budget from 256 to 32768.
+
+    The three things that must all be true together: the row goes back to
+    `pending` (retryable, not a row-shaped park and not `rejected`), the
+    attempt is ledgered under bai even though the call raised (on_attempt
+    fires before the response hook runs), and the fact recorded is
+    `provider_fault`, not `unroutable` or a skip.
+    """
+    monkeypatch.setenv("BAI_API_KEY", "sk-test")
+    # cerebras/lightning stay unkeyed so bai's failure is the whole story -
+    # nothing else in the pool is eligible to fail over to, which is what
+    # forces the fleet-wide provider-fault path rather than a quiet divert.
+    monkeypatch.delenv("CEREBRAS_API_KEY", raising=False)
+    monkeypatch.delenv("LIGHTNING_API_KEY", raising=False)
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "weighing the section...",
+                        },
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 4096,
+                    "total_tokens": 4107,
+                },
+            },
+        )
+
+    router = Router(cfg, transport=httpx.MockTransport(handler))
+    with make_store(tmp_path) as store:
+        totals = run(store, cfg, router, paths)
+        assert totals["errors"] == 1
+        assert totals["gen_ok"] == 0
+        task = only_task(store)
+        assert task["state"] == "pending"
+        # Ledgered even though the call raised.
+        used = store.usage_today("bai", "deepseek-v4-flash")
+        assert used["requests"] == 1
+        assert used["errors_429"] == 0
+        event = json.loads(store.events("generation_error")[0]["detail_json"])
+        assert event["retryable"] is True
+        assert event["unroutable"] is False
+        assert event["provider_fault"] is True
+        assert event["skipped"] == []
 
 
 def test_a_fleet_wide_provider_fault_parks_instead_of_rejecting(tmp_path, cfg, paths):
