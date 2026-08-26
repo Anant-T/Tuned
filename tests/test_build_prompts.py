@@ -53,21 +53,27 @@ from tuned.data.gates import BANNED_META, VERIFICATION_CUES, _norm_ws
 # floor was raised off think_min, and the IRAC prohibition was sharpened to the
 # line-initial shape the gate actually matches. No metric computed under the
 # old shas describes these prompts.
+#
+# RE-PINNED 2026-08-27 (generator reasoning ceiling). Every gen_* template
+# changed on one line: the clause licensing the reasoning to run as long as
+# it liked was deleted, and the 450-700 band was given an explicit upper
+# stop. Nothing else moved. No metric computed under the old shas describes
+# these prompts.
 EXPECTED_SHAS = {
-    'gen_drafting_v1': '48534e3010f5',
-    'gen_drafting_v2': '618b240ab03e',
-    'gen_irac_analysis_v1': '97185cd2068e',
-    'gen_irac_analysis_v2': 'b43d2e4afa38',
-    'gen_irac_analysis_v3': '09e8c6ffaf80',
-    'gen_irac_analysis_v4': '509cbb93c08c',
-    'gen_statute_qa_v1': '94e43b22bf48',
-    'gen_statute_qa_v2': '4d04338ba007',
-    'gen_statute_qa_v3': '5888a6c4461d',
-    'gen_statute_qa_v4': '713a9060835e',
-    'gen_summarization_v1': 'a0f723fb731e',
-    'gen_summarization_v2': '651dca540f34',
-    'gen_transition_v1': '113813116cfb',
-    'gen_transition_v2': '2f28a53e5259',
+    'gen_drafting_v1': '81c32d92dc4e',
+    'gen_drafting_v2': 'ce93f92f0407',
+    'gen_irac_analysis_v1': 'e5be81e7722b',
+    'gen_irac_analysis_v2': 'f8cc2833f697',
+    'gen_irac_analysis_v3': '63b7780879f2',
+    'gen_irac_analysis_v4': '2a45e85db800',
+    'gen_statute_qa_v1': 'cc51aafecf90',
+    'gen_statute_qa_v2': 'c4fbc1ecd5ca',
+    'gen_statute_qa_v3': '26ffcf6e5cfa',
+    'gen_statute_qa_v4': '1c10b3fcecb5',
+    'gen_summarization_v1': 'cff4bd7f2f61',
+    'gen_summarization_v2': '8ec09bd8abed',
+    'gen_transition_v1': '1228ef95517a',
+    'gen_transition_v2': '7e941b37e54e',
     'judge_pointwise_v1': 'cd552205602e',
     'judge_tiebreak_v1': 'a34456f4918b',
     'probe_answer_v1': '8370e47920ee',
@@ -147,7 +153,17 @@ ANSWER_LENGTH_CLAUSE = "250 to 450 words"
 # ~725-1,125 est tokens: clear of think_min 500 and clear of think_max 3,000.
 # The band VALUES are untouched - this moves the instruction onto the band, not
 # the band onto the instruction.
-REASONING_FLOOR_CLAUSE = "450 to 700 words of deliberation is normal"
+#
+# CEILING ADDED 2026-08-27, and the constant trimmed to match. The floor
+# alone was only half a band: each template capped the reasoning here and
+# then, in the same sentence, licensed it to run as long as the matter
+# needed. gpt-oss obeyed the cap; deepseek-v4-flash obeyed the licence and
+# wrote a median 1,727 words, which is ~80% of all gate failures. The
+# licence is gone and every template now names 700 as a stop, in its own
+# wording - so the shared literal ends at `deliberation` and the trailing
+# " is normal" no longer exists anywhere. The band is now defended from
+# both sides: think_min 500 below, an instructed 700-word stop above.
+REASONING_FLOOR_CLAUSE = "450 to 700 words of deliberation"
 
 # A "defuser" is the clause that stops an instruction from reading as a
 # script. Two families, defending different failure modes, and both are

@@ -271,7 +271,7 @@ RESTATEMENT_OPENINGS = (
 INSTRUCTION_ECHO_SPANS = (
     "never write as though the matter had been handed to you as a text",
     "those headings belong to the answer and never inside your reasoning",
-    "450 to 700 words of deliberation is normal",
+    "450 to 700 words of deliberation",
     "let me check this, or actually, that does not follow, is a real thought",
     "work it out before you commit to anything",
 )
