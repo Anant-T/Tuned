@@ -50,7 +50,7 @@ def test_main_run_shape():
     # be correct (position_ids -> block-diagonal mask, verified against the
     # pinned trl 0.24.0 / unsloth_zoo 2026.8.3 / transformers 5.5.0 sources)
     # but NET-NEGATIVE - it forfeits SDPA's is_causal fast path and enable_gqa
-    # (8->32 KV-head expansion), materializes a 64 MiB mask, and pays 8192^2
+    # (8->32 KV-head expansion), materializes a 64 MiB mask, and pays 12288^2
     # attention on ~2,500-token segments. ga=6 buys packing's only real
     # benefit (a 3x gradient batch, ~30k real tokens/optimizer step) at zero
     # VRAM or kernel change. save_steps counts OPTIMIZER steps, which get ~3x

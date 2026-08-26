@@ -117,7 +117,7 @@ train:
   # transformers 5.5 builds the block-diagonal mask from position_ids on
   # plain SDPA) - but it IS net-negative here: it forfeits SDPA's is_causal
   # fast path AND enable_gqa (8->32 KV-head expansion per layer), materializes
-  # a 64 MiB bool mask, and pays 8192^2 attention over ~2,500-token segments.
+  # a 64 MiB bool mask, and pays 12288^2 attention over ~2,500-token segments.
   # At bs=1 the collator pads to the longest row IN THE BATCH (= the row
   # itself), so the unpacked lane wastes zero tokens on padding; packing's
   # only real benefit is the 3x gradient batch, and ga=6 buys exactly that
