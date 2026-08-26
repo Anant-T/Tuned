@@ -1005,3 +1005,45 @@ def test_the_deepseek_arm_is_an_isolated_workdir(tmp_path):
     doc["build"]["harmony_prefill"] = "I start from the facts. "
     cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
     assert cfg.build.workdir == "data/build/exp_deepseek"
+
+
+DEEPSEEK_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1_exp_deepseek.yaml"
+
+
+def test_the_deepseek_arm_config_is_fenced(tmp_path):
+    """The two holes the live config has that an experiment arm may not.
+
+    1. The live generator list falls over bai -> cerebras/gpt-oss -> paid
+       lightning; a 429 storm would turn a deepseek arm into a gpt-oss arm
+       without anything noticing. The arm pins the single ref.
+    2. The live config declares no openai usd_cap, which _openai_usd_cap
+       reads as UNCAPPED, and gpt-5-mini/nano sit in judge and tiebreak as
+       backstops. usd_cap 0.0 ALONE does not block either - _usd_per_1m
+       returns 0.0 for a missing price, so est_cost is 0 and 0 > 0.0 is
+       False. The price must be present too (exp_measure's precedent).
+    Plus: none of the Harmony flags, which are gpt-oss's chat format.
+    """
+    import yaml
+
+    from tuned.data.generate import _openai_usd_cap
+
+    cfg = load_build_config(DEEPSEEK_CONFIG, allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_deepseek"
+    assert list(cfg.routing.generator) == ["bai/deepseek-v4-flash"]
+    assert _openai_usd_cap(cfg) == 0.0
+    openai = next(p for p in cfg.providers if p.name == "openai")
+    for model in openai.models:
+        assert model.limits["usd_cap"] == 0.0
+        assert model.limits["usd_per_1m_prompt"] > 0
+        assert model.limits["usd_per_1m_completion"] > 0
+    raw = yaml.safe_load(DEEPSEEK_CONFIG.read_text(encoding="utf-8"))
+    for key in ("harmony_completions", "harmony_prefill", "harmony_s1_continue",
+                "prompt_overlay", "require_pretreatment_manifest", "pretreatment_manifest"):
+        assert key not in raw["build"], key
+    # Everything else is the live config, byte for byte in intent: same
+    # judge and tiebreak order, same bai provider block.
+    live = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    assert list(cfg.routing.judge) == list(live.routing.judge)
+    assert list(cfg.routing.tiebreak) == list(live.routing.tiebreak)
+    bai = next(p for p in cfg.providers if p.name == "bai")
+    assert bai.models[0].params["reasoning_effort"] == "low"
