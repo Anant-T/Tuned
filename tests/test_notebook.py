@@ -34,8 +34,9 @@ def test_notebook_is_valid_and_complete():
     assert 'launcher = ["torchrun", "--nproc_per_node=2"]' in joined
     # the chunked-CE env var must be set BEFORE `import unsloth` in the
     # torchrun children, so it has to sit in the parent env. 32, not 16: the
-    # CE transient scales with sequence length, and ~0.7 GiB at 8192/16 goes
-    # to ~1.05 GiB at 12288 - 32 chunks returns it to ~0.5 GiB.
+    # CE transient scales with sequence length; the qualified peaks were
+    # measured at 16, so 32 only adds margin (unquantified but real). Spent
+    # 2026-08-26 and kept after the 12288 raise was reverted.
     assert 'UNSLOTH_CE_LOSS_N_CHUNKS"] = "32"' in joined
     # the retired lanes must not creep back in as dead switches
     for dead in ("DDP = ", "MP = ", "DDP_8B", "law_v1_mp.yaml", "law_v1_ddp.yaml",
@@ -55,8 +56,8 @@ def test_notebook_is_valid_and_complete():
     assert '"--save-steps", "1"' in probe_line
     assert "--no-hub" not in probe_line, "the merged gate must push a checkpoint"
     assert '"SAVETEST"' not in joined, "SAVETEST is retired into the PROBE gate"
-    # the raise is pending until the merged gate runs green at 12288
-    assert "PROBE_SEQ = 12288" in joined
+    # 8192 is the qualified cap; 12288 OOM'd on 2026-08-26 and was reverted
+    assert "PROBE_SEQ = 8192" in joined
     # allocator headroom - peaks land ~1.4 GiB from the 14.56 GiB cap
     assert 'PYTORCH_ALLOC_CONF"] = "expandable_segments:True"' in joined
     # scratch cache - never /kaggle/working

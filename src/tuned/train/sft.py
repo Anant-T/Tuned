@@ -5,7 +5,7 @@ one rank per GPU, and each rank holds the full model.
 All launches are prefixed CUDA_VISIBLE_DEVICES=0,1 and go through
 `torchrun --nproc_per_node=2 -m tuned.train.sft --config configs/law_v1_8b_ddp.yaml --mode smoke`:
 
-Probe:    ... --max-steps 2 --save-steps 1 --dataset data/probe_long.jsonl --max-seq-length 12288
+Probe:    ... --max-steps 2 --save-steps 1 --dataset data/probe_long.jsonl --max-seq-length 8192
 Smoke:    ... (no extra args)
 Resume:   ... --resume --max-steps 64 --allow-schedule-change
 Main:     ... --mode main --time-budget-s 37800 (later sessions add --resume;
@@ -136,7 +136,7 @@ def check_vram_reserved(reserved_gib: list[float], limit_gib: float = 13.5) -> N
             "abort line - too close to the 14.56 GiB cap to trust across a "
             "multi-session run (fragmentation only grows). OOM ladder in "
             "configs/law_v1_8b_ddp.yaml: standard-quant repo (-1.31 GiB) -> "
-            "seq 8192 -> seq 6144 (UNSLOTH_CE_LOSS_N_CHUNKS is already at "
+            "seq 6144 (UNSLOTH_CE_LOSS_N_CHUNKS is already at "
             "32, not a lever left to spend)."
         )
 
@@ -579,10 +579,11 @@ def main(argv: list[str] | None = None) -> None:
         """The 13.5 GiB abort line, live. A pre-training check can never fire
         (adamw_8bit state appears at the first optimizer step, DDP buckets at
         the first backward), and the post-run check_vram_reserved fires after
-        the quota is spent - so check EVERY step. The old every-25th sampling assumed a fixed
-        bucket (seq 8192 with drop-never-truncate, every row the same
-        length); above the longest row the cap no longer binds, the bucket is
-        variable, and the peak step is whichever one carries the longest row.
+        the quota is spent - so check EVERY step. The old every-25th
+        sampling assumed a fixed bucket, and there never was one: at bs=1 the
+        collator pads to the longest row IN THE BATCH (= the row itself), so
+        every step carries a different length and the peak step is whichever
+        one happens to carry the longest row.
         A stats-counter read, no CUDA sync - free against a ~74 s step."""
 
         def __init__(self, limit_gib: float = 13.5, early: int = 3, every: int = 1):
@@ -599,7 +600,7 @@ def main(argv: list[str] | None = None) -> None:
                 raise RuntimeError(
                     f"peak reserved {worst:.2f} GiB > {self.limit_gib} GiB at "
                     f"step {state.global_step} - OOM-bound profile; ladder: "
-                    "standard-quant repo -> seq 8192 -> seq 6144 "
+                    "standard-quant repo -> seq 6144 "
                     "(UNSLOTH_CE_LOSS_N_CHUNKS already at 32)"
                 )
             return control
