@@ -62,8 +62,28 @@ Per file:
 
 1. Delete the permissive clause (*"runs as long as the problem deserves"* /
    *"takes as long as the decision deserves"*).
-2. Delete *"Work the point through fully — 450 to 700 words of deliberation is
-   normal for a matter of any substance."*
+2. **Keep the literal substring `450 to 700 words of deliberation`. Replace only
+   the tail** — *"is normal for a matter of any substance"* — with a hard ceiling.
+
+   This sentence is not surplus prose, and an earlier draft of this spec was
+   wrong to call for its deletion. `tests/test_build_prompts.py` pins it as
+   `REASONING_FLOOR_CLAUSE`, and its comment records why it exists:
+
+   > RAISED 2026-08-18 off "a few hundred words". […] Measured: every one of the
+   > 20 attempt-1 gpt-oss `length_band` violations was `think<think_min` […]
+   > 450-700 words is ~2,900-4,500 chars, ~725-1,125 est tokens: clear of
+   > think_min 500 and clear of think_max 3,000.
+
+   It is the mechanism that holds traces **above** the floor, added four days ago
+   to fix the mirror image of today's problem. Deleting it would regress that fix
+   for gpt-oss while chasing deepseek. The band values were always right; only
+   the permission around them is wrong.
+
+   The literal substring must also survive because two test constants match on
+   it — `_PACKET_MARKERS` in `test_build_prompts.py` and `HIDDEN_REASONING_TARGETS`
+   in `test_build_harmony.py` — where it distinguishes a base template from its
+   Harmony overlay (the overlay strips the reasoning-length target by design).
+   Preserving it keeps the edit's blast radius to one constant instead of three.
 3. Restate the existing word ranges as **bands with a hard ceiling** — for both
    the trace and the answer. Do not invent new numbers: 250–450 for the answer
    and 450–700 for the trace are the numbers already in the files.
@@ -75,6 +95,30 @@ Per file:
    must keep a lower bound as explicit as its upper one.
 4. Leave the self-verification paragraph intact. It is a length amplifier, but
    `self_verification` passes 86/99 today and cutting it trades one gate for another.
+5. **Spend no net words.** `test_generator_user_block_is_the_intended_size` asserts
+   `250 <= words <= 500` over each template's whole user block, and two files are
+   nearly full: `gen_drafting_v1` has **5** words of headroom and `gen_transition_v2`
+   has **4**. The ceiling was already raised once (470 → 500) for this same reason.
+   The edit deletes a clause and rewrites a tail, so it must come out word-neutral
+   or shorter on every file — and on those two it must be checked, not assumed.
+6. **The permissive clause has at least four surface forms and cannot be matched
+   on one word.** Only 5 of 14 files say *"deserves"*; the others say *"as long as
+   it needs to"*, *"as long as the point requires"*, *"as long as the case
+   requires"*, and so on. A find-and-replace keyed on `deserves` silently misses 9
+   of 14 files and would leave most of the corpus unfixed while every test passed.
+   Each file gets read.
+
+### One production constant tracks this wording
+
+`gates.py` `INSTRUCTION_ECHO_SPANS` contains the literal
+`"450 to 700 words of deliberation is normal"`. `check_prompt_echo` matches it
+against **generated traces** to catch a model that parrots its own instructions
+back as reasoning — a gate that fails 13/99 on the arm today. Change the prompt
+tail without changing this span and the gate keeps hunting a sentence no prompt
+issues any more: it would not fail loudly, it would quietly stop detecting.
+
+No test exercises this span, so nothing in CI will catch it. Update it with the
+edit. This is functional, not hygiene.
 
 **Scope: all 14 generator prompts** in `src/tuned/data/prompts/` —
 `gen_irac_analysis_v1..v4`, `gen_summarization_v1..v2`, `gen_statute_qa_v1..v4`,
@@ -108,10 +152,26 @@ after:
 
 > Roughly 250 to 450 words is the length you would expect of a strong candidate,
 > and you do not exceed it. Your own working beforehand is never a retelling of the
-> materials, and it keeps to the same discipline: not less than 450 words, and on
-> no account more than 700.
+> materials. Work the point through fully — 450 to 700 words of deliberation, and
+> 700 is a ceiling you do not cross.
 
-The other 13 make the same move in their own words.
+Note what survives: the sentence, the band, and the literal `450 to 700 words of
+deliberation`. What goes is the permission on either side of it. The other 13 make
+the same move in their own words.
+
+### Re-pinning the template shas
+
+Every template's sha is pinned in the test suite, deliberately, so that any edit
+forces a look. `tests/test_build_prompts.py` holds `EXPECTED_SHAS` for the 14 base
+templates, and `test_template_sha_is_pinned` asserts each one. Editing the prompts
+without re-pinning turns 14 green tests red.
+
+Re-pin by reading the new sha from `prompt_registry.load(prompt_id).sha` after the
+edit — never by copying it out of a test failure message, which is how a wrong
+value gets laundered into a pin. `test_sha_is_twelve_hex_of_the_raw_file` and
+`test_templates_are_lf_only` both guard the pin, so **the files must be written
+LF-only**; a CRLF write changes every hash. This repo has already lost one task to
+`Path.write_text` converting a file to CRLF on Windows.
 
 `prompt_registry.load` hashes each file's bytes into `Template.sha`, so every
 edited template gets a new sha automatically. No provenance bookkeeping is needed.
@@ -182,7 +242,21 @@ Critical from a test pinned to a config that was not committed.
 - **Judging the treatment arm.** Gate pass rates answer the question. Accept rate
   at n~20 was already recorded as a null result.
 - **Editing `prompts_harmony/`.** That overlay is gpt-oss's Harmony format and is
-  not on the deepseek path.
+  not on the deepseek path. Leaving it alone is a decision, not an oversight, and
+  it is the right one on the merits: the overlay already strips the whole
+  reasoning-length packet by design, and gpt-oss's measured failure mode is
+  falling *below* `think_min`, not overrunning the ceiling. Removing its
+  permission to run long would push it further into the failure this build spent
+  2026-08-18 fixing.
+
+  **The cost is real and must be recorded.** After this edit the base templates
+  say "ceiling" and the overlay still says "as long as it needs", and **no test
+  detects the divergence.** The guard usually credited with catching it —
+  `test_generator_overlays_differ_from_their_base_in_exactly_two_lines` — counts
+  *how many lines differ*, not how they differ, and the clause being edited already
+  sits on one of those two lines. `_PACKET_MARKERS` misses it too. The divergence
+  is therefore deliberate, documented here, and invisible to CI; anyone later
+  syncing overlay to base must read this paragraph first.
 - **Touching the live control store.** Read-only, always.
 
 ## Acceptance criteria
