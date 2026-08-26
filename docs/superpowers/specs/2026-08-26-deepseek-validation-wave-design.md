@@ -22,7 +22,7 @@ quirk, the length band, and the new seed gate) → `judge.py`. This arm does tha
 
 | # | question | measurement | pass line |
 |---|---|---|---|
-| 1 | Does the pipe work end to end? | calls made, HTTP errors, 429s, `finish_reason=length` retries raised by `_bai_response_hook`, latency per call | **≥ 90%** of calls return non-empty content |
+| 1 | Does the pipe work end to end? | calls made, HTTP errors, 429s, `finish_reason=length` retries raised by `_bai_response_hook`, latency per call; **every** `generation.model` is `deepseek-v4-flash` and the `budget_ledger` shows $0 | **≥ 90%** of calls return non-empty content; 0 generations from any other model; $0 spent |
 | 2 | Does the seed gate work live? | seeds in the arm store with `token_count > seed_token_budget(cfg)` (= 4,692) vs. tasks planned against such seeds | **exactly 0** planned tasks over budget, with **≥ 1** oversize seed present in the store |
 | 3 | Were the projections right? | `think_tokens` and templated row length (pinned Qwen3 tokenizer, same path as `assemble.token_length`) vs. projected reasoning mean 2,097 and row mean 4,440 / p99 9,719 | reported; no pass line |
 | 4 | **The real unknown:** how often does `reasoning_effort: low` blow the build's own `length_band.think_max = 3000`? | fraction of generations gated `think>think_max` | reported; **> 30%** means `low` and `think_max` disagree and one must move before scaling |
@@ -41,8 +41,19 @@ The pass lines are written here, before the run, so they cannot move afterwards.
   (`file:...?mode=ro`). The live store is never opened for write by anything in this arm.
 - **Config:** `configs/data_law_v1_exp_deepseek.yaml` — a copy of the live
   `configs/data_law_v1.yaml` (which already carries the uncommitted b.ai provider block and
-  `bai/deepseek-v4-flash` at the head of `routing.generator`) with `build.workdir` changed and a
-  header comment stating the arm's purpose. Copied from the **live** config, not from
+  `bai/deepseek-v4-flash` at the head of `routing.generator`) with `build.workdir` changed, a
+  header comment stating the arm's purpose, and **two cost/contamination fences the live config
+  does not have**:
+  1. `routing.generator: [bai/deepseek-v4-flash]` — the single ref. The live list falls over to
+     `cerebras/gpt-oss-120b` (free) and then `lightning` (paid) when b.ai is cooling, and a 429
+     storm would silently turn a deepseek arm into a gpt-oss arm, contaminating measurements
+     3–5. The report asserts every `generation.model == 'deepseek-v4-flash'`.
+  2. `usd_cap: 0.0` on the `openai` provider. The live config declares no cap, and
+     `generate._openai_usd_cap` reads that as **uncapped**; gpt-5-mini/nano sit in `judge` and
+     `tiebreak` as backstops, so a gap in the free pool would spend money silently. A zero cap
+     is `exp_measure`'s precedent and makes spend on this arm impossible outright — judging runs
+     entirely on qwen (A), gemma (B) and mistral (tiebreak).
+  Copied from the **live** config, not from
   `exp_s1`/`exp_measure`: those arms carry `harmony_completions`, `harmony_prefill`,
   `harmony_s1_continue` and `prompt_overlay: src/tuned/data/prompts_harmony`, which are gpt-oss's
   Harmony chat format and must not reach a deepseek generation. `require_pretreatment_manifest`
@@ -121,11 +132,11 @@ worktree `.env` now carries `BAI_API_KEY` (added 2026-08-26) alongside the judge
 |---|---|---|
 | generate | b.ai rpm 8; ~33 s/call at `low`; `MAX_ATTEMPTS = 3` on gate failures → 40–80 calls | 8–12 min |
 | judge A | groq/qwen3.6-27b, rpm 30 | not binding |
-| judge B | cerebras/gemma-4-31b, **rpm 5, tpm 30k** — the bottleneck | ~8–10 min for 40 rows |
+| judge B | cerebras/gemma-4-31b, **tpm 30k** binds before rpm 5 on ~8–9k-token judge prompts → ~3.5 calls/min | ~12 min for 40 rows |
 | tiebreak | mistral-large, rpm 2, disagreements only | overlaps |
 | seed + measure | | ~5 min |
 
-≈ 25 min, inside the box. If generation runs long, the generate step is cut at its batch cap
+≈ 28 min, inside the box. If generation runs long, the generate step is cut at its batch cap
 and judging proceeds on whatever landed — a smaller n, reported as such.
 
 Family separation on a deepseek row excludes `{deepseek, qwen, gemma}` from the tiebreak, which
@@ -166,7 +177,8 @@ The gpt-oss baseline for #5 is computed from the live store's `judgement` table 
    per-source counts including oversize seeds, and is idempotent.
 3. The arm store contains ≥ 1 seed over budget and **0** tasks planned against one.
 4. `generate` and `judge` both run to their batch cap or an empty queue without operator
-   intervention; ≥ 90% of b.ai calls return content.
+   intervention; ≥ 90% of b.ai calls return content; every generation is deepseek; `$0` on the
+   arm's `budget_ledger`.
 5. The report exists with every section above filled from the arm store, and states each
    pre-registered pass line beside its measured value.
 6. The live store's main file (`data/build/state/law_v1.sqlite3`) has the same size and
