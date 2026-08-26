@@ -1040,10 +1040,25 @@ def test_the_deepseek_arm_config_is_fenced(tmp_path):
     for key in ("harmony_completions", "harmony_prefill", "harmony_s1_continue",
                 "prompt_overlay", "require_pretreatment_manifest", "pretreatment_manifest"):
         assert key not in raw["build"], key
-    # Everything else is the live config, byte for byte in intent: same
-    # judge and tiebreak order, same bai provider block.
-    live = load_build_config(DATA_CONFIG, allow_unpinned=True)
-    assert list(cfg.routing.judge) == list(live.routing.judge)
-    assert list(cfg.routing.tiebreak) == list(live.routing.tiebreak)
+    # The judge/tiebreak order used to be asserted as EQUAL to the live
+    # config's. That made a committed test depend on a file's uncommitted
+    # working state - configs/data_law_v1.yaml carries the bai block and the
+    # reordered tiebreak as unstaged edits, so the equality passes here and
+    # fails on anyone else's checkout. The INVARIANT is asserted directly on
+    # the arm config instead, and it is the one this arm's header spells out:
+    #
+    # on a DEEPSEEK generation family separation excludes {deepseek, qwen,
+    # gemma}, which makes groq/openai/gpt-oss-20b eligible for the tiebreak
+    # seat for the first time - and with three verdicts that seat decides
+    # outright (judge_policy.resolve). mistral must therefore come BEFORE
+    # gpt-oss-20b, or every contested row goes to the family measured 0/10 on
+    # IPC->BNS mapping.
+    tiebreak = list(cfg.routing.tiebreak)
+    assert tiebreak.index("mistral/mistral-large-latest") < tiebreak.index(
+        "groq/openai/gpt-oss-20b"
+    ), tiebreak
+    # ...and the two slots the dual judge actually fills are the free qwen and
+    # gemma families, ahead of the $0-fenced openai backstops.
+    assert list(cfg.routing.judge)[:2] == ["groq/qwen/qwen3.6-27b", "cerebras/gemma-4-31b"]
     bai = next(p for p in cfg.providers if p.name == "bai")
     assert bai.models[0].params["reasoning_effort"] == "low"
