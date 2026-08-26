@@ -1,7 +1,7 @@
 # Raise the training sequence cap to 12,288
 
 **Date:** 2026-08-26
-**Status:** approved, not yet implemented
+**Status:** IMPLEMENTED, THEN REVERTED — see the OUTCOME section at the end
 **Lane:** `configs/law_v1_8b_ddp.yaml` — Qwen3-8B, 2x T4 DDP, qualified 2026-08-08 at seq 8192
 
 ## Summary
@@ -126,3 +126,90 @@ Stated explicitly so they are not re-investigated:
 - **Recalibrating the 24,000-char proxy** in `curated.py:145` / `replay.py:168`. This is the change that would actually recover dropped rows, at zero VRAM cost. Tracked separately.
 - **Raising `MAX_CHUNK_TOKENS`** above 1,500. The only change that would make training rows longer, and a corpus-design decision with teacher-cost and citation-context consequences, not a memory decision.
 - **Seq 16,384.** Needs ~+3.0 GiB against ~2.3 GiB of headroom, forcing the standard-quant rung and its accuracy cost, and leaving under 1 GiB of margin — below this lane's own green bar.
+
+---
+
+## OUTCOME: REJECTED (2026-08-26, same day)
+
+**Seq 12288 does not fit this lane.** The requalification run OOM'd on
+Kaggle: rank 1 died inside step 0's backward allocating
+`empty_strided_cuda((s32, 12288), (12288, 1), torch.float16)` — 288 MiB
+requested against 192.75 MiB free, with 13.86 GiB already allocated by
+PyTorch. Extrapolated reserved peak ~14.3 GiB against the 13.5 GiB abort
+line: **roughly 0.8 GiB over, not marginal.** Both blocks were reverted to
+8192 in `3ce7583`.
+
+### The spec's load-bearing error
+
+The Gate plan above claims:
+
+> SMOKE runs `data/smoke_v1.jsonl`, whose rows top out well under 8192; at a
+> 12,288 cap it exercises a byte-identical memory shape to the qualified
+> 8192 SMOKE.
+
+**This was false and was asserted without measuring.** The length table in
+"The measurement that shapes this decision" covers only the LAW corpus
+(`curated_c1.jsonl`, `replay.jsonl`). `data/smoke_v1.jsonl` is built by
+`src/tuned/data/smoke.py` from OpenThoughts-114k and applies **no length
+filter at all** — those QwQ-32B CoT traces were being truncated at 8192 and
+began truncating at 12,288 instead. The allocation shape in the traceback is
+the proof: a real 12,288-token row.
+
+Generalized: on this lane it is **SMOKE, not MAIN, that sets the memory
+ceiling.** The LAW corpus is bounded by `MAX_CHUNK_TOKENS = 1500`; the smoke
+corpus is bounded by nothing but the cap itself.
+
+### Second failure: the gate was skipped
+
+`MODE` was left at its default `"SMOKE"`, so the 60-step run went straight in
+without the PROBE gate the plan requires. Cost ~4 minutes (11:50→11:54 UTC)
+rather than a full session, but the ladder existed precisely to catch this
+and was not walked. `_ReservedCeiling` never fired either — a hard OOM inside
+step 0's backward pre-empts `on_step_end`, so the every-step check added by
+Task 2 cannot catch a first-step blowout. It still earns its place for a
+slow creep across a long MAIN run.
+
+### What survived the revert
+
+All three are cap-independent and were kept:
+
+- `_ReservedCeiling` checking every step (Task 2). The `every=25` default
+  rested on a "fixed bucket" premise that was never true at `bs=1`.
+- SAVETEST merged into PROBE (Task 4).
+- `UNSLOTH_CE_LOSS_N_CHUNKS=32`, which only lowers peaks against the
+  qualified 16.
+
+### What actually drove the request
+
+Not the corpus, and not the 8192 cap — this spec proved the cap recovers
+zero rows today, and that finding stands. The real driver surfaced after the
+OOM: room for **DeepSeek teacher reasoning traces**
+(`docs/reports/2026-08-25-bai-deepseek-qualification.md`, baseline 298–10,426
+tokens, mean ~6,300–7,000). At that trace length a templated row averages
+~9,350 tokens — so 12,288 would not have been enough either, and the mean row
+overshoots 8192.
+
+Three constraints converge against long traces on this lane, and only the
+first is about VRAM:
+
+1. **Inference economics.** SFT teaches the length distribution, so ~70% of
+   every user-facing response becomes unseen deliberation.
+2. **Quota.** ~9,350 tok/example × 15–20k examples = 140–187M tokens ≈ 3–4
+   quota-weeks per epoch, against a planned ~1.
+3. **Bimodality.** Mixing ~9,350-token rows into a corpus with p50 2,438
+   teaches an incoherent length policy.
+
+The cheap knob is the teacher, not the trainer: `reasoning_effort: "minimal"`
+yields 1,537-token traces (sd 506), which fits 8192 with room. Whether a
+1,537-token trace trains a worse reasoner than a 6,650-token one is the one
+open empirical question, and it is answerable with a few hundred free b.ai
+calls rather than more GPU quota.
+
+### Rules this leaves behind
+
+- **Never raise the cap without a PROBE gate**, and rebuild
+  `data/probe_long.jsonl` at the new target first.
+- **Size the corpus before sizing the cap.** The free measurement (teacher
+  output lengths) comes before the GPU one. This change did it backwards.
+- **`smoke_v1.jsonl` has no length filter.** Any cap change alters SMOKE's
+  memory shape, whatever the LAW corpus does.
