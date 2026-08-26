@@ -28,14 +28,16 @@ def test_checkpoint_repo_is_the_live_one():
 
 def test_tokens_per_optimizer_step():
     run = load_config(CONFIGS / "law_v1_8b_ddp.yaml").train.smoke
-    # 8192 x 1 x 2 x 2 ranks = 32,768 tokens/optimizer-step - the budget the
-    # measured 74.7 s/step and the peak-VRAM numbers were taken under.
-    assert run.max_seq_length * run.per_device_train_batch_size * run.gradient_accumulation_steps * 2 == 32768
+    # An UPPER BOUND, not the real batch: 12288 x 1 x 2 x 2 ranks = 49,152.
+    # At bs=1 the collator pads to the longest row IN THE BATCH, which is the
+    # row itself, so real tokens/step are set by row length (~2.5k p50,
+    # 7.6k p100 across the built corpus) and stay ~30k regardless of the cap.
+    assert run.max_seq_length * run.per_device_train_batch_size * run.gradient_accumulation_steps * 2 == 49152
 
 
 def test_smoke_run_shape():
     run = load_config(CONFIGS / "law_v1_8b_ddp.yaml").train.smoke
-    assert run.max_seq_length == 8192
+    assert run.max_seq_length == 12288
     assert run.per_device_train_batch_size == 1
     assert run.gradient_accumulation_steps == 2
     assert run.max_steps == 60
@@ -56,7 +58,7 @@ def test_main_run_shape():
     # the same cadence band the lane qualified at (25 x 74.7 s ~= 31 min).
     # 50 would have meant ~3.1 h between checkpoints.
     run = load_config(CONFIGS / "law_v1_8b_ddp.yaml").train.main
-    assert run.max_seq_length == 8192
+    assert run.max_seq_length == 12288
     assert run.per_device_train_batch_size == 1
     assert run.gradient_accumulation_steps == 6
     assert run.save_steps == 10

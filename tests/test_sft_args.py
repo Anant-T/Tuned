@@ -21,7 +21,7 @@ def test_smoke_sft_kwargs():
     assert kw["save_steps"] == 25
     assert kw["save_strategy"] == "steps"
     assert kw["output_dir"] == "outputs/smoke"
-    assert kw["max_length"] == 8192
+    assert kw["max_length"] == 12288
 
 
 def test_hub_kwargs_only_when_repo_set():
@@ -128,7 +128,7 @@ def test_dataset_and_seq_overrides():
     run = load_config(CONFIG, allow_unpinned=True).train.smoke
     assert apply_overrides(run).dataset == run.dataset
     assert apply_overrides(run, dataset="data/probe_long.jsonl").dataset == "data/probe_long.jsonl"
-    assert apply_overrides(run).max_seq_length == 8192
+    assert apply_overrides(run).max_seq_length == 12288
     assert apply_overrides(run, max_seq_length=10240).max_seq_length == 10240
 
 

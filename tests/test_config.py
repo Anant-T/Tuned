@@ -28,7 +28,7 @@ def test_masking_markers_and_think_tags():
 
 def test_smoke_run_settings():
     cfg = load_config(CONFIG, allow_unpinned=True)
-    assert cfg.train.smoke.max_seq_length == 8192
+    assert cfg.train.smoke.max_seq_length == 12288
     assert cfg.train.smoke.max_steps == 60
     assert cfg.train.seed == 3407
 

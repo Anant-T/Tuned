@@ -1,4 +1,9 @@
 # 8B DDP lane - Qwen3-8B under plain 2x T4 data-parallel via torchrun.
+# REQUALIFICATION PENDING at seq 12288 (raised 2026-08-26). The gate numbers
+# below were measured at seq 8192 and remain the reference for the memory
+# shape at real row lengths, which this raise does not change. Do NOT start a
+# MAIN run until the merged PROBE gate is green at 12288.
+#
 # The production lane, FULLY QUALIFIED on Kaggle 2026-08-08 - all four gates
 # green: PROBE (per-rank peaks 12.80/13.00 GiB), SAVETEST (checkpoint pushed
 # and visible on the Hub), SMOKE (60/60 steps, 74.7 s/step, train_loss 0.5722
@@ -23,8 +28,13 @@
 #       --config configs/law_v1_8b_ddp.yaml --mode smoke
 #
 # ga=2: at 8B the per-token memory footprint is small enough to spend the
-# budget on sequence length rather than throughput - 8192 x 1 x 2 x 2 ranks =
-# 32,768 tokens/optimizer-step.
+# budget on sequence length rather than throughput. 12288 x 1 x 2 x 2 ranks =
+# 49,152 tokens/optimizer-step is the CEILING, not the batch - at bs=1 the
+# collator pads to the longest row in the batch (= the row itself), so real
+# tokens/step follow row length and stay ~30k. The cap was raised 8192 ->
+# 12288 on 2026-08-26 as headroom, not to admit longer rows: the built corpus
+# tops out at 7,610 tokens (p100 across 5,420 rows) and is bounded by
+# chunks.py's MAX_CHUNK_TOKENS = 1500, not by this number.
 #
 # Step-0 gate (mandatory before trusting any loss/grad_norm number out of this
 # lane): assert non-zero assistant-label coverage. unsloth#2771 / trl#3927 -
@@ -94,9 +104,9 @@ train:
   # clip that actually bounds an fp16 spike here.
   max_grad_norm: 0.3
   smoke:
-    max_seq_length: 8192
+    max_seq_length: 12288
     per_device_train_batch_size: 1
-    gradient_accumulation_steps: 2   # 8192 x 2 x 2 ranks = 32,768 tokens/step
+    gradient_accumulation_steps: 2   # 12288 x 1 x 2 x 2 ranks = 49,152 tokens/step CEILING
     max_steps: 60
     save_steps: 25
     dataset: data/smoke_v1.jsonl
@@ -122,7 +132,7 @@ train:
   # dataset, read post_filter_rows=, set max_steps = rows // (bs * ga * 2),
   # commit. check_resume_schedule then freezes it for every later session.
   main:
-    max_seq_length: 8192
+    max_seq_length: 12288
     per_device_train_batch_size: 1
     gradient_accumulation_steps: 6
     max_steps: 0
