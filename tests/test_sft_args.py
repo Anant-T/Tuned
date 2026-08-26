@@ -21,7 +21,7 @@ def test_smoke_sft_kwargs():
     assert kw["save_steps"] == 25
     assert kw["save_strategy"] == "steps"
     assert kw["output_dir"] == "outputs/smoke"
-    assert kw["max_length"] == 8192
+    assert kw["max_length"] == 12288
 
 
 def test_hub_kwargs_only_when_repo_set():
@@ -128,7 +128,7 @@ def test_dataset_and_seq_overrides():
     run = load_config(CONFIG, allow_unpinned=True).train.smoke
     assert apply_overrides(run).dataset == run.dataset
     assert apply_overrides(run, dataset="data/probe_long.jsonl").dataset == "data/probe_long.jsonl"
-    assert apply_overrides(run).max_seq_length == 8192
+    assert apply_overrides(run).max_seq_length == 12288
     assert apply_overrides(run, max_seq_length=10240).max_seq_length == 10240
 
 
@@ -428,3 +428,63 @@ def test_dataset_prep_runs_rank0_first_not_twice():
     assert -1 not in (first, second, load, ctor)
     assert first < load < second < ctor  # one block for load+map, one for the
     # trainer ctor (unsloth's internal num_proc=8 tokenization) + masking map
+
+
+def test_ceiling_check_due_fires_on_every_step_at_every_1():
+    from tuned.train.sft import ceiling_check_due
+
+    # every=1 is the default the variable-bucket cap requires: the peak step
+    # is whichever step carries the longest row, so sampling can miss it.
+    assert all(ceiling_check_due(s, early=3, every=1) for s in range(1, 120))
+
+
+def test_ceiling_check_due_still_samples_when_asked():
+    from tuned.train.sft import ceiling_check_due
+
+    assert ceiling_check_due(1, early=3, every=25)
+    assert ceiling_check_due(3, early=3, every=25)
+    assert not ceiling_check_due(4, early=3, every=25)
+    assert not ceiling_check_due(10, early=3, every=25)
+    assert ceiling_check_due(25, early=3, every=25)
+
+
+def test_reserved_ceiling_defaults_to_every_step():
+    import inspect
+
+    from tuned.train import sft
+
+    src = inspect.getsource(sft.main)
+    assert "every: int = 1" in src, "_ReservedCeiling must default to every=1"
+    assert "every: int = 25" not in src
+
+
+def test_reserved_ceiling_guard_is_negated():
+    # Pins the call-site guard's polarity. `ceiling_check_due` returns True
+    # exactly on steps the ceiling SHOULD be read, so on_step_end must skip
+    # (return control) when it is FALSE - "if not ceiling_check_due(...)".
+    # Flipping that to "if ceiling_check_due(...): return control" silently
+    # disables the reserved-VRAM check on every step it would have fired on
+    # (ceiling_check_due itself stays correct, so every test exercising it
+    # directly would still pass) - this test is what catches that inversion.
+    import inspect
+
+    from tuned.train import sft
+
+    src = inspect.getsource(sft.main)
+    assert "if not ceiling_check_due(state.global_step, self.early, self.every):" in src
+    assert "if ceiling_check_due(state.global_step, self.early, self.every):" not in src
+
+
+def test_remediation_ladders_name_the_8192_rung():
+    import inspect
+
+    import pytest
+
+    from tuned.train import sft
+
+    with pytest.raises(SystemExit) as excinfo:
+        sft.check_vram_reserved([14.0])
+    assert "seq 8192 -> seq 6144" in str(excinfo.value)
+
+    # The _ReservedCeiling raise is nested inside main(); read its source.
+    assert "seq 8192 -> seq 6144" in inspect.getsource(sft.main)

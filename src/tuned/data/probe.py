@@ -11,7 +11,7 @@ with max_seq_length <= target_tokens.
 
 Build:  python -m tuned.data.probe --config configs/law_v1_8b_ddp.yaml
         (target defaults to the config's smoke max_seq_length; --target-tokens
-        overrides it for above-config probes, e.g. 8192)
+        overrides it for above-config probes, e.g. 16384)
 """
 
 import json

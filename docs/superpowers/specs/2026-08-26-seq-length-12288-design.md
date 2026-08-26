@@ -59,7 +59,7 @@ Deliberately **not** spent: the standard-quant repo rung. Dynamic 4-bit is an ac
 
 ### Code — `src/tuned/train/sft.py`
 
-**`_ReservedCeiling` sampling — a real hole this change opens.** The callback checks steps 1–3 then every 25th, justified in its docstring by "the full memory shape exists by step 1-2 at bs=1 with a fixed bucket". That premise holds at 8192-with-drop, where every probe row truncates to the same length. It is false once the cap exceeds the longest row: the peak-memory step becomes whichever step carries the longest row, and it has a 1-in-25 chance of being sampled.
+**`_ReservedCeiling` sampling — a real hole this change opens.** The callback checks steps 1–3 then every 25th, justified in its docstring by "the full memory shape exists by step 1-2 at bs=1 with a fixed bucket". That premise holds at 8192-with-drop, where every probe row truncates to the same length. It is false once the cap exceeds the longest row: the peak-memory step becomes whichever step carries the longest row. `torch.cuda.max_memory_reserved()` is a monotonic high-water mark, though, so sampling every 25th step cannot miss that peak — it only reports it up to 24 steps late, blaming the breach on whichever later step happened to be sampled while quota keeps burning on a profile already known to be OOM-bound.
 
 Change the default `every=25` -> `every=1`. `torch.cuda.max_memory_reserved()` is a stats-counter read with no CUDA sync — free against a ~74 s step. Update the docstring to state the new rationale (variable bucket, every step checked).
 

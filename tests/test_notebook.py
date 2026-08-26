@@ -33,21 +33,30 @@ def test_notebook_is_valid_and_complete():
     # torchrun unconditionally - one rank per GPU, full model per rank
     assert 'launcher = ["torchrun", "--nproc_per_node=2"]' in joined
     # the chunked-CE env var must be set BEFORE `import unsloth` in the
-    # torchrun children (default n_chunks=4 leaves a ~2.4-3.0 GiB loss-step
-    # transient at seq 8192), so it has to sit in the parent env
-    assert 'UNSLOTH_CE_LOSS_N_CHUNKS"] = "16"' in joined
+    # torchrun children, so it has to sit in the parent env. 32, not 16: the
+    # CE transient scales with sequence length, and ~0.7 GiB at 8192/16 goes
+    # to ~1.05 GiB at 12288 - 32 chunks returns it to ~0.5 GiB.
+    assert 'UNSLOTH_CE_LOSS_N_CHUNKS"] = "32"' in joined
     # the retired lanes must not creep back in as dead switches
     for dead in ("DDP = ", "MP = ", "DDP_8B", "law_v1_mp.yaml", "law_v1_ddp.yaml",
                  '"configs/law_v1.yaml"', "device_map"):
         assert dead not in joined, f"retired-lane leftover in the notebook: {dead}"
-    # PROBE runs no-hub on the long probe dataset (short unpacked examples
-    # would make the long-seq VRAM probe a false green); PROBE_SEQ probes
-    # above-config lengths without a config edit
+    # PROBE runs the long probe dataset (short unpacked examples would make
+    # the long-seq VRAM probe a false green) and now PUSHES: the checkpoint
+    # path does not depend on row length, so the old separate SAVETEST mode
+    # cost a second model load for nothing.
     assert '"data/probe_long.jsonl"' in joined
-    assert "--no-hub" in joined
     assert "PROBE_SEQ" in joined
     assert "--max-seq-length" in joined
     assert "tuned.data.probe" in joined
+    probe_line = next(
+        line for line in joined.splitlines() if line.strip().startswith('"PROBE":')
+    )
+    assert '"--save-steps", "1"' in probe_line
+    assert "--no-hub" not in probe_line, "the merged gate must push a checkpoint"
+    assert '"SAVETEST"' not in joined, "SAVETEST is retired into the PROBE gate"
+    # the raise is pending until the merged gate runs green at 12288
+    assert "PROBE_SEQ = 12288" in joined
     # allocator headroom - peaks land ~1.4 GiB from the 14.56 GiB cap
     assert 'PYTORCH_ALLOC_CONF"] = "expandable_segments:True"' in joined
     # scratch cache - never /kaggle/working
@@ -133,7 +142,7 @@ def test_notebook_is_valid_and_complete():
     # the 13.5 abort line applies to RESERVED (the allocator high-water that
     # actually OOMs) - the PROBE bullet used to point readers at the smaller
     # allocated number, and the two mentions disagreed with each other
-    assert "abort-and-rethink at ~13.5 GiB reserved" in joined
+    assert "peak_vram_reserved_gb_dev0/1` below **13.5 GiB**" in joined
     assert "abort-and-rethink at ~13.5." not in joined
     # notebook cells read configs with plain yaml and never import the package:
     # a kernel started before the editable install misses the .pth, so only
