@@ -46,25 +46,30 @@ The template-drift test self-skips locally and runs on Kaggle.
 
 ## Smoke run
 
-The lane (`configs/law_v1_8b_ddp.yaml`) is **fully qualified** — all four gates
-ran green on Kaggle on 2026-08-08:
+The lane (`configs/law_v1_8b_ddp.yaml`) raised `max_seq_length` 8192 -> 12288
+on 2026-08-26 as deliberate headroom (today's longest row is 7,610 tokens).
+**Requalification at 12288 is pending.** The numbers below are the reference
+gate run at seq 8192, green on Kaggle on 2026-08-08; the memory shape at real
+row lengths is unchanged by the raise, but the merged PROBE gate has not yet
+run green at 12288:
 
-- **PROBE** (2-step VRAM-ceiling check, no Hub push): per-rank peaks 12.80/13.00 GiB.
-- **SAVETEST** (4-step save/push gate): checkpoint pushed and visible on the Hub.
+- **PROBE** (2-step VRAM-ceiling check, pushes a checkpoint): per-rank peaks 12.80/13.00 GiB at seq 8192.
 - **SMOKE** (60 steps): 60/60 complete, 74.7 s/step, ~438 tok/s aggregate, peaks 12.98/13.18 GiB.
 - **RESUME**: fresh session, training continued from step 61 with optimizer/scaler state restored.
 
-Set `MODE` in the first code cell of `kaggle_smoke.ipynb`, then Run All:
+Set `MODE` in the first code cell of `kaggle_smoke.ipynb`, then Run All. Gate
+ladder: PROBE -> SMOKE -> RESUME.
 
-1. `MODE = "SAVETEST"` -> Run All interactively (~15 min). Green = checkpoint in the
-   HF repo printed by the re-home cell, `grad_norm` finite by step 3.
+1. `MODE = "PROBE"` (+ `PROBE_SEQ`, the sequence length being requalified) ->
+   Run All interactively (~15 min). Checks VRAM headroom at that sequence
+   length AND pushes a checkpoint in the same session (`--save-steps 1`, no
+   `--no-hub`) - SAVETEST was retired into this gate. Green = checkpoint in
+   the HF repo printed by the re-home cell, `grad_norm` finite by step 3.
 2. `MODE = "SMOKE"` -> **Save & Run All** (background, ~1.2 h; immune to the
    20-min idle timeout). Green = loss down, no NaN, peak VRAM < 14 GB.
 3. Fresh session, `MODE = "RESUME"` -> verifies checkpoint resume from the Hub.
-4. `MODE = "PROBE"` (+ optional `PROBE_SEQ`) -> checks VRAM headroom at a given
-   sequence length before committing to it in the config.
 
-Training always launches as 2-rank DDP via `torchrun` at seq 8192 — both T4s,
+Training always launches as 2-rank DDP via `torchrun` at seq 12288 — both T4s,
 every session, no lane switches left to flip. A Kaggle T4x2 session bills
 1x wall-clock regardless of GPU count. See
 `docs/reports/2026-08-08-project-record.md` for the full lane history —
