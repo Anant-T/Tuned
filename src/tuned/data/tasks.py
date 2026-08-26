@@ -64,6 +64,26 @@ from tuned.data import prompt_registry
 # Max tasks any one seed may back, across every task type and wave.
 PER_SEED_CAP = 4
 
+# What the assistant turn needs, subtracted from the train config's
+# max_seq_length to leave a seed budget the planner can honour.
+#
+# assemble.py already drops a row whose rendered length exceeds
+# max_seq_length - but at the FAR END of the pipeline, after the teacher has
+# been paid for the generation. Measured 2026-08-26 over 1,368 real
+# generations (docs/reports/2026-08-26-row-length-under-deepseek-traces.md):
+# 16 rows were dropped that way, averaging a 7,597-token seed against a
+# 492-token trace, and all 16 came from PredEx and TathyaNyaya - the two
+# sources chunks.py does not chunk. The drop is therefore silent at the point
+# it costs a call, and biased, since what it removes is the longest and most
+# substantive cases.
+#
+# 3,500 = a 2,097-token reasoning trace (deepseek-v4-flash at the shipped
+# `reasoning_effort: low`) + a ~1,331-token p99 answer + ~30 of chat template.
+# It is a RESERVE, not a prediction: a shorter reply simply leaves the row
+# further inside the cap, and assemble.py remains the backstop for a reply
+# that overruns it.
+REPLY_RESERVE_TOKENS = 3_500
+
 TASK_ID_LEN = 16
 
 # Default task-type mix per stream. Overridable per call (task_type_mix=) and
@@ -272,8 +292,19 @@ def _existing_in_queue(store, stream: str, arm: str | None) -> int:
     )
 
 
+def seed_token_budget(cfg) -> int:
+    """The longest seed that can still leave room for an assistant turn.
+
+    Derived rather than configured: the seed budget and the training cap
+    describe one row, and a literal here would drift out of step with
+    train.main.max_seq_length the first time that moved.
+    """
+    return max(0, int(cfg.max_seq_length) - REPLY_RESERVE_TOKENS)
+
+
 def _candidate_seeds(
-    store, *, limit: int, sources: Sequence[str] | None, stream: str
+    store, *, limit: int, sources: Sequence[str] | None, stream: str,
+    max_seed_tokens: int,
 ) -> list[tuple[str, int]]:
     """(seed_id, tasks already planned on it), fewest-first, under the cap.
 
@@ -325,6 +356,22 @@ def _candidate_seeds(
     A seed that declares NOTHING stays eligible for any wave, which is every
     other builder's contract today: transition.py is the only writer of
     meta_json.stream on a seed row in the tree.
+
+    A seed longer than `max_seed_tokens` is never offered, and that is the
+    fourth exclusion of the same shape. It is the general case of the
+    `oversize` clause above: that flag only exists on rows chunks.py has
+    chunked, which is the InJudgements source alone, so PredEx and
+    TathyaNyaya - 92.8% and 69.9% of whose seeds exceed the chunk band - can
+    never carry it. Those two sources supplied every one of the 16 rows
+    assemble.py dropped for length in the 2026-08-26 measurement. Chunking
+    them is NOT the fix (seeds.predex_seed builds its text as facts + the
+    court's reasoning, so a chunk is either an unanswerable fragment or the
+    answer without its question); refusing to plan against them is.
+
+    An unmeasured seed - token_count NULL - stays eligible, on the same
+    contract as the clauses above. Nothing in the tree writes a NULL today;
+    the COALESCE is there because the column permits one, and assemble.py is
+    still the backstop.
     """
     clauses = [
         "COALESCE(t.n, 0) < ?",
@@ -334,8 +381,9 @@ def _candidate_seeds(
         "THEN json_extract(s.meta_json, '$.held_out') END, 0) = 0",
         "COALESCE(CASE WHEN json_valid(s.meta_json) "
         "THEN json_extract(s.meta_json, '$.stream') END, ?) = ?",
+        "COALESCE(s.token_count, 0) <= ?",
     ]
-    params: list = [PER_SEED_CAP, stream, stream]
+    params: list = [PER_SEED_CAP, stream, stream, max_seed_tokens]
     if sources:
         clauses.append(f"s.source_id IN ({', '.join('?' * len(sources))})")
         params.extend(sources)
@@ -391,9 +439,8 @@ def plan_rows(
 ) -> list[dict]:
     """The rows plan_wave would insert - pure enough to test and to preview.
 
-    Reads the store, writes nothing. `cfg` is accepted for signature parity
-    with the other builders (and as the hook for future per-stream policy);
-    no field is read off it today.
+    Reads the store, writes nothing. `cfg` supplies max_seq_length, from
+    which seed_token_budget derives the longest seed worth planning against.
     """
     planned_already = _existing_in_queue(store, stream, arm)
     wanted = max(0, n - planned_already)
@@ -407,7 +454,10 @@ def plan_rows(
         prompt_registry.variants(task_type)
     quota = allocate(mix, wanted)
 
-    candidates = _candidate_seeds(store, limit=wanted, sources=sources, stream=stream)
+    candidates = _candidate_seeds(
+        store, limit=wanted, sources=sources, stream=stream,
+        max_seed_tokens=seed_token_budget(cfg),
+    )
     if not candidates:
         return []
     pair_counts = _sample_counts(store, [seed_id for seed_id, _ in candidates])

@@ -19,6 +19,7 @@ from tuned.data.generate import MAX_ATTEMPTS
 from tuned.data.tasks import (
     CURATED_C2_MIX,
     PER_SEED_CAP,
+    REPLY_RESERVE_TOKENS,
     REOPEN_STATES,
     SYNTHESIS_MIX,
     TERMINALLY_DEAD,
@@ -28,6 +29,7 @@ from tuned.data.tasks import (
     plan_rows,
     plan_wave,
     reopen_tasks,
+    seed_token_budget,
     task_id_for,
 )
 
@@ -430,6 +432,57 @@ def test_a_chunk_flagged_oversize_is_never_planned_against(tmp_path, cfg):
         planned = {r[0] for r in store.conn.execute("SELECT DISTINCT seed_id FROM task")}
         assert "big1" not in planned
         assert {"ok1", "plain"} <= planned
+
+
+def test_seed_token_budget_leaves_room_for_the_assistant_turn(cfg):
+    """The budget is the train cap minus what the reply needs, never negative.
+
+    Pinned as arithmetic rather than a literal so that moving
+    train.main.max_seq_length moves the planner with it - the two numbers
+    describe one row and drifting apart is what puts a doomed task in the
+    queue.
+    """
+    assert seed_token_budget(cfg) == cfg.max_seq_length - REPLY_RESERVE_TOKENS
+
+    class _Tiny:
+        max_seq_length = 100
+
+    assert seed_token_budget(_Tiny) == 0
+
+
+def test_a_seed_too_long_to_leave_reply_room_is_never_planned_against(tmp_path, cfg):
+    """The fourth seed-level exclusion, and the same shape as the other three.
+
+    assemble.py drops a row whose RENDERED length exceeds max_seq_length -
+    at the far end of the pipeline, after the teacher has already been paid
+    for the generation. Measured 2026-08-26 over 1,368 real generations, the
+    16 rows dropped that way averaged a 7,597-token seed against a 492-token
+    trace, and every one came from PredEx or TathyaNyaya, whose seeds are
+    never chunked. So the drop is silent where it costs a call, and BIASED -
+    what it removes is the longest, most substantive cases.
+
+    Both directions: the seed one token inside the budget is still selected,
+    and so is the seed that records no length at all, which stays eligible
+    on the same contract as the other exclusions ("a seed that declares
+    NOTHING stays eligible").
+    """
+    budget = seed_token_budget(cfg)
+    with open_store(tmp_path, n_seeds=0) as store:
+        store.upsert_seeds([
+            {"seed_id": "fits", "source_id": SOURCE_ID, "text": "t",
+             "token_count": budget, "case_type": "bail", "code_era": "bns"},
+            {"seed_id": "over", "source_id": SOURCE_ID, "text": "t",
+             "token_count": budget + 1, "case_type": "bail", "code_era": "bns"},
+            {"seed_id": "way_over", "source_id": SOURCE_ID, "text": "t",
+             "token_count": 50_369, "case_type": "bail", "code_era": "bns"},
+            {"seed_id": "unmeasured", "source_id": SOURCE_ID, "text": "t",
+             "token_count": None, "case_type": "bail", "code_era": "bns"},
+        ])
+        assert plan_wave(store, cfg, "synthesis", 12) > 0
+        planned = {r[0] for r in store.conn.execute("SELECT DISTINCT seed_id FROM task")}
+        assert "over" not in planned
+        assert "way_over" not in planned
+        assert {"fits", "unmeasured"} <= planned
 
 
 def test_a_seed_that_declares_a_stream_is_only_planned_into_that_stream(tmp_path, cfg):
