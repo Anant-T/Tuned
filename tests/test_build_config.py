@@ -818,7 +818,12 @@ def test_recovery_refuses_canonical_aliases_of_the_live_control(tmp_path, workdi
 
 @pytest.mark.parametrize(
     "workdir",
-    ["data/build/exp_recovery", "data/build/exp_harmony", "data/build/exp_s1"],
+    [
+        "data/build/exp_recovery",
+        "data/build/exp_harmony",
+        "data/build/exp_s1",
+        "data/build/exp_measure",
+    ],
 )
 def test_isolated_experiment_siblings_are_not_treated_as_live_control(
     tmp_path, workdir
@@ -979,3 +984,24 @@ def test_eval_cohort_strata_refuses_empty_duplicate_and_non_string(tmp_path):
         path.write_text(_yaml.safe_dump(doc), encoding="utf-8")
         with pytest.raises(ValueError, match="eval_cohort_strata"):
             load_build_config(path, allow_unpinned=True)
+
+
+def test_the_deepseek_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_deepseek is an experiment sibling, not the live control.
+
+    The one-line fence that makes everything else in the deepseek arm
+    possible: is_live_control_workdir is what load_build_config and the
+    write guards consult, and an unlisted name under data/build reads as
+    the frozen control.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_deepseek") is False
+    assert is_live_control_workdir("data/build") is True
+    # A recovery-capable doc on the new sibling loads; on the live root it
+    # is refused. Same shape as the exp_recovery tests above.
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_deepseek"
+    doc["build"]["harmony_prefill"] = "I start from the facts. "
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_deepseek"

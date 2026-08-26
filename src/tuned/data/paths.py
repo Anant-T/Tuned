@@ -14,7 +14,9 @@ from pathlib import Path
 # exp_harmony) are allowed next to these names, not under them.
 LIVE_WORKDIR = Path("data/build")
 LIVE_STATE_DB = LIVE_WORKDIR / "state" / "law_v1.sqlite3"
-ISOLATED_WORKDIR_SIBLINGS = frozenset({"exp_recovery", "exp_harmony", "exp_s1"})
+ISOLATED_WORKDIR_SIBLINGS = frozenset(
+    {"exp_recovery", "exp_harmony", "exp_s1", "exp_measure", "exp_deepseek"}
+)
 
 
 def package_repo_root() -> Path:
