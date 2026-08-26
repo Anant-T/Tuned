@@ -45,9 +45,12 @@
 #   1. swap model.repo to unsloth/Qwen3-8B-bnb-4bit (standard quant, not the
 #      "-unsloth-" dynamic quant) - saves exactly 1.31 GiB; re-pin revision
 #      via scripts/pin_revision.py before using it, do not guess a sha.
-#   2. raise UNSLOTH_CE_LOSS_N_CHUNKS 16 -> 32 (halves the ~0.7 GiB loss-step
+#   2. raise UNSLOTH_CE_LOSS_N_CHUNKS 16 -> 32 (already spent as of 2026-08-26 - the notebook ships 32) (halves the ~0.7 GiB loss-step
 #      transient again).
-#   3. drop max_seq_length to 6144 (still keeps most judgments intact).
+#   3. drop max_seq_length to 8192 - the ceiling this lane is already
+#      qualified at (2026-08-08), and above the corpus p100 of 7,610 tokens,
+#      so it costs nothing until the corpus grows past it.
+#   4. drop max_seq_length to 6144 (still keeps most judgments intact).
 # NOT on the ladder: use_gradient_checkpointing "unsloth" (CPU offload) - it
 # is a no-op under DDP; unsloth PR#4240 states prior DDP fixes "eliminated
 # CPU offloading entirely" for compatibility. That lever only does anything

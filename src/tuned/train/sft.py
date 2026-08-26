@@ -137,7 +137,7 @@ def check_vram_reserved(reserved_gib: list[float], limit_gib: float = 13.5) -> N
             "abort line - too close to the 14.56 GiB cap to trust across a "
             "multi-session run (fragmentation only grows). OOM ladder in "
             "configs/law_v1_8b_ddp.yaml: standard-quant repo (-1.31 GiB) -> "
-            "UNSLOTH_CE_LOSS_N_CHUNKS 32 -> seq 6144."
+            "UNSLOTH_CE_LOSS_N_CHUNKS 32 -> seq 8192 -> seq 6144."
         )
 
 
@@ -590,7 +590,8 @@ def main(argv: list[str] | None = None) -> None:
                 raise RuntimeError(
                     f"peak reserved {worst:.2f} GiB > {self.limit_gib} GiB at "
                     f"step {state.global_step} - OOM-bound profile; ladder: "
-                    "standard-quant repo -> UNSLOTH_CE_LOSS_N_CHUNKS 32 -> seq 6144"
+                    "standard-quant repo -> UNSLOTH_CE_LOSS_N_CHUNKS 32 -> "
+                    "seq 8192 -> seq 6144"
                 )
             return control
 

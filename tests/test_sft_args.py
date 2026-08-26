@@ -456,3 +456,18 @@ def test_reserved_ceiling_defaults_to_every_step():
     src = inspect.getsource(sft.main)
     assert "every: int = 1" in src, "_ReservedCeiling must default to every=1"
     assert "every: int = 25" not in src
+
+
+def test_remediation_ladders_name_the_8192_rung():
+    import inspect
+
+    import pytest
+
+    from tuned.train import sft
+
+    with pytest.raises(SystemExit) as excinfo:
+        sft.check_vram_reserved([14.0])
+    assert "seq 8192 -> seq 6144" in str(excinfo.value)
+
+    # The _ReservedCeiling raise is nested inside main(); read its source.
+    assert "seq 8192 -> seq 6144" in inspect.getsource(sft.main)
