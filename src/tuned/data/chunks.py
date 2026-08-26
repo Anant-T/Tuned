@@ -13,17 +13,38 @@ work begins:
   `seed` ROWS FROM `seeds.py`  specifically the InJudgements rows -
                               seeds.py's own docstring says so directly:
                               "Text is kept WHOLE here (no chunking) -
-                              segment.py chunks it later by segment." PredEx
-                              and TathyaNyaya are already short excerpts and
-                              are not touched here. chunk_seed_rows drives
-                              this one, and it REPLACES the whole-text parent
-                              row with its chunks (deletes the parent,
-                              inserts the children) rather than leaving both
-                              in the table - a wave planner that can see both
-                              would plan against the 50,000-word original as
+                              segment.py chunks it later by segment."
+                              chunk_seed_rows drives this one, and it
+                              REPLACES the whole-text parent row with its
+                              chunks (deletes the parent, inserts the
+                              children) rather than leaving both in the
+                              table - a wave planner that can see both would
+                              plan against the 50,000-word original as
                               readily as against its own chunks, which is
                               exactly the prompt-budget blowout chunking
                               exists to prevent.
+
+PREDEX AND TATHYANYAYA ARE LEFT WHOLE ON PURPOSE, AND NOT BECAUSE THEY ARE
+SHORT. An earlier version of this docstring said they "are already short
+excerpts", which is false: measured 2026-08-26 over all 60,603 seeds, 92.8%
+of PredEx and 69.9% of TathyaNyaya rows exceed MAX_CHUNK_TOKENS, with p99s of
+10,389 and 11,734 tokens and maxima of 50,369 and 30,098
+(docs/reports/2026-08-26-row-length-under-deepseek-traces.md). Chunking them
+would look like an obvious win and is a trap.
+
+The real reason is that each of those seeds CARRIES ITS OWN ANSWER.
+seeds.predex_seed builds its text as `facts + "\n\n" + the court's reasoning`
+and tathyanyaya_seed is documented as the same treatment, so a chunk of one is
+either an unanswerable fragment (facts, reasoning removed) or the answer with
+no question (reasoning, facts removed). There is no split of a whole case that
+preserves the task, which is why this module takes the InJudgements source
+alone.
+
+Their LENGTH is still a real problem, and it is solved one layer up rather
+than here: tasks.seed_token_budget refuses to plan a wave against a seed with
+no room left for its own reply. Every row assemble.py has ever dropped for
+length came from these two sources, precisely because the `oversize` flag
+below can only exist on rows this module chunked.
 
 Both drivers funnel through the same core: segment_document (segment.py)
 produces tier-selected segments, pack_chunks bins them into the token band
