@@ -458,6 +458,23 @@ def test_reserved_ceiling_defaults_to_every_step():
     assert "every: int = 25" not in src
 
 
+def test_reserved_ceiling_guard_is_negated():
+    # Pins the call-site guard's polarity. `ceiling_check_due` returns True
+    # exactly on steps the ceiling SHOULD be read, so on_step_end must skip
+    # (return control) when it is FALSE - "if not ceiling_check_due(...)".
+    # Flipping that to "if ceiling_check_due(...): return control" silently
+    # disables the reserved-VRAM check on every step it would have fired on
+    # (ceiling_check_due itself stays correct, so every test exercising it
+    # directly would still pass) - this test is what catches that inversion.
+    import inspect
+
+    from tuned.train import sft
+
+    src = inspect.getsource(sft.main)
+    assert "if not ceiling_check_due(state.global_step, self.early, self.every):" in src
+    assert "if ceiling_check_due(state.global_step, self.early, self.every):" not in src
+
+
 def test_remediation_ladders_name_the_8192_rung():
     import inspect
 

@@ -5,8 +5,7 @@ one rank per GPU, and each rank holds the full model.
 All launches are prefixed CUDA_VISIBLE_DEVICES=0,1 and go through
 `torchrun --nproc_per_node=2 -m tuned.train.sft --config configs/law_v1_8b_ddp.yaml --mode smoke`:
 
-Probe:    ... --max-steps 2 --no-hub --dataset data/probe_long.jsonl --max-seq-length 8192
-Savetest: ... --max-steps 4 --save-steps 2
+Probe:    ... --max-steps 2 --save-steps 1 --dataset data/probe_long.jsonl --max-seq-length 12288
 Smoke:    ... (no extra args)
 Resume:   ... --resume --max-steps 64 --allow-schedule-change
 Main:     ... --mode main --time-budget-s 37800 (later sessions add --resume;
@@ -137,19 +136,26 @@ def check_vram_reserved(reserved_gib: list[float], limit_gib: float = 13.5) -> N
             "abort line - too close to the 14.56 GiB cap to trust across a "
             "multi-session run (fragmentation only grows). OOM ladder in "
             "configs/law_v1_8b_ddp.yaml: standard-quant repo (-1.31 GiB) -> "
-            "UNSLOTH_CE_LOSS_N_CHUNKS 32 -> seq 8192 -> seq 6144."
+            "seq 8192 -> seq 6144 (UNSLOTH_CE_LOSS_N_CHUNKS is already at "
+            "32, not a lever left to spend)."
         )
 
 
 def ceiling_check_due(step: int, early: int, every: int) -> bool:
     """Whether the reserved-VRAM ceiling should be read at this step.
 
-    The `every` sampling existed because at seq 8192 with drop-never-truncate
-    the bucket was FIXED - every row truncated to the same length, so the full
-    memory shape appeared by step 1-2 and later steps could only differ by
-    fragmentation. Above the longest row the cap stops binding and the bucket
-    is variable: the peak step is whichever step carries the longest row, and
-    sampling can miss it entirely. Hence every=1 at the call site."""
+    torch.cuda.max_memory_reserved() is a MONOTONIC high-water mark and
+    nothing in this repo calls reset_peak_memory_stats, so a later sample
+    still observes an earlier breach - sampling every 25th step was never at
+    risk of missing one, only of reporting it late. every=1 exists so the
+    abort fires AT the breaching step: the `at step {N}` in the error message
+    then names the step that actually caused the breach, not whichever later
+    step happened to be sampled. At ga=6 (~224 s/optimizer step), 24 late
+    steps is ~90 minutes of Kaggle quota spent training on a profile already
+    known to be OOM-bound. It costs nothing to check every step either way -
+    a stats-counter read, no CUDA sync, against a ~74 s step. `every` still
+    exists and still samples (rather than checking every step) when set above
+    1."""
     return step <= early or step % every == 0
 
 
@@ -334,8 +340,11 @@ def main(argv: list[str] | None = None) -> None:
 
     cfg = load_config(args.config)  # strict: refuses unpinned revision
     if args.no_hub:
-        # Actually strip the repo, not just skip the preflight: a PROBE run
-        # must never push to (or depend on) the lane's checkpoint repo.
+        # Actually strip the repo, not just skip the preflight: --no-hub is
+        # for a throwaway run - e.g. the 2-step row-count probe used to
+        # derive train.main.max_steps - that must never push to (or depend
+        # on) the lane's checkpoint repo. The PROBE gate itself no longer
+        # passes this flag; it pushes a checkpoint on purpose.
         cfg = dataclasses.replace(cfg, hub=HubCfg(checkpoint_repo=None))
 
     # Preflight - before any GPU import or model load.
@@ -590,8 +599,8 @@ def main(argv: list[str] | None = None) -> None:
                 raise RuntimeError(
                     f"peak reserved {worst:.2f} GiB > {self.limit_gib} GiB at "
                     f"step {state.global_step} - OOM-bound profile; ladder: "
-                    "standard-quant repo -> UNSLOTH_CE_LOSS_N_CHUNKS 32 -> "
-                    "seq 8192 -> seq 6144"
+                    "standard-quant repo -> seq 8192 -> seq 6144 "
+                    "(UNSLOTH_CE_LOSS_N_CHUNKS already at 32)"
                 )
             return control
 

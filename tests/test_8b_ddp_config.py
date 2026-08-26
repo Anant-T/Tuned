@@ -1,9 +1,11 @@
 """The production lane (configs/law_v1_8b_ddp.yaml): Qwen3-8B under plain
-2x T4 data-parallel via torchrun. FULLY QUALIFIED 2026-08-08 - all four gates
-green (PROBE 12.80/13.00 GiB, SAVETEST, SMOKE 60/60 at 74.7 s/step with peaks
-12.98/13.18 GiB, RESUME). Every value asserted here is a live contract with
-the Kaggle notebook, notebooks/stage_model.ipynb, or the Hub checkpoint repo -
-none of it may drift without re-running the ladder."""
+2x T4 data-parallel via torchrun. Qualified at seq 8192 on 2026-08-08 - all
+four gates green (PROBE 12.80/13.00 GiB, SAVETEST, SMOKE 60/60 at 74.7 s/step
+with peaks 12.98/13.18 GiB, RESUME). max_seq_length was raised 8192 -> 12288
+on 2026-08-26 as headroom (asserted below); requalification at 12288 via the
+merged PROBE gate is pending. Every value asserted here is a live contract
+with the Kaggle notebook, notebooks/stage_model.ipynb, or the Hub checkpoint
+repo - none of it may drift without re-running the ladder."""
 
 from pathlib import Path
 

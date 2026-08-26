@@ -18,9 +18,11 @@
 # (unsloth_fused_ce_loss) - Apple's cut-cross-entropy is dead code on sm_75
 # (commented out upstream; its Triton kernels need 96KB shared mem vs T4's
 # 64KB). Default chunking (n_chunks=4 at this seq/vocab) leaves a ~2.4-3.0
-# GiB transient at the loss step; the notebook sets UNSLOTH_CE_LOSS_N_CHUNKS=16
-# (must be in env before `import unsloth`), cutting that to ~0.7 GiB - that
-# margin is what the measured peaks above depend on.
+# GiB transient at the loss step; the notebook now sets UNSLOTH_CE_LOSS_N_CHUNKS=32
+# (must be in env before `import unsloth`). The measured peaks above were taken
+# at 16 on 2026-08-08, cutting that transient to ~0.7 GiB - that margin is what
+# those numbers depend on; 32 was spent later (2026-08-26) as an OOM-ladder
+# rung, its own margin unmeasured.
 # Each rank holds the FULL model (no model split) - the parallelism is over
 # data, not layers. Launch:
 #
