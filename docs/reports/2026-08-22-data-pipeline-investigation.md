@@ -17,7 +17,7 @@ This file is a write-up of a Cursor investigation plus the probe that followed. 
 
 ## 1. What `.claude/worktrees` is
 
-`.claude/worktrees` is Claude Code’s isolated git checkout folder. The whole `.claude/` tree is gitignored as agent scratch.
+`.claude/worktrees` is the coding agent’s isolated git checkout folder. The whole `.claude/` tree is gitignored as agent scratch.
 
 There is **one** live worktree:
 
