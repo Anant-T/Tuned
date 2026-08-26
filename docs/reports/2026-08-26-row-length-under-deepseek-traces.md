@@ -86,8 +86,9 @@ proportional-tail worry is unfounded.
    `low | medium | high | xhigh | max`, and one upstream enforces it while the other does not,
    producing a ~20% hard-failure rate. Any note recommending `minimal` (including earlier
    working notes on this question) should read `low`.
-4. **The row-length lever that remains is the seed, not the teacher.** Trimming or chunking the
-   39 seeds above 4,096 tokens would do more for the drop rate than any reasoning setting.
+4. **The row-length lever that remains is the seed, not the teacher.** See the addendum below,
+   which traces the whole tail to two seed sources — and finds that chunking them, the obvious
+   fix, is the wrong one.
 5. **Nothing here needs GPU quota**, and the corpus question that blocked the main run is now
    answered for the length dimension.
 
