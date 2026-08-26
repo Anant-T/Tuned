@@ -393,7 +393,11 @@ def test_a_retry_re_rolls_the_same_request_and_never_bumps_effort(cfg, attempt):
 
 def test_clean_generation_lands_in_judging(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg)
+        # bai (family deepseek) leads routing.generator since 2026-08-25; this
+        # test is about cerebras's own generation plumbing (provider/family
+        # recorded on the row), so bai is excluded to keep it the answering
+        # generator.
+        router = FakeRouter(cfg, missing_keys={"bai"})
         totals = run(store, cfg, router, paths)
         assert totals["gen_ok"] == 1
         assert totals["gated_out"] == 0
@@ -411,7 +415,9 @@ def test_clean_generation_lands_in_judging(tmp_path, cfg, paths):
 
 def test_generation_records_usage_against_the_ledger(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
-        run(store, cfg, FakeRouter(cfg), paths)
+        # bai leads routing.generator since 2026-08-25; excluded so cerebras
+        # is what the ledger actually gets charged against here.
+        run(store, cfg, FakeRouter(cfg, missing_keys={"bai"}), paths)
         used = store.usage_today("cerebras", "gpt-oss-120b")
         assert used == {
             "requests": 1,
@@ -724,7 +730,13 @@ def test_a_reply_the_gates_pass_can_still_break_the_judge_sizing_premise(tmp_pat
     exactly the shape a provider that does not bill its reasoning channel
     against max_tokens would return. It goes back for a regeneration."""
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg, {"generator": [chat_response(OVERSIZE_ANSWER, OVERSIZE_THINK)]})
+        # bai leads routing.generator since 2026-08-25; excluded so the
+        # pinned "cerebras/gpt-oss-120b" ref below is the one that actually
+        # answers.
+        router = FakeRouter(
+            cfg, {"generator": [chat_response(OVERSIZE_ANSWER, OVERSIZE_THINK)]},
+            missing_keys={"bai"},
+        )
         run(store, cfg, router, paths)
         task = only_task(store)
         gen = store.latest_generation(task["task_id"])
@@ -799,7 +811,12 @@ def test_a_missing_trace_parks_as_a_provider_fact_not_a_content_failure(
     instrumentation, it only stops the row being counted as a rejection.
     """
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg, {"generator": [chat_response(CLEAN_ANSWER, None)]})
+        # bai leads routing.generator since 2026-08-25; excluded so the
+        # pinned "cerebras/gpt-oss-120b" ref below is the one named as
+        # responsible.
+        router = FakeRouter(
+            cfg, {"generator": [chat_response(CLEAN_ANSWER, None)]}, missing_keys={"bai"}
+        )
         run(store, cfg, router, paths)
         task = only_task(store)
         assert task["state"] == GEN_UNROUTABLE_STATE
@@ -839,7 +856,10 @@ def test_a_dead_generator_is_counted_as_parked_and_named(tmp_path, cfg, paths):
     """
     with make_store(tmp_path, n_seeds=6, n_tasks=6) as store:
         traceless = chat_response(CLEAN_ANSWER, None)
-        router = FakeRouter(cfg, {"generator": [traceless]})
+        # bai leads routing.generator since 2026-08-25; excluded so the
+        # pinned "cerebras/gpt-oss-120b" ref below is the one that gets
+        # named in the parked totals.
+        router = FakeRouter(cfg, {"generator": [traceless]}, missing_keys={"bai"})
         totals = run(store, cfg, router, paths, n_workers=6)
 
         assert totals["parked"] == {"cerebras/gpt-oss-120b": 6}
@@ -1090,7 +1110,11 @@ def test_provider_failure_returns_the_task_to_the_queue(tmp_path, cfg, paths):
         "429 everywhere", status=429, provider="cerebras", model="gpt-oss-120b", retryable=True
     )
     with make_store(tmp_path) as store:
-        totals = run(store, cfg, FakeRouter(cfg, {"generator": [error]}), paths)
+        # bai leads routing.generator since 2026-08-25; excluded so the
+        # manufactured 429 (declared against cerebras above) is the one
+        # actually raised and ledgered.
+        router = FakeRouter(cfg, {"generator": [error]}, missing_keys={"bai"})
+        totals = run(store, cfg, router, paths)
         assert totals["errors"] == 1
         assert totals["gen_ok"] == 0
         task = only_task(store)
@@ -1324,7 +1348,9 @@ def test_loop_stops_when_the_queue_is_empty(tmp_path, cfg, paths, capsys):
 
 def test_status_line_reports_the_batch_and_the_budget(tmp_path, cfg, paths, capsys):
     with make_store(tmp_path) as store:
-        run(store, cfg, FakeRouter(cfg), paths)
+        # bai leads routing.generator since 2026-08-25; excluded so the
+        # status line's spend is reported against cerebras, as pinned below.
+        run(store, cfg, FakeRouter(cfg, missing_keys={"bai"}), paths)
         line = capsys.readouterr().out.strip().splitlines()[-1]
         assert line.startswith(
             "batch 1: claimed=1 gen-ok=1 gated-out=0 err=0 lost-lease=0 tokens=1700"
@@ -1354,10 +1380,23 @@ def test_streams_are_claimed_separately(tmp_path, cfg, paths):
 # --------------------------------------------------------------------------
 
 def _narrow_generator(cfg):
-    """The config with the sole generator family cut back to the window the
-    pilot actually ran against."""
-    return cfg_with_context(
+    """The config with every generator family cut back to the window the
+    pilot actually ran against.
+
+    TWO FAMILIES ARE NARROWED SINCE 2026-08-25, not one. bai (family
+    deepseek) joined routing.generator with an 800,000-token window that
+    dwarfs the pilot window this fixture recreates, so leaving it alone would
+    make it the family that answers every "too long for the generator" row
+    below instead of the pool emptying. Narrowing it alongside gpt-oss keeps
+    the family-excluded mechanism doing the exclusion, rather than a
+    missing-key stand-in that a real Router would classify differently (a
+    missing key is not row-shaped; see generate.ROW_SHAPED_SKIPS).
+    """
+    narrowed = cfg_with_context(
         cfg, family="gpt-oss", role="generator", max_context=NARROW_GENERATOR_CONTEXT
+    )
+    return cfg_with_context(
+        narrowed, family="deepseek", role="generator", max_context=NARROW_GENERATOR_CONTEXT
     )
 
 
@@ -1372,7 +1411,10 @@ def test_the_shipped_generator_window_holds_the_longest_row_this_build_makes(
     caught the pin, and it is the one that fails if anybody lowers it again.
     """
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
-        router = FakeRouter(cfg)
+        # bai leads routing.generator since 2026-08-25 and its 800,000-token
+        # window would swallow LONG_SEED_TEXT without narrowing anything;
+        # excluded so this stays a test of cerebras's own declared window.
+        router = FakeRouter(cfg, missing_keys={"bai"})
         run(store, cfg, router, paths)
         (attempt,) = router.calls_for("generator")
         assert attempt["est_tokens"] > NARROW_GENERATOR_CONTEXT
@@ -1399,6 +1441,8 @@ def test_a_long_prompt_parks_when_no_generator_can_hold_it(tmp_path, cfg, paths)
     """
     narrow = _narrow_generator(cfg)
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
+        # _narrow_generator narrows both gpt-oss and deepseek (bai), so the
+        # pool genuinely empties rather than bai answering instead.
         router = FakeRouter(narrow)
         run(store, narrow, router, paths)
         # The attempt is recorded, but `ref is None` - the context filter
@@ -1406,14 +1450,18 @@ def test_a_long_prompt_parks_when_no_generator_can_hold_it(tmp_path, cfg, paths)
         # spent.
         (attempt,) = router.calls_for("generator")
         assert attempt["est_tokens"] > NARROW_GENERATOR_CONTEXT
-        assert attempt["exclude_families"] == frozenset({"gpt-oss"})
+        # Both narrowed families are excluded now that bai (deepseek) is one
+        # of them, not just gpt-oss.
+        assert attempt["exclude_families"] == frozenset({"gpt-oss", "deepseek"})
         assert attempt["ref"] is None
         task = only_task(store)
         assert task["state"] == GEN_UNROUTABLE_STATE
         assert task["disposition"] == "unroutable:generator"
 
     # ...and with a second generator family present it still diverts, so the
-    # routing itself is intact and only the pool changed.
+    # routing itself is intact and only the pool changed. bai (deepseek)
+    # stays narrowed along with gpt-oss - the second family under test here
+    # is secondgen, not bai's deepseek.
     two = _narrow_generator(cfg_with_two_generator_families(cfg))
     with make_store(tmp_path / "two", text=LONG_SEED_TEXT) as store:
         router = FakeRouter(two)
@@ -1427,7 +1475,9 @@ def test_a_long_prompt_parks_when_no_generator_can_hold_it(tmp_path, cfg, paths)
 
 def test_a_short_prompt_excludes_no_generator(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg)
+        # bai leads routing.generator since 2026-08-25; excluded so the
+        # pinned "cerebras/gpt-oss-120b" ref below is the one that answers.
+        router = FakeRouter(cfg, missing_keys={"bai"})
         run(store, cfg, router, paths)
         call = router.calls_for("generator")[0]
         assert call["est_tokens"] <= 8192
@@ -1476,6 +1526,8 @@ def test_the_generator_opts_a_family_into_reasoning_and_leaves_gpt_oss_alone(
     )
     two = _narrow_generator(cfg_with_two_generator_families(cfg))
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
+        # _narrow_generator narrows bai's deepseek family too, so the
+        # failover under test lands on secondgen, not on bai.
         router = FakeRouter(two)
         task = only_task(store)
         asyncio.run(generate_once(store, two, router, task, paths=paths, attempt=2))
@@ -1485,7 +1537,9 @@ def test_the_generator_opts_a_family_into_reasoning_and_leaves_gpt_oss_alone(
         assert store.events("effort_bump") != []
 
     with make_store(tmp_path / "short") as store:
-        router = FakeRouter(cfg)
+        # bai leads routing.generator since 2026-08-25; excluded so this
+        # stays a check of cerebras's own (unbumped) params.
+        router = FakeRouter(cfg, missing_keys={"bai"})
         task = only_task(store)
         asyncio.run(generate_once(store, cfg, router, task, paths=paths, attempt=2))
         call = router.calls_for("generator")[0]
@@ -1502,8 +1556,9 @@ def test_a_row_no_generator_can_hold_parks_recoverably(tmp_path, cfg, paths):
     the lease the claim actually handed out."""
     with make_store(tmp_path) as store:
         # A seed longer than every generator's context window - sized
-        # against the REAL 131k window, not a narrowed one, because "no
-        # generator can hold this row" is exactly what is being asserted.
+        # against the real widest window (bai's 800,000 since 2026-08-25),
+        # not a narrowed one, because "no generator can hold this row" is
+        # exactly what is being asserted.
         store.upsert_seeds(
             [{**seed_rows(1)[0], "text": OVERSIZE_SEED_TEXT}]
         )
@@ -1521,8 +1576,9 @@ def test_a_row_no_generator_can_hold_parks_recoverably(tmp_path, cfg, paths):
         assert only_task(store)["claimed_by"] is None
         event = json.loads(store.events("generation_error")[0]["detail_json"])
         assert event["unroutable"] is True
-        # One generator family since the 2026-08-18 demotion.
-        assert set(event["excluded_families"]) == {"gpt-oss"}
+        # Two generator families since bai (deepseek) joined 2026-08-25
+        # alongside gpt-oss; OVERSIZE_SEED_TEXT is sized to exceed both.
+        assert set(event["excluded_families"]) == {"gpt-oss", "deepseek"}
 
 
 def test_a_stale_worker_cannot_park_a_task_it_no_longer_holds(tmp_path, cfg, paths):
@@ -1531,7 +1587,8 @@ def test_a_stale_worker_cannot_park_a_task_it_no_longer_holds(tmp_path, cfg, pat
     with make_store(tmp_path) as store:
         store.upsert_seeds([{**seed_rows(1)[0], "text": OVERSIZE_SEED_TEXT}])
         task = store.claim_tasks("stale-worker", 1)[0]
-        result = asyncio.run(generate_once(store, cfg, FakeRouter(cfg), task, paths=paths))
+        router = FakeRouter(cfg)
+        result = asyncio.run(generate_once(store, cfg, router, task, paths=paths))
         assert result.unroutable is True
         # The lease expired and somebody else took the task while the call ran.
         store.set_task_state(task["task_id"], "pending")
@@ -1552,7 +1609,12 @@ def test_a_keyless_batch_leaves_the_wave_intact(tmp_path, cfg, paths):
     FIRST pilot launch does. It used to take {'pending': 3} to
     {'rejected': 3} with zero calls made, and `rejected` is terminal."""
     with make_store(tmp_path, n_seeds=3, n_tasks=3) as store:
-        router = FakeRouter(cfg, missing_keys={"cerebras", "lightning", "mistral"})
+        # bai joined routing.generator as a THIRD unkeyed provider on
+        # 2026-08-25 and must be named alongside the other two or it alone
+        # would still route every row.
+        router = FakeRouter(
+            cfg, missing_keys={"bai", "cerebras", "lightning", "mistral"}
+        )
         totals = run(store, cfg, router, paths, n_workers=3)
         assert totals["gen_ok"] == 0
         assert totals["errors"] == 3
@@ -1565,7 +1627,10 @@ def test_a_keyless_batch_leaves_the_wave_intact(tmp_path, cfg, paths):
 
 def test_a_missing_key_is_never_a_row_shaped_failure(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg, missing_keys={"cerebras", "lightning", "mistral"})
+        # bai joined routing.generator as a third unkeyed provider 2026-08-25.
+        router = FakeRouter(
+            cfg, missing_keys={"bai", "cerebras", "lightning", "mistral"}
+        )
         result = asyncio.run(
             generate_once(store, cfg, router, only_task(store), paths=paths)
         )
@@ -1579,7 +1644,10 @@ def test_a_keyless_task_parks_recoverably_at_the_attempt_cap(tmp_path, cfg, path
     nothing about the row was ever judged, so it must not be counted as a
     reject, and re-opening it must be able to bring it back."""
     with make_store(tmp_path) as store:
-        router = FakeRouter(cfg, missing_keys={"cerebras", "lightning", "mistral"})
+        # bai joined routing.generator as a third unkeyed provider 2026-08-25.
+        router = FakeRouter(
+            cfg, missing_keys={"bai", "cerebras", "lightning", "mistral"}
+        )
         for _ in range(MAX_ATTEMPTS):
             run(store, cfg, router, paths)
         task = only_task(store)
@@ -1592,13 +1660,15 @@ def test_a_transient_pool_skip_still_re_queues(tmp_path, cfg, paths):
     """Cooling and over-budget lift on their own, so the row goes back to the
     queue rather than parking."""
     with make_store(tmp_path) as store:
-        # BOTH generator refs have to be transiently out, or the row simply
-        # routes to the other one: since 2026-08-19 routing.generator is
-        # cerebras (free, first) then lightning (paid overflow), and a cooling
-        # cerebras is exactly the case where lightning is meant to answer.
+        # ALL THREE generator refs have to be transiently out, or the row
+        # simply routes to one of the others: since 2026-08-25
+        # routing.generator is bai then cerebras (both free) then lightning
+        # (paid overflow), and cooling every free ref is exactly the case
+        # where lightning is meant to answer - but lightning is put
+        # over-budget too, so nothing at all is left and the row re-queues.
         router = FakeRouter(
             cfg,
-            cooling={"cerebras/gpt-oss-120b"},
+            cooling={"bai/deepseek-v4-flash", "cerebras/gpt-oss-120b"},
             over_budget={"lightning/lightning-ai/gpt-oss-120b"},
         )
         result = asyncio.run(
@@ -1615,7 +1685,9 @@ def test_a_transient_pool_skip_still_re_queues(tmp_path, cfg, paths):
 
 def _park_keyless(store, cfg, paths):
     """The motivating park: nothing routable, so the row exhausts unspent."""
-    router = FakeRouter(cfg, missing_keys={"cerebras", "lightning", "mistral"})
+    # bai joined routing.generator as a THIRD unkeyed provider on 2026-08-25;
+    # without it excluded here too, bai alone would still route the row.
+    router = FakeRouter(cfg, missing_keys={"bai", "cerebras", "lightning", "mistral"})
     for _ in range(MAX_ATTEMPTS):
         run(store, cfg, router, paths)
     task = only_task(store)
@@ -1725,7 +1797,11 @@ def test_the_context_estimate_routes_devanagari_past_a_generator_latin_fits(
     assert abs(len(latin) - len(devanagari)) < len(latin) * 0.25
 
     with make_store(tmp_path, text=latin) as store:
-        router = FakeRouter(narrow)
+        # The Latin text fits even the narrowed 8192 window, so narrowing
+        # alone would not exclude bai here (unlike the Devanagari case below)
+        # - it is excluded by key instead, to keep this a test of cerebras's
+        # own estimate rather than of routing preference.
+        router = FakeRouter(narrow, missing_keys={"bai"})
         asyncio.run(generate_once(store, narrow, router, only_task(store), paths=paths))
         assert router.calls_for("generator")[0]["ref"].provider == "cerebras"
 
@@ -1746,9 +1822,11 @@ def test_the_context_estimate_routes_devanagari_past_a_generator_latin_fits(
         assert "gpt-oss" in event["excluded_families"]
 
     # ...and on the SHIPPED window both scripts route, which is the 2026-08-19
-    # probe showing up as behaviour rather than as a config line.
+    # probe showing up as behaviour rather than as a config line. bai leads
+    # routing.generator since 2026-08-25; excluded so this stays a check of
+    # cerebras's own (shipped, unnarrowed) window.
     with make_store(tmp_path / "shipped", text=devanagari) as store:
-        router = FakeRouter(cfg)
+        router = FakeRouter(cfg, missing_keys={"bai"})
         asyncio.run(generate_once(store, cfg, router, only_task(store), paths=paths))
         assert router.calls_for("generator")[0]["ref"].provider == "cerebras"
 
@@ -1840,7 +1918,11 @@ def test_every_attempt_is_ledgered_including_the_429(tmp_path, cfg, paths):
         "rate limited", status=429, provider="cerebras", model="gpt-oss-120b", retryable=True
     )
     with make_store(tmp_path) as store:
-        run(store, cfg, FakeRouter(cfg, {"generator": [error]}), paths)
+        # bai leads routing.generator since 2026-08-25; excluded so the
+        # manufactured 429 (declared against cerebras above) is the one
+        # actually raised and ledgered.
+        router = FakeRouter(cfg, {"generator": [error]}, missing_keys={"bai"})
+        run(store, cfg, router, paths)
         used = store.usage_today("cerebras", "gpt-oss-120b")
         assert used["requests"] == 1
         assert used["errors_429"] == 1

@@ -415,6 +415,139 @@ def test_resolve_quirks_composes_request_hooks_in_order():
     assert resolve_quirks(("groq",)) is QUIRKS["groq"]
 
 
+def _bai_reply(content, *, finish_reason, reasoning="weighing the section...", completion=4096):
+    return {
+        "id": "chatcmpl-1",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning,
+                },
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": completion,
+            "total_tokens": 11 + completion,
+        },
+    }
+
+
+def test_bai_quirk_raises_the_reply_budget_to_the_models_ceiling(monkeypatch):
+    """The caller's budget is an ANSWER budget; b.ai's is a REPLY budget.
+
+    deepseek-v4-flash bills reasoning against max_tokens and emits it first, so
+    a 4000-token budget is not 4000 tokens of answer - it is 4000 tokens of
+    reasoning-then-answer, and the measured empty-content rate at 4096 was
+    10/20 on a real synthesis prompt while at 12288 it was 0/4. Sending the
+    caller's number unchanged puts the shipped GENERATION_OUTPUT_TOKENS (4000)
+    exactly on the 50% empty point.
+
+    The hook is the ONLY place this can be fixed: build_payload applies
+    req.max_tokens AFTER merging model params, so neither params nor
+    role_params can raise it.
+
+    This does not loosen any length gate. reply_budget_chars derives from
+    max_output_tokens(cfg), a config value - not from what went on the wire -
+    so over-long answers are still caught while the model gets room to think.
+    """
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+    payloads = []
+
+    def handler(request):
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json=_body())
+
+    bai = _provider("bai", quirks=("bai",))
+    deepseek = _model(
+        "deepseek-v4-flash",
+        family="deepseek",
+        limits={"rpm": 13, "max_context": 800_000, "max_output": 16384},
+    )
+
+    # The shipped generation budget is raised to the model's reply ceiling.
+    _complete(_client(handler, provider=bai, model=deepseek), _request(max_tokens=4000))
+    assert payloads[-1]["max_tokens"] == 16384
+
+    # A caller already at or above the ceiling is left alone - the hook raises
+    # a floor, it does not clamp.
+    _complete(_client(handler, provider=bai, model=deepseek), _request(max_tokens=32768))
+    assert payloads[-1]["max_tokens"] == 32768
+
+    # A call with no reply allowance stays that way: the hook does not invent one.
+    _complete(_client(handler, provider=bai, model=deepseek), _request(params={"top_p": 0.9}))
+    assert "max_tokens" not in payloads[-1]
+
+    # ...and none of this leaks onto other providers.
+    _complete(_client(handler, provider=_provider("groq")), _request(max_tokens=4000))
+    assert payloads[-1]["max_tokens"] == 4000
+
+
+def test_bai_quirk_rejects_the_truncated_empty_reply(monkeypatch):
+    """deepseek-v4-flash bills reasoning against max_tokens and emits it FIRST,
+    so a budget that runs out mid-reasoning returns a well-formed HTTP 200
+    whose content is the empty string. Measured 2026-08-25: empty content and
+    finish_reason == "length" coincided on every observed call, at every budget
+    from 256 to 32768 - 3/3 empty at 512, 10/20 at 4096 on the real synthesis
+    prompt, 0/4 at 12288.
+
+    Without this the default hook returns text="" and the row is stored as if
+    the model had answered with nothing. Retryable rather than fatal because
+    reasoning length is not deterministic even at temperature 0 (298-10,426
+    tokens observed), so the same call at the same budget genuinely may fit."""
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+    bai = _provider("bai", quirks=("bai",))
+    client = _client(
+        lambda request: httpx.Response(200, json=_bai_reply("", finish_reason="length")),
+        provider=bai,
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        _complete(client, _request(max_tokens=4096))
+
+    assert excinfo.value.retryable is True
+    assert not excinfo.value.context_exceeded  # the prompt fit; the REPLY did not
+    message = str(excinfo.value).lower()
+    assert "truncated" in message and "length" in message
+
+
+def test_bai_quirk_passes_through_a_complete_reply(monkeypatch):
+    """The rejection is scoped to the truncated-empty case. A finished reply is
+    returned untouched, and a truncated reply that still carries content is a
+    partial answer for the gates to judge - not this hook's call to discard."""
+    monkeypatch.setenv("TUNED_TEST_KEY", "sk-secret")
+    bai = _provider("bai", quirks=("bai",))
+
+    done = _complete(
+        _client(
+            lambda request: httpx.Response(
+                200, json=_bai_reply("Section 103 BNS.", finish_reason="stop")
+            ),
+            provider=bai,
+        ),
+        _request(max_tokens=4096),
+    )
+    assert done.text == "Section 103 BNS."
+    assert done.reasoning == "weighing the section..."  # reasoning_content, not reasoning
+    assert done.finish_reason == "stop"
+
+    partial = _complete(
+        _client(
+            lambda request: httpx.Response(
+                200, json=_bai_reply("Section 103 of the", finish_reason="length")
+            ),
+            provider=bai,
+        ),
+        _request(max_tokens=4096),
+    )
+    assert partial.text == "Section 103 of the"
+    assert partial.finish_reason == "length"
+
+
 # --- 3. retries -------------------------------------------------------------
 
 
@@ -840,7 +973,11 @@ def _router(cfg, **kw) -> Router:
 def test_pick_respects_configured_order(cfg, keys):
     router = _router(cfg)
     assert router.pick("judge").ref == GROQ_JUDGE
-    assert router.pick("generator").ref == ModelRef("cerebras", "gpt-oss-120b")
+    # The generator's head-of-list provider has changed more than once (most
+    # recently to bai on 2026-08-25); what this test is actually about is that
+    # pick() walks routing.generator IN ORDER, not which provider sits first,
+    # so the expectation is read off the config instead of pinned by name.
+    assert router.pick("generator").ref == ModelRef(*cfg.routing.generator[0].split("/", 1))
     assert router.pick("probe").ref == ModelRef("groq", "openai/gpt-oss-20b")
 
 
@@ -854,15 +991,21 @@ def test_pick_excludes_families_at_call_time(cfg, keys):
         picked = router.pick(role, exclude_families=frozenset({"gpt-oss"}))
         assert picked is not None and picked.model_cfg.family != "gpt-oss"
 
-    # tiebreak's first ref IS gpt-oss, so exclusion must move the pick along.
-    assert router.pick("tiebreak").ref == ModelRef("groq", "openai/gpt-oss-20b")
-    assert router.pick("tiebreak", exclude_families=frozenset({"gpt-oss"})).ref == ModelRef(
-        "cerebras", "gemma-4-31b"
+    # tiebreak's first ref is mistral since the 2026-08-25 reorder (see the
+    # routing.tiebreak comment in the shipped config - it moved mistral back
+    # ahead of gpt-oss-20b once the generator's own family stopped being
+    # gpt-oss on every row), so excluding mistral's family is what must move
+    # the pick along here.
+    assert router.pick("tiebreak").ref == ModelRef("mistral", "mistral-large-latest")
+    assert router.pick("tiebreak", exclude_families=frozenset({"mistral"})).ref == ModelRef(
+        "groq", "openai/gpt-oss-20b"
     )
-    # ...and since the 2026-08-18 demotion there IS no second generator family,
-    # so excluding gpt-oss leaves the generator role with nothing to pick. That
-    # is the routing half of "a long prompt now parks instead of diverting".
-    assert router.pick("generator", exclude_families=frozenset({"gpt-oss"})) is None
+    # ...and since b.ai (family deepseek) joined the generator role ahead of
+    # cerebras on 2026-08-25, excluding gpt-oss no longer empties it: deepseek
+    # is a distinct family and already the preferred ref, so it still answers.
+    assert router.pick("generator", exclude_families=frozenset({"gpt-oss"})).ref == ModelRef(
+        "bai", "deepseek-v4-flash"
+    )
 
 
 def test_pick_skips_missing_key(cfg, keys, monkeypatch):
@@ -1132,7 +1275,10 @@ def test_pick_reports_why_it_skipped(cfg, keys):
 
     router2 = _router(cfg)
     skipped2: set[str] = set()
-    assert router2.pick("tiebreak", exclude_families=frozenset({"gpt-oss"}), skipped=skipped2)
+    # mistral is tiebreak's first ref since the 2026-08-25 reorder, so
+    # excluding IT is what surfaces "family-excluded" before the walk lands on
+    # the next ref (groq/openai/gpt-oss-20b).
+    assert router2.pick("tiebreak", exclude_families=frozenset({"mistral"}), skipped=skipped2)
     assert skipped2 == {"family-excluded"}  # only reasons seen BEFORE the hit
 
 
@@ -1313,8 +1459,11 @@ def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys
     Router.complete raises straight through instead of failing over, so a
     param picked for the first ref turns every failover into a dead call.
 
-    Needs two generator families to have something to fail over to; the
-    shipped config has carried one since the 2026-08-18 mistral demotion."""
+    Needs a family the params-under-test never touch to fail over to. The
+    shipped config has carried two generator families (deepseek and gpt-oss)
+    since b.ai joined on 2026-08-25, but both configure reasoning_effort, so
+    a fixture-synthesised third family is still what makes "the answering
+    ref's params differ from the first tried" observable."""
     cfg = cfg_with_two_generator_families(cfg)
     clock = FakeClock()
     sleeper = FakeSleeper(clock)
@@ -1327,11 +1476,14 @@ def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys
             # second generator family lives under cerebras too, so failing the
             # whole provider would fail both refs and there would be nothing
             # to fail over TO.
-            # Both cerebras generators AND the paid lightning overflow are
-            # failed, so the fixture's own second family is what answers. The
-            # test is about WHICH ref the params were resolved for, so it needs
-            # the answering ref to be a different one from the first tried.
-            if model.family == "gpt-oss":
+            # bai/deepseek-v4-flash (family deepseek) leads routing.generator
+            # since 2026-08-25, so it must fail too or it answers on the first
+            # attempt and there is no failover to observe. Both cerebras
+            # generators AND the paid lightning overflow are failed as well,
+            # so the fixture's own second family is what answers. The test is
+            # about WHICH ref the params were resolved for, so it needs the
+            # answering ref to be a different one from the first tried.
+            if model.family in ("deepseek", "gpt-oss"):
                 return httpx.Response(500, text="down")
             return httpx.Response(200, json=_body())
 
@@ -1355,7 +1507,7 @@ def test_params_for_ref_is_resolved_against_the_ref_about_to_be_called(cfg, keys
         )
     )
     assert ref == ModelRef("cerebras", "second-generator")
-    assert payloads[0]["reasoning_effort"] == "high"      # cerebras/gpt-oss-120b
+    assert payloads[0]["reasoning_effort"] == "high"      # bai/deepseek-v4-flash
     assert "reasoning_effort" not in payloads[-1]         # the second family
 
 
@@ -1515,12 +1667,14 @@ def test_build_check_request_is_pure():
 def test_check_refs_covers_every_configured_model(cfg):
     refs = check_refs(cfg)
     expected = sum(len(p.models) for p in cfg.providers)
-    # 8: the magistral generator block went when the line was retired upstream
+    # 9: the magistral generator block went when the line was retired upstream
     # and zai-glm-4.7 went on 2026-08-18 when it was archived. The mistral
     # block survives the 2026-08-19 judge surgery - mistral-SMALL lost the
-    # judge seat to calibration, and mistral-LARGE took the tiebreak seat - and
-    # lightning/gpt-oss-120b joined the same day as the paid generator overflow.
-    assert len(refs) == expected == 8
+    # judge seat to calibration, and mistral-LARGE took the tiebreak seat -
+    # lightning/gpt-oss-120b joined the same day as the paid generator
+    # overflow, and bai/deepseek-v4-flash joined 2026-08-25 as the free
+    # generator that now leads the list.
+    assert len(refs) == expected == 9
     assert ModelRef("groq", "qwen/qwen3.6-27b") in refs
     assert check_refs(cfg, "groq/qwen/qwen3.6-27b") == (ModelRef("groq", "qwen/qwen3.6-27b"),)
     with pytest.raises(KeyError):
@@ -1790,11 +1944,12 @@ def test_unkeyed_roles_names_the_role_and_the_env_vars(cfg, monkeypatch):
     _unset(monkeypatch, "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENAI_API_KEY")
     gaps = unkeyed_roles(cfg, ("generator", "judge"))
     assert set(gaps) == {"generator", "judge"}
-    # TWO providers on the generator role since 2026-08-19: cerebras (free,
-    # first) and lightning (paid, the overflow). Both keys are named because
-    # either one alone makes the role usable - the list is the failover, and
-    # the ORDER of the refs is where the cost policy lives, not here.
-    assert gaps["generator"] == ("CEREBRAS_API_KEY", "LIGHTNING_API_KEY")
+    # THREE providers on the generator role since bai joined 2026-08-25: bai
+    # and cerebras (both free) and lightning (paid, the overflow). All three
+    # keys are named because any one alone makes the role usable - the list is
+    # the failover, and the ORDER of the refs is where the cost policy lives,
+    # not here.
+    assert gaps["generator"] == ("BAI_API_KEY", "CEREBRAS_API_KEY", "LIGHTNING_API_KEY")
     assert "GROQ_API_KEY" in gaps["judge"]
     # One key is enough to make a role usable: the rest is failover.
     monkeypatch.setenv("GROQ_API_KEY", "sk-test")
@@ -2538,11 +2693,14 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
         sized = pool_gaps(
             patched, needed_tokens=judge_needed, tiebreak_needed_tokens=tiebreak_needed
         )
-        # Both generator families, because the paid backstop is spent on judge
-        # slot B for a mistral row and is therefore gone from its tiebreak too.
-        # What the test turns on is unchanged: every one of these flips on the
-        # pinned gap between the judge prompt and the tiebreak prompt.
+        # All three generator families now: deepseek (bai, since 2026-08-25)
+        # joins gpt-oss and secondgen because the paid backstop is spent on
+        # judge slot B for a mistral row and is therefore gone from its
+        # tiebreak too. What the test turns on is unchanged: every one of
+        # these flips on the pinned gap between the judge prompt and the
+        # tiebreak prompt.
         assert [(g.role, g.generator_family) for g in sized] == [
+            ("tiebreak", "deepseek"),
             ("tiebreak", "gpt-oss"),
             ("tiebreak", "secondgen"),
         ]
@@ -3229,37 +3387,43 @@ def test_the_judge_sizer_only_narrows_below_the_flat_worst_case(cfg, keys):
 def test_the_generator_prefers_the_free_provider_and_fails_over_to_the_paid_one(cfg, keys):
     """THE COST POLICY IS THE LIST ORDER, so it is pinned like one.
 
-    cerebras is a free tier and lightning is paid. Router.pick walks
-    routing.generator in order and only moves on when a ref is INELIGIBLE, so
-    "cerebras first" is the whole of the control that drains the free quota
-    before money is spent. Reversing the two lines would spend from call one
-    and nothing else in the build would notice.
+    bai and cerebras are both free tiers; lightning is the sole paid provider.
+    Router.pick walks routing.generator in order and only moves on when a ref
+    is INELIGIBLE, so "every free ref before the paid one" is the whole of the
+    control that drains free quota before money is spent. This asserts the
+    ORDERING invariant rather than which specific provider sits first - that
+    has already changed once (bai overtook cerebras on 2026-08-25) and pinning
+    it by name would make this test re-break on the next free provider added
+    or reordered, without the cost policy itself having broken.
 
     Both halves are asserted: the preference, and the failover that makes the
     preference safe rather than merely cheap.
     """
-    free = ModelRef("cerebras", "gpt-oss-120b")
     paid = ModelRef("lightning", "lightning-ai/gpt-oss-120b")
-    assert list(cfg.routing.generator) == [
-        "cerebras/gpt-oss-120b",
-        "lightning/lightning-ai/gpt-oss-120b",
-    ], "the free provider must be listed first - this ordering IS the cost policy"
+    generator_refs = list(cfg.routing.generator)
+    assert generator_refs[-1] == "lightning/lightning-ai/gpt-oss-120b", (
+        "the paid provider must be listed last - every free ref must be tried first"
+    )
+    assert len(generator_refs) > 1, "need at least one free ref ahead of the paid one"
+    free_refs = [ModelRef(*ref.split("/", 1)) for ref in generator_refs[:-1]]
 
-    # Preference: with everything eligible, the free one answers.
-    assert _router(cfg).pick("generator").ref == free
+    # Preference: with everything eligible, a free provider answers - never
+    # the paid one.
+    assert _router(cfg).pick("generator").ref in free_refs
 
-    # Failover on BUDGET, which is the case the ordering exists for: the free
-    # tier's daily quota runs out and the paid overflow takes the row.
+    # Failover on BUDGET, which is the case the ordering exists for: every
+    # free tier's daily quota runs out and the paid overflow takes the row.
     spent = _router(
-        cfg, budget_ok=lambda provider, model, tokens: provider != "cerebras"
+        cfg, budget_ok=lambda provider, model, tokens: provider == "lightning"
     )
     assert spent.pick("generator").ref == paid
 
-    # ...and on the other two transient reasons a ref is passed over.
+    # ...and on the other two transient reasons a ref is passed over: cool
+    # down every free ref and confirm the paid one still answers.
     cooling = _router(cfg)
-    cooling.report_failure(free)
-    for _ in range(10):
-        cooling.report_failure(free)
+    for free in free_refs:
+        for _ in range(11):
+            cooling.report_failure(free)
     assert cooling.pick("generator").ref == paid
 
 

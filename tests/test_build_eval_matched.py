@@ -1231,8 +1231,16 @@ def test_contract_from_config_reads_think_min_and_teacher(tmp_path):
     control_c = E.contract_from_config(live)
     treat_c = E.contract_from_config(recovery)
     assert control_c.think_min == treat_c.think_min == 500
-    assert control_c.teacher_family == treat_c.teacher_family == "gpt-oss"
-    assert control_c.teacher_model == treat_c.teacher_model == "gpt-oss-120b"
+    # NOT a cross-config invariant since bai (family deepseek) took the live
+    # generator's lead spot on 2026-08-25: data_law_v1_exp_recovery.yaml's own
+    # header pins it to "Cerebras gpt-oss-120b is the only generator" as an
+    # ISOLATED, frozen experiment, so the live and recovery teachers are now
+    # expected to differ rather than required to match. Each side is read
+    # against its own config instead of against the other.
+    assert control_c.teacher_family == "deepseek"
+    assert control_c.teacher_model == "deepseek-v4-flash"
+    assert treat_c.teacher_family == "gpt-oss"
+    assert treat_c.teacher_model == "gpt-oss-120b"
     assert control_c.gate_contract == tuple(GATE_ORDER)
 
 

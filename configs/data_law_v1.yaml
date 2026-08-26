@@ -251,6 +251,69 @@ providers:
   # no spin, no deadlock, and next_wait() agrees with acquire(). No per-call
   # ceiling is needed and none was added; the provider's own 429 handling with
   # backoff takes it from there.
+  # b.ai, added 2026-08-25. Free tier, and the ONLY new FAMILY in this file:
+  # everything else here is gpt-oss/gemma/qwen/mistral, so deepseek is the one
+  # generator family that is not also sitting in the judge pool.
+  #
+  # THE RATE LIMIT IS A REQUEST-COUNTED BUCKET OF 10 - not a token budget and
+  # not a concurrency cap. Measured three ways on 2026-08-25:
+  #   * 24 requests back-to-back admitted 10; 24 fired simultaneously admitted
+  #     12. A 17x difference in overlap moved the count by two, so it is NOT
+  #     an in-flight cap.
+  #   * ~41 req/min carrying only ~650 tok/min throttled, while ~4.5 req/min
+  #     carrying ~4,700 tok/min ran clean. 7x the tokens passes and 9x the
+  #     requests does not, so it is NOT token-weighted.
+  #   * every saturating test admitted exactly ten, and recovery from a drained
+  #     bucket to first success took 40.5 s.
+  # REJECTED CALLS CONSUME SLOTS TOO: 15 deliberately-invalid requests drained
+  # it and the next VALID call came back 429. That is why rpm is 8 and not 10.
+  #
+  # The corollary that matters for cost: a cheap call and an expensive call
+  # consume the same one slot, so batching large prompts is free and chatty
+  # small calls are the wasteful shape here.
+  #
+  # tpm IS DELIBERATELY ABSENT, and this comment is the fence against adding it
+  # back. TokenBucket charges `context_est_tokens + max_tokens` per call
+  # (generate.py est_tokens -> bucket.acquire), so a tpm here is a SECOND,
+  # client-side limiter measured not to exist on the server. A tpm of 18000
+  # against ~6,800 est-tokens per call refills for ~23 s and throttles this ref
+  # to ~2.6 requests/min - one sixth of the real ceiling - and because acquire()
+  # holds its lock across the wait, it serialises every worker behind it.
+  # limits.get("tpm") returning None disables that dimension, which is exactly
+  # what a request-counted bucket needs.
+  #
+  # tpd/rpd are OMITTED rather than guessed: no daily cap was reached across
+  # ~4.6M tokens, and store._cap reads a missing cap as unlimited, which is the
+  # honest state rather than a number nobody measured.
+  #
+  # max_context 800000 is inside a MEASURED bracket, not a claim: 844,701
+  # prompt tokens returned 200 and 900,000 returned 400 "Input token exceed the
+  # limit". The 18,752 figure in the first day's notes was never a context
+  # measurement at all - it was the rate limiter interfering with the probe.
+  #
+  # reasoning_effort low IS A RELIABILITY SETTING, not a quality preference.
+  # Reasoning is billed against max_tokens and emitted first, and the ladder
+  # measures low 2,097 / high 4,300 / default 6,576 / max 12,573 tokens. At
+  # default the call averages 73 s and at max 99.3 s - against a Cloudflare
+  # origin timeout of ~100 s that killed 2 of 4 max-effort calls with HTTP 524.
+  # SSE streaming fixes that completely (4/4, one running 172 s), but
+  # ChatClient has no streaming path, so until it does, low is the setting that
+  # finishes: 33.4 s per call, and still ~3x the reasoning trace that
+  # gpt-oss-120b's 668 tokens produce.
+  - name: bai
+    base_url: https://api.b.ai/v1
+    api_key_env: BAI_API_KEY
+    quirks: [bai]
+    models:
+      - id: deepseek-v4-flash
+        family: deepseek
+        roles: [generator]
+        # max_output 16384 is a REPLY ceiling, not an answer ceiling: the bai
+        # request hook raises a smaller caller budget up to it, because
+        # reasoning is billed here and emitted first. 4096 measured 10/20 empty
+        # on the real synthesis prompt; 12288 measured 0/4.
+        limits: {rpm: 8, max_context: 800000, max_output: 16384}
+        params: {temperature: 0.7, top_p: 0.95, reasoning_effort: low}
   - name: cerebras
     base_url: https://api.cerebras.ai/v1
     api_key_env: CEREBRAS_API_KEY
@@ -751,7 +814,16 @@ routing:
   # providers rather than a second family: family separation still removes
   # gpt-oss from the judge pool for every row, and undersized_families still
   # takes the family's largest window.
-  generator: [cerebras/gpt-oss-120b, lightning/lightning-ai/gpt-oss-120b]
+  # deepseek LEADS since 2026-08-25. Both it and cerebras are free, so the
+  # free-before-paid rule does not order them; what does is that cerebras
+  # carries `tpd: 1000000`, which against ~2,745 tokens per generated example
+  # is ~364 examples/day - a 15-20k corpus is a 41-55 DAY run on it. b.ai has
+  # no observed daily cap and is rate-bound at ~600 calls/hour instead.
+  # cerebras stays second because it is 35x faster per call (2.1 s vs 33 s) and
+  # is the right overflow when b.ai is cooling or throttled; lightning stays
+  # last because it is the only PAID ref and the free budget drains first.
+  generator: [bai/deepseek-v4-flash, cerebras/gpt-oss-120b,
+              lightning/lightning-ai/gpt-oss-120b]
   # JUDGE: qwen then gemma, the two free families, then the paid backstops -
   # which is the standing "every free judge is preferred to the paid one" rule.
   # On a gpt-oss generation family separation removes both openai models, so
@@ -763,8 +835,26 @@ routing:
   # gpt-oss row judged by qwen and gemma the exclusion set is
   # {gpt-oss, qwen, gemma} and mistral is the ONE family left - which is what
   # keeps the third opinion free rather than paid.
-  tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b,
-             mistral/mistral-large-latest,
+  # REORDERED 2026-08-25, and ONLY because the generator changed. The list
+  # above was written when every generation was gpt-oss: the exclusion set was
+  # {gpt-oss, qwen, gemma}, gpt-oss-20b was excluded on every row, and mistral
+  # was the one family left. Listing gpt-oss-20b first cost nothing because it
+  # never won.
+  #
+  # On a DEEPSEEK generation the exclusion set is {deepseek, qwen, gemma} and
+  # gpt-oss-20b is suddenly ELIGIBLE AND FIRST - so the seat silently changed
+  # hands. That seat is not an ordinary vote: with three verdicts the tiebreak
+  # decides outright (judge_policy.resolve), so it would have handed every
+  # contested row to the family measured at 0/10 on IPC->BNS mapping, which
+  # states the BNS has 447 sections and that S103 is perjury.
+  #
+  # mistral first restores the model that actually held this seat. gpt-oss-20b
+  # stays ahead of the paid backstops because it still has one job it alone can
+  # do: mistral's probed window is 52,812, so on a row longer than that
+  # undersized_families removes mistral and 20b's 131,072 is what stops the
+  # tiebreak pool emptying.
+  tiebreak: [mistral/mistral-large-latest, groq/openai/gpt-oss-20b,
+             cerebras/gemma-4-31b,
              openai/gpt-5-mini, openai/gpt-5-nano]
   probe: [groq/openai/gpt-oss-20b]
   family_separation: true

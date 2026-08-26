@@ -65,12 +65,18 @@ def paths(tmp_path):
 
 
 def judged_store(tmp_path, paths, cfg, n=1, generator_script=None):
-    """A store whose n tasks have been generated and are waiting in 'judging'."""
+    """A store whose n tasks have been generated and are waiting in 'judging'.
+
+    The generator is pinned to cerebras/gpt-oss-120b - bai (family deepseek)
+    leads routing.generator since 2026-08-25 and is excluded here, because
+    this whole suite is written against "the generator was gpt-oss" (family
+    separation, model ids, event fields below all assume it).
+    """
     store = open_store(tmp_path, n_seeds=n)
     plan_wave(store, cfg, "synthesis", n, task_type_mix={"irac_analysis": 1.0})
     asyncio.run(
         run_workers(
-            store, cfg, FakeRouter(cfg, generator_script), paths=paths,
+            store, cfg, FakeRouter(cfg, generator_script, missing_keys={"bai"}), paths=paths,
             streams=["synthesis"], n_workers=n, max_batches=1,
         )
     )
@@ -935,15 +941,23 @@ def test_a_recorded_slot_is_never_bought_twice(tmp_path, cfg, paths):
 
 
 def _narrow_generator(cfg):
-    """The generator family cut back to the window the pilot ran against.
+    """Every generator family cut back to the window the pilot ran against.
 
     Needed since 2026-08-19: the probes put cerebras at 131k, so LONG_SEED_TEXT
     no longer diverts anywhere and the judge-side paths only a diverted row
     reaches were never entered. cfg_with_context refuses if the (family, role)
     is missing, so this cannot silently no-op.
+
+    BOTH gpt-oss AND deepseek are narrowed since 2026-08-25: bai (family
+    deepseek) joined routing.generator with an 800,000-token window, and
+    leaving it alone would make it the family that answers instead of the
+    long row diverting to the fixture's own second family.
     """
-    return cfg_with_context(
+    narrowed = cfg_with_context(
         cfg, family="gpt-oss", role="generator", max_context=NARROW_GENERATOR_CONTEXT
+    )
+    return cfg_with_context(
+        narrowed, family="deepseek", role="generator", max_context=NARROW_GENERATOR_CONTEXT
     )
 
 

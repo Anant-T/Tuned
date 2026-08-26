@@ -110,6 +110,13 @@ _CONTEXT_OVERFLOW_MARKERS = (
     "prompt is too long",
     "input is too long",
     "input length exceeds",
+    # b.ai, measured 2026-08-25: a 900,000-token prompt returns 400 with the
+    # body "Input token exceed the limit" (844,701 was accepted). None of the
+    # markers above match it, so without this line a genuine overflow reads as
+    # a malformed payload of OURS and aborts the call instead of failing over
+    # to a larger ref. Latent while max_context/CONTEXT_SAFETY_MARGIN keeps the
+    # routing ceiling at ~640k, which is why it is one line and not a probe.
+    "input token exceed",
 )
 # NOT markers, and the reason is worth recording: "too many tokens" and
 # "reduce the length" also describe a max_tokens larger than the model's
@@ -567,6 +574,82 @@ def _openai_request_hook(payload: dict, model: ModelCfg) -> dict:
     return adjusted
 
 
+def _bai_request_hook(payload: dict, model: ModelCfg) -> dict:
+    """The caller's budget is an ANSWER budget; b.ai's is a REPLY budget.
+
+    This is the mirror image of ``_cerebras_request_hook``, and it exists for
+    the opposite reason.  Cerebras 400s on a budget above its ceiling, so that
+    hook clamps DOWN.  deepseek-v4-flash accepts anything (max_tokens up to
+    131072 returned 200), but it bills reasoning against the same allowance and
+    emits it FIRST - so a budget that looks generous as an answer allowance is
+    consumed by thinking and the answer never starts.  This hook raises UP.
+
+    The number that matters: ``GENERATION_OUTPUT_TOKENS`` ships at 4000, and
+    the measured empty-content rate at 4096 was 10/20 on the real synthesis
+    prompt against 0/4 at 12288.  The shipped budget sits exactly on the 50%
+    point, so half of all lead-generator calls would return nothing - and the
+    survivors would be biased toward SHORT traces, which is silent selection on
+    the corpus rather than honest sampling.
+
+    This is the only layer that can fix it.  ``build_payload`` applies
+    ``req.max_tokens`` AFTER merging the model's params, so neither ``params``
+    nor ``role_params`` can raise the number the caller passed.
+
+    It does not weaken any length gate: ``reply_budget_chars`` is derived from
+    ``max_output_tokens(cfg)``, a config value rather than what went on the
+    wire, so an over-long answer is still caught by the gates while the model
+    gets the room it needs to think.
+    """
+    max_output = model.limits.get("max_output")
+    requested = payload.get("max_tokens")
+    if max_output is None or requested is None or requested >= max_output:
+        return payload
+    raised = dict(payload)
+    raised["max_tokens"] = int(max_output)
+    return raised
+
+
+def _bai_response_hook(data: dict) -> tuple[str, str | None]:
+    """b.ai spends the reply budget on reasoning FIRST, and says so with a 200.
+
+    ``deepseek-v4-flash`` is a reasoning model whose thinking is billed against
+    ``max_tokens`` and emitted before any answer, so a budget that runs out
+    mid-thought returns a perfectly well-formed HTTP 200 whose ``content`` is
+    the empty string.  The default hook would hand that back as ``text=""`` and
+    the row would be stored as though the model had answered with nothing.
+
+    Measured 2026-08-25 across budgets from 256 to 32768: an empty ``content``
+    and ``finish_reason == "length"`` coincided on every observed call - 3/3
+    empty at 512, 1/3 at 2048, 10/20 at 4096 on the real synthesis prompt, 0/4
+    at 12288.  The truncation flag is therefore the detector, and it is exact;
+    the empty-rate is not a property of any particular budget but of how hard
+    the prompt is, which is why this checks the flag rather than a threshold.
+
+    RETRYABLE rather than fatal, deliberately: reasoning length is not
+    deterministic even at ``temperature=0`` (298-10,426 tokens observed on one
+    prompt), so the identical call at the identical budget genuinely may fit on
+    the next attempt.  Aborting would throw away a row that costs nothing to
+    re-ask.
+    """
+    text, reasoning = _default_response_hook(data)
+    if text:
+        return text, reasoning
+    choices = data.get("choices") or []
+    finish_reason = choices[0].get("finish_reason") if choices else None
+    if finish_reason == "length":
+        usage = data.get("usage") or {}
+        spent = (usage.get("completion_tokens_details") or {}).get(
+            "reasoning_tokens", usage.get("completion_tokens")
+        )
+        raise ProviderError(
+            "reply truncated before any content: finish_reason=length with "
+            f"{spent} reasoning tokens consuming the whole budget - raise "
+            "max_output or lower reasoning_effort",
+            retryable=True,
+        )
+    return text, reasoning
+
+
 DEFAULT_QUIRK = Quirk(
     request_hook=_default_request_hook,
     response_hook=_default_response_hook,
@@ -578,6 +661,11 @@ DEFAULT_QUIRK = Quirk(
 # later gets its hook edited here rather than a config change.
 QUIRKS: dict[str, Quirk] = {
     "default": DEFAULT_QUIRK,
+    "bai": Quirk(
+        request_hook=_bai_request_hook,
+        response_hook=_bai_response_hook,
+        retry_after=_default_retry_after,
+    ),
     "cerebras": Quirk(
         request_hook=_cerebras_request_hook,
         response_hook=_default_response_hook,

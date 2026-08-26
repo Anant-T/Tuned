@@ -797,8 +797,10 @@ def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
         )
         for old, new in (
             (anchor, injected),
-            ("  generator: [cerebras/gpt-oss-120b]",
-             f"  generator: [cerebras/gpt-oss-120b, {SECOND_GENERATOR_REF}]"),
+            ("  generator: [bai/deepseek-v4-flash, cerebras/gpt-oss-120b,\n"
+             "              lightning/lightning-ai/gpt-oss-120b]",
+             "  generator: [bai/deepseek-v4-flash, cerebras/gpt-oss-120b,\n"
+             f"              lightning/lightning-ai/gpt-oss-120b, {SECOND_GENERATOR_REF}]"),
             ("  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,",
              f"  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b, {SECOND_GENERATOR_REF},"),
         ):
@@ -809,11 +811,20 @@ def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
     return str(path)
 
 
-# Long enough that prompt + max_tokens needs 11,008 tokens of declared window
-# (measured: 4,711 estimated prompt tokens + 4,096 max_output, times
+# Long enough that prompt + max_tokens needs 10,910 tokens of declared window
+# (measured: 4,632 estimated prompt tokens + 4,096 max_output, times
 # CONTEXT_SAFETY_MARGIN), while prompt + trace + answer still fit the
 # 8192-token length band - so a test can move the routing without the length
 # gate firing and masking the result.
+#
+# 59 REPEATS, NOT 60 - the seed itself must also clear
+# tasks.seed_token_budget(cfg) (max_seq_length 8192 minus the 3,500-token
+# reply reserve = 4,692), or plan_wave silently plans nothing against it and
+# every test below reads as "no task was ever claimed" with no other clue why.
+# At 60 repeats the seed's own token_count (len(text)//4 = 4,710) OVERSHOT
+# that ceiling by 18 tokens, so plan_wave planned zero tasks against it; at 59
+# it is 4,631, comfortably under, and still far above what the window check
+# below needs.
 #
 # IT IS NO LONGER LONG FOR THE SHIPPED POOL, and that is the point of saying
 # the number out loud. This constant was sized against a cerebras max_context
@@ -825,7 +836,7 @@ def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
 # reproduces the old exclusion exactly, and refuses if the pool moves under
 # it. Growing the text instead would need ~420,000 characters, which the
 # length band would reject long before the router saw it.
-LONG_SEED_TEXT = (SEED_TEXT + " ") * 60
+LONG_SEED_TEXT = (SEED_TEXT + " ") * 59
 
 # The window that makes LONG_SEED_TEXT too long, as a name rather than a
 # literal sprinkled through the suite. Any value below 11,008 works; 8192 is
@@ -834,16 +845,22 @@ LONG_SEED_TEXT = (SEED_TEXT + " ") * 60
 NARROW_GENERATOR_CONTEXT = 8192
 
 # A seed no model in the SHIPPED pool can hold, for the tests that are about
-# the row rather than about the pool. Sized against the real 131,072 rather
-# than narrowed by fixture, because "no generator can hold this" is the thing
-# those tests assert and a fixture would make it true by construction.
+# the row rather than about the pool. Sized against the real widest window
+# rather than narrowed by fixture, because "no generator can hold this" is
+# the thing those tests assert and a fixture would make it true by
+# construction.
 #
 # The arithmetic, so the next window change can redo it: exclusion needs
-# required_context(est + max_output) > 131,072, i.e. est > 100,762 at
-# CONTEXT_SAFETY_MARGIN 1.25 and max_output 4,096. At 4 chars/token that is
-# 403,048 characters; 450,000 clears it with room and still costs a test
-# nothing but memory.
-OVERSIZE_SEED_TEXT = "word " * 90_000
+# required_context(est + max_output) > the widest declared generator window,
+# which is bai's 800,000 since 2026-08-25 (was cerebras/lightning's 131,072
+# before bai joined - the old 90,000-word text cleared THAT but left
+# deepseek, bai's family, comfortably eligible). That needs est > 636,000 at
+# CONTEXT_SAFETY_MARGIN 1.25 and max_output 4,000. Measured on the real
+# rendered prompt rather than assumed from a chars/token constant - template
+# overhead pushes the estimate above a flat chars/4 - 550,000 "word "
+# repeats measures context_est_tokens=688,224, comfortably past 636,000, and
+# still costs a test nothing but memory.
+OVERSIZE_SEED_TEXT = "word " * 550_000
 
 # Everything a transition seed must carry: the four template slots AND the
 # two dates, without which check_temporal is fatally undecidable on this
