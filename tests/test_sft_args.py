@@ -428,3 +428,31 @@ def test_dataset_prep_runs_rank0_first_not_twice():
     assert -1 not in (first, second, load, ctor)
     assert first < load < second < ctor  # one block for load+map, one for the
     # trainer ctor (unsloth's internal num_proc=8 tokenization) + masking map
+
+
+def test_ceiling_check_due_fires_on_every_step_at_every_1():
+    from tuned.train.sft import ceiling_check_due
+
+    # every=1 is the default the variable-bucket cap requires: the peak step
+    # is whichever step carries the longest row, so sampling can miss it.
+    assert all(ceiling_check_due(s, early=3, every=1) for s in range(1, 120))
+
+
+def test_ceiling_check_due_still_samples_when_asked():
+    from tuned.train.sft import ceiling_check_due
+
+    assert ceiling_check_due(1, early=3, every=25)
+    assert ceiling_check_due(3, early=3, every=25)
+    assert not ceiling_check_due(4, early=3, every=25)
+    assert not ceiling_check_due(10, early=3, every=25)
+    assert ceiling_check_due(25, early=3, every=25)
+
+
+def test_reserved_ceiling_defaults_to_every_step():
+    import inspect
+
+    from tuned.train import sft
+
+    src = inspect.getsource(sft.main)
+    assert "every: int = 1" in src, "_ReservedCeiling must default to every=1"
+    assert "every: int = 25" not in src

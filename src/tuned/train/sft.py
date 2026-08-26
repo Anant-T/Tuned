@@ -141,6 +141,18 @@ def check_vram_reserved(reserved_gib: list[float], limit_gib: float = 13.5) -> N
         )
 
 
+def ceiling_check_due(step: int, early: int, every: int) -> bool:
+    """Whether the reserved-VRAM ceiling should be read at this step.
+
+    The `every` sampling existed because at seq 8192 with drop-never-truncate
+    the bucket was FIXED - every row truncated to the same length, so the full
+    memory shape appeared by step 1-2 and later steps could only differ by
+    fragmentation. Above the longest row the cap stops binding and the bucket
+    is variable: the peak step is whichever step carries the longest row, and
+    sampling can miss it entirely. Hence every=1 at the call site."""
+    return step <= early or step % every == 0
+
+
 def check_eos_in_labels(eos_kept: int, mode: str) -> None:
     """A model whose labels never contain <|im_end|> (the Qwen3 turn
     terminator) never learns to STOP - it fails the blind-judge eval by
@@ -558,17 +570,17 @@ def main(argv: list[str] | None = None) -> None:
         """The 13.5 GiB abort line, live. A pre-training check can never fire
         (adamw_8bit state appears at the first optimizer step, DDP buckets at
         the first backward), and the post-run check_vram_reserved fires after
-        the quota is spent - so check the first steps (the full memory shape
-        exists by step 1-2 at bs=1 with a fixed bucket) and every 25th after
-        (fragmentation only grows). A stats-counter read, no CUDA sync.
-        Raises like _NonFiniteGuard: rc=0 must never carry an OOM-bound
-        profile."""
+        the quota is spent - so check EVERY step. The old every-25th sampling assumed a fixed
+        bucket (seq 8192 with drop-never-truncate, every row the same
+        length); above the longest row the cap no longer binds, the bucket is
+        variable, and the peak step is whichever one carries the longest row.
+        A stats-counter read, no CUDA sync - free against a ~74 s step."""
 
-        def __init__(self, limit_gib: float = 13.5, early: int = 3, every: int = 25):
+        def __init__(self, limit_gib: float = 13.5, early: int = 3, every: int = 1):
             self.limit_gib, self.early, self.every = limit_gib, early, every
 
         def on_step_end(self, args, state, control, **kwargs):
-            if state.global_step > self.early and state.global_step % self.every:
+            if not ceiling_check_due(state.global_step, self.early, self.every):
                 return control
             worst = max(
                 _gib(torch.cuda.max_memory_reserved(i))
