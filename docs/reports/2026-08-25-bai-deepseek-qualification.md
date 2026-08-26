@@ -301,9 +301,13 @@ empty content, and whose request hook sets reasoning per role:
 * **judge / tiebreak → `thinking: {"type": "disabled"}`.** The only knob that is exactly
   deterministic (reasoning 0, sd 0). A judge does not need a visible trace, and this removes
   the empty-reply failure entirely while running ~3–4× faster.
-* **generator → `reasoning_effort: "minimal"`.** Keeps the trace (which the ≥80%
-  reasoning-trace floor needs) while cutting reasoning ~4.4× and tightening its variance, so
-  a much smaller `max_output` becomes safe. Guard it against the unresolved intermittent 400.
+* **generator → `reasoning_effort: "low"`.** Keeps the trace (which the ≥80%
+  reasoning-trace floor needs) while cutting reasoning to 2,097 tokens, so a much smaller
+  `max_output` becomes safe. **Not `"minimal"`** — see the resolution section above: it is
+  outside the `low|medium|high|xhigh|max` enum and buys a ~20% hard-failure rate on a status
+  `_ABORT_STATUSES` treats as fatal. `low` is what shipped in `configs/data_law_v1.yaml`, and
+  `docs/reports/2026-08-26-row-length-under-deepseek-traces.md` later confirmed it keeps the
+  templated row inside the 8192 training cap (1.5% over, against 85% at baseline).
 
 Suggested `limits`, all measured rather than documented:
 `{rpm: 8, tpm: null, max_context: 800000, max_output: 12288}`.
@@ -317,7 +321,9 @@ Suggested `limits`, all measured rather than documented:
   pass, which was never a context measurement at all — it was the rate limiter interfering.
   800000 is a safe declaration well inside the measured boundary.
 * **`max_output: 12288`** sized for unconstrained reasoning (mean 6,300, observed max 10,426);
-  with `reasoning_effort: "minimal"` on the generator, 4096 suffices and is ~3× cheaper.
+  with `reasoning_effort: "low"` on the generator a smaller budget suffices, though the shipped
+  config keeps 16384 as a REPLY ceiling because the bai request hook raises a smaller caller
+  budget up to it — reasoning is billed here and emitted first.
 
 Because the limiter counts requests and ignores size, **the cheap call and the expensive call
 cost the same**. Batch aggressively: one 200k-token call beats twenty 10k-token calls.

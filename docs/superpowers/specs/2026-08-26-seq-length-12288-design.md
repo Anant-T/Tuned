@@ -199,11 +199,19 @@ first is about VRAM:
 3. **Bimodality.** Mixing ~9,350-token rows into a corpus with p50 2,438
    teaches an incoherent length policy.
 
-The cheap knob is the teacher, not the trainer: `reasoning_effort: "minimal"`
-yields 1,537-token traces (sd 506), which fits 8192 with room. Whether a
-1,537-token trace trains a worse reasoner than a 6,650-token one is the one
-open empirical question, and it is answerable with a few hundred free b.ai
-calls rather than more GPU quota.
+The cheap knob is the teacher, not the trainer: `reasoning_effort: "low"`
+yields 2,097-token traces, which fits 8192 with room — and it is already the
+shipped setting in `configs/data_law_v1.yaml`. (Not `"minimal"`: that value is
+outside the `low|medium|high|xhigh|max` enum and carries a ~20% hard-failure
+rate, because one upstream enforces the schema and the other does not.)
+
+**Settled 2026-08-26** by
+`docs/reports/2026-08-26-row-length-under-deepseek-traces.md`: measured over
+1,368 real stored generations through the pinned tokenizer, `low` puts 1.5% of
+rows over 8192 against 1.2% today, while baseline traces would put **85%** over.
+8192 holds. The residual open question is only whether a 2,097-token trace
+trains a worse reasoner than a 6,576-token one — answerable with free b.ai
+calls, not GPU quota.
 
 ### Rules this leaves behind
 
