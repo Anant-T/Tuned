@@ -104,3 +104,96 @@ proportional-tail worry is unfounded.
   confirmatory, not decisive, since `low` clears the cap with 2.7k tokens of margin at p90.
 - `magistral-small-latest` contributing 59 trace-less generations means the ≥80%
   reasoning-trace floor is a live constraint on generator mix, separate from length.
+
+---
+
+# Addendum: where the long seeds come from
+
+Following the lever the section above names — the seed, not the teacher.
+
+## The tail is two sources, and only two
+
+| source | generations | rows over 8192 |
+|---|---|---|
+| `s3://indian-supreme-court-judgments` | 915 | **0** |
+| `L-NLProc/PredEx_Instruction-Tuning_Pred-Exp` | 251 | 11 |
+| `L-NLProc/TathyaNyaya-…-NyayaFacts-Datasets` | 202 | 5 |
+
+The SC path is bounded and provably so: 915 of 915 generations drew a seed of **at most exactly
+1,500 tokens**, because `chunks.chunk_seed_rows` packs those documents into the
+`MIN_CHUNK_TOKENS…MAX_CHUNK_TOKENS` band and replaces each parent row with its chunks. The
+mechanism works perfectly where it runs.
+
+It runs on one source. `chunk_seed_rows` takes `source_id: str = INJUDGEMENTS_SOURCE_ID`, and
+nothing calls it for the other two.
+
+## The stated reason for that exclusion is false
+
+`chunks.py`'s module docstring:
+
+> PredEx and TathyaNyaya are already short excerpts and are not touched here.
+
+Measured over all 60,603 seeds:
+
+| source | n | mean | p50 | p90 | p99 | max | over 1,500 |
+|---|---|---|---|---|---|---|---|
+| SC judgments (chunked) | 41,940 | 1,275 | 1,324 | 1,492 | 3,593 | 68,423 | 7.4% |
+| PredEx | 10,663 | 2,847 | 2,405 | 4,368 | 10,389 | 50,369 | **92.8%** |
+| TathyaNyaya | 8,000 | 2,692 | 2,101 | 4,978 | 11,734 | 30,098 | **69.9%** |
+
+They are not short excerpts. Nine in ten PredEx seeds exceed the chunk band the docstring
+implies they sit inside.
+
+## …but the exclusion is still correct, for a reason the docstring does not give
+
+`seeds.predex_seed` builds its text as `facts + "\n\n" + court reasoning` — **the seed carries
+its own answer**. Chunking it would split the case into fragments that either drop the
+reasoning (leaving an unanswerable task) or drop the facts (leaving the answer with no
+question). `tathyanyaya_seed` is documented as "same treatment as predex_seed".
+
+So chunking these two sources is semantically wrong, and the right conclusion is the opposite
+of what the docstring invites: **do not chunk them, and fix the stated reason**, because anyone
+reading "already short excerpts" against the table above would reasonably decide the fix is to
+chunk them and would silently corrupt the task.
+
+## `token_count` is trustworthy here, unlike the other proxy
+
+`seeds.py` records `token_count = len(text) // 4` for both these sources, flagged
+`{"estimator": "chars/4"}`. Against the real Qwen3 tokenizer on 1,368 generations:
+
+| source | real / recorded | reading |
+|---|---|---|
+| SC judgments | 1.000 (915/915 exact) | counted, not estimated — `chunks.py` uses the real tokenizer |
+| PredEx | 0.876 | chars/4 **over**-counts by ~14% |
+| TathyaNyaya | 0.906 | chars/4 **over**-counts by ~10% |
+
+Over-counting is the safe direction: a gate on this value is conservative. Worth stating
+plainly because it is the opposite of the 24,000-char proxy in `curated.py:145` /
+`replay.py:168`, which assumes 2.93 chars/token and is 17–30% too **strict**. Same pipeline,
+two char-based estimators, erring in opposite directions.
+
+## Recommendation: gate before generation, do not chunk and do not leave it
+
+A row over the cap is dropped by `assemble.py` at the *end* of the pipeline — after the teacher
+has already produced it. That is three problems in one: a wasted generation, a drop that is
+silent at the point it matters, and a **biased** drop, since the rows removed are systematically
+the longest and most substantive cases.
+
+The seed budget at `reasoning_effort: low`: `8192 − 2,097 (trace) − ~1,331 (p99 answer, scaled)
+− ~30 (template) ≈ 4,730 real tokens`, which is ~5,300 on the recorded chars/4 value for these
+two sources.
+
+| gate (recorded `token_count`) | excludes | remaining pool |
+|---|---|---|
+| 4,096 | 2,845 (4.7%) | 57,758 |
+| **5,300** | **1,455 (2.4%)** | **59,148** |
+| 6,144 | 1,019 (1.7%) | 59,584 |
+
+**This is effectively free.** The corpus targets 15–20k examples against a 60,603-seed pool
+where each seed can carry four task types. Excluding 2.4% of seeds costs nothing that is
+scarce, and buys back ~1.5% of teacher calls plus an explicit, countable exclusion in place of
+a silent one.
+
+Not urgent — 1.5% is a small tax and the corpus is buildable without this. But it is a
+cheaper, more honest place to spend the constraint than either chunking (which would break the
+task) or the sequence cap (which does not fit the hardware).
