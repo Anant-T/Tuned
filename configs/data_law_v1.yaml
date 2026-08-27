@@ -385,9 +385,35 @@ providers:
         # with `reasoning_effort: minimal`: that arm was run and measured WORSE
         # (7/10, three truncations), which is why `low` above is left alone.
         # docs/reports/2026-08-27-deepseek-as-judge-slot-b.md has the run.
+        #
+        # temperature 0.2 IS THIS REPO'S JUDGE CONVENTION, not a tuning guess:
+        # build_payload's own docstring states it (providers.py:955-959, "the
+        # generator wants temperature 0.7 / top_p 0.95 and the judge wants
+        # 0.2") and mistral-large-latest's tiebreak block below is the other
+        # instance. It is needed HERE because `params` above sets 0.7 for the
+        # generator and judge.py sends no per-call temperature at all, so
+        # without this line every judge call inherits generator sampling.
+        #
+        # WHAT FORCED IT: the 2026-08-27 probe scored ONE unchanging candidate
+        # 20 times and got (5,5,5) x12, (4,3,3) x3, (4,5,5) x2, (4,4,4),
+        # (4,4,5), (5,4,5). That is not a tidiness problem - under a
+        # `min_axis 4` rule the (4,3,3) draws REJECT the candidate the (5,5,5)
+        # draws accept, so 3 of 20 draws flipped the decision on identical
+        # input. The answer-rate below was measured at 0.7 and has NOT been
+        # re-measured at 0.2; re-measuring is its own experiment.
+        #
+        # A KEY role_params CANNOT REACH: `reasoning_effort`. The merge is a
+        # dict overlay (model.params < role_params[role] < req.params), so a
+        # role layer can only set or override a key, never UNSET one. "thinking
+        # disabled and no reasoning_effort key at all" is therefore not
+        # expressible here at all, and it is the one arm never tried - `low`
+        # asks for some reasoning while `thinking: disabled` asks for none, so
+        # the pair may be why suppression measured ~82% rather than higher.
+        # That is a HYPOTHESIS, untested: it would need a code-level change to
+        # try, and nothing here establishes it.
         role_params:
-          judge: {thinking: {type: disabled}}
-          tiebreak: {thinking: {type: disabled}}
+          judge: {thinking: {type: disabled}, temperature: 0.2}
+          tiebreak: {thinking: {type: disabled}, temperature: 0.2}
   - name: cerebras
     base_url: https://api.cerebras.ai/v1
     api_key_env: CEREBRAS_API_KEY

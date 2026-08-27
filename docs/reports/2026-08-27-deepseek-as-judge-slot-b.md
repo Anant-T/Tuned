@@ -1,7 +1,8 @@
 # deepseek takes judge slot B: it answers, and that is all this measured
 
 2026-08-27. `bai/deepseek-v4-flash` now holds a seat in `routing.judge` and
-`routing.tiebreak`, with `thinking: {type: disabled}` scoped to those two roles.
+`routing.tiebreak`, with `thinking: {type: disabled}` and `temperature: 0.2`
+scoped to those two roles.
 
 **Pass line, fixed before the run: at least 9 of 10 calls return a parseable
 three-axis verdict. Measured: 9/10. PASS — by exactly one call.** A
@@ -50,9 +51,13 @@ In the `bai` provider block:
 ```yaml
 roles: [generator, judge, tiebreak]
 role_params:
-  judge: {thinking: {type: disabled}}
-  tiebreak: {thinking: {type: disabled}}
+  judge: {thinking: {type: disabled}, temperature: 0.2}
+  tiebreak: {thinking: {type: disabled}, temperature: 0.2}
 ```
+
+`temperature: 0.2` is the repo's judge convention (`build_payload` docstring,
+`providers.py:955-959`); it was added after the probe, for the reason in §6.
+Every measurement below was taken at the model's generator default of 0.7.
 
 and the ref appended to `routing.judge` (position 3) and `routing.tiebreak`
 (position 4) — after every free ref, before every paid one.
@@ -80,11 +85,11 @@ shipped** — not by reading the YAML, because `role_params` is the middle of
 three merge layers and `req.max_tokens` is applied after all of them, so the
 key has to survive the merge to reach the wire.
 
-| role | `thinking` | `max_tokens` |
-|---|---|---|
-| `judge` | `{"type": "disabled"}` | 1024 |
-| `tiebreak` | `{"type": "disabled"}` | 1024 |
-| `generator` | *absent* | 16384 |
+| role | `thinking` | `max_tokens` | `temperature` |
+|---|---|---|---|
+| `judge` | `{"type": "disabled"}` | 1024 | 0.2 |
+| `tiebreak` | `{"type": "disabled"}` | 1024 | 0.2 |
+| `generator` | *absent* | 16384 | 0.7 |
 
 The generator row is asserted in the same test: deepseek is still
 `routing.generator` ref 2, and a `thinking: disabled` that leaked onto the
@@ -173,8 +178,25 @@ ran the identical call with `minimal` substituted:
 `minimal` measured **worse**, not better. At n=10 that is not a conclusive
 ranking, but it is conclusive that `minimal` is not the fix for the 4.8%, and
 the 2026-08-25 "both work" note should be read as "neither knob is
-deterministic". **The config was left as the brief specified; no effort key was
-added.**
+deterministic". **No effort key was added to the config.**
+
+### The arm that was never tried, because config cannot express it
+
+Both arms above carry a `reasoning_effort` key, and every arm reachable from
+this config always will. The merge is a **dict overlay** — `model.params <
+role_params[role] < req.params` — so a role layer can set or override a key but
+can never **unset** one. `reasoning_effort: low` sits in the model's `params`
+for the generator's benefit, and there is no way to spell "thinking disabled,
+and no `reasoning_effort` key at all" in YAML.
+
+That untried arm is worth naming because the two keys pull against each other:
+`reasoning_effort: low` asks for *some* reasoning while `thinking: disabled`
+asks for *none*, and a provider resolving that conflict inconsistently is one
+plausible account of the ~82% suppression measured above. **This is a
+hypothesis and nothing here tests it** — the shipped pairing was not compared
+against a payload with the key absent, because producing one requires a code
+change rather than a config change. It is recorded so the next person tuning
+this does not assume the space was exhausted.
 
 ### What a truncation actually costs — traced, not assumed
 
@@ -202,6 +224,30 @@ suggests at a glance.
 
 ## 6. What this does NOT establish
 
+### It does not fill slot B for the rows that are stalling today
+
+`cerebras/gpt-oss-120b` is 402 (§1). It is the lead generator, so with it dead
+the free generator **is** `bai/deepseek-v4-flash` — and on a deepseek-generated
+row `family_separation` excludes the deepseek **judge** as well. What is left
+for slot B on that row is `cerebras/gemma-4-31b` (402) and the two paid
+`openai` refs behind the `usd_cap: 0.0` fence. **Slot B on a deepseek row is
+still empty after this change.**
+
+That is not a corner case, it is the case both motivating failures came from:
+the 2026-08-23 live drain's 34 `judge_error` and the validation wave's 8 lost
+rows were both on deepseek-generated waves. A reader deciding whether the build
+can now be run should read this as: **it cannot, not on the current fleet.**
+
+What this change actually buys is slot B for **gpt-oss and lightning** rows.
+It becomes load-bearing the moment cerebras is funded — which restores
+gpt-oss generation, and on a gpt-oss row separation excludes `{gpt-oss}`,
+leaving qwen in slot A and deepseek in slot B with both paid refs excluded
+along with the generator. It is equally load-bearing if generation moves to any
+other non-deepseek family. Until one of those happens, the seat is correct and
+idle.
+
+### Judging quality
+
 **Judging quality is entirely unmeasured.** No gold-labelled calibration was
 run against this model, no `judge_threshold` row exists for it, and its
 verdicts will enter the build under the same provisional thresholds any
@@ -217,14 +263,29 @@ that pairing outright. The probe made it anyway because the question was
 mechanical — does a verdict come back — but it means the *scores* in §4 are
 self-assessment and carry no evidence about accuracy whatsoever.
 
-**The verdicts are not self-consistent.** Twenty verdicts on one unchanging
-candidate: `(5,5,5)` x12, `(4,3,3)` x3, `(4,5,5)` x2, `(4,4,4)`, `(4,4,5)`,
-`(5,4,5)`. A two-point swing on two axes between calls. The judge call inherits
-**`temperature: 0.7`, `top_p: 0.95`** from the model's generator params, because
-`role_params` here carries only `thinking` — `mistral-large-latest`'s tiebreak
-block pins `temperature: 0.2` for exactly this reason. Pinning a judge
-temperature was outside this task's brief and is the obvious next lever; the
-spread above is self-consistency, and it is not the same as accuracy.
+**The verdicts were not self-consistent, and the config was corrected for it.**
+Twenty verdicts on one unchanging candidate: `(5,5,5)` x12, `(4,3,3)` x3,
+`(4,5,5)` x2, `(4,4,4)`, `(4,4,5)`, `(5,4,5)`. A two-point swing on two axes
+between calls on identical input.
+
+This is not merely untidy. Under a `min_axis 4` rule the `(4,3,3)` draws
+**reject** the candidate the `(5,5,5)` draws **accept** — so **3 of the 20
+draws flipped the decision**, with nothing about the candidate changing.
+
+The cause was sampling: every probe call inherited **`temperature: 0.7`,
+`top_p: 0.95`** from the model's generator `params`, because the `role_params`
+block carried only `thinking`. `temperature: 0.2` for a judge is this repo's
+convention, stated in `build_payload`'s own docstring
+(`providers.py:955-959`) and already live in `mistral-large-latest`'s tiebreak
+block. **Both `role_params` blocks now pin `temperature: 0.2`.**
+
+**Every number in §4 and §5 was measured at 0.7 and has not been re-measured
+at 0.2.** The 20/21 answer-rate is a property of the configuration that was
+probed, not of the one that ships. Re-measuring at 0.2 is a separate,
+properly-designed experiment — it was deliberately not bolted onto this run,
+and no measured value in this report was changed. Lower temperature is expected
+to tighten the verdict spread; its effect on the truncation rate is unknown in
+either direction.
 
 **One prompt, one shape, one stream.** 6,903 tokens on `synthesis`. The same
 store holds rows rendering to 14k-19k judge prompts, and nothing was measured

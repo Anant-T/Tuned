@@ -601,6 +601,13 @@ def test_shipped_bai_judge_payload_disables_thinking_and_keeps_the_small_budget(
         )
         assert payload["thinking"] == {"type": "disabled"}, role
         assert payload["max_tokens"] == DEFAULT_JUDGE_REPLY_TOKENS, role
+        # The repo's judge convention, and the reason build_payload has a role
+        # layer at all (providers.py:955-959). `params` sets 0.7 for the
+        # generator and judge.py sends no per-call temperature, so without the
+        # role layer every judge call would inherit generator sampling - which
+        # on this model produced (4,3,3) and (5,5,5) verdicts on ONE unchanging
+        # candidate, either side of a min_axis 4 rule.
+        assert payload["temperature"] == 0.2, role
 
     generating = client.build_payload(
         ChatRequest(
@@ -612,6 +619,7 @@ def test_shipped_bai_judge_payload_disables_thinking_and_keeps_the_small_budget(
     )
     assert "thinking" not in generating
     assert generating["max_tokens"] == 16384
+    assert generating["temperature"] == 0.7  # the generator keeps its own
 
 
 def test_shipped_deepseek_is_the_free_judge_ahead_of_the_paid_backstops():
@@ -634,9 +642,12 @@ def test_shipped_deepseek_is_the_free_judge_ahead_of_the_paid_backstops():
         )
 
     # The seat exists only because the model declares the roles; role_params
-    # for a role the model does not serve is refused at load.
+    # for a role the model does not serve is refused at load. Pinned by
+    # EQUALITY like every other roles assertion in this module: a superset
+    # test would let a fourth role appear here unnoticed, and the roles a
+    # model declares are what the Router walks.
     _provider, model = cfg.model_for(deepseek)
-    assert set(model.roles) >= {"generator", "judge", "tiebreak"}
+    assert tuple(model.roles) == ("generator", "judge", "tiebreak")
 
 
 # --- 3. retries -------------------------------------------------------------
@@ -3380,10 +3391,15 @@ def test_the_judge_pool_is_the_one_calibration_left_behind(cfg):
     )
     assert roles["cerebras/gemma-4-31b"] == ("judge", "tiebreak")
     # bai/deepseek-v4-flash, 2026-08-27, and it is UNPROVEN in exactly the
-    # sense mistral-large is: it was measured to ANSWER as a judge (10/10
-    # parseable three-axis verdicts on a real judge prompt - see
-    # docs/reports/2026-08-27-deepseek-as-judge-slot-b.md) and never measured
-    # to judge WELL, because no gold-labelled calibration has been run on it.
+    # sense mistral-large is: it was measured to ANSWER as a judge and never
+    # measured to judge WELL, because no gold-labelled calibration has been
+    # run on it. The answer-rate, stated as it was measured rather than at its
+    # best batch: 9/10 on the pre-registered batch against a 9/10 pass line,
+    # 20/21 pooled over every call. The one failure was NOT a bad verdict but
+    # an empty one - HTTP 200, finish_reason=length, the whole 1,024-token
+    # reply budget spent on reasoning - which is a live failure mode of this
+    # provider and not a rounding error. See
+    # docs/reports/2026-08-27-deepseek-as-judge-slot-b.md.
     # It holds a judge seat rather than a tiebreak-only one because the
     # alternative that day was not a proven judge: gemma answers HTTP 402 and
     # the next ref in the list is paid. That trade is the config's, not this

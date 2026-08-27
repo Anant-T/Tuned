@@ -691,10 +691,17 @@ def cfg_without_the_promoted_judge(cfg: BuildConfig) -> BuildConfig:
 
     Every promotion since then has widened it, so this drops ALL of them rather
     than the one that happened to be newest when it was written - see
-    PROMOTED_JUDGES. Leaving a later arrival behind is how this fixture would
-    silently stop constructing the shape the rules need: the pool would still
-    have a spare family, slot B would fill, and the rule about slot B running
-    out would pass without ever reaching its own condition.
+    PROMOTED_JUDGES. Leaving a later arrival behind does NOT fail quietly, and
+    it is worth being exact about that: the pool would still have a spare
+    family, slot B would fill, and the rules about slot B running out go RED -
+    measured, on the deepseek promotion, at 14 tests across two modules.
+
+    The cost is misdirection, not a false green. Those failures surface at
+    assertions about parking, re-queueing and pool gaps - several layers from
+    the cause - so they read as a regression in judge.py or the Router when
+    what actually happened is that this fixture stopped constructing the
+    condition its own name promises. Widening it here is what keeps the next
+    promotion from being debugged in the wrong file.
 
     Composed with cfg_without_the_paid_judges this restores the shape those
     rules were written against, by ROUTING only: the dropped models keep their
@@ -732,9 +739,11 @@ def cfg_without_the_free_tiebreak(cfg: BuildConfig) -> BuildConfig:
     path, tiebreak_unroutable_two_judge_decision -> reject) therefore need the
     condition constructed. Dropping every free survivor from routing.tiebreak
     is the smallest way to do it and leaves the judge slots untouched - EVERY
-    one, not just mistral, because a survivor left behind would keep the seat
-    filled and the rules would pass without reaching their own condition. See
-    FREE_TIEBREAKS.
+    one, not just mistral, because a survivor left behind keeps the seat filled
+    and the rules that need it empty go RED rather than quietly passing. See
+    FREE_TIEBREAKS, and the note there about where those failures surface: at
+    the park-loudly and pool-gap assertions, which points the reader at judge.py
+    instead of at this fixture.
     """
     from dataclasses import replace
 
