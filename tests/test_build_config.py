@@ -1247,3 +1247,119 @@ def test_the_gptoss_arms_are_fenced_and_differ_only_in_the_prompt_overlay():
                 and not ln.startswith("  prompt_overlay:")]
 
     assert _body(GPTOSS_CTL_CONFIG) == _body(GPTOSS_NEW_CONFIG)
+
+
+def test_the_ds_v4rerun_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_ds_v4rerun is an experiment sibling, not the live control.
+
+    The pre-edit-prompt half of the 2026-08-28 clean rerun of the v4-vs-v5
+    deepseek generation-yield A/B (the original ran its two arms 13h41m apart
+    across b.ai's hidden multi-upstream pool and is uninterpretable). Same
+    fence as the gpt-oss floor arms above, with the same extra thing to
+    prove: this arm carries `prompt_overlay`, which makes it a RECOVERY
+    experiment (config._is_recovery_experiment), and a recovery config aimed
+    at the live workdir is refused outright.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_ds_v4rerun") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_ds_v4rerun"
+    doc["build"]["prompt_overlay"] = "data/build/exp_gptoss_ctl/prompts_preedit"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_ds_v4rerun"
+    assert cfg.build.prompt_overlay == "data/build/exp_gptoss_ctl/prompts_preedit"
+
+
+def test_the_ds_v5rerun_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_ds_v5rerun is an experiment sibling, not the live control.
+
+    The shipped-prompt half of the same rerun. It sets no overlay - it reads
+    the same src/tuned/data/prompts/ bytes the live config reads, which is
+    the whole point of it - so the only fence it needs is this one.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_ds_v5rerun") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_ds_v5rerun"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_ds_v5rerun"
+
+
+DS_V4RERUN_CONFIG = (
+    Path(__file__).parent.parent / "configs" / "data_law_v1_exp_ds_v4rerun.yaml"
+)
+DS_V5RERUN_CONFIG = (
+    Path(__file__).parent.parent / "configs" / "data_law_v1_exp_ds_v5rerun.yaml"
+)
+
+
+def test_the_ds_rerun_arms_are_fenced_and_differ_only_in_the_prompt_overlay():
+    """Both deepseek-rerun arms carry both cost fences, and differ in ONE key.
+
+    This is the clean re-run of the confounded v4-vs-v5 comparison (original
+    result: v4 pass 49.5% n=99 vs v5 31.9% n=94, arms 13h41m apart across
+    b.ai's hidden multi-upstream pool - uninterpretable). Four properties, all
+    load-bearing:
+
+    1. The single-ref generator, deepseek only - a 429 storm falling over to
+       another family would silently confound the length-yield measurement
+       this rerun exists to produce.
+    2. usd_cap 0.0 WITH prices on both gpt-5 models. A bare usd_cap 0.0
+       blocks nothing: _usd_per_1m returns 0.0 for a missing price, so
+       est_cost is 0 and 0 > 0.0 is False. The price must be present too.
+    3. The length_band matches the shipped live config's - this measures the
+       generation-time length_band gate under two prompt eras, not a
+       different band.
+    4. The pairing. The two arms are a matched pair whose ONLY intended
+       difference is build.prompt_overlay - v4rerun reads the pre-edit
+       templates (REUSED from data/build/exp_gptoss_ctl/prompts_preedit
+       rather than duplicated), v5rerun reads the shipped ones. Any third
+       difference confounds the comparison, so the line-level equality is
+       asserted rather than trusted.
+    """
+    import yaml
+
+    from tuned.data.generate import _provider_usd_cap
+
+    live = load_build_config(
+        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        allow_unpinned=True,
+    )
+    for path, workdir, overlay in (
+        (DS_V4RERUN_CONFIG, "data/build/exp_ds_v4rerun",
+         "data/build/exp_gptoss_ctl/prompts_preedit"),
+        (DS_V5RERUN_CONFIG, "data/build/exp_ds_v5rerun", None),
+    ):
+        cfg = load_build_config(path, allow_unpinned=True)
+        assert cfg.build.workdir == workdir
+        assert cfg.build.prompt_overlay == overlay
+        assert list(cfg.routing.generator) == ["bai/deepseek-v4-flash"]
+        assert _provider_usd_cap(cfg, "openai") == 0.0
+        openai = next(p for p in cfg.providers if p.name == "openai")
+        for model in openai.models:
+            assert model.limits["usd_cap"] == 0.0
+            assert model.limits["usd_per_1m_prompt"] > 0
+            assert model.limits["usd_per_1m_completion"] > 0
+        assert cfg.build.length_band == live.build.length_band
+        assert cfg.build.length_band.think_max == 3000
+        assert cfg.build.length_band.total_max == 8192
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for key in ("harmony_completions", "harmony_prefill", "harmony_s1_continue",
+                    "require_pretreatment_manifest", "pretreatment_manifest"):
+            assert key not in raw["build"], key
+        assert path.read_bytes().count(b"\r") == 0
+        bai = next(p for p in cfg.providers if p.name == "bai")
+        assert bai.models[0].limits["rpm"] == 8
+
+    def _body(path: Path) -> list[str]:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        first_key = next(i for i, ln in enumerate(lines) if not ln.startswith("#"))
+        return [ln for ln in lines[first_key:]
+                if not ln.startswith("  workdir:")
+                and not ln.startswith("  prompt_overlay:")]
+
+    assert _body(DS_V4RERUN_CONFIG) == _body(DS_V5RERUN_CONFIG)

@@ -24,6 +24,8 @@ ISOLATED_WORKDIR_SIBLINGS = frozenset(
         "exp_prompt_v5",
         "exp_gptoss_ctl",
         "exp_gptoss_new",
+        "exp_ds_v4rerun",
+        "exp_ds_v5rerun",
     }
 )
 
