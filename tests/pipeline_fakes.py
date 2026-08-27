@@ -673,28 +673,51 @@ def cfg_with_two_generator_families(cfg: BuildConfig) -> BuildConfig:
     )
 
 
+# Every free judge PROMOTED into routing.judge after the two-family era: gemma
+# on 2026-08-19 (it took mistral-small's seat when calibration removed that
+# model) and bai/deepseek-v4-flash on 2026-08-27 (it took the slot-B seat
+# gemma's HTTP 402 had emptied). Both are free, both sit ahead of the paid
+# backstops, and either one alone is enough to keep the pool from running out.
+PROMOTED_JUDGES = ("cerebras/gemma-4-31b", "bai/deepseek-v4-flash")
+
+
 def cfg_without_the_promoted_judge(cfg: BuildConfig) -> BuildConfig:
-    """The judge pool as it was before gemma was promoted into it.
+    """The judge pool as it was before the free judges were promoted into it.
 
     A family of rules is ABOUT a judge pool that RUNS OUT: slot B parking a row
     that has already paid for slot A, and the re-open that must not re-buy it.
     Those need a pool with one usable family besides the generator's, and until
     2026-08-19 the shipped config supplied one by coincidence.
 
-    gemma took mistral-small's judge seat that day, so the shipped pool no
-    longer runs out - qwen fills slot A and gemma fills slot B. Composed with
-    cfg_without_the_paid_judges this restores the shape those rules were
-    written against, by ROUTING only: gemma keeps its tiebreak seat and its
-    provider block, so every other walk has the shape it has in production.
+    Every promotion since then has widened it, so this drops ALL of them rather
+    than the one that happened to be newest when it was written - see
+    PROMOTED_JUDGES. Leaving a later arrival behind is how this fixture would
+    silently stop constructing the shape the rules need: the pool would still
+    have a spare family, slot B would fill, and the rule about slot B running
+    out would pass without ever reaching its own condition.
+
+    Composed with cfg_without_the_paid_judges this restores the shape those
+    rules were written against, by ROUTING only: the dropped models keep their
+    tiebreak seats and their provider blocks, so every other walk has the shape
+    it has in production.
     """
     from dataclasses import replace
 
-    judge = tuple(r for r in cfg.routing.judge if r != "cerebras/gemma-4-31b")
-    assert len(judge) == len(cfg.routing.judge) - 1, (
-        "cerebras/gemma-4-31b is not in routing.judge - this fixture describes "
-        "a pool that no longer exists"
+    judge = tuple(r for r in cfg.routing.judge if r not in PROMOTED_JUDGES)
+    assert len(judge) == len(cfg.routing.judge) - len(PROMOTED_JUDGES), (
+        f"not all of {list(PROMOTED_JUDGES)} are in routing.judge - this "
+        "fixture describes a pool that no longer exists"
     )
     return replace(cfg, routing=replace(cfg.routing, judge=judge))
+
+
+# The FREE tiebreak refs that survive separation on a gpt-oss row judged by
+# qwen and gemma - i.e. the ones whose family is in none of {gpt-oss, qwen,
+# gemma}. mistral-large-latest was given that seat on 2026-08-19;
+# bai/deepseek-v4-flash joined routing.tiebreak on 2026-08-27 with the judge
+# seat. The other free refs in that list (groq/openai/gpt-oss-20b,
+# cerebras/gemma-4-31b) are excluded by separation on such a row already.
+FREE_TIEBREAKS = ("mistral/mistral-large-latest", "bai/deepseek-v4-flash")
 
 
 def cfg_without_the_free_tiebreak(cfg: BuildConfig) -> BuildConfig:
@@ -702,20 +725,23 @@ def cfg_without_the_free_tiebreak(cfg: BuildConfig) -> BuildConfig:
 
     On the shipped config there is one: a gpt-oss generation is judged by qwen
     and gemma, the tiebreak excludes {gpt-oss, qwen, gemma}, and
-    mistral-large-latest is the one family that survives - which is the whole
+    mistral-large-latest is the family that survives - which is the whole
     point of putting it in that seat on 2026-08-19.
 
     Rules about what happens when NOTHING survives (judge.py's park-loudly
     path, tiebreak_unroutable_two_judge_decision -> reject) therefore need the
-    condition constructed. Dropping mistral from routing.tiebreak is the
-    smallest way to do it and leaves the judge slots untouched.
+    condition constructed. Dropping every free survivor from routing.tiebreak
+    is the smallest way to do it and leaves the judge slots untouched - EVERY
+    one, not just mistral, because a survivor left behind would keep the seat
+    filled and the rules would pass without reaching their own condition. See
+    FREE_TIEBREAKS.
     """
     from dataclasses import replace
 
-    tiebreak = tuple(r for r in cfg.routing.tiebreak if r != "mistral/mistral-large-latest")
-    assert len(tiebreak) == len(cfg.routing.tiebreak) - 1, (
-        "mistral/mistral-large-latest is not in routing.tiebreak - this fixture "
-        "describes a pool that no longer exists"
+    tiebreak = tuple(r for r in cfg.routing.tiebreak if r not in FREE_TIEBREAKS)
+    assert len(tiebreak) == len(cfg.routing.tiebreak) - len(FREE_TIEBREAKS), (
+        f"not all of {list(FREE_TIEBREAKS)} are in routing.tiebreak - this "
+        "fixture describes a pool that no longer exists"
     )
     return replace(cfg, routing=replace(cfg.routing, tiebreak=tiebreak))
 

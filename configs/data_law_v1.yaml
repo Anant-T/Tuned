@@ -347,13 +347,47 @@ providers:
     models:
       - id: deepseek-v4-flash
         family: deepseek
-        roles: [generator]
+        roles: [generator, judge, tiebreak]
         # max_output 16384 is a REPLY ceiling, not an answer ceiling: the bai
         # request hook raises a smaller caller budget up to it, because
         # reasoning is billed here and emitted first. 4096 measured 10/20 empty
         # on the real synthesis prompt; 12288 measured 0/4.
         limits: {rpm: 8, max_context: 800000, max_output: 16384}
         params: {temperature: 0.7, top_p: 0.95, reasoning_effort: low}
+        # JUDGE SLOT B, from 2026-08-27. The seat was empty: cerebras/gemma-4-31b
+        # returns HTTP 402 payment_required, verified by direct probe the same
+        # day (so does cerebras/gpt-oss-120b), which leaves routing.judge with
+        # one working free ref and makes the next candidate the PAID
+        # openai/gpt-5-mini - reachable on any row family_separation does not
+        # exclude it from. See the routing.judge comment.
+        #
+        # JUDGING IS THE OPPOSITE CASE to the reply ceiling above, and the
+        # request hook already knows it: a judge call arrives with a
+        # deliberately small budget (1,024) because a verdict is short, so
+        # _bai_request_hook leaves a JUDGING_ROLES budget untouched instead of
+        # raising it 16x into room to think. What a small budget CANNOT do is
+        # stop the model thinking inside it - reasoning is billed against
+        # max_tokens and emitted FIRST here, so a call that deliberates returns
+        # a well-formed HTTP 200 whose content is empty and whose
+        # finish_reason is "length". `thinking: disabled` is what stops that,
+        # and it is scoped to the judging roles on purpose: the generator wants
+        # the reasoning it is being paid for, and role_params is the only layer
+        # that can say so for one role and not the other.
+        #
+        # MEASURED, not assumed - the ~90%-effective figure that `thinking:
+        # disabled` carried from 2026-08-25 would be one empty reply in ten,
+        # which is not a basis for a production judge seat. 21 real judge-role
+        # calls on a 6,903-token judge prompt returned 20 parseable three-axis
+        # verdicts; the one failure was this exact shape, 1,024 reasoning
+        # tokens and no content. Suppression is PROBABILISTIC, not a switch -
+        # three of the 21 thought anyway (637, 748, 1024 tokens), and when it
+        # thinks it does not think a little. Do NOT try to fix the remainder
+        # with `reasoning_effort: minimal`: that arm was run and measured WORSE
+        # (7/10, three truncations), which is why `low` above is left alone.
+        # docs/reports/2026-08-27-deepseek-as-judge-slot-b.md has the run.
+        role_params:
+          judge: {thinking: {type: disabled}}
+          tiebreak: {thinking: {type: disabled}}
   - name: cerebras
     base_url: https://api.cerebras.ai/v1
     api_key_env: CEREBRAS_API_KEY
@@ -923,7 +957,22 @@ routing:
   # which is the standing "every free judge is preferred to the paid one" rule.
   # On a gpt-oss generation family separation removes both openai models, so
   # the two slots really are qwen (A) and gemma (B).
+  #
+  # SLOT B WAS EMPTY on 2026-08-27: cerebras/gemma-4-31b answers HTTP 402
+  # payment_required, verified by direct probe that day, as does
+  # cerebras/gpt-oss-120b. That leaves qwen as the only working free judge, and
+  # the ref the pool reaches for slot B is then openai/gpt-5-mini - a PAID
+  # model. family_separation is not a guard against that in general: it
+  # excludes the GENERATOR's family, so it hides the openai refs on a gpt-oss
+  # row and not on any other. bai/deepseek-v4-flash goes in ahead of them
+  # because it is free, it is a family no other judge here holds, and the
+  # 2026-08-23 live drain that stalled with 34 judge_error was exactly this
+  # gap. It sits AFTER gemma so a revived free ref is still preferred, and
+  # BEFORE the paid refs because free-before-paid is the standing rule.
+  # Its judge params disable thinking - see the bai provider block; without
+  # that a 1,024-token verdict budget is spent reasoning and comes back empty.
   judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,
+          bai/deepseek-v4-flash,
           openai/gpt-5-mini, openai/gpt-5-nano]
   # TIEBREAK: mistral sits third, ahead of the paid backstops and behind the
   # two free families that separation will usually have spent already. On a
@@ -958,8 +1007,13 @@ routing:
   # of them. Mistral first costs nothing on a gpt-oss row (it never wins there
   # either) and is what keeps a deepseek row's tiebreak off the family that
   # scored 0/10 on IPC->BNS mapping.
+  # deepseek added 2026-08-27 with the judge seat, same reasoning and same
+  # placement rule: after the free refs, ahead of the paid ones. It cannot
+  # break a tie it was party to - family_separation removes the generator's
+  # family and both judged slots' families before this list is walked - so on
+  # a deepseek-generated row, or one deepseek already judged, it is not here.
   tiebreak: [mistral/mistral-large-latest, groq/openai/gpt-oss-20b,
-             cerebras/gemma-4-31b,
+             cerebras/gemma-4-31b, bai/deepseek-v4-flash,
              openai/gpt-5-mini, openai/gpt-5-nano]
   probe: [groq/openai/gpt-oss-20b]
   family_separation: true

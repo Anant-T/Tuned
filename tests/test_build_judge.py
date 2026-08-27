@@ -862,12 +862,40 @@ def _lengthen(store, task_id, words):
     return gen
 
 
+def _past_every_judge_window(cfg) -> int:
+    """`_lengthen` words that overflow EVERY judge in the pool, DERIVED.
+
+    The largest judge window has moved twice - 8,192 when zai-glm-4.7 held a
+    seat, 131,072 after it left, and 800,000 since bai/deepseek-v4-flash took
+    slot B on 2026-08-27. A pinned word count is how a test about "no eligible
+    model at all" quietly becomes a test about a judge that DID fit: the row
+    routes, a slot answers, and the assertion moves to the next slot without
+    anything going red about the premise.
+
+    `undersized_families` excludes a model when `needed * CONTEXT_SAFETY_MARGIN`
+    exceeds its `max_context`, `context_estimate` counts latin text at
+    CHARS_PER_TOKEN_LATIN characters per token, and one `_lengthen` word is the
+    5 characters of "word ". Halved margin on top, because the estimate is over
+    characters and the exact tokenisation is not the point here.
+    """
+    from tuned.data.providers import CHARS_PER_TOKEN_LATIN, CONTEXT_SAFETY_MARGIN
+
+    widest = max(
+        m.limits.get("max_context") or 0
+        for p in cfg.providers
+        for m in p.models
+        if "judge" in m.roles
+    )
+    tokens = widest / CONTEXT_SAFETY_MARGIN
+    return int(tokens * CHARS_PER_TOKEN_LATIN / 5 * 1.5)
+
+
 def test_an_unroutable_judge_parks_instead_of_re_queueing(tmp_path, cfg, paths):
     """Past every judge's context window there is no eligible model at all.
     Re-queueing would re-pay whichever slots did answer and meet the same
     wall tomorrow, so the row parks with a diagnostic."""
     with judged_store(tmp_path, paths, cfg) as store:
-        _lengthen(store, only_task(store)["task_id"], 200000)
+        _lengthen(store, only_task(store)["task_id"], _past_every_judge_window(cfg))
         router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
         totals = run_judge(store, cfg, router, paths)
         task = only_task(store)
@@ -2146,7 +2174,7 @@ def test_an_unroutable_judge_is_still_not_a_quality_reject(tmp_path, cfg, paths)
     """Routing emptiness stays an operational park after thresholds exist."""
     with judged_store(tmp_path, paths, cfg) as store:
         _activate_rules(store, (QWEN, "min_axis", 4), (GEMMA, "min_axis", 4))
-        _lengthen(store, only_task(store)["task_id"], 200000)
+        _lengthen(store, only_task(store)["task_id"], _past_every_judge_window(cfg))
         run_judge(store, cfg, FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]}), paths)
         task = only_task(store)
         assert task["state"] == "judge_unroutable"

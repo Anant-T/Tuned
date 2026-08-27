@@ -563,6 +563,82 @@ def test_the_bai_hook_still_raises_a_generator_budget():
     assert out["max_tokens"] == 16384
 
 
+def test_shipped_bai_judge_payload_disables_thinking_and_keeps_the_small_budget():
+    """The two halves of the slot-B guarantee, on the config as SHIPPED.
+
+    The hook (above) is what stops the 1,024-token verdict budget being raised
+    16x into room to think; `thinking: disabled` is what stops the model
+    spending the 1,024 it keeps. Neither is sufficient alone: reasoning is
+    billed against max_tokens here and emitted FIRST, so a judge that
+    deliberates returns HTTP 200 with empty content and finish_reason=length
+    and the row reads as a content failure rather than the provider fact it is.
+
+    Asserted through build_payload rather than by reading the YAML, because the
+    key has to survive the merge to reach the wire: role_params is the middle
+    of three layers and req.max_tokens is applied after all of them.
+
+    Role-SCOPED, and the generator half is asserted here too: deepseek is still
+    routing.generator ref 2, and a `thinking: disabled` that leaked onto the
+    generator would silently strip the reasoning trace this corpus is made of.
+    """
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    ref = ModelRef("bai", "deepseek-v4-flash")
+    provider, model = cfg.model_for(ref)
+
+    def _never_called(request):  # build_payload performs no request
+        raise AssertionError("build_payload must not perform a request")
+
+    client = ChatClient(provider, model, transport=httpx.MockTransport(_never_called))
+
+    for role in ("judge", "tiebreak"):
+        payload = client.build_payload(
+            ChatRequest(
+                messages=({"role": "user", "content": "score this"},),
+                ref=ref,
+                role=role,
+                max_tokens=DEFAULT_JUDGE_REPLY_TOKENS,
+            )
+        )
+        assert payload["thinking"] == {"type": "disabled"}, role
+        assert payload["max_tokens"] == DEFAULT_JUDGE_REPLY_TOKENS, role
+
+    generating = client.build_payload(
+        ChatRequest(
+            messages=({"role": "user", "content": "answer this"},),
+            ref=ref,
+            role="generator",
+            max_tokens=4000,
+        )
+    )
+    assert "thinking" not in generating
+    assert generating["max_tokens"] == 16384
+
+
+def test_shipped_deepseek_is_the_free_judge_ahead_of_the_paid_backstops():
+    """Slot B, and the reason it is filled: cerebras/gemma-4-31b answers HTTP
+    402 payment_required as of 2026-08-27, so without a third free ref the pool
+    reaches openai/gpt-5-mini - which family_separation only hides on a gpt-oss
+    row. Placement is the policy: after every free ref, before every paid one.
+    """
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    deepseek = ModelRef("bai", "deepseek-v4-flash")
+
+    for role in ("judge", "tiebreak"):
+        refs = list(cfg.routing_refs(role))
+        assert deepseek in refs, f"routing.{role} has no free slot-B ref"
+        here = refs.index(deepseek)
+        paid = [i for i, r in enumerate(refs) if r.provider == "openai"]
+        assert paid, f"routing.{role} lost its paid backstops"
+        assert here < min(paid), (
+            f"routing.{role} puts bai/deepseek-v4-flash behind a paid ref"
+        )
+
+    # The seat exists only because the model declares the roles; role_params
+    # for a role the model does not serve is refused at load.
+    _provider, model = cfg.model_for(deepseek)
+    assert set(model.roles) >= {"generator", "judge", "tiebreak"}
+
+
 # --- 3. retries -------------------------------------------------------------
 
 
@@ -1032,7 +1108,10 @@ def test_pick_skips_missing_key(cfg, keys, monkeypatch):
 def test_pick_skips_over_budget(cfg, keys):
     def budget_ok(provider, model, tokens):
         assert tokens == 500
-        return not (provider == "groq" or provider == "cerebras")
+        # Every FREE judge over budget, which since 2026-08-27 is three
+        # providers rather than two: bai/deepseek-v4-flash took slot B ahead
+        # of the paid backstop. The paid ref is what is left.
+        return provider not in ("groq", "cerebras", "bai")
 
     router = _router(cfg, budget_ok=budget_ok)
     assert router.pick("judge", est_tokens=500).ref == PAID_JUDGE
@@ -1171,7 +1250,7 @@ def test_complete_raises_when_every_ref_fails(cfg, keys):
         clock=clock,
         sleeper=sleeper,
         client_factory=_factory(
-            clock, sleeper, seen, {"groq": 500, "cerebras": 503, "openai": 500}
+            clock, sleeper, seen, {"groq": 500, "cerebras": 503, "bai": 500, "openai": 500}
         ),
     )
 
@@ -1179,12 +1258,14 @@ def test_complete_raises_when_every_ref_fails(cfg, keys):
         asyncio.run(router.complete("judge", [{"role": "user", "content": "grade this"}]))
 
     assert excinfo.value.retryable is True
-    # Four refs over three providers: the openai backstop contributes two, and
+    # Five refs over four providers: the openai backstop contributes two, and
     # BOTH have to be tried before the role is out of options. cerebras IS
     # among them since 2026-08-19 - gemma was promoted into the judge role when
-    # mistral was removed - which is what makes this four refs and not three.
-    assert "all 4 eligible model(s) failed" in str(excinfo.value)
+    # mistral was removed - and bai since 2026-08-27, when deepseek took the
+    # slot-B seat gemma's 402 had emptied.
+    assert "all 5 eligible model(s) failed" in str(excinfo.value)
     assert seen.count("groq") == 2 and seen.count("cerebras") == 2
+    assert seen.count("bai") == 2
     assert seen.count("openai") == 4  # two refs, two in-provider attempts each
 
 
@@ -1328,8 +1409,9 @@ def test_retries_charge_the_rpm_bucket_too(cfg, keys):
                 "judge",
                 [{"role": "user", "content": "hi"}],
                 # Isolate the groq ref: every OTHER family in the judge pool,
-                # which since 2026-08-19 is gemma plus the gpt-oss backstop.
-                exclude_families=frozenset({"gemma", "glm", "gpt-oss"}),
+                # which since 2026-08-19 is gemma plus the gpt-oss backstop,
+                # and since 2026-08-27 deepseek in slot B as well.
+                exclude_families=frozenset({"gemma", "glm", "gpt-oss", "deepseek"}),
                 est_tokens=100,
             )
         )
@@ -1894,7 +1976,7 @@ def test_overflow_at_every_ref_is_reported_as_a_row_shaped_failure(cfg, keys):
         clock=clock,
         sleeper=sleeper,
         client_factory=_overflow_factory(
-            clock, sleeper, seen, {"groq", "cerebras", "openai"}, OVERFLOW_BODY
+            clock, sleeper, seen, {"groq", "cerebras", "bai", "openai"}, OVERFLOW_BODY
         ),
     )
 
@@ -1906,7 +1988,7 @@ def test_overflow_at_every_ref_is_reported_as_a_row_shaped_failure(cfg, keys):
     # Every ref was offered it, the two paid backstops included - a 400 that
     # says "too long for this window" never charges the breaker, so the pass
     # runs to the end of the list rather than stopping at the first refusal.
-    assert seen == ["groq", "cerebras", "openai", "openai"]
+    assert seen == ["groq", "cerebras", "bai", "openai", "openai"]
 
 
 def test_undersized_families_keeps_an_explicit_safety_margin(cfg):
@@ -3297,9 +3379,19 @@ def test_the_judge_pool_is_the_one_calibration_left_behind(cfg):
         "and a judge seat would need gold labels first"
     )
     assert roles["cerebras/gemma-4-31b"] == ("judge", "tiebreak")
+    # bai/deepseek-v4-flash, 2026-08-27, and it is UNPROVEN in exactly the
+    # sense mistral-large is: it was measured to ANSWER as a judge (10/10
+    # parseable three-axis verdicts on a real judge prompt - see
+    # docs/reports/2026-08-27-deepseek-as-judge-slot-b.md) and never measured
+    # to judge WELL, because no gold-labelled calibration has been run on it.
+    # It holds a judge seat rather than a tiebreak-only one because the
+    # alternative that day was not a proven judge: gemma answers HTTP 402 and
+    # the next ref in the list is paid. That trade is the config's, not this
+    # test's; what is pinned here is that it is visible.
     assert list(cfg.routing.judge) == [
         "groq/qwen/qwen3.6-27b",
         "cerebras/gemma-4-31b",
+        "bai/deepseek-v4-flash",
         "openai/gpt-5-mini",
         "openai/gpt-5-nano",
     ]
