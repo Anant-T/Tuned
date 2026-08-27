@@ -678,16 +678,30 @@ providers:
       # otherwise arrive here through build_payload.
       #
       # NO tpd on either block, and that is a decision rather than an
-      # omission: operator's call 2026-08-15, this provider runs UNCAPPED. An
-      # absent cap reads as unlimited (store._cap treats a missing key as
-      # infinity), the same way the cerebras blocks leave rpd absent. The
-      # rpm/tpm below are real RATE limits - OpenAI's actual tier limits - and
-      # not spend controls, so nothing in this file brakes spend. Any spend
-      # brake lives server-side in the OpenAI billing dashboard, where a
-      # config edit cannot remove it. Uncapped is not the same as preferred:
-      # both refs sit LAST in routing.judge and routing.tiebreak, so every
-      # free judge is tried first and these are reached only by rows nothing
-      # free can serve.
+      # omission: operator's call 2026-08-15. An absent cap reads as
+      # unlimited (store._cap treats a missing key as infinity), the same way
+      # the cerebras blocks leave rpd absent. The rpm/tpm below are real RATE
+      # limits - OpenAI's actual tier limits, still true today.
+      #
+      # SUPERSEDED 2026-08-27, kept in place rather than deleted: this
+      # paragraph used to end here with "...and not spend controls, so
+      # nothing in this file brakes spend. Any spend brake lives server-side
+      # in the OpenAI billing dashboard, where a config edit cannot remove
+      # it. Uncapped is not the same as preferred: both refs sit LAST in
+      # routing.judge and routing.tiebreak..." That was true THEN, when this
+      # file carried no usd_cap anywhere - see THE SPEND FENCE immediately
+      # below, added the same day. It is false NOW: THIS FILE DOES BRAKE
+      # SPEND for this provider, from right here, via usd_cap: 0.0 on both
+      # models below - and it works only because usd_per_1m_prompt and
+      # usd_per_1m_completion sit beside it (a bare usd_cap blocks nothing,
+      # see THE TRAP below). The billing-dashboard brake still exists as a
+      # second, independent line of defence, but it is no longer the ONLY
+      # one, and a config edit can now remove the one described here. What is
+      # still true and worth keeping: both refs sit LAST in routing.judge and
+      # routing.tiebreak, so every free judge is tried first and these are
+      # reached, and billed, only by rows nothing free can serve - the fence
+      # below is what stops that path from ever costing more than $0.
+      #
       # THE SPEND FENCE, added 2026-08-27 once a deepseek lead generator made
       # these two reachable (family_separation only excludes {deepseek} on a
       # deepseek row, not {deepseek, gpt-oss} - so a slot-B pool gap, the exact

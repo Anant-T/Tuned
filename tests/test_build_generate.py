@@ -441,12 +441,19 @@ def test_generator_call_carries_the_rendered_prompt(tmp_path, cfg, paths):
         # NOT think_max + ANSWER_TOKEN_ALLOWANCE: that identity was retired
         # 2026-08-18 (see GENERATION_OUTPUT_TOKENS) precisely because it mixed
         # a chars//4 gate threshold with a real-token call budget. This
-        # assertion used to read `cfg.build.length_band.think_max + 1000` and
-        # passed only by COINCIDENCE, because the shipped think_max (3000) summed
-        # to exactly 4000 - the same trap test_the_generation_budget_does_not_
-        # move_when_the_band_moves exists to catch. Raising think_max to 4000
-        # broke the coincidence; the actual call budget is the decoupled
-        # constant regardless of the band.
+        # assertion used to read `cfg.build.length_band.think_max + 1000`, and
+        # at shipped values BOTH forms pass - think_max (3000) + 1000 still
+        # equals GENERATION_OUTPUT_TOKENS (4000), so this rewrite does not
+        # catch any break the old form missed. The reason to keep it is the
+        # other direction: the old form fails SPURIOUSLY the moment think_max
+        # moves for a legitimate reason, or GENERATION_OUTPUT_TOKENS is
+        # legitimately re-priced on its own - neither of which is an actual
+        # break in what the generator call sends - while this form never
+        # misfires and is never worse at catching a real one. The test that
+        # actually guards the decoupling itself is the sibling
+        # test_the_generation_budget_does_not_move_when_the_band_moves,
+        # below; this assertion just has to describe the real call correctly
+        # without re-deriving it from the band.
         assert call["max_tokens"] == GENERATION_OUTPUT_TOKENS
         assert call["est_tokens"] > call["max_tokens"]
 

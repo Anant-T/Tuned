@@ -807,9 +807,16 @@ def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
         )
         for old, new in (
             (anchor, injected),
-            ("  generator: [bai/deepseek-v4-flash, cerebras/gpt-oss-120b,\n"
+            # Anchor matches routing.generator's CURRENT order - gpt-oss
+            # reclaimed the lead slot from deepseek on 2026-08-27 (Task 1).
+            # This branch has no callers today (see the docstring above), so
+            # nothing exercises a stale anchor here and it can go quietly out
+            # of sync with the live config, which is exactly what happened to
+            # this same anchor once already. Keep it matched on every
+            # reorder even though nothing currently runs it.
+            ("  generator: [cerebras/gpt-oss-120b, bai/deepseek-v4-flash,\n"
              "              lightning/lightning-ai/gpt-oss-120b]",
-             "  generator: [bai/deepseek-v4-flash, cerebras/gpt-oss-120b,\n"
+             "  generator: [cerebras/gpt-oss-120b, bai/deepseek-v4-flash,\n"
              f"              lightning/lightning-ai/gpt-oss-120b, {SECOND_GENERATOR_REF}]"),
             ("  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,",
              f"  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b, {SECOND_GENERATOR_REF},"),
