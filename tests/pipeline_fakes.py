@@ -757,12 +757,22 @@ def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
     the shipped one points at the operator's live data/build.
 
     `two_generator_families` is the file-level twin of
-    cfg_with_two_generator_families, and one CLI test genuinely needs it. The
-    judge pool's only remaining hole is reachable ONLY from a mistral
-    generation - that is what removes mistral from the judge pool and empties
-    slot B - and mistral stopped being a generator on 2026-08-18. Without this
-    the CLI under test stops refusing and proceeds into a real run, which on a
-    machine with keys set means live network calls from a unit test.
+    cfg_with_two_generator_families. It is the same idea applied to the config
+    FILE rather than to a loaded BuildConfig: the judge pool's only remaining
+    hole is reachable ONLY from a mistral generation - that is what removes
+    mistral from the judge pool and empties slot B - and mistral stopped being a
+    generator on 2026-08-18.
+
+    IT HAS NO CALLERS, and the correction is worth recording because the wrong
+    version of this comment was believed. An earlier draft said "one CLI test
+    genuinely needs it"; that was checked on 2026-08-27 and is false at HEAD and
+    was false at c3e01a9 - every use of the NAME in the suite is of
+    cfg_with_two_generator_families, the BuildConfig-level twin, which is heavily
+    used and is not this. So this branch is dead code today. It is kept rather
+    than deleted because the scenario it builds is real and awkward to
+    reconstruct, and a CLI test that needs a two-family config file is a
+    plausible near-term need. Anyone who deletes it is not breaking a test; and
+    anyone who cites it as load-bearing should re-run the grep first.
     """
     raw = DATA_CONFIG.read_text(encoding="utf-8")
     redirected = raw.replace("workdir: data/build", f"workdir: {(tmp_path / 'build').as_posix()}")

@@ -183,16 +183,47 @@ moved.
 
 ## What this changes in `configs/data_law_v1.yaml`
 
-**Nothing, on the strength of this arm — and the two routes the spec put out of scope come
-back.**
+**Nothing on the strength of this arm — and the two routes the spec put out of scope come
+back.** That is a statement about what this arm's *evidence* moves. It is not a statement
+that the live config is unchanged by this branch: merging it changes the generator order for
+reasons this arm never examined, which is the next subsection and the more consequential
+half of this answer.
 
 The spec's rule was: if measurements 1-4 pass and 5 and 7 hold, nothing changes but the
 prompts and deepseek stays lead generator. 1-4 did not pass. So the condition for "nothing
-changes" is not met, and the live config keeps its current `length_band`
-(`think_min: 500, think_max: 3000, total_max: 8192`) and its current generator order
-unexamined by this run.
+changes" is not met, and nothing in this arm's evidence moves the live `length_band`
+(`configs/data_law_v1.yaml:16` — `think_min: 500, think_max: 3000, total_max: 8192`).
 
-What the numbers do force is a decision this task did not have the scope to take:
+### Merging this branch promotes deepseek to lead generator
+
+That has to be said here because no other document on the branch says it, and because it is
+in direct tension with the finding below.
+
+At the branch point (`589ce43`) the committed `configs/data_law_v1.yaml` carried
+`generator: [cerebras/gpt-oss-120b, lightning/lightning-ai/gpt-oss-120b]` and **no `bai`
+provider block at all**. Task 1 (`869da9b`) committed the b.ai integration, so the file now
+ships `generator: [bai/deepseek-v4-flash, cerebras/gpt-oss-120b, lightning/...]` at
+`:825`, and reorders `routing.tiebreak` at `:856` — mistral ahead of `groq/openai/gpt-oss-20b`
+— as a direct consequence, because family separation stops excluding gpt-oss-20b once the
+generation is a deepseek one. Both changes are justified in-config and covered by tests.
+Neither is examined by this arm, and it would be wrong to read the sentence above as saying
+the generator order is unchanged: it is unchanged in the *working tree*, and it changes on
+*merge*.
+
+So the position this report leaves the build in is: **merging makes deepseek the lead
+production generator, and this arm's own evidence says that generator does not fit the band
+the same file declares.** The median treatment generation is over `think_max: 3000` (trace
+p50 3,126 tokens) and 22.3% of rows exceed the 8,192 trainer cap. A `think_max` raise, or a
+demotion of deepseek to a minority source, is **owed before or at that merge** — it is not a
+follow-up that can wait for the next arm, because the merge is what puts the generator into
+production.
+
+That decision is not this task's to take, and it is not taken here. It sits with whoever
+merges the branch, and it lands in exactly three places in `configs/data_law_v1.yaml`:
+`build.length_band` at `:16`, `routing.generator` at `:825`, and `routing.tiebreak` at
+`:856`.
+
+What the numbers do force, on the same evidence:
 
 - **`think_max: 3000` and this generator are incompatible.** The treatment's trace p50 is
   **3,126 tokens** — the median generation is now over the ceiling, not the tail, and that
@@ -209,8 +240,31 @@ What the numbers do force is a decision this task did not have the scope to take
   loosely.** Matched, v5 is indistinguishable from v4 on every gate, measurements 5 and 6
   held, and every one of the 14 templates came out word-neutral or shorter. There is no
   measured harm to undo, and equally no measured benefit: the honest status of `286fd3a`
-  after this run is **inert on deepseek**, not helpful. Its stated value for gpt-oss —
-  holding traces above `think_min` — is untested here and unaffected either way.
+  after this run is **inert on deepseek**, not helpful.
+
+  **Its effect on gpt-oss is untested and it is not neutral — an earlier version of this
+  line said "unaffected either way" and that was wrong.** The claim came from the spec's
+  out-of-scope section, which argued that leaving `prompts_harmony/` alone was safe because
+  the overlay strips the reasoning-length packet. That is true of the overlay and **irrelevant
+  to the live path**: `configs/data_law_v1.yaml` sets neither `prompt_overlay` nor
+  `harmony_completions` (only the `exp_recovery` / `exp_harmony` / `exp_s1` arms do — see
+  `config.py`, which calls `set_overlay(None)` when the key is absent). On the live config
+  `cerebras/gpt-oss-120b` and `lightning/lightning-ai/gpt-oss-120b`, refs 2 and 3 and the
+  documented overflow when b.ai throttles, read the **base** templates this branch edited.
+
+  The direction of the risk is against gpt-oss. All 14 templates lost
+  `is normal for a matter of any substance` in favour of pure ceiling framing, and that
+  sentence was added on 2026-08-18 for the express purpose of pushing gpt-oss traces **up**:
+  gpt-oss's measured failure mode is `think<think_min`, the mirror image of deepseek's. So
+  the honest statement is that the edit is **measured inert on deepseek** (McNemar wash on
+  all four gates, sign test p = 0.87 on trace length) and **unmeasured on gpt-oss, in a
+  direction that works against the one job that sentence had**.
+
+  The mitigation is real and it is framing, not removal: `450 to 700 words of deliberation`
+  and `Work the point through fully` both survive verbatim in **14 of 14** templates, so the
+  floor language is intact and only the surrounding permission changed. That is a reasoned
+  argument for why the risk is probably small. It is not a measurement, and nothing on this
+  branch measures it.
 
   The caveat is that "no measured harm" rests on the matched view, and the matched view
   covers attempt 1 only. The pooled harms — `length_band` 49% → 32%, and 22.3% of rows over
@@ -344,6 +398,8 @@ The tightest form of the length question: the SAME task, the same seed and the s
 - sign test on the direction of the per-task change: **p = 0.87** (21 shorter / 19 longer, 0 tied)
 - 95% bootstrap interval on the median per-task change (10,000 resamples, seed 3407): **[-378, +476]** words
 - per-task change ranges from **-4,526** to **+5,319** words: the run-to-run spread on a single task dwarfs the shift being looked for.
+
+Within a row, the median delta is **not** the difference of the two medians and will not look like it — `predex` below is the clearest case, 1,431 to 2,519 with a median per-task delta of -374. Both are correct: a median of per-task changes and a difference of two independently-ordered medians are different quantities, and they diverge whenever the changes are large and two-sided, which here they are.
 
 | source arm | pairs | median control | median treatment | median delta |
 |---|---|---|---|---|
@@ -493,34 +549,34 @@ Descriptive, not causal. Buckets are trace words; `n` is generations with conten
 | `judging` / - | 0 | 9 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,reply_budget | 3 | 5 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,prompt_echo,reply_budget | 0 | 3 |
+| `format_parked` / exhausted:format:length_band,irac_placement,prompt_echo,reply_budget | 0 | 2 |
 | `judging` / regenerate:length_band | 0 | 2 |
 | `format_parked` / exhausted:format:think_format,length_band | 0 | 2 |
-| `format_parked` / exhausted:format:length_band,irac_placement,prompt_echo,reply_budget | 0 | 2 |
 | `format_parked` / exhausted:format:irac_placement | 4 | 1 |
-| `format_parked` / exhausted:format:irac_placement,verbatim_overlap | 2 | 1 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap | 2 | 1 |
+| `format_parked` / exhausted:format:irac_placement,verbatim_overlap | 2 | 1 |
 | `format_parked` / exhausted:format:length_band,irac_placement | 1 | 1 |
-| `format_parked` / exhausted:format:length_band,irac_placement,reply_budget | 1 | 1 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,banned_meta,prompt_echo,reply_budget | 1 | 1 |
-| `rejected` / reject:length_band,citations,verbatim_overlap,banned_meta,reply_budget | 0 | 1 |
-| `format_parked` / exhausted:format:irac_placement,verbatim_overlap,banned_meta | 0 | 1 |
-| `judging` / regenerate:irac_placement | 0 | 1 |
-| `judging` / regenerate:irac_placement,verbatim_overlap | 0 | 1 |
+| `format_parked` / exhausted:format:length_band,irac_placement,reply_budget | 1 | 1 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,banned_meta | 0 | 1 |
-| `judging` / regenerate:length_band,irac_placement,reply_budget | 0 | 1 |
-| `format_parked` / exhausted:format:prompt_echo | 0 | 1 |
-| `judging` / regenerate:length_band,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
-| `judging` / regenerate:length_band,verbatim_overlap,banned_meta,reply_budget | 0 | 1 |
-| `format_parked` / exhausted:format:length_band,statutory_grounding,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
+| `judging` / regenerate:irac_placement | 0 | 1 |
+| `rejected` / reject:length_band,citations,verbatim_overlap,banned_meta,reply_budget | 0 | 1 |
+| `judging` / regenerate:irac_placement,verbatim_overlap | 0 | 1 |
+| `format_parked` / exhausted:format:irac_placement,verbatim_overlap,banned_meta | 0 | 1 |
 | `rejected` / reject:length_band,citations,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
+| `format_parked` / exhausted:format:prompt_echo | 0 | 1 |
+| `judging` / regenerate:length_band,irac_placement,reply_budget | 0 | 1 |
+| `judging` / regenerate:length_band,verbatim_overlap,banned_meta,reply_budget | 0 | 1 |
+| `judging` / regenerate:length_band,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
+| `format_parked` / exhausted:format:length_band,statutory_grounding,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
 | `accepted` / judge:accept | 9 | 0 |
 | `judge_error` / judge-slot-b:role 'judge': no eligible model (skipped: cooling, family-excluded, over-budget) | 8 | 0 |
 | `rejected` / judge:reject | 3 | 0 |
 | `format_parked` / exhausted:format:length_band,statutory_grounding,irac_placement | 2 | 0 |
 | `format_parked` / exhausted:format:length_band,statutory_grounding,irac_placement,banned_meta,prompt_echo | 1 | 0 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,prompt_echo | 1 | 0 |
-| `format_parked` / exhausted:format:length_band,verbatim_overlap,prompt_echo | 1 | 0 |
 | `format_parked` / exhausted:format:banned_meta | 1 | 0 |
+| `format_parked` / exhausted:format:length_band,verbatim_overlap,prompt_echo | 1 | 0 |
 
 ## 7. Per-arm composition
 

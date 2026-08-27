@@ -249,6 +249,24 @@ Critical from a test pinned to a config that was not committed.
   permission to run long would push it further into the failure this build spent
   2026-08-18 fixing.
 
+  > **CORRECTED 2026-08-27, after the Task 3 arm.** The paragraph above is right
+  > that the overlay is not on the deepseek path, and **wrong that this makes the
+  > edit safe for gpt-oss.** The overlay stripping the reasoning-length packet is
+  > irrelevant to the LIVE path, because `configs/data_law_v1.yaml` sets neither
+  > `prompt_overlay` nor `harmony_completions` — only `exp_recovery`,
+  > `exp_harmony` and `exp_s1` do, and `config.py` calls `set_overlay(None)` when
+  > the key is absent. On the live config `cerebras/gpt-oss-120b` and
+  > `lightning/lightning-ai/gpt-oss-120b` — refs 2 and 3, the documented overflow
+  > when b.ai throttles — read the BASE templates this task edited. All 14 lost
+  > `is normal for a matter of any substance`, which was added on 2026-08-18
+  > precisely to push gpt-oss traces UP. So the edit is measured inert on deepseek
+  > and **unmeasured on gpt-oss, in a direction that works against that sentence's
+  > only job**. Mitigation, stated as the reasoned argument it is rather than as a
+  > measurement: `450 to 700 words of deliberation` and `Work the point through
+  > fully` survive verbatim in 14 of 14 templates, so the floor language is intact
+  > and only the permission around it changed. See
+  > `docs/reports/2026-08-27-generator-prompt-length-fix.md`.
+
   **The cost is real and must be recorded.** After this edit the base templates
   say "ceiling" and the overlay still says "as long as it needs", and **no test
   detects the divergence.** The guard usually credited with catching it —
