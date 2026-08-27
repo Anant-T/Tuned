@@ -686,48 +686,41 @@ providers:
       #   far under the published free-tier scale (order 1B/month) and is still
       #   a FLOOR, not a measurement.
       #
-      # usd_cap: 0.0 ADDED 2026-08-27 (found by review). Until now this model
-      # declared NO price and NO cap: its free status rested entirely on La
-      # Plateforme's Experiment tier terms, which this file asserts nothing
-      # about and cannot enforce - Task 1's usd_cap mechanism works on ANY
-      # provider now, so leaving this one bare was decoration where a real
-      # fence was possible. usd_per_1m_prompt/completion are La Plateforme's
-      # published rates for mistral-large-latest (mistral.ai/pricing, checked
-      # 2026-08-27): $0.5 in / $1.5 out per 1M tokens. Both are declared
-      # beside the cap on purpose - see THE TRAP in the openai provider block:
-      # usd_cap alone blocks nothing, because a missing price reads as 0.0 and
-      # 0.0 + 0.0 > 0.0 is False. With a real price, any positive est_tokens
-      # makes est_cost > 0.0 = usd_cap, so this ref is now BLOCKED FROM ITS
-      # FIRST CALL, the same permanently-fenced shape as the openai backstops.
+      # A usd_cap WAS ADDED HERE 2026-08-27 and REVERTED THE SAME DAY - kept
+      # as history rather than deleted, because the trade it got wrong is
+      # exactly the trade the next reviewer will be tempted to make again.
+      # usd_cap: 0.0 plus usd_per_1m_prompt: 0.5 / usd_per_1m_completion: 1.5
+      # (La Plateforme's published rate for Mistral Large, checked 2026-08-27)
+      # made this ref permanently unroutable from its first call, the same
+      # fenced shape as the openai backstops - and it was measured to remove
+      # the ONLY live tiebreak candidate for EITHER generator family, since
+      # cerebras/gemma-4-31b (the other tiebreak-eligible family on most rows)
+      # is 402. The cap traded a low-probability tier-terms risk (this build
+      # uses a tiny fraction of a ~1B-token/month free allowance) for a
+      # certain, immediate one: every contested row on every generator family
+      # loses its last tiebreak the moment the cap lands.
       #
-      # THE CONSEQUENCE, MEASURED RATHER THAN ASSUMED: this does NOT statically
-      # empty routing.tiebreak for either generator family - Router.pick moves
-      # on to the next eligible ref, same as any other ineligibility. On a
-      # gpt-oss row (judges qwen+gemma, tiebreak excludes {gpt-oss,qwen,gemma})
-      # the seat that used to go to mistral now goes to bai/deepseek-v4-flash -
-      # a SEAT CHANGE of the same kind routing.tiebreak's own comments already
-      # track for gpt-oss-20b and deepseek, not a new failure mode. On a
-      # deepseek row (judges qwen+gpt-oss-20b, tiebreak excludes
-      # {deepseek,qwen,gpt-oss}) the seat falls through to cerebras/gemma-4-31b
-      # - which is STATICALLY eligible (family/key/budget all clear) but is
-      # the SAME ref probed HTTP 402 elsewhere in this file. Before this cap,
-      # a contested deepseek row's outcome hinged on mistral's actual liveness
-      # (probed inconclusive - a 45s read-timeout, not a confirmed failure);
-      # this cap removes that possibility UNCONDITIONALLY, so the contested-
-      # deepseek-row reject path recorded next to groq/openai/gpt-oss-20b
-      # above is now certain whenever gemma is down, rather than contingent on
-      # mistral also being down. Verified with budget_ok_for directly (blocks
-      # at any positive est_tokens) and with Router.pick under both exclusion
-      # sets above - not merely reasoned about. Made anyway: an unconditional,
-      # provable $0 fence on every paid or unverified-free path is this file's
-      # standing policy, and the alternative - leaving mistral's real cost
-      # exposure resting on an unenforced tier promise - is the same gap Task
-      # 1 closed for lightning.
+      # WHAT MADE THE CAP LOOK RIGHT AT THE TIME was a probe that read
+      # mistral as possibly dead - a 45s read-timeout, logged as
+      # "inconclusive, not confirmed dead" in the comment that justified the
+      # cap. A DIRECT PROBE AFTERWARD (not through the Router) corrected that:
+      # attempt 1 read-timed-out at 180s, attempt 2 returned HTTP 200 in
+      # 101.1s. providers._CALL_DEADLINE_S is 300.0, so a ~101s call fits
+      # comfortably - mistral is SLOW, not unavailable, and the fleet's own
+      # deadline already accommodates it. No cap belongs on a ref this build
+      # cannot afford to lose and that is not, in fact, failing.
+      #
+      # ITS FREE STATUS STILL RESTS ON TIER TERMS RATHER THAN ON ANYTHING THIS
+      # CONFIG ASSERTS, and that is unchanged by the revert - La Plateforme's
+      # "Experiment" tier, not a usd_cap here, is what keeps this free. If
+      # that ever needs enforcing again, the fix is not a blind $0 fence: it
+      # is a cap large enough to clear this build's real usage (the tpd floor
+      # above already reasons about that scale) rather than one that blocks
+      # the first token.
       - id: mistral-large-latest
         family: mistral
         roles: [tiebreak]
-        limits: {rpm: 2, tpm: 30000, tpd: 5000000, max_context: 52812, max_output: 8192,
-                 usd_cap: 0.0, usd_per_1m_prompt: 0.5, usd_per_1m_completion: 1.5}
+        limits: {rpm: 2, tpm: 30000, tpd: 5000000, max_context: 52812, max_output: 8192}
         params: {}
         role_params:
           tiebreak: {temperature: 0.2}
@@ -760,6 +753,20 @@ providers:
   # and they are deliberately generous because this provider is PAID: the
   # binding constraint on it is the operator's wallet and the cost ruling in
   # routing.generator, not a rate limit. Nothing here probed them.
+  #
+  # THIS PROVIDER DECLARES NEITHER A PRICE NOR A usd_cap, stated plainly here
+  # because a reader meeting this block should not have to read all the way
+  # down to routing.generator's comment to learn it: it is PAID and it is
+  # UNFENCED. The only thing protecting the build from it today is that it is
+  # absent from every routing list (removed from routing.generator 2026-08-27
+  # - see that comment for the incident: a usd_cap declared on any provider
+  # but the one literally named "openai" was silently unreachable, so this
+  # provider carried a paid ref with no fence actually behind it while it was
+  # routed). Absence from a routing list is not a fence and does not survive
+  # a careless re-add. RE-ADDING THIS TO ANY ROUTING LIST REQUIRES DECLARING
+  # usd_cap HERE FIRST, WITH BOTH usd_per_1m_prompt AND usd_per_1m_completion
+  # beside it - a bare usd_cap blocks nothing (see THE TRAP in the openai
+  # provider block) - or the exact defect that was removed comes back.
   #
   # LICENSING / ToS: lightning-ai/* are OPEN WEIGHTS (gpt-oss is Apache-2.0)
   # SELF-HOSTED by Lightning, so the upstream vendor is not a party to this
@@ -1144,20 +1151,30 @@ routing:
   # first) rather than resting on this verdict alone.
   #
   # THE CONTESTED-ROW CONSEQUENCE, RECORDED RATHER THAN FIXED (found by
-  # review, 2026-08-27): "goes to the tiebreak pool (mistral first)" is true
-  # on paper, not guaranteed in practice. After judges qwen and gpt-oss-20b,
-  # routing.tiebreak's exclusion set is {deepseek, qwen, gpt-oss} - which
-  # removes groq/openai/gpt-oss-20b itself, bai/deepseek-v4-flash, and both
-  # openai refs (family gpt-oss by deliberate lumping) - leaving only
-  # [mistral/mistral-large-latest, cerebras/gemma-4-31b]. gemma answers HTTP
-  # 402 (same probe as elsewhere in this file); mistral read-timed-out at 45s
-  # in a 2026-08-27 probe - INCONCLUSIVE, not confirmed dead. If mistral is in
-  # fact unreachable, judge.py's tiebreak_unroutable_two_judge_decision path
-  # REJECTS the row rather than parking it (judge.py:1334-1344). So today a
-  # CONTESTED deepseek row completes only when its two judges AGREE; a real
-  # disagreement is auto-rejected, not retried. Conservative and non-fatal -
-  # the same shape as every other park/reject-loudly path in this file - but
-  # it is a real yield consequence, and recording it rather than fixing it is
+  # review, 2026-08-27; corrected 2026-08-27 - the first version of this
+  # paragraph described a REJECT that the code does not do). After judges
+  # qwen and gpt-oss-20b, routing.tiebreak's exclusion set is {deepseek,
+  # qwen, gpt-oss} - which removes groq/openai/gpt-oss-20b itself,
+  # bai/deepseek-v4-flash, and both openai refs (family gpt-oss by
+  # deliberate lumping) - leaving [mistral/mistral-large-latest,
+  # cerebras/gemma-4-31b]. gemma answers HTTP 402. mistral is ALIVE - direct
+  # probe 2026-08-27, HTTP 200 in 101.1s against the 300s call deadline, see
+  # the mistral provider block - so on a live fleet this seat is normally
+  # reachable and this paragraph is not describing today's typical outcome.
+  #
+  # WHAT ACTUALLY HAPPENS IF MISTRAL IS ALSO UNREACHABLE, because the pool
+  # still has to survive that: judge.py's tiebreak_unroutable_two_judge_
+  # decision path (the clean "reject the unresolved disagreement" path) only
+  # fires when unroutable is True, and unroutable requires every skip to be
+  # `context_exceeded` or `family-excluded` (providers.ROW_SHAPED_SKIPS;
+  # generate.py's ROW_SHAPED_SKIPS = frozenset({"family-excluded"})). A
+  # provider that is genuinely tried and fails - a timeout, a 402, an
+  # over-budget block - is not a row-shaped skip, so unroutable stays False.
+  # The row RE-QUEUES instead of rejecting, and burns another attempt on the
+  # next pass; at MAX_JUDGE_ATTEMPTS (8) it parks in judge_error - the same
+  # shape as the 2026-08-23 live-drain stall, not a clean, cheap reject. This
+  # is NOT conservative or non-fatal: it costs up to eight judge passes per
+  # row before the operator sees it. Recording it rather than fixing it is
   # this file's own standing rule.
   #
   # THE OPEN RISK, STATED PLAINLY: the 0/10 score was measured on UNGROUNDED

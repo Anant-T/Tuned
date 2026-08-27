@@ -575,6 +575,17 @@ def budget_ok_for(store, cfg, *, quota=None):
         # declared elsewhere (lightning, in this build) was silently unreachable.
         usd_cap = _provider_usd_cap(cfg, provider)
         if usd_cap is not None:
+            # est_cost prices the PROMPT side of est_tokens only
+            # (completion=False) - there is no reply yet to size when this
+            # runs, so nothing forecasts what it will cost. usd_per_1m_
+            # completion is not dead: _provider_usd_spent prices REALIZED
+            # completion tokens into the running total once a call has
+            # actually happened, so it still counts against the cap on every
+            # call AFTER the one that produced them. What it cannot do is
+            # stop a single very large first reply from overshooting the cap
+            # before that reply is ever measured. Recorded, not changed -
+            # forecasting completion cost ahead of the call is a separate
+            # decision (found by review, 2026-08-27).
             est_cost = (
                 float(est_tokens)
                 * _usd_per_1m(model_cfg.limits, completion=False)

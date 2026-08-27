@@ -686,6 +686,24 @@ PROMOTED_JUDGES = (
 )
 
 
+# Every provider in this config that is PAID, maintained by hand rather than
+# derived - see test_the_generator_prefers_the_free_provider_and_parks_once_
+# all_are_ineligible's docstring for why: a provider that declares neither a
+# price nor a usd_cap is not thereby free, and inferring paid-ness from price
+# presence alone is exactly the hole a 2026-08-27 review found (a re-added
+# lightning ref, with no price and no cap, passed a price-only invariant
+# silently). lightning is here even though routing.generator does not carry
+# it today - the allowlist describes the FLEET's paid providers, not the
+# current routing lists, so it still catches lightning if it is ever re-added
+# unchanged. openai is here even though both its models already declare
+# usd_cap - the allowlist is deliberately redundant with a correct
+# declaration; what it exists to catch is an INCORRECT one. A new paid
+# provider added to this config and left out of this tuple defeats the
+# invariant silently, the same failure shape PROMOTED_JUDGES above warns
+# about for the judge pool.
+PAID_PROVIDERS = frozenset({"lightning", "openai"})
+
+
 def cfg_without_the_promoted_judge(cfg: BuildConfig) -> BuildConfig:
     """The judge pool as it was before the free judges were promoted into it.
 

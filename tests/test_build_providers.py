@@ -18,6 +18,7 @@ httpx = pytest.importorskip("httpx")
 
 from pipeline_fakes import (  # noqa: E402
     NARROW_GENERATOR_CONTEXT,
+    PAID_PROVIDERS,
     SECOND_GENERATOR_CONTEXT,
     cfg_without_the_free_tiebreak,
     cfg_without_the_promoted_judge,
@@ -3583,23 +3584,36 @@ def test_the_generator_prefers_the_free_provider_and_parks_once_all_are_ineligib
     generator_refs`, which is Task 1's exact bug - a fence that recognises
     only one provider by literal name - reborn as a test assertion instead of
     production code. A future paid ref under any OTHER name would pass this
-    check while reopening the hole lightning was removed to close. The
-    invariant below is name-free: any generator ref that declares a per-token
-    PRICE also declares a usd_cap beside it, whichever provider it is under.
-    A price with no cap is unmetered paid overflow; a cap with no price
-    blocks nothing either (see the openai block's own "usd_cap ALONE BLOCKS
-    NOTHING" comment) - this checks the price side of that pair, which is the
-    side a silent re-introduction would actually violate.
+    check while reopening the hole lightning was removed to close.
+
+    THE FIRST REPLACEMENT (same day) TRADED COVERAGE RATHER THAN WIDENING IT,
+    and a second review caught that too: a price-only invariant - "any ref
+    that declares a PRICE also declares a usd_cap" - cannot see a provider
+    that declares NEITHER, and lightning is exactly that provider (see its
+    block: no usd_per_1m_prompt/completion, no usd_cap, PAID regardless).
+    Verified directly: wiring in a priced-and-uncapped ref still fails this
+    test; re-adding "lightning/lightning-ai/gpt-oss-120b" UNCHANGED passed it,
+    because there was nothing price-shaped to trip on.
+
+    So paid-ness cannot be inferred from price presence alone - a provider
+    that declares no prices is not thereby free. PAID_PROVIDERS below is a
+    maintained allowlist, the same shape as pipeline_fakes.PROMOTED_JUDGES:
+    it does not derive from anything else in the config, so a NEW paid
+    provider silently passes this test until someone adds its name here -
+    which is a real, named risk rather than a hidden one, and cheaper than
+    the alternative of guessing paid-ness from partial declarations.
     """
     generator_refs = list(cfg.routing.generator)
     for ref in cfg.routing_refs("generator"):
-        _, model = cfg.model_for(ref)
+        provider, model = cfg.model_for(ref)
         priced = (
             "usd_per_1m_prompt" in model.limits or "usd_per_1m_completion" in model.limits
         )
-        assert not priced or "usd_cap" in model.limits, (
-            f"{ref.provider}/{ref.model} declares a price with no usd_cap - "
-            "unmetered paid overflow would be reachable from routing.generator"
+        paid = priced or provider.name in PAID_PROVIDERS
+        assert not paid or "usd_cap" in model.limits, (
+            f"{ref.provider}/{ref.model} is priced, or under a known-paid "
+            "provider, but declares no usd_cap - unmetered paid overflow "
+            "would be reachable from routing.generator"
         )
     refs = [ModelRef(*ref.split("/", 1)) for ref in generator_refs]
     assert refs, "need at least one generator ref"

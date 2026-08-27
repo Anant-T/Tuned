@@ -507,6 +507,14 @@ def main(argv=None) -> int:  # pragma: no cover - the live probe path
             replies = []
             try:
                 for messages in probe_questions(rows):
+                    # No est_tokens -> est_tokens=0 -> a usd_cap gate sees
+                    # est_cost 0.0 and a zero-cost call never trips
+                    # `spent + 0.0 > cap` on its own (generate.budget_ok_for).
+                    # Harmless while routing.probe holds a single free ref
+                    # with no usd_cap declared, but this re-opens THE TRAP
+                    # (see the openai/mistral provider blocks) the moment a
+                    # priced ref reaches this role. Not changed here - a
+                    # separate decision (found by review, 2026-08-27).
                     _, response = await router.complete(
                         PROBE_ROLE, messages, max_tokens=256,
                         on_attempt=usage_recorder(store),
