@@ -14,7 +14,10 @@
 
 Measurement 1 decides how the rest is read. The pass line was a median trace under **900
 words**; the control was **1,727**; the treatment measured **2,507**. Traces did not get
-shorter under the ceilinged prompts — pooled, they got longer.
+shorter under the ceilinged prompts — pooled, they got longer. That pooled comparison is
+confounded and the confound is disclosed below: **the two arms ran fourteen hours apart**
+and nothing in the design controls for the provider. What survives it is the matched
+attempt-1 result and the compliance figure, and both point the same way.
 
 On the matched pairs — the same 40 seeds and the same 40 prompt variants, one generation
 each under v4 and v5 — the per-task change in trace length is **indistinguishable from
@@ -64,8 +67,16 @@ succeeded in moving it, so length and whatever else co-varies with a long genera
 
 ### The two guards
 
-Measurement **5 held**: `self_verification` 87% → 86% pooled, 88% → 85% matched. Shortening
-did not cost the verification cue — mainly because nothing shortened.
+Measurement **5 held**, and its pass line was registered as **`>= 80%, must not
+regress` (control 87%)** — both halves, not just the threshold. The measured values fall on
+the wrong side of a literal reading of the second half: `self_verification` went 87% → 86%
+pooled (86/99 to 81/94) and 88% → 85% matched (35/40 to 34/40). Neither is a regression in
+any sense the data supports. Paired over the same 40 tasks the gate is a wash — 29 pass in
+both arms, 0 fail in both, 6 flip one way and 5 the other, **McNemar p = 1.00** — and the
+pooled Wilson intervals, [79%, 92%] control against [78%, 92%] treatment, are all but
+identical. A one-row and a one-generation difference at these n are not a direction. The
+verdict is **PASS** on that basis, not on the threshold alone. Shortening did not cost the
+verification cue — mainly because nothing shortened.
 
 Measurement **7 is recorded FAIL and the label overstates it.** Pooled, `think<think_min`
 breaches went 3/99 (3.0%) to 6/94 (6.4%) against a `<= 5%` line. On the matched attempt-1
@@ -75,6 +86,52 @@ matched view does not reproduce. There is no evidence here that the ceiling conv
 ceiling breaches into floor breaches. The pooled difference comes from the retry path, not
 from the first attempt.
 
+### The arms ran fourteen hours apart, and nothing controls for that
+
+This is the largest gap in the design and it is not closed by anything below.
+
+The control generations span **2026-08-26T18:56:20Z to 19:22:42Z**. The treatment
+generations span **2026-08-27T08:37:08Z to 09:04:41Z**. First call to first call the gap is
+**13 hours 41 minutes**, which the heading rounds. Across it the treatment's latency rose
+**24%**: mean 35.5 s to 43.9 s, p50 32.5 s to 41.1 s.
+
+A 24% latency rise is exactly what longer traces would produce. It is *also* exactly what a
+different upstream would produce, and this project's own record on b.ai is that **multiple
+upstreams sit behind one model id**. Nothing in the response envelope carries a
+provider-side identifier — no upstream name, no served-model string, no fingerprint — and
+none is recorded in the store. **The two explanations are therefore not separable from this
+data.** "v5 made the traces longer" and "the upstream serving deepseek-v4-flash on the
+Thursday morning was not the one serving it on the Wednesday evening" fit the same
+observations equally well.
+
+The report calls the two arms "paired by construction" in the Method section. That pairing
+is real for everything under this repository's control — seeds, task plan, prompt variants,
+routing, sampling params, gate thresholds — and it does not extend to the provider. Run-time
+separation is an uncontrolled variable and it is named here as one.
+
+**What this weakens:** the pooled wrong-sign headline. Median trace words 1,727 to 2,507,
+`length_band` 49% to 32%, rows over the 8,192-token cap 8.1% to 22.3% — every pooled
+between-arm difference in this report is confounded by the fourteen hours, and none of them
+can be attributed to the prompt edit on this evidence.
+
+**What this does not weaken:**
+
+- **The matched attempt-1 wash.** McNemar p = 0.80 to 1.00 across the four gates and a sign
+  test at p = 0.87 on trace length are *null* results. A drifting upstream is a reason a
+  between-arm difference might be spurious; it is not a mechanism that manufactures a null.
+  If anything it makes the wash more striking, since it survived a fourteen-hour gap.
+- **The on-the-wire compliance finding, which is the real basis for the conclusion.**
+  **86% of treatment generations exceeded the instructed 700-word ceiling** (81/94), against
+  84% under the permissive v4 wording (83/99). That is a statement about the treatment arm
+  measured against its own instruction, not a between-arm comparison, so no upstream drift
+  touches it. A generator told that 700 words is a hard ceiling wrote past it in six
+  generations out of every seven. That, and not the pooled medians, is what supports "the
+  prompt is not a lever".
+
+Any follow-up arm should record a provider-side identifier per call and, where the question
+is a between-arm one, interleave the two arms in a single run rather than running them
+back to back.
+
 ### One number that is not comparable, and one that genuinely got worse
 
 `prompt_echo` shows 87% → 80% and **must not be read as a regression**. The gate itself
@@ -82,12 +139,23 @@ changed between the two runs: `286fd3a` broadened `gates.INSTRUCTION_ECHO_SPANS`
 `450 to 700 words of deliberation is normal` to `450 to 700 words of deliberation`, which is
 strictly more general and therefore strictly more likely to fire. The control was scored
 with the narrow span, the treatment with the broad one. That is the **only** behavioural
-difference in `src/` between the two runs other than the 14 templates: `git diff
-1f6c0c0..HEAD -- src/` touches `gates.py` (that one line), `harmony.py` (a smoke-probe
-constant not on this path), and the 14 templates. Nothing else. The b.ai request and
-response hooks in `providers.py` look new in that diff but were already live in the working
-tree when the control ran — `ac5db21`, committed before the control run, documents them in
-the arm config.
+difference in `src/` between the two runs other than the 14 templates. `git diff
+1f6c0c0..HEAD -- src/` touches, in full: `gates.py` (that one line), `harmony.py` (a
+smoke-probe constant not on this path), `paths.py` (+9/-1, this task's own
+`exp_prompt_v5` workdir declaration, which no generation path reads), `providers.py`, and
+the 14 templates.
+
+The `providers.py` entry is the b.ai request and response hooks, and they look new in that
+diff without being new *behaviour*: they were already live in the working tree when the
+control ran, and 869da9b committed them rather than introducing them. **The data proves
+that, and the commit history only suggests it**, so the data is what is cited here. The
+control's maximum `completion_tokens` is **12,145** — far above the shipped
+`GENERATION_OUTPUT_TOKENS` of 4,000, and nothing but `_bai_request_hook` raising the budget
+to the model's 16,384 `max_output` can produce a reply that long. And the control has
+**0/99 empty-content rows** against the roughly 50%-at-4,096 empty rate that the same
+hook's docstring records measuring. Both are facts about the control run itself. (For what
+it is worth the commit message agrees: `ac5db21`, committed before the control run,
+documents the hook in the arm config.)
 
 The number that did get worse is the one the trainer cares about. **Rows over the
 8,192-token cap went from 8/99 (8.1%) to 21/94 (22.3%)**, and the templated row mean from
@@ -106,6 +174,12 @@ matched past attempt 1** — a row only has an attempt 2 because it already fail
 failing sets differ between arms — so it is reported as a shape to look at, not a measured
 effect of the edit.
 
+And the pooled half of that contrast carries the fourteen-hour confound. `length_band`
+49% → 32% is a between-arm difference measured across a provider gap this design does not
+control, so the retry path is one candidate explanation for it and a different upstream is
+another. The matched half is unaffected: a null does not become a null because the upstream
+moved.
+
 
 ## What this changes in `configs/data_law_v1.yaml`
 
@@ -121,19 +195,32 @@ unexamined by this run.
 What the numbers do force is a decision this task did not have the scope to take:
 
 - **`think_max: 3000` and this generator are incompatible.** The treatment's trace p50 is
-  **3,126 tokens** — the median generation is now over the ceiling, not the tail. 57 of 94
-  rows breach `think>think_max` against 44 of 99 in the control. The spec named raising
+  **3,126 tokens** — the median generation is now over the ceiling, not the tail, and that
+  is a fact about the treatment arm on its own rather than a between-arm comparison. (The
+  57 of 94 versus 44 of 99 `think>think_max` breach counts *are* a between-arm comparison
+  and inherit the fourteen-hour confound; the incompatibility does not rest on them. The
+  control alone already breached 44 of 99.) The spec named raising
   `think_max` and demoting deepseek to a minority source as the two routes this fix was the
   alternative to. The fix did not work, so they are back on the table, and they are now the
   only levers left that this build has evidence for.
 - **The 8,192 row cap is the harder constraint.** 22.3% of treatment rows exceed it. Raising
   `think_max` alone would convert `length_band` failures into rows the assembler drops.
-- **Do not revert the prompt edit on this evidence.** Matched, v5 is indistinguishable from
-  v4 on every gate, measurements 5 and 6 held, and every one of the 14 templates came out
-  word-neutral or shorter. There is no measured harm to undo. Equally there is no measured
-  benefit: the honest status of `286fd3a` after this run is **inert on deepseek**, not
-  helpful. Its stated value for gpt-oss — holding traces above `think_min` — is untested
-  here and unaffected either way.
+- **Do not revert the prompt edit on this evidence — and hold that recommendation
+  loosely.** Matched, v5 is indistinguishable from v4 on every gate, measurements 5 and 6
+  held, and every one of the 14 templates came out word-neutral or shorter. There is no
+  measured harm to undo, and equally no measured benefit: the honest status of `286fd3a`
+  after this run is **inert on deepseek**, not helpful. Its stated value for gpt-oss —
+  holding traces above `think_min` — is untested here and unaffected either way.
+
+  The caveat is that "no measured harm" rests on the matched view, and the matched view
+  covers attempt 1 only. The pooled harms — `length_band` 49% → 32%, and 22.3% of rows over
+  the trainer's cap — are set aside above as living in the retry path, but **the retry
+  escalation is itself arm-differential**: treatment traces grow 2,048 → 2,715 → 3,138 words
+  by attempt while control traces did not, and the v5 prompt tail is a live candidate cause
+  that this arm cannot rule in or out (see *What is still unmeasured*). If the tail turns
+  out to drive that escalation, it is a real harm that the attempt-1 wash is blind to by
+  construction. Keeping the edit is the right call on what is measured; it is not a
+  finding that the edit is safe.
 - **`gates.INSTRUCTION_ECHO_SPANS` is now broader than the wording any prompt issues.** That
   is deliberate and documented, but it means the `prompt_echo` series is discontinuous at
   `286fd3a`. Any future comparison against a pre-`286fd3a` arm has to say so.
@@ -147,8 +234,15 @@ What the numbers do force is a decision this task did not have the scope to take
 - **Whether shorter traces would fix the gates is still open.** No intervention in this run
   produced them. `reasoning_effort` is already at the enum floor (`low`; `disabled` yields
   no trace at all and violates the >=80% reasoning-trace floor), and the prompt is now
-  measured as not being a lever. What remains untried: a smaller output budget, a different
-  generator, or accepting the lengths and moving the band.
+  measured as not being a lever. **A smaller output budget is not on that list, and it is
+  worth saying why: it has already been measured and rejected here.**
+  `providers._bai_request_hook` exists precisely to raise the budget, and its docstring
+  records the measurement — a 4,096-token budget returned empty content on **10 of 20** real
+  synthesis calls, against 0 of 4 at 12,288, and the surviving rows are biased toward short
+  traces, which the docstring calls "silent selection on the corpus rather than honest
+  sampling". Squeezing the budget would buy shorter traces by discarding the long ones
+  unrecorded. What genuinely remains untried: a different generator, or accepting the
+  lengths and moving the band.
 - **Which of the three gate failures is length-driven cannot be told apart.** `length_band`,
   `irac_placement` and `verbatim_overlap` all fail more on long traces in both arms, but
   with length unmoved there is no contrast to attribute anything to. The one thing that is
@@ -173,6 +267,17 @@ which opens both stores read-only and is modelled on the control's own
 counted with the pinned tokenizer. Trace words are `len(think.split())`, the counter that
 reproduces the control's recorded 1,727 median and 836 answer median exactly.
 
+**Two percentile conventions are in play and the report does not reconcile them.** Section 1
+reports medians with `statistics.median` (the mean of the two middle values on an even n);
+section 3's `p50` column comes from `report_ab.py`'s own `pct`, inherited unchanged from the
+control's `report_wave.py`, which takes the nearest index on an `n - 1` scale. On the same
+series the two disagree slightly — treatment trace words read **2,507** in section 1 and
+**2,500** in section 3 — and on the tails the gap is larger: `pct` puts the control's trace
+p90 at **3,664** where a nearest-rank definition gives **3,773**, the figure the spec
+quotes. Both are computed from the same rows; neither is wrong; they are different
+definitions. `pct` is kept as-is so that every length figure in section 3 is directly
+comparable with the control's own banked report, which used it.
+
 The arms are paired by construction: `scripts/seed_exp_store.py --per-source 200 --seed
 3407` against the same live store gives both arms the same 600 seeds; the same three
 `tasks.py` invocations give the same 40 tasks; and `prompt_registry.pick_variant` keys on
@@ -187,7 +292,6 @@ was genuinely missing a required heading, which the spec's own prose records as 
 rounds to 54%. Both are reported as measured. Neither changes any verdict.
 
 <!-- measured output of data/build/exp_prompt_v5/out/report_ab.py -->
-
 ## 0. What was compared
 
 - control store `data/build/exp_deepseek/state/law_v1.sqlite3` (v4 prompts, banked 2026-08-26), treatment store `data/build/exp_prompt_v5/state/law_v1.sqlite3` (v5 prompts). Both opened read-only.
@@ -206,7 +310,7 @@ This is the population the pass lines were fixed against: every generation with 
 | 2 | `length_band` pass rate | **> 70%** | 49% (49/99) | **32% (30/94)** | **FAIL** |
 | 3 | `irac_placement` pass rate | **> 60%** | 38% (38/99) | **34% (32/94)** | **FAIL** |
 | 4 | `verbatim_overlap` pass rate | **> 70%** | 54% (53/99) | **45% (42/94)** | **FAIL** |
-| 5 | `self_verification` pass rate | **>= 80%** | 87% (86/99) | **86% (81/94)** | **PASS** |
+| 5 | `self_verification` pass rate | **>= 80%, must not regress** | 87% (86/99) | **86% (81/94)** | **PASS** |
 | 6 | answer well-formedness (`missing_in_answer` empty) | **>= 95%** | 99.0% (96/97) | **100.0% (91/91)** | **PASS** |
 | 7 | `think<think_min` breaches | **<= 5%** | 3.0% (3/99) | **6.4% (6/94)** | **FAIL** |
 
@@ -222,7 +326,7 @@ The pooled population above is **not** composition-matched: a task that fails it
 | 2 | `length_band` pass rate | **> 70%** | 45% (18/40) | **40% (16/40)** | **FAIL** |
 | 3 | `irac_placement` pass rate | **> 60%** | 42% (17/40) | **42% (17/40)** | **FAIL** |
 | 4 | `verbatim_overlap` pass rate | **> 70%** | 50% (20/40) | **45% (18/40)** | **FAIL** |
-| 5 | `self_verification` pass rate | **>= 80%** | 88% (35/40) | **85% (34/40)** | **PASS** |
+| 5 | `self_verification` pass rate | **>= 80%, must not regress** | 88% (35/40) | **85% (34/40)** | **PASS** |
 | 6 | answer well-formedness (`missing_in_answer` empty) | **>= 95%** | 97.4% (37/38) | **100.0% (39/39)** | **PASS** |
 | 7 | `think<think_min` breaches | **<= 5%** | 7.5% (3/40) | **7.5% (3/40)** | **FAIL** |
 
@@ -389,33 +493,33 @@ Descriptive, not causal. Buckets are trace words; `n` is generations with conten
 | `judging` / - | 0 | 9 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,reply_budget | 3 | 5 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,prompt_echo,reply_budget | 0 | 3 |
-| `format_parked` / exhausted:format:length_band,irac_placement,prompt_echo,reply_budget | 0 | 2 |
-| `format_parked` / exhausted:format:think_format,length_band | 0 | 2 |
 | `judging` / regenerate:length_band | 0 | 2 |
+| `format_parked` / exhausted:format:think_format,length_band | 0 | 2 |
+| `format_parked` / exhausted:format:length_band,irac_placement,prompt_echo,reply_budget | 0 | 2 |
 | `format_parked` / exhausted:format:irac_placement | 4 | 1 |
 | `format_parked` / exhausted:format:irac_placement,verbatim_overlap | 2 | 1 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap | 2 | 1 |
 | `format_parked` / exhausted:format:length_band,irac_placement | 1 | 1 |
 | `format_parked` / exhausted:format:length_band,irac_placement,reply_budget | 1 | 1 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,banned_meta,prompt_echo,reply_budget | 1 | 1 |
-| `judging` / regenerate:length_band,irac_placement,reply_budget | 0 | 1 |
-| `judging` / regenerate:length_band,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
-| `rejected` / reject:length_band,citations,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
-| `format_parked` / exhausted:format:prompt_echo | 0 | 1 |
-| `judging` / regenerate:irac_placement,verbatim_overlap | 0 | 1 |
 | `rejected` / reject:length_band,citations,verbatim_overlap,banned_meta,reply_budget | 0 | 1 |
-| `judging` / regenerate:irac_placement | 0 | 1 |
-| `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,banned_meta | 0 | 1 |
-| `format_parked` / exhausted:format:length_band,statutory_grounding,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
-| `judging` / regenerate:length_band,verbatim_overlap,banned_meta,reply_budget | 0 | 1 |
 | `format_parked` / exhausted:format:irac_placement,verbatim_overlap,banned_meta | 0 | 1 |
+| `judging` / regenerate:irac_placement | 0 | 1 |
+| `judging` / regenerate:irac_placement,verbatim_overlap | 0 | 1 |
+| `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,banned_meta | 0 | 1 |
+| `judging` / regenerate:length_band,irac_placement,reply_budget | 0 | 1 |
+| `format_parked` / exhausted:format:prompt_echo | 0 | 1 |
+| `judging` / regenerate:length_band,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
+| `judging` / regenerate:length_band,verbatim_overlap,banned_meta,reply_budget | 0 | 1 |
+| `format_parked` / exhausted:format:length_band,statutory_grounding,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
+| `rejected` / reject:length_band,citations,irac_placement,verbatim_overlap,reply_budget | 0 | 1 |
 | `accepted` / judge:accept | 9 | 0 |
 | `judge_error` / judge-slot-b:role 'judge': no eligible model (skipped: cooling, family-excluded, over-budget) | 8 | 0 |
 | `rejected` / judge:reject | 3 | 0 |
 | `format_parked` / exhausted:format:length_band,statutory_grounding,irac_placement | 2 | 0 |
 | `format_parked` / exhausted:format:length_band,statutory_grounding,irac_placement,banned_meta,prompt_echo | 1 | 0 |
-| `format_parked` / exhausted:format:length_band,verbatim_overlap,prompt_echo | 1 | 0 |
 | `format_parked` / exhausted:format:length_band,irac_placement,verbatim_overlap,prompt_echo | 1 | 0 |
+| `format_parked` / exhausted:format:length_band,verbatim_overlap,prompt_echo | 1 | 0 |
 | `format_parked` / exhausted:format:banned_meta | 1 | 0 |
 
 ## 7. Per-arm composition
