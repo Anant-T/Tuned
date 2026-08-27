@@ -15,7 +15,14 @@ from pathlib import Path
 LIVE_WORKDIR = Path("data/build")
 LIVE_STATE_DB = LIVE_WORKDIR / "state" / "law_v1.sqlite3"
 ISOLATED_WORKDIR_SIBLINGS = frozenset(
-    {"exp_recovery", "exp_harmony", "exp_s1", "exp_measure", "exp_deepseek"}
+    {
+        "exp_recovery",
+        "exp_harmony",
+        "exp_s1",
+        "exp_measure",
+        "exp_deepseek",
+        "exp_prompt_v5",
+    }
 )
 
 

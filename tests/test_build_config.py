@@ -1007,6 +1007,24 @@ def test_the_deepseek_arm_is_an_isolated_workdir(tmp_path):
     assert cfg.build.workdir == "data/build/exp_deepseek"
 
 
+def test_the_prompt_v5_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_prompt_v5 is an experiment sibling, not the live control.
+
+    The treatment half of the 2026-08-27 prompt-length A/B. Same one-line
+    fence as the deepseek arm above: an unlisted name under data/build reads
+    as the frozen control, and every write guard in the tree would then
+    refuse the arm - or, worse, aim it at the control store.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_prompt_v5") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_prompt_v5"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_prompt_v5"
+
+
 DEEPSEEK_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1_exp_deepseek.yaml"
 
 
@@ -1062,3 +1080,46 @@ def test_the_deepseek_arm_config_is_fenced(tmp_path):
     assert list(cfg.routing.judge)[:2] == ["groq/qwen/qwen3.6-27b", "cerebras/gemma-4-31b"]
     bai = next(p for p in cfg.providers if p.name == "bai")
     assert bai.models[0].params["reasoning_effort"] == "low"
+
+
+PROMPT_V5_CONFIG = (
+    Path(__file__).parent.parent / "configs" / "data_law_v1_exp_prompt_v5.yaml"
+)
+
+
+def test_the_prompt_v5_arm_config_is_fenced_and_matches_its_control(tmp_path):
+    """The treatment arm carries both of the deepseek arm's cost fences, and
+    differs from it ONLY in the workdir and the header.
+
+    Two separate properties, both load-bearing for the A/B:
+
+    1. The fences. Same two holes as the control arm - the single-ref
+       generator (a 429 storm must not silently turn this into a gpt-oss
+       arm) and usd_cap 0.0 WITH prices on both gpt-5 models (a bare
+       usd_cap 0.0 blocks nothing: _usd_per_1m returns 0.0 for a missing
+       price, so est_cost is 0 and 0 > 0.0 is False).
+    2. The pairing. Control and treatment are a matched pair whose only
+       intended difference is the prompt text on disk. Any third difference
+       between the two config files silently confounds the comparison, so
+       the byte-level equality is asserted rather than trusted. If a future
+       edit to either arm is deliberate, re-pair them here on purpose.
+    """
+    from tuned.data.generate import _openai_usd_cap
+
+    cfg = load_build_config(PROMPT_V5_CONFIG, allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_prompt_v5"
+    assert list(cfg.routing.generator) == ["bai/deepseek-v4-flash"]
+    assert _openai_usd_cap(cfg) == 0.0
+    openai = next(p for p in cfg.providers if p.name == "openai")
+    for model in openai.models:
+        assert model.limits["usd_cap"] == 0.0
+        assert model.limits["usd_per_1m_prompt"] > 0
+        assert model.limits["usd_per_1m_completion"] > 0
+
+    def _body(path: Path) -> list[str]:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        first_key = next(i for i, ln in enumerate(lines) if not ln.startswith("#"))
+        return [ln for ln in lines[first_key:] if not ln.startswith("  workdir:")]
+
+    assert _body(PROMPT_V5_CONFIG) == _body(DEEPSEEK_CONFIG)
+    assert PROMPT_V5_CONFIG.read_bytes().count(b"\r") == 0
