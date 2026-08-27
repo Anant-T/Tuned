@@ -53,6 +53,22 @@ build:
   # The raise only becomes coherent again if a generator with a LARGER output
   # ceiling leads routing.generator - i.e. if the deepseek-shaped case comes
   # back, not merely because deepseek is still routing.generator ref 2.
+  #
+  # SUPERSEDED 2026-08-27, kept in place rather than deleted: "cerebras/
+  # gpt-oss-120b back in the lead" and "which IS the lead generator now" were
+  # true of routing.generator's ORDER, not of what is actually generating.
+  # ref 1 (cerebras/gpt-oss-120b) is currently returning HTTP 402
+  # payment_required, so it generates nothing and every row today comes from
+  # ref 2 (bai/deepseek-v4-flash) alone - the deepseek-shaped case this
+  # comment's own table was built from. This does NOT re-open the case for
+  # raising think_max: the 1,281-row gpt-oss measurement above is a
+  # historical fact about a real generation batch, not an inference from
+  # "lead generator" status, and gpt-oss's failure mode (think < think_min at
+  # 29.7%, a FLOOR problem) is unchanged by who is generating today. The
+  # caveat is only that "lead generator" here names a config position that
+  # ref 1's 402 currently makes theoretical - if ref 1 comes back this
+  # measurement is live again; until then, deepseek is generating everything
+  # and this file's think_max reasoning has not been re-evaluated against it.
   length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 3000, answer_min: 120}
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
@@ -521,7 +537,10 @@ providers:
       # not a separation concern.
       - id: openai/gpt-oss-20b
         family: gpt-oss
-        roles: [tiebreak, probe]
+        # judge ADDED 2026-08-27 - see routing.judge below for why (the
+        # deepseek-row slot B gap) and the 0/10 IPC->BNS caveat that comes
+        # with it.
+        roles: [judge, tiebreak, probe]
         limits: {rpm: 30, tpm: 8000, tpd: 200000, rpd: 1000, max_context: 131072, max_output: 65536}
         params: {temperature: 0.2}
   - name: mistral
@@ -837,6 +856,14 @@ providers:
 # backstop: every free judge is preferred to it, so the ~$1/day cap is only
 # ever spent on rows nothing free can serve.
 #
+# SUPERSEDED 2026-08-27, kept in place rather than deleted: there was never
+# a "~$1/day cap" to spend - that phrase described a metered budget this
+# file did not yet declare. Both openai/gpt-5-* now carry usd_cap: 0.0 (see
+# THE SPEND FENCE further down and Task 1's generalised fence), so the real
+# number is zero: these refs are fenced to $0 spend, not metered at ~$1/day.
+# What is still true: both refs sit LAST in routing.judge and
+# routing.tiebreak, so every free judge is tried first.
+#
 # What made it qualify, and the bar any replacement must clear:
 # max_context >= 29708. That is not a round number because it is not a
 # preference - it is required_context(worst-case judge call), and the
@@ -872,6 +899,16 @@ providers:
 # routing tokens of prompt, and slot B died at 5,531 routing tokens of judge
 # prompt - which grounding plus a trace near think_max (3000) clears
 # routinely. Slot B is now openai/gpt-5-mini.
+#
+# SUPERSEDED 2026-08-27, kept in place rather than deleted: "slot B is now
+# openai/gpt-5-mini" is false twice over today. First, routing.judge now
+# lists bai/deepseek-v4-flash and groq/openai/gpt-oss-20b ahead of both
+# openai refs, so on the rows this paragraph describes slot B lands on one
+# of those free refs before it ever reaches openai. Second, even if it did
+# reach openai/gpt-5-mini, THE SPEND FENCE further down holds both openai
+# refs at usd_cap: 0.0 - a fenced ref cannot fill a slot, it can only be
+# skipped over - so "slot B is now openai/gpt-5-mini" describes a ref that
+# is present in the list but unreachable in practice.
 #
 # THE DIVERT POINT IN THAT PARAGRAPH IS HISTORY, NOT CURRENT BEHAVIOUR. It was
 # computed against the stale cerebras max_context of 8192; with the probed
@@ -932,6 +969,22 @@ providers:
 #
 # NOT an option: letting a judge share the generator's family when the pool
 # runs out. Family separation is a data-quality invariant, not a preference.
+#
+# WHAT PREFLIGHT CANNOT SEE, recorded 2026-08-27 rather than fixed here.
+# generate.preflight_messages(cfg, ["generator","judge","tiebreak"]) returns
+# ([], []) - no warnings - on this shipped config, because it builds a
+# BUDGET-BLIND Router: it checks family/context eligibility only, the same
+# checks Step 2's pool-membership script above runs. It has no idea that
+# openai/gpt-5-mini and openai/gpt-5-nano carry usd_cap: 0.0, or that
+# cerebras/gemma-4-31b and cerebras/gpt-oss-120b are currently answering
+# HTTP 402. So a fenced-to-zero or 402'd ref reads to preflight as a slot
+# that IS filled, when in the fleet it is a slot that CANNOT be filled - a
+# clean preflight here is not evidence of a healthy pool, only of a pool
+# that is shaped correctly on paper. Confirming a slot can actually be
+# bought requires the kind of live probe Step 2's report and this file's
+# HTTP 402 notes above are built from, not preflight. Changing preflight to
+# see budget or liveness is a separate change, with its own validation, and
+# is deliberately not made here.
 routing:
   # ONE generator since 2026-08-18 - see the mistral block for the measurement
   # that removed the second. A prompt too long for this model's window has
@@ -1019,8 +1072,36 @@ routing:
   # BEFORE the paid refs because free-before-paid is the standing rule.
   # Its judge params disable thinking - see the bai provider block; without
   # that a 1,024-token verdict budget is spent reasoning and comes back empty.
+  #
+  # groq/openai/gpt-oss-20b ADDED 2026-08-27, for the gap the paragraph above
+  # does not cover: on a DEEPSEEK-generated row, family_separation excludes
+  # deepseek itself from this pool, leaving cerebras/gemma-4-31b (HTTP 402,
+  # same probe as above) and the two fenced openai refs (usd_cap: 0.0,
+  # unreachable by design) - slot B was one candidate deep and that candidate
+  # was dead, so every deepseek row parked in judge_error after 8 attempts.
+  # groq/openai/gpt-oss-20b is free, alive (probed 2026-08-27), and family
+  # gpt-oss - not excluded on a deepseek row - so it fills the gap. It already
+  # sits in routing.tiebreak and routing.probe.
+  #
+  # IT SCORED 0/10 ON IPC->BNS GROUND TRUTH - see routing.tiebreak below,
+  # where it echoes IPC section numbers back as BNS ones - which is exactly
+  # why tiebreak places mistral ahead of it: that ordering keeps it out of
+  # the seat that decides a contested row outright. Here it is not that seat:
+  # as judge B it is one of two independent opinions, not a decider, and a
+  # disagreement with judge A still goes to the tiebreak pool (mistral
+  # first) rather than resting on this verdict alone.
+  #
+  # THE OPEN RISK, STATED PLAINLY: the 0/10 score was measured on UNGROUNDED
+  # recall - reciting BNS section numbers from parameters, with no source
+  # text in front of it. Judging is GROUNDED - the model is shown the source
+  # text and asked to check the answer against it, not recite from memory -
+  # so the measured failure mode may not transfer to the judge role. THAT IS
+  # A HYPOTHESIS, NOT A MEASUREMENT: no calibration of gpt-oss-20b AS A JUDGE
+  # has been run. Placed last among the free refs, immediately before the
+  # paid backstops, so any revived or already-trusted free ref is still
+  # chosen ahead of it.
   judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,
-          bai/deepseek-v4-flash,
+          bai/deepseek-v4-flash, groq/openai/gpt-oss-20b,
           openai/gpt-5-mini, openai/gpt-5-nano]
   # TIEBREAK: mistral sits third, ahead of the paid backstops and behind the
   # two free families that separation will usually have spent already. On a

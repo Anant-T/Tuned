@@ -2370,7 +2370,21 @@ def test_the_preflight_checks_each_generator_family_at_its_own_window(cfg, monke
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = _narrow_generator(cfg_with_two_generator_families(cfg))
+    #
+    # THE FREE JUDGE POOL IS PINNED BACK TO qwen+gemma, and it has to be:
+    # groq/openai/gpt-oss-20b joined routing.judge on 2026-08-27 (same family,
+    # same GROQ_API_KEY as qwen) precisely so a family-excluded row still has
+    # a second free candidate - which is also exactly what would silently fill
+    # the gap this test constructs for the secondgen row below. Dropping every
+    # promoted free judge and reading gemma back in by ROUTING alone (the
+    # model's provider block is untouched) reconstructs the two-free-judge
+    # shape this algorithmic property was written against, independent of how
+    # many free judges the shipped pool carries next.
+    from dataclasses import replace
+
+    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    cfg = replace(cfg, routing=replace(cfg.routing, judge=cfg.routing.judge + ("cerebras/gemma-4-31b",)))
+    cfg = _narrow_generator(cfg)
     for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     patched = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)

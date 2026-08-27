@@ -1269,13 +1269,17 @@ def test_complete_raises_when_every_ref_fails(cfg, keys):
         asyncio.run(router.complete("judge", [{"role": "user", "content": "grade this"}]))
 
     assert excinfo.value.retryable is True
-    # Five refs over four providers: the openai backstop contributes two, and
+    # Six refs over four providers: the openai backstop contributes two, and
     # BOTH have to be tried before the role is out of options. cerebras IS
     # among them since 2026-08-19 - gemma was promoted into the judge role when
     # mistral was removed - and bai since 2026-08-27, when deepseek took the
-    # slot-B seat gemma's 402 had emptied.
-    assert "all 5 eligible model(s) failed" in str(excinfo.value)
-    assert seen.count("groq") == 2 and seen.count("cerebras") == 2
+    # slot-B seat gemma's 402 had emptied. groq ALSO contributes two, also
+    # since 2026-08-27: groq/openai/gpt-oss-20b joined the judge role that day,
+    # for the slot-B seat a DEEPSEEK generation leaves empty (family separation
+    # excludes deepseek from judging its own rows).
+    assert "all 6 eligible model(s) failed" in str(excinfo.value)
+    assert seen.count("groq") == 4  # two refs, two in-provider attempts each
+    assert seen.count("cerebras") == 2
     assert seen.count("bai") == 2
     assert seen.count("openai") == 4  # two refs, two in-provider attempts each
 
@@ -1999,7 +2003,10 @@ def test_overflow_at_every_ref_is_reported_as_a_row_shaped_failure(cfg, keys):
     # Every ref was offered it, the two paid backstops included - a 400 that
     # says "too long for this window" never charges the breaker, so the pass
     # runs to the end of the list rather than stopping at the first refusal.
-    assert seen == ["groq", "cerebras", "bai", "openai", "openai"]
+    # groq appears twice since 2026-08-27: qwen, then groq/openai/gpt-oss-20b,
+    # added to routing.judge for the slot-B seat a DEEPSEEK generation leaves
+    # empty.
+    assert seen == ["groq", "cerebras", "bai", "groq", "openai", "openai"]
 
 
 def test_undersized_families_keeps_an_explicit_safety_margin(cfg):
@@ -2848,12 +2855,19 @@ def test_blocking_key_envs_names_only_keys_that_would_change_something(cfg, keys
     nothing, in the middle of a launch where keys are the scarce thing."""
     # groq, not cerebras: since 2026-08-19 cerebras holds BOTH the generator
     # and the promoted gemma judge, so withholding its key would make every
-    # assertion below true for more than one reason at once. groq holds
-    # exactly one judge, which is what this needs.
+    # assertion below true for more than one reason at once. groq held exactly
+    # one judge when this test was written; since 2026-08-27 it holds two -
+    # qwen (family qwen) and groq/openai/gpt-oss-20b (family gpt-oss, added
+    # for the slot-B seat a DEEPSEEK generation leaves empty) - so excluding
+    # only qwen's family no longer accounts for every groq-keyed judge. Both
+    # families have to be excluded for "this key changes nothing" to hold;
+    # gpt-oss also happens to be the family openai/gpt-5-mini and
+    # openai/gpt-5-nano are lumped into, which is fine here since they are
+    # keyed by `keys` regardless.
     _unset(monkeypatch, "GROQ_API_KEY")
 
     assert _blocking_key_envs(cfg, "judge", frozenset()) == ("GROQ_API_KEY",)
-    assert _blocking_key_envs(cfg, "judge", frozenset({"qwen"})) == ()
+    assert _blocking_key_envs(cfg, "judge", frozenset({"qwen", "gpt-oss"})) == ()
     # ...and a keyed provider is never named at all.
     monkeypatch.setenv("GROQ_API_KEY", "sk-test")
     assert _blocking_key_envs(cfg, "judge", frozenset()) == ()
@@ -3409,10 +3423,25 @@ def test_the_judge_pool_is_the_one_calibration_left_behind(cfg):
     # alternative that day was not a proven judge: gemma answers HTTP 402 and
     # the next ref in the list is paid. That trade is the config's, not this
     # test's; what is pinned here is that it is visible.
+    #
+    # groq/openai/gpt-oss-20b, also 2026-08-27: on a DEEPSEEK generation,
+    # family separation excludes deepseek itself, and the pool above (qwen,
+    # gemma) left slot B with one candidate - gemma, HTTP 402 - so every
+    # deepseek row parked in judge_error. It is UNPROVEN in the same sense as
+    # mistral-large and deepseek: no gold-labelled calibration of it AS A
+    # JUDGE has been run. What IS measured, and measured badly, is unrelated
+    # to judging - 0/10 on IPC->BNS ground truth, recited from parameters with
+    # no source text in front of it - which is exactly why routing.tiebreak
+    # puts mistral-large ahead of it: that ordering keeps it out of the seat
+    # that decides a contested row outright. Here it is not that seat; it is
+    # one of two independent opinions, placed last among the free judges so
+    # any more-trusted or revived free ref is still chosen first.
+    assert roles["groq/openai/gpt-oss-20b"] == ("judge", "tiebreak", "probe")
     assert list(cfg.routing.judge) == [
         "groq/qwen/qwen3.6-27b",
         "cerebras/gemma-4-31b",
         "bai/deepseek-v4-flash",
+        "groq/openai/gpt-oss-20b",
         "openai/gpt-5-mini",
         "openai/gpt-5-nano",
     ]

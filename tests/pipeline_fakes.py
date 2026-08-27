@@ -675,10 +675,15 @@ def cfg_with_two_generator_families(cfg: BuildConfig) -> BuildConfig:
 
 # Every free judge PROMOTED into routing.judge after the two-family era: gemma
 # on 2026-08-19 (it took mistral-small's seat when calibration removed that
-# model) and bai/deepseek-v4-flash on 2026-08-27 (it took the slot-B seat
-# gemma's HTTP 402 had emptied). Both are free, both sit ahead of the paid
-# backstops, and either one alone is enough to keep the pool from running out.
-PROMOTED_JUDGES = ("cerebras/gemma-4-31b", "bai/deepseek-v4-flash")
+# model), bai/deepseek-v4-flash on 2026-08-27 (it took the slot-B seat
+# gemma's HTTP 402 had emptied), and groq/openai/gpt-oss-20b, same day (it
+# took the slot-B seat a DEEPSEEK generation leaves empty, since separation
+# excludes deepseek from judging its own rows). All three are free, all three
+# sit ahead of the paid backstops, and any ONE of them alone is enough to keep
+# the pool from running out.
+PROMOTED_JUDGES = (
+    "cerebras/gemma-4-31b", "bai/deepseek-v4-flash", "groq/openai/gpt-oss-20b",
+)
 
 
 def cfg_without_the_promoted_judge(cfg: BuildConfig) -> BuildConfig:
