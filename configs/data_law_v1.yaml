@@ -685,10 +685,49 @@ providers:
       #   which reads like a provider limit and is not one. 5,000,000 is still
       #   far under the published free-tier scale (order 1B/month) and is still
       #   a FLOOR, not a measurement.
+      #
+      # usd_cap: 0.0 ADDED 2026-08-27 (found by review). Until now this model
+      # declared NO price and NO cap: its free status rested entirely on La
+      # Plateforme's Experiment tier terms, which this file asserts nothing
+      # about and cannot enforce - Task 1's usd_cap mechanism works on ANY
+      # provider now, so leaving this one bare was decoration where a real
+      # fence was possible. usd_per_1m_prompt/completion are La Plateforme's
+      # published rates for mistral-large-latest (mistral.ai/pricing, checked
+      # 2026-08-27): $0.5 in / $1.5 out per 1M tokens. Both are declared
+      # beside the cap on purpose - see THE TRAP in the openai provider block:
+      # usd_cap alone blocks nothing, because a missing price reads as 0.0 and
+      # 0.0 + 0.0 > 0.0 is False. With a real price, any positive est_tokens
+      # makes est_cost > 0.0 = usd_cap, so this ref is now BLOCKED FROM ITS
+      # FIRST CALL, the same permanently-fenced shape as the openai backstops.
+      #
+      # THE CONSEQUENCE, MEASURED RATHER THAN ASSUMED: this does NOT statically
+      # empty routing.tiebreak for either generator family - Router.pick moves
+      # on to the next eligible ref, same as any other ineligibility. On a
+      # gpt-oss row (judges qwen+gemma, tiebreak excludes {gpt-oss,qwen,gemma})
+      # the seat that used to go to mistral now goes to bai/deepseek-v4-flash -
+      # a SEAT CHANGE of the same kind routing.tiebreak's own comments already
+      # track for gpt-oss-20b and deepseek, not a new failure mode. On a
+      # deepseek row (judges qwen+gpt-oss-20b, tiebreak excludes
+      # {deepseek,qwen,gpt-oss}) the seat falls through to cerebras/gemma-4-31b
+      # - which is STATICALLY eligible (family/key/budget all clear) but is
+      # the SAME ref probed HTTP 402 elsewhere in this file. Before this cap,
+      # a contested deepseek row's outcome hinged on mistral's actual liveness
+      # (probed inconclusive - a 45s read-timeout, not a confirmed failure);
+      # this cap removes that possibility UNCONDITIONALLY, so the contested-
+      # deepseek-row reject path recorded next to groq/openai/gpt-oss-20b
+      # above is now certain whenever gemma is down, rather than contingent on
+      # mistral also being down. Verified with budget_ok_for directly (blocks
+      # at any positive est_tokens) and with Router.pick under both exclusion
+      # sets above - not merely reasoned about. Made anyway: an unconditional,
+      # provable $0 fence on every paid or unverified-free path is this file's
+      # standing policy, and the alternative - leaving mistral's real cost
+      # exposure resting on an unenforced tier promise - is the same gap Task
+      # 1 closed for lightning.
       - id: mistral-large-latest
         family: mistral
         roles: [tiebreak]
-        limits: {rpm: 2, tpm: 30000, tpd: 5000000, max_context: 52812, max_output: 8192}
+        limits: {rpm: 2, tpm: 30000, tpd: 5000000, max_context: 52812, max_output: 8192,
+                 usd_cap: 0.0, usd_per_1m_prompt: 0.5, usd_per_1m_completion: 1.5}
         params: {}
         role_params:
           tiebreak: {temperature: 0.2}
@@ -788,7 +827,7 @@ providers:
       # reach a paid judge on a config that had NO usd_cap anywhere).
       #
       # usd_cap: 0.0 means the wallet is zero, so any POSITIVE per-token price
-      # fails generate._openai_usd_spent(...) + est_cost > usd_cap on the
+      # fails generate._provider_usd_spent(...) + est_cost > usd_cap on the
       # first call and blocks it before a token is sent.
       #
       # THE TRAP: usd_cap ALONE BLOCKS NOTHING. generate._usd_per_1m returns
@@ -1083,6 +1122,19 @@ routing:
   # gpt-oss - not excluded on a deepseek row - so it fills the gap. It already
   # sits in routing.tiebreak and routing.probe.
   #
+  # AVAILABILITY IS A SEPARATE QUESTION FROM FAMILY, AND IT DOES NOT HOLD HERE
+  # (found by review, 2026-08-27). On a deepseek row the two LIVE judges -
+  # groq/qwen/qwen3.6-27b (slot A) and groq/openai/gpt-oss-20b (slot B) - are
+  # BOTH keyed by GROQ_API_KEY, one provider's limits. The family invariant
+  # this addition exists for holds (two DIFFERENT families fill the two
+  # slots); the AVAILABILITY invariant does not: withholding GROQ_API_KEY, or
+  # groq itself going down, leaves a deepseek row with ZERO live judges, not
+  # one. test_blocking_key_envs_names_only_keys_that_would_change_something
+  # already encodes this shape - excluding only {"qwen"} no longer proves
+  # GROQ_API_KEY is harmless, {"qwen", "gpt-oss"} is what it now takes. Not
+  # fixed here, only recorded, the same way the slot-B gap itself was
+  # recorded before this ref closed it.
+  #
   # IT SCORED 0/10 ON IPC->BNS GROUND TRUTH - see routing.tiebreak below,
   # where it echoes IPC section numbers back as BNS ones - which is exactly
   # why tiebreak places mistral ahead of it: that ordering keeps it out of
@@ -1090,6 +1142,23 @@ routing:
   # as judge B it is one of two independent opinions, not a decider, and a
   # disagreement with judge A still goes to the tiebreak pool (mistral
   # first) rather than resting on this verdict alone.
+  #
+  # THE CONTESTED-ROW CONSEQUENCE, RECORDED RATHER THAN FIXED (found by
+  # review, 2026-08-27): "goes to the tiebreak pool (mistral first)" is true
+  # on paper, not guaranteed in practice. After judges qwen and gpt-oss-20b,
+  # routing.tiebreak's exclusion set is {deepseek, qwen, gpt-oss} - which
+  # removes groq/openai/gpt-oss-20b itself, bai/deepseek-v4-flash, and both
+  # openai refs (family gpt-oss by deliberate lumping) - leaving only
+  # [mistral/mistral-large-latest, cerebras/gemma-4-31b]. gemma answers HTTP
+  # 402 (same probe as elsewhere in this file); mistral read-timed-out at 45s
+  # in a 2026-08-27 probe - INCONCLUSIVE, not confirmed dead. If mistral is in
+  # fact unreachable, judge.py's tiebreak_unroutable_two_judge_decision path
+  # REJECTS the row rather than parking it (judge.py:1334-1344). So today a
+  # CONTESTED deepseek row completes only when its two judges AGREE; a real
+  # disagreement is auto-rejected, not retried. Conservative and non-fatal -
+  # the same shape as every other park/reject-loudly path in this file - but
+  # it is a real yield consequence, and recording it rather than fixing it is
+  # this file's own standing rule.
   #
   # THE OPEN RISK, STATED PLAINLY: the 0/10 score was measured on UNGROUNDED
   # recall - reciting BNS section numbers from parameters, with no source

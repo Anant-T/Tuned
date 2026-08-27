@@ -3447,7 +3447,9 @@ def test_the_judge_pool_is_the_one_calibration_left_behind(cfg):
     ]
     assert "mistral/mistral-large-latest" in cfg.routing.tiebreak
     # The free families come before the paid backstops in both lists, which is
-    # the standing rule that keeps the ~$1/day cap for rows nothing free serves.
+    # the standing rule that keeps the fenced-to-$0 openai backstops (usd_cap:
+    # 0.0, not a metered ~$1/day - that phrasing was corrected 2026-08-27)
+    # reached only by rows nothing free serves.
     assert cfg.routing.tiebreak.index("mistral/mistral-large-latest") < (
         cfg.routing.tiebreak.index("openai/gpt-5-mini")
     )
@@ -3575,12 +3577,30 @@ def test_the_generator_prefers_the_free_provider_and_parks_once_all_are_ineligib
     outcome, rather than pinning specific provider names - those have
     already reordered once (bai overtook cerebras 2026-08-25) without the
     cost policy itself breaking.
+
+    THE "no paid overflow" GUARD WAS NAME-BASED UNTIL A 2026-08-27 REVIEW
+    caught it: it hardcoded `"lightning/lightning-ai/gpt-oss-120b" not in
+    generator_refs`, which is Task 1's exact bug - a fence that recognises
+    only one provider by literal name - reborn as a test assertion instead of
+    production code. A future paid ref under any OTHER name would pass this
+    check while reopening the hole lightning was removed to close. The
+    invariant below is name-free: any generator ref that declares a per-token
+    PRICE also declares a usd_cap beside it, whichever provider it is under.
+    A price with no cap is unmetered paid overflow; a cap with no price
+    blocks nothing either (see the openai block's own "usd_cap ALONE BLOCKS
+    NOTHING" comment) - this checks the price side of that pair, which is the
+    side a silent re-introduction would actually violate.
     """
     generator_refs = list(cfg.routing.generator)
-    assert "lightning/lightning-ai/gpt-oss-120b" not in generator_refs, (
-        "lightning must stay out of routing.generator until it carries a "
-        "usd_cap with prices beside it - see the fence added 2026-08-27"
-    )
+    for ref in cfg.routing_refs("generator"):
+        _, model = cfg.model_for(ref)
+        priced = (
+            "usd_per_1m_prompt" in model.limits or "usd_per_1m_completion" in model.limits
+        )
+        assert not priced or "usd_cap" in model.limits, (
+            f"{ref.provider}/{ref.model} declares a price with no usd_cap - "
+            "unmetered paid overflow would be reachable from routing.generator"
+        )
     refs = [ModelRef(*ref.split("/", 1)) for ref in generator_refs]
     assert refs, "need at least one generator ref"
 
