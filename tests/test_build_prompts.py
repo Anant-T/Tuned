@@ -36,7 +36,12 @@ from pathlib import Path
 import pytest
 
 from tuned.data import prompt_registry as reg
-from tuned.data.gates import BANNED_META, VERIFICATION_CUES, _norm_ws
+from tuned.data.gates import (
+    BANNED_META,
+    INSTRUCTION_ECHO_SPANS,
+    VERIFICATION_CUES,
+    _norm_ws,
+)
 
 # --------------------------------------------------------------------------
 # Golden hashes. A failure here is not a bug report, it is a question: did you
@@ -473,6 +478,92 @@ def test_generator_states_the_irac_answer_contract(prompt_id):
     assert IRAC_LINE_START_CLAUSE in rendered
     assert ANSWER_LENGTH_CLAUSE in rendered
     assert REASONING_FLOOR_CLAUSE in rendered
+
+
+@pytest.mark.parametrize("prompt_id", GEN_IDS)
+def test_generator_caps_the_band_from_above_and_grants_no_licence(prompt_id):
+    """The band is a band, not a floor. 700 must be restated as a stop.
+
+    ADDED 2026-08-27 with the ceiling, because REASONING_FLOOR_CLAUSE cannot
+    carry this property and never could. That constant was trimmed to
+    "450 to 700 words of deliberation" when the fourteen tails diverged, and
+    that substring is present in the PRE-ceiling wording too - the old tail
+    read "450 to 700 words of deliberation is normal for a matter of any
+    substance". So the assertion above passes on both the wording this task
+    removed and the wording it installed, which leaves the entire edit
+    unguarded: restoring the licence tomorrow keeps the suite green.
+
+    Two independent things are checked, because the failure had two halves.
+
+    CEILING: only the text AFTER the band marker counts. The marker contains
+    "700" itself, so partitioning on it is what makes the pre-ceiling wording
+    fail rather than pass by accident.
+
+    LICENCE: every one of the fourteen templates capped the reasoning and
+    then, in the same sentence, licensed it past the cap - "runs as long as
+    the matter needs", "takes as long as the question deserves", and two
+    other surface forms. gpt-oss obeyed the cap; deepseek-v4-flash obeyed the
+    licence and wrote a median 1,727 words, ~80% of all gate failures. The
+    shared surface of that family is "as long as", which appears nowhere in
+    any template now, so its absence is the cheap general guard. A future
+    licence phrased some other way would still slip past this - the ceiling
+    check above is the backstop.
+    """
+    user = reg.load(prompt_id).user or ""
+    _, marker, after = user.partition(REASONING_FLOOR_CLAUSE)
+    assert marker, f"{prompt_id} lost the band marker entirely"
+    ceiling_sentence = after.split(".")[0]
+    assert "700" in ceiling_sentence, (
+        f"{prompt_id} names the band but never closes it: {ceiling_sentence!r}. "
+        f"The upper bound has to be restated as a stop AFTER the band - naming "
+        f"450 to 700 and then leaving the length open is the exact wording that "
+        f"produced a median 1,727-word trace."
+    )
+    assert "as long as" not in _norm_ws(user).lower(), (
+        f"{prompt_id} has an 'as long as' licence again. Capping the reasoning "
+        f"and then permitting it to run past the cap in the same breath is the "
+        f"2026-08-27 regression; the cap is the instruction, not the licence."
+    )
+
+
+def test_every_instruction_echo_span_still_occurs_in_a_live_template():
+    """A stale echo span fails SILENTLY, so the suite has to hold it.
+
+    gates.INSTRUCTION_ECHO_SPANS is matched against GENERATED traces to catch
+    a teacher parroting its own instructions back. Nothing matches it against
+    the prompts, so a span whose wording has been edited out of every template
+    can never fire: check_prompt_echo simply stops detecting that class, with
+    no error and a green suite. The 2026-08-27 ceiling edit is exactly how
+    that happens - it deleted " is normal" from all fourteen templates, and
+    the span read "450 to 700 words of deliberation is normal".
+
+    check_prompt_echo compares against _norm_ws(think).lower(), so both sides
+    are normalised the same way here.
+
+    The contract is "at least one live template", deliberately not "every
+    template". Coverage today is uneven and legitimately so:
+
+        14 - never write as though the matter had been handed to you as a text
+        14 - 450 to 700 words of deliberation
+        14 - let me check this, or actually, that does not follow, ...
+         2 - those headings belong to the answer and never inside your reasoning
+         1 - work it out before you commit to anything (gen_irac_analysis_v1)
+
+    A span that matches NOTHING is a bug in the span or a prompt edit that was
+    not carried through. It is never a reason to delete the span or to loosen
+    this test.
+    """
+    live = {i: _norm_ws(reg.load(i).user).lower() for i in reg.all_ids()}
+    dead = sorted(
+        span
+        for span in INSTRUCTION_ECHO_SPANS
+        if not any(span in user for user in live.values())
+    )
+    assert not dead, (
+        f"instruction-echo spans matching no live template: {dead}. "
+        f"check_prompt_echo can never fire on these - repoint the span at the "
+        f"wording the templates actually use now."
+    )
 
 
 def _reasoning_paragraphs(prompt_id: str) -> list[str]:

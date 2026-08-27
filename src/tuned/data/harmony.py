@@ -288,7 +288,7 @@ Work it out before you commit to anything. Reason in the first person and in the
 When the thinking is done, write the judgment's analysis under four headings, each on its own line — Issue, Rule, Application, Conclusion.
 """
 _SMOKE_WORD_COUNT = (
-    " Roughly 450 to 700 words of deliberation is normal for a matter of any substance."
+    " Roughly 450 to 700 words of deliberation, and 700 is a ceiling you do not cross."
 )
 _GROUNDED_PREFILL = (
     "I start from the facts. A stabbed B once in the chest in Delhi. Let me check whether "
