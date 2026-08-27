@@ -1206,8 +1206,10 @@ routing:
   #
   # THE HONEST CAVEAT: under the PRE-edit prompts gpt-oss measured 55.6% and
   # would beat deepseek - the prompt-ceiling edit (286fd3a) is what dethroned
-  # it, not a change in gpt-oss itself, and that same edit is a measured
-  # no-op on deepseek. Re-adding gpt-oss as a generator requires reverting
+  # it, not a change in gpt-oss itself, while the matched-pair A/B found no
+  # steering effect of that edit on deepseek trace length (its pooled arm
+  # rates stay confounded - see THE MEASURED BASIS above; not settled either
+  # way). Re-adding gpt-oss as a generator requires reverting
   # that edit first; it does not qualify on the prompts as currently shipped.
   #
   # THE CONSEQUENCES:
