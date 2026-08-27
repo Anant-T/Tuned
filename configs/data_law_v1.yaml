@@ -13,9 +13,12 @@ build:
   mix: {grounded_synthesis: 0.60, curated: 0.16, replay: 0.24}
   overgeneration: 2.0
   held_out_frac: 0.10
-  # think_max RAISED 3000 -> 4000 on 2026-08-27, measured over the 99 banked
+  # think_max STAYS 3000 (2026-08-27) - RAISED to 4000 and then REVERTED the
+  # same day, and this comment is the fence against raising it again on the
+  # same reasoning that moved it the first time. A sweep over the 99 banked
   # v4 (bai/deepseek-v4-flash) generations in
-  # data/build/exp_deepseek/state/law_v1.sqlite3:
+  # data/build/exp_deepseek/state/law_v1.sqlite3 showed a +11pp length_band
+  # pass-rate gain from 3000 -> 4000:
   #
   #   #   think_max   length_band pass   blocked by total_max alone
   #   #   3000              49.5%              4.0%
@@ -23,12 +26,34 @@ build:
   #   #   4500              63.6%             16.2%
   #   #   inf               64.6%             33.3%
   #
-  # The gain saturates past 4000: the binding constraint becomes total_max
-  # (8192, the STUDENT's context - not moved by this or any config change),
-  # not think_max. 4000 is the point on the curve that buys most of the
-  # available pass-rate gain (49.5% -> 60.6%) before the marginal return
-  # drops off and the cost shifts to a ceiling this file cannot lift.
-  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 4000, answer_min: 120}
+  # THAT SWEEP WAS DEEPSEEK-SHAPED, and it stopped applying the moment Task 1
+  # (same day) demoted deepseek to routing.generator ref 2 and put
+  # cerebras/gpt-oss-120b back in the lead. Measured on the 1,281 gpt-oss
+  # generations already in the live store, which IS the lead generator now:
+  #
+  #   median think_est          620 tokens   (deepseek: ~2,250)
+  #   think < think_min         381/1281 = 29.7%   <- gpt-oss's actual failure mode
+  #   think > 3000              65/1281  = 5.1%
+  #   think > 4000              36/1281  = 2.8%
+  #   rescued by 3000 -> 4000   29/1281  = 2.3pp,  not 11pp
+  #
+  # Under gpt-oss lead the raise buys 2.3pp, not 11pp, and gpt-oss's dominant
+  # failure is think < think_min at 29.7% - think_max cannot touch a FLOOR
+  # problem at any value. The cost side did not shrink to match: at
+  # think_max 4000 the worst-case gate-legal reply is ~4,717 real tokens
+  # (legal_reply_chars/4.24, the measured worst-case chars/token), which is
+  # MORE than both GENERATION_OUTPUT_TOKENS (4,000 - deliberately decoupled
+  # from this band, see generate.py) and cerebras/gpt-oss-120b's own hard
+  # max_output ceiling (4,096, and lightning's is the same 4,096) - the gate
+  # would accept replies that two of the three generator refs cannot
+  # physically emit in one call. test_the_generation_budget_covers_the_
+  # largest_gate_legal_reply pins the ~226-token margin this value must not
+  # spend.
+  #
+  # The raise only becomes coherent again if a generator with a LARGER output
+  # ceiling leads routing.generator - i.e. if the deepseek-shaped case comes
+  # back, not merely because deepseek is still routing.generator ref 2.
+  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 3000, answer_min: 120}
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
 
