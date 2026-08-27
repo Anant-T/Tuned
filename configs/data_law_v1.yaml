@@ -1166,7 +1166,7 @@ routing:
   # still has to survive that: judge.py's tiebreak_unroutable_two_judge_
   # decision path (the clean "reject the unresolved disagreement" path) only
   # fires when unroutable is True, and unroutable requires every skip to be
-  # `context_exceeded` or `family-excluded` (providers.ROW_SHAPED_SKIPS;
+  # `context_exceeded` or `family-excluded` (generate.ROW_SHAPED_SKIPS;
   # generate.py's ROW_SHAPED_SKIPS = frozenset({"family-excluded"})). A
   # provider that is genuinely tried and fails - a timeout, a 402, an
   # over-budget block - is not a row-shaped skip, so unroutable stays False.
