@@ -604,6 +604,64 @@ SECOND_GENERATOR_REF = "cerebras/second-generator"
 SECOND_GENERATOR_CONTEXT = 32000
 
 
+def cfg_with_gpt_oss_reinstated_as_generator(cfg: BuildConfig) -> BuildConfig:
+    """cerebras/gpt-oss-120b put back into routing.generator, ALONGSIDE
+    whatever is already there.
+
+    cerebras/gpt-oss-120b was removed from routing.generator outright on
+    2026-08-28 (operator directive: bai/deepseek-v4-flash is the sole
+    generator, cerebras spends only on judging - see routing.generator's own
+    comment). The model itself is untouched in cfg.providers (still declares
+    `roles: [generator]`), so this is a routing-only edit, exactly like
+    cfg_with_two_generator_families a few lines down - it just reuses the
+    REAL gpt-oss-120b instead of a synthetic model.
+
+    A handful of pool/preflight tests need specifically THIS family, not a
+    foreign synthetic one: gpt-oss is the family shared by
+    groq/openai/gpt-oss-20b AND both openai backstops (gpt-5-mini/nano), by
+    deliberate config lumping (see the openai provider block's own
+    comments). A gpt-oss-generated row's family_separation therefore excludes
+    all three of those judge/tiebreak candidates AT ONCE - a self-referential
+    scarcity that cfg_with_two_generator_families' "secondgen" family cannot
+    reproduce, because secondgen is foreign to every other model in the pool
+    on purpose. Before 2026-08-28 the shipped config supplied this scarcity
+    for free, since gpt-oss WAS the real generator; tests that read it off
+    the shipped pool now have to construct it, the same way
+    cfg_with_two_generator_families already constructs its own shape rather
+    than assuming the config still carries mistral-small.
+    """
+    from dataclasses import replace
+
+    return replace(
+        cfg,
+        routing=replace(
+            cfg.routing, generator=cfg.routing.generator + ("cerebras/gpt-oss-120b",)
+        ),
+    )
+
+
+def cfg_with_gpt_oss_as_sole_generator(cfg: BuildConfig) -> BuildConfig:
+    """routing.generator REPLACED with just cerebras/gpt-oss-120b.
+
+    Many generate.py tests are written against "the generator was gpt-oss"
+    (provider/family recorded on the row, model ids in FakeRouter scripts,
+    output-ceiling numbers) and used to get that pin for free with
+    ``FakeRouter(cfg, ..., missing_keys={"bai"})``: the shipped
+    routing.generator fell over from bai to cerebras, so excluding bai's key
+    left cerebras as the only eligible ref. Since 2026-08-28
+    bai/deepseek-v4-flash is the SOLE routing.generator ref (operator
+    directive: deepseek is the sole generator, cerebras spends only on
+    judging - see routing.generator's own comment), so excluding bai now
+    leaves NOTHING - there is no second ref to fall over to. This builds a
+    cfg whose routing.generator is gpt-oss-120b alone instead, the same
+    model these tests always meant to pin, still valid in cfg.providers
+    (only the ROUTING reference was removed, not the model).
+    """
+    from dataclasses import replace
+
+    return replace(cfg, routing=replace(cfg.routing, generator=("cerebras/gpt-oss-120b",)))
+
+
 def cfg_with_two_generator_families(cfg: BuildConfig) -> BuildConfig:
     """The shipped config with a SECOND generator family, SYNTHESISED here.
 

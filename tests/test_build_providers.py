@@ -23,6 +23,7 @@ from pipeline_fakes import (  # noqa: E402
     cfg_without_the_free_tiebreak,
     cfg_without_the_promoted_judge,
     cfg_with_context,
+    cfg_with_gpt_oss_reinstated_as_generator,
     cfg_with_two_generator_families,
     cfg_with_split_pools,
     cfg_without_the_paid_judges,
@@ -196,16 +197,30 @@ def _complete(client: ChatClient, req: ChatRequest):
 
 
 def _narrow_generator(cfg):
-    """The sole generator family cut back to the window the pilot ran against.
+    """Every generator family cut back to the window the pilot ran against.
 
     Needed since 2026-08-19. Both cerebras models were pinned at 8192 by a
     config value nobody had probed; the probes put them at 131,072, so every
     property that is ABOUT a generator too small for the row it is handed now
     has to construct one. cfg_with_context refuses a (family, role) it did not
     find, so this cannot quietly no-op the way the stale pin did.
+
+    NARROWS BOTH gpt-oss AND deepseek, mirroring test_build_generate.py's
+    fixture of the same name (there since 2026-08-25, when bai joined
+    routing.generator with an 800,000-token window that would otherwise
+    swallow every "too small" property below). This module's own copy went
+    unfixed then because the shipped config's REAL generator was still
+    gpt-oss, so narrowing only gpt-oss kept working by coincidence - until
+    2026-08-28, when cerebras/gpt-oss-120b was removed from routing.generator
+    outright (operator directive: deepseek is the sole generator) and
+    deepseek became the only real generator family, which this fixture was
+    not narrowing at all.
     """
-    return cfg_with_context(
+    narrowed = cfg_with_context(
         cfg, family="gpt-oss", role="generator", max_context=NARROW_GENERATOR_CONTEXT
+    )
+    return cfg_with_context(
+        narrowed, family="deepseek", role="generator", max_context=NARROW_GENERATOR_CONTEXT
     )
 
 
@@ -1689,27 +1704,34 @@ def test_undersized_families_over_the_real_pool(cfg):
     # filter can remove is the 32k one.
     assert undersized_families(cfg, "judge", 20000) == frozenset()
     assert undersized_families(cfg, "judge", 40000) == frozenset()
-    # The generator pool is ONE family since 2026-08-18: cerebras/gpt-oss-120b,
-    # and since the 2026-08-19 probe it holds 131,072 rather than the 8192 the
-    # config had claimed since the beginning. Past that window there is no
-    # other family to fall back to, which is why an over-long row parks instead
-    # of diverting - but the window is now two orders of magnitude above
-    # anything this build produces (pilot prompts ran 1,445-2,799).
+    # The generator pool is ONE family since 2026-08-28: bai/deepseek-v4-flash,
+    # the SOLE routing.generator ref (operator directive - deepseek is the
+    # sole generator, cerebras spends only on judging; see routing.generator's
+    # own comment). Its declared window is 800,000. RE-BASELINED from
+    # cerebras/gpt-oss-120b's 131,072: that model is REMOVED from
+    # routing.generator outright, not merely reordered, so this property now
+    # reads deepseek's own window rather than gpt-oss's. Past the window
+    # there is no other family to fall back to, which is why an over-long row
+    # parks instead of diverting - but the window is orders of magnitude
+    # above anything this build produces (pilot prompts ran 1,445-2,799).
     assert undersized_families(cfg, "generator", 4000) == frozenset()
     assert undersized_families(cfg, "generator", 20000) == frozenset()
     assert undersized_families(cfg, "generator", 60000) == frozenset()
-    # The cliff is where the code puts it, not where a comment says: 131,072 /
+    # The cliff is where the code puts it, not where a comment says: 800,000 /
     # CONTEXT_SAFETY_MARGIN. One token either side of it.
-    assert undersized_families(cfg, "generator", 104_858) == frozenset()
-    assert undersized_families(cfg, "generator", 104_859) == frozenset({"gpt-oss"})
+    assert undersized_families(cfg, "generator", 640_000) == frozenset()
+    assert undersized_families(cfg, "generator", 640_001) == frozenset({"deepseek"})
     # ...and the filter itself is unchanged - narrow the window back to the
-    # value the pilot ran against and the old exclusions return verbatim.
+    # value the pilot ran against and the old exclusions return verbatim. The
+    # NUMBERS (6,554 / 6,555) are unaffected by which family is narrowed -
+    # they come from NARROW_GENERATOR_CONTEXT (8192) and CONTEXT_SAFETY_MARGIN
+    # alone - only the family name in the result changes.
     narrow = cfg_with_context(
-        cfg, family="gpt-oss", role="generator", max_context=NARROW_GENERATOR_CONTEXT
+        cfg, family="deepseek", role="generator", max_context=NARROW_GENERATOR_CONTEXT
     )
-    assert undersized_families(narrow, "generator", 20000) == frozenset({"gpt-oss"})
+    assert undersized_families(narrow, "generator", 20000) == frozenset({"deepseek"})
     assert undersized_families(narrow, "generator", 6_554) == frozenset()
-    assert undersized_families(narrow, "generator", 6_555) == frozenset({"gpt-oss"})
+    assert undersized_families(narrow, "generator", 6_555) == frozenset({"deepseek"})
 
 
 def test_undersized_families_keeps_a_mixed_family_with_one_large_model(cfg):
@@ -2016,14 +2038,19 @@ def test_undersized_families_keeps_an_explicit_safety_margin(cfg):
 
     The 8k judge carried this until 2026-08-18; with zai-glm-4.7 retired the
     smallest judge in the pool is mistral, so the same rule is read at its
-    window instead. The generator half is read at 131,072 for the same reason
-    since 2026-08-19: an estimate that merely equals the probed window is a
-    coin flip on a 400, exactly as it was at 8192."""
+    window instead. The generator half is read at deepseek's own 800,000
+    since 2026-08-28 (operator directive: deepseek is the sole generator,
+    replacing cerebras/gpt-oss-120b's 131,072 from the 2026-08-19 probe): an
+    estimate that merely equals the declared window is a coin flip on a 400,
+    exactly as it was at 8192."""
     assert CONTEXT_SAFETY_MARGIN > 1.0
     # 131,072, not 32,000: mistral left on 2026-08-19 and the smallest judge in
     # the pool is now 131k, so the rule is read at that window on both sides.
     assert "qwen" in undersized_families(cfg, "judge", 131072)
-    assert "gpt-oss" in undersized_families(cfg, "generator", 131072)
+    # 800,000, not 131,072: cerebras/gpt-oss-120b is removed from
+    # routing.generator (2026-08-28), so the generator half now reads
+    # deepseek's own declared window.
+    assert "deepseek" in undersized_families(cfg, "generator", 800000)
     # ...and the margin does not start excluding models with real headroom.
     assert undersized_families(cfg, "judge", 4000) == frozenset()
 
@@ -2057,34 +2084,29 @@ def test_the_context_estimate_counts_chat_template_overhead():
 def test_unkeyed_roles_names_the_role_and_the_env_vars(cfg, monkeypatch):
     """The fleet must refuse to start when a role it routes has no usable key
     - the alternative is a wave of tasks that never reaches a provider."""
-    _unset(monkeypatch, "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENAI_API_KEY")
+    _unset(monkeypatch, "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENAI_API_KEY", "BAI_API_KEY")
     gaps = unkeyed_roles(cfg, ("generator", "judge"))
     assert set(gaps) == {"generator", "judge"}
-    # TWO providers on the generator role since lightning was removed
-    # 2026-08-27: bai and cerebras (both free). Lightning - the sole paid ref
-    # this role ever had - carried no usd_cap, and a review found the fence
-    # only ever reached the provider literally named "openai"
-    # (generate._provider_usd_cap, née _openai_usd_cap), so it was pulled from
-    # routing rather than left reachable with nothing behind it. Both
-    # remaining keys are named because either alone makes the role usable -
-    # the list is the failover, and the ORDER of the refs is where the cost
-    # policy lives, not here (it moved once already: bai led 2026-08-25 to
-    # 2026-08-27, then gpt-oss reclaimed the lead slot - see
-    # routing.generator's own comment). So the order asserted here is DERIVED
-    # from the live config's routing rather than a snapshot that the next
-    # reorder would silently outdate.
+    # ONE provider on the generator role since 2026-08-28: bai/deepseek-v4-
+    # flash is the SOLE routing.generator ref (operator directive - deepseek
+    # is the sole generator, cerebras spends only on judging; see
+    # routing.generator's own comment). RE-BASELINED from the two-provider
+    # (bai, cerebras) shape that held from lightning's removal (2026-08-27)
+    # to cerebras's removal (2026-08-28): there is no longer a failover list
+    # here, just the one key that makes the role usable at all.
     expected_generator_envs = []
     for ref in cfg.routing_refs("generator"):
         provider, _ = cfg.model_for(ref)
         if provider.api_key_env not in expected_generator_envs:
             expected_generator_envs.append(provider.api_key_env)
     assert gaps["generator"] == tuple(expected_generator_envs)
-    assert set(gaps["generator"]) == {"BAI_API_KEY", "CEREBRAS_API_KEY"}
+    assert set(gaps["generator"]) == {"BAI_API_KEY"}
     assert "GROQ_API_KEY" in gaps["judge"]
-    # One key is enough to make a role usable: the rest is failover.
+    # The generator's one key is what makes the role usable now - there is no
+    # second ref left to fail over to.
     monkeypatch.setenv("GROQ_API_KEY", "sk-test")
     assert set(unkeyed_roles(cfg, ("generator", "judge"))) == {"generator"}
-    monkeypatch.setenv("CEREBRAS_API_KEY", "sk-test")
+    monkeypatch.setenv("BAI_API_KEY", "sk-test")
     assert unkeyed_roles(cfg, ("generator", "judge")) == {}
     # ...and a role whose every provider is still unkeyed keeps reporting.
     # OPENAI is the one held back here: probe routes to groq, which is keyed
@@ -2100,11 +2122,14 @@ def test_the_shipped_config_has_no_fatal_judge_hole_left(cfg, keys):
     already paid for judge A. The openai backstop is the fourth family that
     fills slot B.
 
-    Pinned as "no fatal JUDGE gap". The tiebreak is a different matter since
-    2026-08-19: gemma was promoted into the judge role, so on a gpt-oss row it
-    fills slot B and the tiebreak has no family it has not already spent. That
-    warns rather than refuses, deliberately, and it is asserted below rather
-    than left to be discovered."""
+    Pinned as "no fatal JUDGE gap". The tiebreak used to be a different
+    matter (2026-08-19 to 2026-08-28): gemma was promoted into the judge
+    role, so on a gpt-oss row it filled slot B and the tiebreak had no
+    family it had not already spent - a WARN, not a refusal. That gap does
+    not reproduce on deepseek (see the RE-BASELINED note below), so what is
+    asserted now is that removing the free tiebreak survivors leaves no
+    tiebreak gap at all - a strictly cleaner property than the one this
+    docstring originally described."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
@@ -2131,18 +2156,27 @@ def test_the_shipped_config_has_no_fatal_judge_hole_left(cfg, keys):
     assert slot_b == GEMMA_JUDGE
 
     # AND NO TIEBREAK GAP EITHER, which is the 2026-08-19 surgery's second
-    # half: qwen and gemma take the judge slots on a gpt-oss row, the tiebreak
-    # excludes {gpt-oss, qwen, gemma}, and mistral-large-latest is the one
-    # family left. Take it back out and the gap returns, still only warning.
+    # half: qwen and gemma take the judge slots on a deepseek row, the
+    # tiebreak excludes {deepseek, qwen, gemma}, and groq/openai/gpt-oss-20b
+    # (family gpt-oss, untouched by that exclusion) decides it.
     assert [g for g in gaps if g.role == "tiebreak"] == []
     without = pool_gaps(
         cfg_without_the_free_tiebreak(cfg), needed_tokens=worst_case_judge_tokens(cfg)
     )
-    # Only the gpt-oss row: a secondgen generation has not spent the gpt-oss
-    # family, so its tiebreak still resolves there.
+    # RE-BASELINED 2026-08-28: with cerebras/gpt-oss-120b removed from
+    # routing.generator outright (operator directive - deepseek is the sole
+    # generator), the "gpt-oss row" this used to describe no longer exists.
+    # Stripping mistral and bai (FREE_TIEBREAKS) from routing.tiebreak used
+    # to reopen a gap for a gpt-oss-generated row specifically, because
+    # gpt-oss lumps groq/openai/gpt-oss-20b AND both openai backstops into
+    # the SAME family as the generator, so a gpt-oss row's exclusion set
+    # removed every one of them at once. deepseek shares no family with any
+    # tiebreak-role model (mistral/gpt-oss/gemma/openai are all distinct
+    # from deepseek), so stripping mistral+bai leaves gpt-oss-20b standing
+    # for BOTH the secondgen and the real deepseek row - nothing here
+    # reopens a gap for either generator family any more.
     tiebreak_gaps = [g for g in without if g.role == "tiebreak"]
-    assert {g.generator_family for g in tiebreak_gaps} == {"gpt-oss"}
-    assert all(not g.fatal for g in tiebreak_gaps)
+    assert tiebreak_gaps == []
 
     # ...and the hole really is closed by the ADDITION, not by the check going
     # quiet: take the backstop back out and the old gap is reported verbatim.
@@ -2349,7 +2383,13 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
     # 2026-08-19, so slot B fills at every size and the gap under test here
     # cannot occur. See cfg_without_the_promoted_judge.
     cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
-    for env in ("CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
+    # BAI_API_KEY added 2026-08-28: cerebras/gpt-oss-120b is removed from
+    # routing.generator (operator directive - deepseek is the sole
+    # generator), so bai/deepseek-v4-flash is now the only REAL generator
+    # ref, and it needs its own key to be an eligible (keyed) generator
+    # family at all - CEREBRAS_API_KEY alone now only keys the synthetic
+    # secondgen family this fixture adds under the cerebras provider.
+    for env in ("BAI_API_KEY", "CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     _unset(monkeypatch, "GROQ_API_KEY", "OPENAI_API_KEY")
     # The fourth-family judge the operator is sourcing, behind the key that
@@ -2361,7 +2401,7 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
     # test expressible. It is the shape cerebras/zai-glm-4.7 held until it was
     # retired on 2026-08-18 (archived upstream): a third family, keyed, that
     # serves the short rows and not the long ones. Without one in the pool a
-    # gpt-oss row has no keyed slot B at any size either, both gaps classify
+    # deepseek row has no keyed slot B at any size either, both gaps classify
     # unservable, and the per-gap distinction this test is about cannot be seen.
     widened = _with_judge_model(
         _with_fourth_judge(cfg, max_context=131072),
@@ -2382,15 +2422,17 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
         assert gap.key_envs == ("GROQ_API_KEY", "OPENAI_API_KEY")
         assert "no row size is servable" in gap.detail
 
-    # ...and the classification is per GAP, not per config: a gpt-oss row can
+    # ...and the classification is per GAP, not per config: a deepseek row can
     # still be judged by mistral + the keyed 8k judge, so at 2,000 tokens it
     # has no gap at all and at 23,729 its gap is one the override may
-    # legitimately cover.
+    # legitimately cover. RE-BASELINED 2026-08-28: the real generator family
+    # is deepseek now, not gpt-oss - cerebras/gpt-oss-120b is removed from
+    # routing.generator (operator directive: deepseek is the sole generator).
     small = pool_gaps(widened, needed_tokens=2000)
     assert [g.generator_family for g in small if g.fatal] == ["secondgen"]
     big = pool_gaps(widened, needed_tokens=worst_case_judge_tokens(widened))
-    gpt_oss = next(g for g in big if g.generator_family == "gpt-oss" and g.fatal)
-    assert (gpt_oss.key_shaped, gpt_oss.unservable) == (True, False)
+    deepseek_gap = next(g for g in big if g.generator_family == "deepseek" and g.fatal)
+    assert (deepseek_gap.key_shaped, deepseek_gap.unservable) == (True, False)
 
     # ...and the same walk goes quiet the moment the key lands.
     monkeypatch.setenv("GROQ_API_KEY", "sk-test")
@@ -2436,7 +2478,20 @@ def test_the_advice_the_preflight_prints_is_the_threshold_it_enforces(cfg, keys)
     # NO GAP AT ALL (2026-08-19 probe), and a property about what a gap advises
     # needs a gap. It is also the honest fixture: this is the exact pool the
     # advice was designed against.
-    cfg = cfg_without_the_free_tiebreak(cfg_with_two_generator_families(cfg))
+    #
+    # cfg_with_gpt_oss_reinstated_as_generator ADDED 2026-08-28:
+    # cerebras/gpt-oss-120b is removed from routing.generator outright
+    # (operator directive - deepseek is the sole generator, cerebras spends
+    # only on judging), so stripping mistral+bai from routing.tiebreak
+    # (cfg_without_the_free_tiebreak) no longer reopens a gap by itself -
+    # deepseek shares no family with groq/openai/gpt-oss-20b or the openai
+    # backstops, so it is never excluded from them and always has a tiebreak.
+    # Only a gpt-oss-generated row reproduces the single self-referential
+    # gap this test needs (gpt-oss lumps all three of those into one
+    # excluded family), so gpt-oss-120b is put back for this test only.
+    cfg = cfg_without_the_free_tiebreak(
+        cfg_with_gpt_oss_reinstated_as_generator(cfg_with_two_generator_families(cfg))
+    )
     with judge_prompt_overlay_with_pinned_tiebreak_gap():
         gaps = pool_gaps(
             cfg,
@@ -2606,8 +2661,22 @@ def test_a_tiebreak_gap_names_the_key_that_would_fill_it(cfg, keys, monkeypatch)
     # narrowing "gemma tiebreak" would narrow the gemma JUDGE as well and move
     # slot B underneath the gap this is reading. Dropping it from the judge
     # list leaves it whole as a tiebreak, which is what the remedy is about.
+    #
+    # cfg_with_gpt_oss_reinstated_as_generator ADDED 2026-08-28:
+    # cerebras/gpt-oss-120b is removed from routing.generator outright
+    # (operator directive - deepseek is the sole generator, cerebras spends
+    # only on judging), so stripping mistral+bai from routing.tiebreak no
+    # longer empties it on its own - deepseek shares no family with
+    # groq/openai/gpt-oss-20b or the openai backstops, so a deepseek row is
+    # never excluded from them and this fifth-family key-shaped gap would
+    # never surface (gpt-oss-20b fills the seat before the pool ever reaches
+    # fifthparty). Reinstating gpt-oss-120b as an additional real generator
+    # reproduces the self-referential exclusion (gpt-oss lumps
+    # groq/openai/gpt-oss-20b and both openai backstops into one family) a
+    # gpt-oss-generated row needs to actually reach fifthparty.
     patched = _with_tiebreak_family(
-        cfg_without_the_free_tiebreak(cfg), api_key_env="FIFTHPARTY_API_KEY"
+        cfg_without_the_free_tiebreak(cfg_with_gpt_oss_reinstated_as_generator(cfg)),
+        api_key_env="FIFTHPARTY_API_KEY",
     )
     _unset(monkeypatch, "FIFTHPARTY_API_KEY")
     gap = next(
@@ -2727,8 +2796,23 @@ def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg
     # ...and the promoted judge dropped with it: gemma joined routing.judge on
     # 2026-08-19, so slot B fills at every size and the gap under test here
     # cannot occur. See cfg_without_the_promoted_judge.
+    #
+    # cfg_with_gpt_oss_reinstated_as_generator ADDED 2026-08-28:
+    # cerebras/gpt-oss-120b is removed from routing.generator outright
+    # (operator directive - deepseek is the sole generator, cerebras spends
+    # only on judging), so the shipped pool no longer supplies the property
+    # this test is about for free. This test specifically needs the REAL
+    # gpt-oss self-lump (it shares family with groq/openai/gpt-oss-20b AND
+    # both openai backstops), not cfg_with_two_generator_families' foreign
+    # "secondgen" family - deepseek shares no family with anything left in
+    # this reduced judge pool, so a deepseek row always has two independent
+    # rescue candidates (the openai family and secondgen) and never gaps
+    # here at all; only gpt-oss and secondgen compete for the same scarce
+    # remainder, which is the scarcity this test measures.
     cfg = _narrow_generator(
-        cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+        cfg_without_the_promoted_judge(
+            cfg_with_gpt_oss_reinstated_as_generator(cfg_with_two_generator_families(cfg))
+        )
     )
     # 26k, not 20k: correcting the reply conversion (2026-08-18, review round
     # 2 / I6) raised the 8k-window check from 15,104 to 19,104 tokens, i.e.
@@ -2749,7 +2833,9 @@ def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg
 
     # Both generator families lose slot B at the flat size: qwen is now too
     # small and glm always was, so the pool is mistral + the gpt-oss backstop
-    # and each family's own is one of them.
+    # and each family's own is one of them. (deepseek, also present as a
+    # third real generator family since 2026-08-28, never appears here - see
+    # the note above.)
     assert fatal() == {("gpt-oss", "b"), ("secondgen", "b")}
     # Sized at what its own 8k window permits, the gpt-oss family's judges fit
     # again and its refusal disappears; the 40k mistral family really can make
@@ -2811,7 +2897,16 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
     # ...and the promoted judge dropped with it: gemma joined routing.judge on
     # 2026-08-19, so slot B fills at every size and the gap under test here
     # cannot occur. See cfg_without_the_promoted_judge.
-    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    #
+    # cfg_with_gpt_oss_reinstated_as_generator ADDED 2026-08-28: cerebras/
+    # gpt-oss-120b is removed from routing.generator outright (operator
+    # directive - deepseek is the sole generator, cerebras spends only on
+    # judging), so the shipped pool carries only ONE real generator family
+    # today, not two. This property needs THREE families walked (see below),
+    # so gpt-oss is put back alongside deepseek for this test.
+    cfg = cfg_without_the_promoted_judge(
+        cfg_with_two_generator_families(cfg_with_gpt_oss_reinstated_as_generator(cfg))
+    )
     with judge_prompt_overlay_with_pinned_tiebreak_gap():
         judge_needed = worst_case_judge_tokens(cfg)
         tiebreak_needed = worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
@@ -2823,19 +2918,19 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
         sized = pool_gaps(
             patched, needed_tokens=judge_needed, tiebreak_needed_tokens=tiebreak_needed
         )
-        # All three generator families now: deepseek (bai) joins gpt-oss and
-        # secondgen because the paid backstop is spent on judge slot B for a
-        # mistral row and is therefore gone from its tiebreak too. The ORDER
-        # here follows routing.generator: gpt-oss led 2026-08-18 to
-        # 2026-08-25, deepseek led 2026-08-25 to 2026-08-27, and gpt-oss is
-        # back in front since (Task 1) - so gpt-oss precedes deepseek again,
-        # with secondgen last because cfg_with_two_generator_families always
-        # appends it. What the test turns on is unchanged regardless of this
-        # order: every one of these flips on the pinned gap between the judge
-        # prompt and the tiebreak prompt.
+        # All three generator families now: gpt-oss (reinstated above) and
+        # secondgen join deepseek because the paid backstop is spent on judge
+        # slot B for a mistral row and is therefore gone from its tiebreak
+        # too. The ORDER here follows routing.generator: deepseek is the
+        # SOLE shipped ref since 2026-08-28 (operator directive), so it comes
+        # first; cfg_with_gpt_oss_reinstated_as_generator appends gpt-oss
+        # right after it, and cfg_with_two_generator_families always appends
+        # secondgen last. What the test turns on is unchanged regardless of
+        # this order: every one of these flips on the pinned gap between the
+        # judge prompt and the tiebreak prompt.
         assert [(g.role, g.generator_family) for g in sized] == [
-            ("tiebreak", "gpt-oss"),
             ("tiebreak", "deepseek"),
+            ("tiebreak", "gpt-oss"),
             ("tiebreak", "secondgen"),
         ]
         # Sized by the JUDGE's number instead, that same model reads as big
@@ -3143,6 +3238,19 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
 
     text = DATA_CONFIG.read_text(encoding="utf-8")
 
+    # cfg_with_gpt_oss_reinstated_as_generator ADDED 2026-08-28: cerebras/
+    # gpt-oss-120b is removed from routing.generator outright (operator
+    # directive - deepseek is the sole generator, cerebras spends only on
+    # judging). The JUDGE gap this test reads its advice off of only exists
+    # on a gpt-oss-generated row - gpt-oss lumps groq/openai/gpt-oss-20b and
+    # both openai backstops into one family, so removing the promoted judges
+    # empties slot B for gpt-oss specifically; deepseek shares no family with
+    # any of them and always has openai left, so it never gaps this way.
+    # Reinstating gpt-oss as an additional real generator (the model itself
+    # is untouched in cfg.providers) reproduces the pool this test's numbers
+    # were designed against.
+    cfg = cfg_with_gpt_oss_reinstated_as_generator(cfg)
+
     # THE SHIPPED POOL HAS NO GAPS AT ALL since the gemma probe, so the advice
     # string has to be read off the pool that still has one. Narrowing gemma is
     # the exact config the advice was designed against.
@@ -3317,9 +3425,14 @@ def test_a_statute_qa_sized_prompt_now_routes_to_the_generator(cfg):
     not merely the current state.
     """
     probed, narrow = cfg, _narrow_generator(cfg)
+    # RE-BASELINED 2026-08-28: the sole shipped generator family is deepseek
+    # now, not gpt-oss - cerebras/gpt-oss-120b is removed from
+    # routing.generator outright (operator directive: deepseek is the sole
+    # generator). _narrow_generator narrows both families; only deepseek is
+    # actually routed, so it is the one that excludes here.
     for needed in (7_000, 10_000, 13_515, 25_000):
         assert undersized_families(probed, "generator", needed) == frozenset(), needed
-        assert undersized_families(narrow, "generator", needed) == frozenset({"gpt-oss"}), needed
+        assert undersized_families(narrow, "generator", needed) == frozenset({"deepseek"}), needed
     # 13,515 is not arbitrary: it is the prompt_tokens the live probe sent and
     # the provider accepted with a 200.
     assert undersized_families(probed, "generator", 13_515) == frozenset()
@@ -3340,8 +3453,20 @@ def test_the_tiebreak_route_is_open_for_a_long_row(cfg, keys):
     assert preflight_messages(cfg, ("generator", "judge", "tiebreak")) == ([], [])
     # Take that seat away and the separation-shaped gap comes straight back,
     # which is what says the seat is what closed it.
+    #
+    # cfg_with_gpt_oss_reinstated_as_generator ADDED 2026-08-28: cerebras/
+    # gpt-oss-120b is removed from routing.generator outright (operator
+    # directive - deepseek is the sole generator, cerebras spends only on
+    # judging), so stripping mistral+bai from routing.tiebreak no longer
+    # reopens a gap on the shipped pool by itself - deepseek shares no family
+    # with groq/openai/gpt-oss-20b or the openai backstops, so it is never
+    # excluded from them and the tiebreak stays open. Only a gpt-oss row
+    # reproduces the separation-shaped gap this test is about (gpt-oss lumps
+    # all three of those into one excluded family), so gpt-oss-120b is put
+    # back as an additional real generator for this half of the test.
     _, without = preflight_messages(
-        cfg_without_the_free_tiebreak(cfg), ("generator", "judge", "tiebreak")
+        cfg_without_the_free_tiebreak(cfg_with_gpt_oss_reinstated_as_generator(cfg)),
+        ("generator", "judge", "tiebreak"),
     )
     assert any("routing.tiebreak" in line for line in without)
 

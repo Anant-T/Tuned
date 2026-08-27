@@ -12,6 +12,7 @@ from pipeline_fakes import (
     build_cfg,
     cfg_with_context,
     cfg_with_fourth_judge_family,
+    cfg_with_gpt_oss_as_sole_generator,
     cfg_with_two_generator_families,
     cfg_without_the_free_tiebreak,
     cfg_without_the_paid_judges,
@@ -67,16 +68,28 @@ def paths(tmp_path):
 def judged_store(tmp_path, paths, cfg, n=1, generator_script=None):
     """A store whose n tasks have been generated and are waiting in 'judging'.
 
-    The generator is pinned to cerebras/gpt-oss-120b - bai (family deepseek)
-    leads routing.generator since 2026-08-25 and is excluded here, because
-    this whole suite is written against "the generator was gpt-oss" (family
-    separation, model ids, event fields below all assume it).
+    The generator is pinned to cerebras/gpt-oss-120b, because this whole
+    suite is written against "the generator was gpt-oss" (family separation,
+    model ids, event fields below all assume it).
+
+    Used to get that pin for free by excluding bai's key from the shipped
+    two-ref routing.generator list, falling over to cerebras. As of
+    2026-08-28 bai/deepseek-v4-flash is the SOLE shipped generator ref
+    (operator directive: deepseek is the sole generator, cerebras spends
+    only on judging) - excluding bai now leaves nothing to fall over to.
+    cfg_with_gpt_oss_as_sole_generator builds its OWN generator list pointing
+    at cerebras/gpt-oss-120b instead (still valid in cfg.providers, just no
+    longer routed to in production), the same way every other
+    synthetic-routing fixture in this module does (see
+    cfg_with_two_generator_families) rather than relying on the shipped
+    config to carry a ref this suite needs for its own reasons.
     """
+    gen_cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
     store = open_store(tmp_path, n_seeds=n)
-    plan_wave(store, cfg, "synthesis", n, task_type_mix={"irac_analysis": 1.0})
+    plan_wave(store, gen_cfg, "synthesis", n, task_type_mix={"irac_analysis": 1.0})
     asyncio.run(
         run_workers(
-            store, cfg, FakeRouter(cfg, generator_script, missing_keys={"bai"}), paths=paths,
+            store, gen_cfg, FakeRouter(gen_cfg, generator_script), paths=paths,
             streams=["synthesis"], n_workers=n, max_batches=1,
         )
     )
@@ -1922,8 +1935,24 @@ def test_the_judge_cli_refuses_the_pool_hole_before_claiming(tmp_path, cfg, monk
     THIS TEST HUNG when the pool changed under it, and that is why the
     construction is spelled out. With no hole the CLI stops refusing, proceeds
     past the preflight and starts a real run - which with keys in the
-    environment means live network calls out of a unit test."""
+    environment means live network calls out of a unit test.
+
+    RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is now the SOLE
+    routing.generator ref (operator directive - deepseek is the sole
+    generator, cerebras spends only on judging). Withholding BAI_API_KEY, as
+    this test used to, now trips the EARLIER "routing.generator has no
+    usable API key" refusal before the CLI ever reaches the judge pool, so
+    BAI_API_KEY must be set for the scenario below to still exercise the
+    judge-pool hole this test is about. Setting it does not fill the hole:
+    with a deepseek generation, family_separation excludes {deepseek} from
+    the judge pool, which removes bai/deepseek-v4-flash itself (it cannot
+    judge its own row) while leaving gemma untouched (family gemma) - slot A
+    still takes gemma, and slot B still has no family left, the same shape
+    as before, just reached by generator-self-exclusion instead of a
+    gpt-oss family lump.
+    """
     monkeypatch.setenv("CEREBRAS_API_KEY", "sk-test")
+    monkeypatch.setenv("BAI_API_KEY", "sk-test")
     for env in ("GROQ_API_KEY", "OPENAI_API_KEY"):
         monkeypatch.delenv(env, raising=False)
     monkeypatch.setattr("tuned.data.providers.load_dotenv_keys", lambda path=None: 0)

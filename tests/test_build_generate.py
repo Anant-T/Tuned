@@ -21,6 +21,8 @@ from pipeline_fakes import (
     build_cfg,
     cfg_with_fourth_judge_family,
     cfg_with_context,
+    cfg_with_gpt_oss_as_sole_generator,
+    cfg_with_gpt_oss_reinstated_as_generator,
     cfg_without_the_promoted_judge,
     cfg_with_extra_judge,
     cfg_with_two_generator_families,
@@ -397,11 +399,14 @@ def test_a_retry_re_rolls_the_same_request_and_never_bumps_effort(cfg, attempt):
 
 def test_clean_generation_lands_in_judging(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
-        # bai (family deepseek) leads routing.generator since 2026-08-25; this
-        # test is about cerebras's own generation plumbing (provider/family
-        # recorded on the row), so bai is excluded to keep it the answering
-        # generator.
-        router = FakeRouter(cfg, missing_keys={"bai"})
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to. This test is about
+        # cerebras's own generation plumbing (provider/family recorded on
+        # the row), so cfg_with_gpt_oss_as_sole_generator pins it directly.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
+        router = FakeRouter(cfg)
         totals = run(store, cfg, router, paths)
         assert totals["gen_ok"] == 1
         assert totals["gated_out"] == 0
@@ -419,9 +424,13 @@ def test_clean_generation_lands_in_judging(tmp_path, cfg, paths):
 
 def test_generation_records_usage_against_the_ledger(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
-        # bai leads routing.generator since 2026-08-25; excluded so cerebras
-        # is what the ledger actually gets charged against here.
-        run(store, cfg, FakeRouter(cfg, missing_keys={"bai"}), paths)
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to; cerebras is pinned
+        # directly so it is what the ledger actually gets charged against.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
+        run(store, cfg, FakeRouter(cfg), paths)
         used = store.usage_today("cerebras", "gpt-oss-120b")
         assert used == {
             "requests": 1,
@@ -750,12 +759,14 @@ def test_a_reply_the_gates_pass_can_still_break_the_judge_sizing_premise(tmp_pat
     exactly the shape a provider that does not bill its reasoning channel
     against max_tokens would return. It goes back for a regeneration."""
     with make_store(tmp_path) as store:
-        # bai leads routing.generator since 2026-08-25; excluded so the
-        # pinned "cerebras/gpt-oss-120b" ref below is the one that actually
-        # answers.
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to; cerebras/gpt-oss-120b is
+        # pinned directly so it is the one that actually answers.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
         router = FakeRouter(
             cfg, {"generator": [chat_response(OVERSIZE_ANSWER, OVERSIZE_THINK)]},
-            missing_keys={"bai"},
         )
         run(store, cfg, router, paths)
         task = only_task(store)
@@ -831,11 +842,14 @@ def test_a_missing_trace_parks_as_a_provider_fact_not_a_content_failure(
     instrumentation, it only stops the row being counted as a rejection.
     """
     with make_store(tmp_path) as store:
-        # bai leads routing.generator since 2026-08-25; excluded so the
-        # pinned "cerebras/gpt-oss-120b" ref below is the one named as
-        # responsible.
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to; cerebras/gpt-oss-120b is
+        # pinned directly so it is the one named as responsible.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
         router = FakeRouter(
-            cfg, {"generator": [chat_response(CLEAN_ANSWER, None)]}, missing_keys={"bai"}
+            cfg, {"generator": [chat_response(CLEAN_ANSWER, None)]}
         )
         run(store, cfg, router, paths)
         task = only_task(store)
@@ -876,10 +890,14 @@ def test_a_dead_generator_is_counted_as_parked_and_named(tmp_path, cfg, paths):
     """
     with make_store(tmp_path, n_seeds=6, n_tasks=6) as store:
         traceless = chat_response(CLEAN_ANSWER, None)
-        # bai leads routing.generator since 2026-08-25; excluded so the
-        # pinned "cerebras/gpt-oss-120b" ref below is the one that gets
-        # named in the parked totals.
-        router = FakeRouter(cfg, {"generator": [traceless]}, missing_keys={"bai"})
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to; cerebras/gpt-oss-120b is
+        # pinned directly so it is the one that gets named in the parked
+        # totals.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
+        router = FakeRouter(cfg, {"generator": [traceless]})
         totals = run(store, cfg, router, paths, n_workers=6)
 
         assert totals["parked"] == {"cerebras/gpt-oss-120b": 6}
@@ -1130,10 +1148,14 @@ def test_provider_failure_returns_the_task_to_the_queue(tmp_path, cfg, paths):
         "429 everywhere", status=429, provider="cerebras", model="gpt-oss-120b", retryable=True
     )
     with make_store(tmp_path) as store:
-        # bai leads routing.generator since 2026-08-25; excluded so the
-        # manufactured 429 (declared against cerebras above) is the one
-        # actually raised and ledgered.
-        router = FakeRouter(cfg, {"generator": [error]}, missing_keys={"bai"})
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to; cerebras is pinned
+        # directly so the manufactured 429 (declared against it above) is
+        # the one actually raised and ledgered.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
+        router = FakeRouter(cfg, {"generator": [error]})
         totals = run(store, cfg, router, paths)
         assert totals["errors"] == 1
         assert totals["gen_ok"] == 0
@@ -1483,9 +1505,13 @@ def test_loop_stops_when_the_queue_is_empty(tmp_path, cfg, paths, capsys):
 
 def test_status_line_reports_the_batch_and_the_budget(tmp_path, cfg, paths, capsys):
     with make_store(tmp_path) as store:
-        # bai leads routing.generator since 2026-08-25; excluded so the
-        # status line's spend is reported against cerebras, as pinned below.
-        run(store, cfg, FakeRouter(cfg, missing_keys={"bai"}), paths)
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to; cerebras is pinned
+        # directly so the status line's spend is reported against it.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
+        run(store, cfg, FakeRouter(cfg), paths)
         line = capsys.readouterr().out.strip().splitlines()[-1]
         assert line.startswith(
             "batch 1: claimed=1 gen-ok=1 gated-out=0 err=0 lost-lease=0 tokens=1700"
@@ -1546,10 +1572,14 @@ def test_the_shipped_generator_window_holds_the_longest_row_this_build_makes(
     caught the pin, and it is the one that fails if anybody lowers it again.
     """
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
-        # bai leads routing.generator since 2026-08-25 and its 800,000-token
-        # window would swallow LONG_SEED_TEXT without narrowing anything;
-        # excluded so this stays a test of cerebras's own declared window.
-        router = FakeRouter(cfg, missing_keys={"bai"})
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), and its
+        # 800,000-token window would swallow LONG_SEED_TEXT without
+        # narrowing anything - cerebras/gpt-oss-120b is pinned directly so
+        # this stays a test of ITS own declared window.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
+        router = FakeRouter(cfg)
         run(store, cfg, router, paths)
         (attempt,) = router.calls_for("generator")
         assert attempt["est_tokens"] > NARROW_GENERATOR_CONTEXT
@@ -1576,8 +1606,12 @@ def test_a_long_prompt_parks_when_no_generator_can_hold_it(tmp_path, cfg, paths)
     """
     narrow = _narrow_generator(cfg)
     with make_store(tmp_path, text=LONG_SEED_TEXT) as store:
-        # _narrow_generator narrows both gpt-oss and deepseek (bai), so the
-        # pool genuinely empties rather than bai answering instead.
+        # RE-BASELINED 2026-08-28: cerebras/gpt-oss-120b is removed from
+        # routing.generator outright (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so narrowing it
+        # via _narrow_generator is now a no-op for exclude_families - it is
+        # never walked as a candidate at all. deepseek (bai) is the only
+        # ROUTED family left, so it is the only one excluded here.
         router = FakeRouter(narrow)
         run(store, narrow, router, paths)
         # The attempt is recorded, but `ref is None` - the context filter
@@ -1585,34 +1619,36 @@ def test_a_long_prompt_parks_when_no_generator_can_hold_it(tmp_path, cfg, paths)
         # spent.
         (attempt,) = router.calls_for("generator")
         assert attempt["est_tokens"] > NARROW_GENERATOR_CONTEXT
-        # Both narrowed families are excluded now that bai (deepseek) is one
-        # of them, not just gpt-oss.
-        assert attempt["exclude_families"] == frozenset({"gpt-oss", "deepseek"})
+        assert attempt["exclude_families"] == frozenset({"deepseek"})
         assert attempt["ref"] is None
         task = only_task(store)
         assert task["state"] == GEN_UNROUTABLE_STATE
         assert task["disposition"] == "unroutable:generator"
 
     # ...and with a second generator family present it still diverts, so the
-    # routing itself is intact and only the pool changed. bai (deepseek)
-    # stays narrowed along with gpt-oss - the second family under test here
-    # is secondgen, not bai's deepseek.
+    # routing itself is intact and only the pool changed. deepseek (bai)
+    # stays narrowed and is the family this row diverts AWAY from; the
+    # second family under test here is secondgen.
     two = _narrow_generator(cfg_with_two_generator_families(cfg))
     with make_store(tmp_path / "two", text=LONG_SEED_TEXT) as store:
         router = FakeRouter(two)
         run(store, two, router, paths)
         call = router.calls_for("generator")[0]
         assert call["est_tokens"] > NARROW_GENERATOR_CONTEXT
-        assert "gpt-oss" in call["exclude_families"]
+        assert "deepseek" in call["exclude_families"]
         assert call["ref"] == ModelRef("cerebras", "second-generator")
         assert only_task(store)["state"] == "judging"
 
 
 def test_a_short_prompt_excludes_no_generator(tmp_path, cfg, paths):
     with make_store(tmp_path) as store:
-        # bai leads routing.generator since 2026-08-25; excluded so the
-        # pinned "cerebras/gpt-oss-120b" ref below is the one that answers.
-        router = FakeRouter(cfg, missing_keys={"bai"})
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to; cerebras/gpt-oss-120b is
+        # pinned directly so it is the one that answers.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
+        router = FakeRouter(cfg)
         run(store, cfg, router, paths)
         call = router.calls_for("generator")[0]
         assert call["est_tokens"] <= 8192
@@ -1672,9 +1708,13 @@ def test_the_generator_opts_a_family_into_reasoning_and_leaves_gpt_oss_alone(
         assert store.events("effort_bump") != []
 
     with make_store(tmp_path / "short") as store:
-        # bai leads routing.generator since 2026-08-25; excluded so this
-        # stays a check of cerebras's own (unbumped) params.
-        router = FakeRouter(cfg, missing_keys={"bai"})
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to; cerebras/gpt-oss-120b is
+        # pinned directly so this stays a check of ITS own (unbumped) params.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
+        router = FakeRouter(cfg)
         task = only_task(store)
         asyncio.run(generate_once(store, cfg, router, task, paths=paths, attempt=2))
         call = router.calls_for("generator")[0]
@@ -1711,9 +1751,12 @@ def test_a_row_no_generator_can_hold_parks_recoverably(tmp_path, cfg, paths):
         assert only_task(store)["claimed_by"] is None
         event = json.loads(store.events("generation_error")[0]["detail_json"])
         assert event["unroutable"] is True
-        # Two generator families since bai (deepseek) joined 2026-08-25
-        # alongside gpt-oss; OVERSIZE_SEED_TEXT is sized to exceed both.
-        assert set(event["excluded_families"]) == {"gpt-oss", "deepseek"}
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so deepseek is
+        # the only family that can appear here regardless of how oversized
+        # the seed is.
+        assert set(event["excluded_families"]) == {"deepseek"}
 
 
 def test_a_stale_worker_cannot_park_a_task_it_no_longer_holds(tmp_path, cfg, paths):
@@ -1932,12 +1975,18 @@ def test_the_context_estimate_routes_devanagari_past_a_generator_latin_fits(
     assert abs(len(latin) - len(devanagari)) < len(latin) * 0.25
 
     with make_store(tmp_path, text=latin) as store:
-        # The Latin text fits even the narrowed 8192 window, so narrowing
-        # alone would not exclude bai here (unlike the Devanagari case below)
-        # - it is excluded by key instead, to keep this a test of cerebras's
-        # own estimate rather than of routing preference.
-        router = FakeRouter(narrow, missing_keys={"bai"})
-        asyncio.run(generate_once(store, narrow, router, only_task(store), paths=paths))
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to. cerebras/gpt-oss-120b is
+        # pinned directly instead (still narrowed the same way by `narrow`
+        # above) so this stays a test of ITS own estimate rather than of
+        # routing preference.
+        gpt_oss_narrow = cfg_with_gpt_oss_as_sole_generator(narrow)
+        router = FakeRouter(gpt_oss_narrow)
+        asyncio.run(
+            generate_once(store, gpt_oss_narrow, router, only_task(store), paths=paths)
+        )
         assert router.calls_for("generator")[0]["ref"].provider == "cerebras"
 
     with make_store(tmp_path / "indic", text=devanagari) as store:
@@ -1954,15 +2003,24 @@ def test_the_context_estimate_routes_devanagari_past_a_generator_latin_fits(
         assert attempt["ref"] is None
         assert result.unroutable is True
         event = json.loads(store.events("generation_error")[0]["detail_json"])
-        assert "gpt-oss" in event["excluded_families"]
+        # RE-BASELINED 2026-08-28: deepseek is the sole routed generator
+        # family now (gpt-oss is removed from routing.generator outright),
+        # so it is the one excluded here, not gpt-oss.
+        assert "deepseek" in event["excluded_families"]
 
     # ...and on the SHIPPED window both scripts route, which is the 2026-08-19
-    # probe showing up as behaviour rather than as a config line. bai leads
-    # routing.generator since 2026-08-25; excluded so this stays a check of
-    # cerebras's own (shipped, unnarrowed) window.
+    # probe showing up as behaviour rather than as a config line.
+    # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+    # routing.generator ref now (operator directive - deepseek is the sole
+    # generator, cerebras spends only on judging), so excluding bai's key
+    # leaves nothing to fall over to; cerebras/gpt-oss-120b is pinned
+    # directly so this stays a check of ITS own (shipped, unnarrowed) window.
     with make_store(tmp_path / "shipped", text=devanagari) as store:
-        router = FakeRouter(cfg, missing_keys={"bai"})
-        asyncio.run(generate_once(store, cfg, router, only_task(store), paths=paths))
+        shipped_gpt_oss = cfg_with_gpt_oss_as_sole_generator(cfg)
+        router = FakeRouter(shipped_gpt_oss)
+        asyncio.run(
+            generate_once(store, shipped_gpt_oss, router, only_task(store), paths=paths)
+        )
         assert router.calls_for("generator")[0]["ref"].provider == "cerebras"
 
 
@@ -2053,10 +2111,14 @@ def test_every_attempt_is_ledgered_including_the_429(tmp_path, cfg, paths):
         "rate limited", status=429, provider="cerebras", model="gpt-oss-120b", retryable=True
     )
     with make_store(tmp_path) as store:
-        # bai leads routing.generator since 2026-08-25; excluded so the
-        # manufactured 429 (declared against cerebras above) is the one
-        # actually raised and ledgered.
-        router = FakeRouter(cfg, {"generator": [error]}, missing_keys={"bai"})
+        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+        # routing.generator ref now (operator directive - deepseek is the
+        # sole generator, cerebras spends only on judging), so excluding
+        # bai's key leaves nothing to fall over to; cerebras is pinned
+        # directly so the manufactured 429 (declared against it above) is
+        # the one actually raised and ledgered.
+        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
+        router = FakeRouter(cfg, {"generator": [error]})
         run(store, cfg, router, paths)
         used = store.usage_today("cerebras", "gpt-oss-120b")
         assert used["requests"] == 1
@@ -2106,11 +2168,15 @@ def test_idle_batches_are_announced_once(tmp_path, cfg, paths, capsys):
 def test_the_fleet_refuses_to_start_without_a_key_for_a_routed_role(tmp_path, cfg, monkeypatch):
     """"loaded 0 key(s) from .env" and then running anyway is how a wave gets
     claimed, failed and reported one row at a time instead of once."""
-    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
+    # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
+    # routing.generator ref now (operator directive - deepseek is the sole
+    # generator, cerebras spends only on judging), so its key is what the
+    # refusal names, not cerebras's.
+    for env in ("BAI_API_KEY", "CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.delenv(env, raising=False)
     refusals, _ = preflight_messages(cfg, ("generator",))
     assert any("routing.generator has no usable API key" in line for line in refusals)
-    assert any("CEREBRAS_API_KEY" in line for line in refusals)
+    assert any("BAI_API_KEY" in line for line in refusals)
     # ...and no override exists for it: there is nothing to override.
     forced, _ = preflight_messages(cfg, ("generator",), allow_pool_gaps=True)
     assert any("no usable API key" in line for line in forced)
@@ -2126,7 +2192,18 @@ def test_the_fleet_refuses_to_start_with_a_judge_slot_it_cannot_fill(cfg, monkey
     # gemma was promoted into the judge role that day, so the paid backstop is
     # no longer what fills slot B and withholding it leaves the pool whole.
     # See cfg_without_the_promoted_judge.
-    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    #
+    # cfg_with_gpt_oss_reinstated_as_generator ADDED 2026-08-28: cerebras/
+    # gpt-oss-120b is removed from routing.generator outright (operator
+    # directive - deepseek is the sole generator, cerebras spends only on
+    # judging). bai/deepseek-v4-flash was never keyed in this test (only
+    # CEREBRAS_API_KEY/GROQ_API_KEY are set below) so it was never actually
+    # an ELIGIBLE generator family even before that removal - the two
+    # families this property always walked were gpt-oss and secondgen, both
+    # keyed via cerebras. Reinstating gpt-oss keeps that shape.
+    cfg = cfg_without_the_promoted_judge(
+        cfg_with_two_generator_families(cfg_with_gpt_oss_reinstated_as_generator(cfg))
+    )
     for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     # Withheld EXPLICITLY: the paid backstop is what fills slot B here, so a
@@ -2160,7 +2237,11 @@ def test_the_fleet_refuses_to_start_with_a_judge_slot_it_cannot_fill(cfg, monkey
 
 
 def test_a_widened_pool_starts_clean(cfg, monkeypatch):
-    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
+    # BAI_API_KEY added 2026-08-28: bai/deepseek-v4-flash is the SOLE
+    # routing.generator ref now (operator directive - deepseek is the sole
+    # generator, cerebras spends only on judging), so it needs its own key
+    # for the generator role to have anything usable at all.
+    for env in ("BAI_API_KEY", "CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     refusals, warnings = preflight_messages(cfg_with_fourth_judge_family(cfg), ("generator",))
     assert (refusals, warnings) == ([], [])
@@ -2246,7 +2327,18 @@ def test_allow_pool_gaps_cannot_override_a_gap_no_row_size_escapes(cfg, monkeypa
     # legitimately for. With it gone the keyed judge pool is the 8k model
     # alone, and the unkeyed families are the ones that would fill the slot at
     # any size - which is the key-shaped, unservable gap under test.
-    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    #
+    # cfg_with_gpt_oss_reinstated_as_generator ADDED 2026-08-28: cerebras/
+    # gpt-oss-120b is removed from routing.generator outright (operator
+    # directive - deepseek is the sole generator, cerebras spends only on
+    # judging). bai/deepseek-v4-flash is never keyed in this test (BAI_API_KEY
+    # is never set) so it was never actually an ELIGIBLE generator family
+    # even before that removal - "BOTH generator families" below always meant
+    # gpt-oss and secondgen, both keyed via cerebras. Reinstating gpt-oss
+    # keeps that shape.
+    cfg = cfg_without_the_promoted_judge(
+        cfg_with_two_generator_families(cfg_with_gpt_oss_reinstated_as_generator(cfg))
+    )
     for env in ("CEREBRAS_API_KEY",):
         monkeypatch.setenv(env, "sk-test")
     for env in ("GROQ_API_KEY", "OPENAI_API_KEY", "MISTRAL_API_KEY"):
@@ -2333,7 +2425,18 @@ def test_the_preflight_advises_one_model_that_closes_every_gap_it_reports(cfg, m
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
-    cfg = cfg_with_two_generator_families(cfg)
+    #
+    # cfg_with_gpt_oss_reinstated_as_generator ADDED 2026-08-28: cerebras/
+    # gpt-oss-120b is removed from routing.generator outright (operator
+    # directive - deepseek is the sole generator, cerebras spends only on
+    # judging). bai/deepseek-v4-flash is never keyed in this test (BAI_API_KEY
+    # is never set), so with gpt-oss also gone the only walkable generator
+    # family left is secondgen, and its row is fully served by the shipped
+    # (unstripped) judge/tiebreak pool here - no gap at all. Only a
+    # gpt-oss-generated row reproduces the gap this test reads its advice off
+    # of (gpt-oss lumps groq/openai/gpt-oss-20b and both openai backstops
+    # into one excluded family), so gpt-oss-120b is put back for this test.
+    cfg = cfg_with_two_generator_families(cfg_with_gpt_oss_reinstated_as_generator(cfg))
     for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     with judge_prompt_overlay_with_pinned_tiebreak_gap():
@@ -2406,11 +2509,22 @@ def test_the_preflight_sizes_the_tiebreak_with_the_tiebreak_prompt(
     were split (2026-08-24 judge-calibration Task 2) - so the pin is a model
     that sits between the two requirements; the parameters put the generator
     on each side of the band, because the flat number only reaches a family
-    whose window does not cap it."""
+    whose window does not cap it.
+
+    RE-BASELINED 2026-08-28: cerebras/gpt-oss-120b is removed from
+    routing.generator outright (operator directive - deepseek is the sole
+    generator, cerebras spends only on judging), so narrowing gpt-oss's
+    window alone is now a no-op for routing - it is never walked as a
+    candidate. gpt-oss-120b is reinstated as an additional real generator so
+    this property (pinned to its 4,096 max_output and the numbers derived
+    from it) still has something to narrow and walk; deepseek stays present
+    too (it is still the shipped production ref) but is not what this test
+    exercises."""
     for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     base = cfg_with_context(
-        cfg, family="gpt-oss", role="generator", max_context=generator_window
+        cfg_with_gpt_oss_reinstated_as_generator(cfg),
+        family="gpt-oss", role="generator", max_context=generator_window,
     )
     with judge_prompt_overlay_with_pinned_tiebreak_gap():
         sizer = judge_sizer(base)
@@ -2436,8 +2550,14 @@ def test_the_preflight_refuses_a_judge_slot_that_is_only_missing_a_key(cfg, monk
     keys arrive piecemeal, the fourth-family judge lands behind the provider
     whose key has not arrived, and every routed role still passes
     unkeyed_roles because one of its refs IS keyed. The fleet used to start
-    and buy judge A for every row in the wave."""
-    for env in ("CEREBRAS_API_KEY",):
+    and buy judge A for every row in the wave.
+
+    BAI_API_KEY added 2026-08-28: bai/deepseek-v4-flash is the SOLE
+    routing.generator ref now (operator directive - deepseek is the sole
+    generator, cerebras spends only on judging), so it is the key that makes
+    the generator role usable - cerebras is no longer a generator ref at
+    all, only a judge one (gemma) here."""
+    for env in ("BAI_API_KEY", "CEREBRAS_API_KEY"):
         monkeypatch.setenv(env, "sk-test")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     widened = cfg_with_fourth_judge_family(cfg)  # the new judge is a groq model

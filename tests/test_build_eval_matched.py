@@ -1231,16 +1231,19 @@ def test_contract_from_config_reads_think_min_and_teacher(tmp_path):
     control_c = E.contract_from_config(live)
     treat_c = E.contract_from_config(recovery)
     assert control_c.think_min == treat_c.think_min == 500
-    # NOT a cross-config invariant, even though both sides currently agree:
-    # data_law_v1_exp_recovery.yaml's own header pins it to "Cerebras
-    # gpt-oss-120b is the only generator" as an ISOLATED, frozen experiment,
-    # so it is read against ITSELF rather than against the live side. The live
-    # side cycled bai (family deepseek) through the lead generator slot
-    # 2026-08-25 to 2026-08-27 and back - see routing.generator's own comment
-    # in data_law_v1.yaml - so the two configs coincide here only because
-    # gpt-oss currently leads on both, not because anything requires it.
-    assert control_c.teacher_family == "gpt-oss"
-    assert control_c.teacher_model == "gpt-oss-120b"
+    # NOT a cross-config invariant, and now they visibly disagree rather than
+    # coincide: data_law_v1_exp_recovery.yaml's own header pins it to
+    # "Cerebras gpt-oss-120b is the only generator" as an ISOLATED, frozen
+    # experiment, so it is read against ITSELF rather than against the live
+    # side. The live side cycled bai (family deepseek) through the lead
+    # generator slot 2026-08-25 to 2026-08-27, gpt-oss reclaimed it
+    # 2026-08-27, and on 2026-08-28 the operator made bai/deepseek-v4-flash
+    # the SOLE routing.generator ref outright (cerebras/gpt-oss-120b removed
+    # entirely, cerebras spends only on judging - see routing.generator's own
+    # comment in data_law_v1.yaml). The two configs no longer coincide
+    # because nothing ever required them to.
+    assert control_c.teacher_family == "deepseek"
+    assert control_c.teacher_model == "deepseek-v4-flash"
     assert treat_c.teacher_family == "gpt-oss"
     assert treat_c.teacher_model == "gpt-oss-120b"
     assert control_c.gate_contract == tuple(GATE_ORDER)

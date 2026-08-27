@@ -69,6 +69,19 @@ build:
   # ref 1's 402 currently makes theoretical - if ref 1 comes back this
   # measurement is live again; until then, deepseek is generating everything
   # and this file's think_max reasoning has not been re-evaluated against it.
+  #
+  # SUPERSEDED 2026-08-28, kept in place rather than deleted: "deepseek is
+  # still routing.generator ref 2" (a few lines up) and "if ref 1 comes
+  # back" (just above) both name a two-ref list that no longer exists. Per
+  # the 2026-08-28 operator directive (see routing.generator below),
+  # cerebras/gpt-oss-120b is REMOVED from routing.generator, not merely
+  # 402'ing behind it - deepseek is the SOLE ref, not "ref 2". "If ref 1
+  # comes back" now means "if cerebras/gpt-oss-120b is re-added to
+  # routing.generator", which per that same comment also requires reverting
+  # the 286fd3a prompt-ceiling edit first. The substance is unchanged: gpt-
+  # oss is not generating, the 1,281-row measurement stays historical, and
+  # this file's think_max reasoning still has not been re-evaluated against
+  # deepseek.
   length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 3000, answer_min: 120}
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
@@ -1068,6 +1081,21 @@ routing:
   # doing that job; the fence above is the second, independent guard now that
   # a free non-gpt-oss generator is loose in this file at all.
   #
+  # SUPERSEDED 2026-08-28, kept in place rather than deleted: "Both entries
+  # are family gpt-oss, so this is one generator FAMILY on two providers"
+  # (top of this note) and "gpt-oss leads again so its own family lump keeps
+  # doing that job" are both false now. Per the 2026-08-28 operator
+  # directive, cerebras/gpt-oss-120b is REMOVED from routing.generator -
+  # there is no second provider, and gpt-oss does not lead, because gpt-oss
+  # is not in the list at all. The risk this paragraph describes - a
+  # deepseek-led row makes gpt-oss-family judges (openai/gpt-5-mini,
+  # openai/gpt-5-nano) REACHABLE via family_separation excluding only
+  # {deepseek} - is no longer a sometimes-true failure mode; it is now the
+  # PERMANENT state, on every row, with no gpt-oss lead ever restoring the
+  # old exclusion. What still holds it safe is what this paragraph already
+  # names: THE SPEND FENCE below (usd_cap: 0.0 with prices) blocks real
+  # spend regardless of which family reaches those refs.
+  #
   # Both it and cerebras are free, so the free-before-paid rule does not order
   # them; what did was that cerebras carries `tpd: 1000000`, which against
   # ~2,745 tokens per generated example is ~364 examples/day - a 15-20k corpus
@@ -1075,6 +1103,15 @@ routing:
   # at ~600 calls/hour instead - still true, and still the reason it stays
   # SECOND rather than being dropped: it is the throughput reserve for when
   # cerebras's daily cap is the binding constraint.
+  #
+  # SUPERSEDED 2026-08-28, kept in place rather than deleted: "it stays
+  # SECOND rather than being dropped" no longer describes anything - bai is
+  # not second in a two-ref list, it is the ONLY ref (operator directive,
+  # 2026-08-28; see below). The throughput reasoning (tpd: 1000000 against
+  # ~2,745 tokens/example is a 41-55 day run on cerebras alone) remains an
+  # accurate historical account of why bai was ORIGINALLY added as a
+  # throughput reserve; it is no longer why bai is IN the list, since
+  # cerebras is not in the list to reserve against any more.
   #
   # LIGHTNING REMOVED 2026-08-27. It is PAID and carried no usd_cap, and a
   # review found generate._openai_usd_cap (now _provider_usd_cap) only ever
@@ -1099,11 +1136,57 @@ routing:
   #
   # The lightning provider block itself stays below, unpinned rather than
   # deleted, so its measured limits are not lost.
-  generator: [cerebras/gpt-oss-120b, bai/deepseek-v4-flash]
+  #
+  # SUPERSEDED 2026-08-28, kept in place rather than deleted: "ref 1" and
+  # "ref 2" named POSITIONS in a two-entry list. cerebras/gpt-oss-120b is not
+  # merely 402'ing behind bai/deepseek-v4-flash any more - it is REMOVED from
+  # routing.generator outright (see the operator directive immediately
+  # below). The single-ref consequence described above - no third ref, a
+  # tripped breaker parks rather than fails over - still holds exactly as
+  # written; only the "ref 1 / ref 2" numbering is stale, because there is
+  # now nothing at ref 1.
+  #
+  # OPERATOR DIRECTIVE, 2026-08-28: bai/deepseek-v4-flash is the SOLE
+  # generator now. cerebras spends only on judging from here on
+  # (cerebras/gemma-4-31b, judge slot B) - not generation - because the
+  # cerebras account is now metered (~$4.63 remaining, ~8M tokens as of
+  # today) and the operator wants that balance spent on judging.
+  #
+  # THE MEASURED BASIS: a paired A/B under the SHIPPED prompt templates
+  # (docs/reports/2026-08-27-gptoss-floor-under-the-prompt-ceiling.md,
+  # independently review-verified) put deepseek's length_band pass rate at
+  # 49.5% (n=99) against gpt-oss's 42.2% (n=90) on the same gate, same
+  # templates. deepseek beats gpt-oss under the prompts this file actually
+  # ships.
+  #
+  # THE HONEST CAVEAT: under the PRE-edit prompts gpt-oss measured 55.6% and
+  # would beat deepseek - the prompt-ceiling edit (286fd3a) is what dethroned
+  # it, not a change in gpt-oss itself, and that same edit is a measured
+  # no-op on deepseek. Re-adding gpt-oss as a generator requires reverting
+  # that edit first; it does not qualify on the prompts as currently shipped.
+  #
+  # THE CONSEQUENCES:
+  # (a) A single generator ref means no failover: a bai breaker trip now
+  #     parks rows rather than moving to a second ref, because there is no
+  #     second ref - the same intended trade already recorded above when
+  #     lightning was removed.
+  # (b) Every row is now deepseek-family, so family_separation excludes
+  #     bai/deepseek-v4-flash from routing.judge and routing.tiebreak on
+  #     EVERY row - it stays routed in both lists but is DORMANT there until
+  #     a second generator family returns.
+  generator: [bai/deepseek-v4-flash]
   # JUDGE: qwen then gemma, the two free families, then the paid backstops -
   # which is the standing "every free judge is preferred to the paid one" rule.
   # On a gpt-oss generation family separation removes both openai models, so
   # the two slots really are qwen (A) and gemma (B).
+  #
+  # SUPERSEDED 2026-08-28, kept in place rather than deleted: "On a gpt-oss
+  # generation" now describes a case that cannot occur - cerebras/
+  # gpt-oss-120b is removed from routing.generator (operator directive,
+  # 2026-08-28; see routing.generator above), so no generation is ever
+  # gpt-oss family any more. Every generation is deepseek family, which is
+  # the "any other" case the mechanism below (groq/openai/gpt-oss-20b ADDED
+  # 2026-08-27) already covers.
   #
   # SLOT B WAS EMPTY on 2026-08-27: cerebras/gemma-4-31b answers HTTP 402
   # payment_required, verified by direct probe that day, as does
@@ -1222,6 +1305,19 @@ routing:
   # of them. Mistral first costs nothing on a gpt-oss row (it never wins there
   # either) and is what keeps a deepseek row's tiebreak off the family that
   # scored 0/10 on IPC->BNS mapping.
+  #
+  # SUPERSEDED 2026-08-28, kept in place rather than deleted: "gpt-oss
+  # reclaimed routing.generator's lead slot" and "deepseek is still ref 2"
+  # both name a two-ref list that the 2026-08-28 operator directive removed.
+  # cerebras/gpt-oss-120b is out of routing.generator entirely, so deepseek
+  # is not "leading" a list it shares with gpt-oss - it is the only entry.
+  # Every generation is now deepseek-led, on every row, not "on every row
+  # cerebras is cooling or throttled for" - the "minority of rows" this
+  # paragraph describes is now ALL rows. Mistral staying first is no longer a
+  # hedge against an occasional silent seat change; it is what keeps EVERY
+  # contested row's tiebreak off the family measured 0/10 on IPC->BNS
+  # mapping. The conclusion (mistral first, unchanged) still holds - only the
+  # "minority" framing is stale.
   # deepseek added 2026-08-27 with the judge seat, same reasoning and same
   # placement rule: after the free refs, ahead of the paid ones. It cannot
   # break a tie it was party to - family_separation removes the generator's
