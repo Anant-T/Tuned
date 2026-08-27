@@ -200,6 +200,67 @@ RITUAL_DEFUSERS = (
     "saving it for the end",
 )
 
+# The counterpart list for the LENGTH band, and the same idiom for the same
+# reason: an accepted-phrasing list rather than free text, so the property
+# cannot drift back out of a template during an edit.
+#
+# These are LICENCES - phrasings that permit the reasoning to exceed the cap
+# the same sentence just set. All four pre-edit surface forms were built on
+# "as long as" ("runs as long as the matter needs", "takes as long as the
+# question deserves", ...), but that single surface is not the property. A
+# review on 2026-08-27 defeated an "as long as"-only guard with:
+#
+#   "...450 to 700 words of deliberation, and 700 is merely typical --
+#    continue further if the matter genuinely requires more depth."
+#
+# which contains no "as long as", puts 700 after the marker, and restores the
+# permission completely. So the list covers four families: (a) restating the
+# cap as merely descriptive - which is what the pre-edit templates literally
+# did, "is normal for a matter of any substance"; (b) open-ended permission;
+# (c) permission to continue past the stop; (d) conditional exemption.
+#
+# Two entries are deliberate judgement calls. "more depth" is the weakest -
+# on its own it describes depth rather than licensing overrun - and is kept
+# because it is the tail of the known counterexample and no legitimate
+# template wording has needed it. Bare "exceed" is deliberately NOT here: it
+# collides with gen_statute_qa_v4's own ceiling, "700 is not to be exceeded",
+# where the word is doing the opposite job.
+#
+# This list NARROWS the hole; it does not close it. See
+# test_generator_caps_the_band_from_above_and_grants_no_licence.
+LENGTH_LICENCES = (
+    # (a) restates the cap as merely descriptive
+    "is normal",
+    "is typical",
+    "merely typical",
+    "only typical",
+    "rough guide",
+    "guideline",
+    # (b) open-ended permission
+    "as long as",
+    "however long",
+    "whatever length",
+    "no upper limit",
+    "no hard limit",
+    "not a hard limit",
+    "not a strict limit",
+    # (c) permission to continue past the stop
+    "continue further",
+    "go further",
+    "go beyond",
+    "run longer",
+    "longer if",
+    "keep going",
+    "need not stop",
+    # (d) conditional exemption
+    "unless the matter",
+    "genuinely requires",
+    "if it requires",
+    "if the matter requires",
+    "if the point requires",
+    "more depth",
+)
+
 # What an enumeration ITEM looks like: an interrogative opening a list item,
 # i.e. one introduced by the colon/dash that opens the list or by the comma
 # between items. Anchoring on that punctuation is what separates a checklist
@@ -497,17 +558,38 @@ def test_generator_caps_the_band_from_above_and_grants_no_licence(prompt_id):
 
     CEILING: only the text AFTER the band marker counts. The marker contains
     "700" itself, so partitioning on it is what makes the pre-ceiling wording
-    fail rather than pass by accident.
+    fail rather than pass by accident (a naive `"700" in user` returns True on
+    the pre-edit text).
 
     LICENCE: every one of the fourteen templates capped the reasoning and
-    then, in the same sentence, licensed it past the cap - "runs as long as
-    the matter needs", "takes as long as the question deserves", and two
-    other surface forms. gpt-oss obeyed the cap; deepseek-v4-flash obeyed the
-    licence and wrote a median 1,727 words, ~80% of all gate failures. The
-    shared surface of that family is "as long as", which appears nowhere in
-    any template now, so its absence is the cheap general guard. A future
-    licence phrased some other way would still slip past this - the ceiling
-    check above is the backstop.
+    then, in the same sentence, licensed it past the cap. gpt-oss obeyed the
+    cap; deepseek-v4-flash obeyed the licence and wrote a median 1,727 words,
+    ~80% of all gate failures. Checked against LENGTH_LICENCES.
+
+    WHAT THIS DOES NOT DO, stated plainly, because the honest limits matter
+    more than the coverage:
+
+    The ceiling assert is NOT a reliable backstop for a reworded licence. It
+    verifies that the digit 700 is PRESENT after the marker; it cannot verify
+    that 700 BINDS. "700 is merely typical -- continue further if the matter
+    genuinely requires more depth" satisfies it completely while restoring the
+    permission in full. An earlier version of this docstring called the
+    ceiling assert the backstop for exactly that case. It is not, and a review
+    was right to say so.
+
+    The licence assert is a PHRASE LIST, so it is evaded by any wording not on
+    it. It is also brittle in a specific way worth knowing: matching is plain
+    substring, so an inserted adverb defeats a long entry - "if the matter
+    genuinely requires" does not contain "if the matter requires". The list
+    leans on short, family-level phrases for that reason, but the weakness is
+    structural, not a gap to be patched away.
+
+    Between them these two narrow the hole; neither closes it, and together
+    they do not close it either. Prose cannot be tested for permissiveness -
+    a licence can always be written in words nobody listed. What this test
+    buys is that the KNOWN regressions, including the one a reviewer actually
+    constructed, cannot land silently. The next edit to this sentence is not
+    safe merely because the suite is green; it still needs a human to read it.
     """
     user = reg.load(prompt_id).user or ""
     _, marker, after = user.partition(REASONING_FLOOR_CLAUSE)
@@ -519,10 +601,15 @@ def test_generator_caps_the_band_from_above_and_grants_no_licence(prompt_id):
         f"450 to 700 and then leaving the length open is the exact wording that "
         f"produced a median 1,727-word trace."
     )
-    assert "as long as" not in _norm_ws(user).lower(), (
-        f"{prompt_id} has an 'as long as' licence again. Capping the reasoning "
-        f"and then permitting it to run past the cap in the same breath is the "
-        f"2026-08-27 regression; the cap is the instruction, not the licence."
+    lowered = _norm_ws(user).lower()
+    licences = sorted(phrase for phrase in LENGTH_LICENCES if phrase in lowered)
+    assert not licences, (
+        f"{prompt_id} licenses the reasoning past its own cap: {licences}. "
+        f"Capping the reasoning and then permitting it to run past the cap in "
+        f"the same breath is the 2026-08-27 regression; the cap is the "
+        f"instruction, not the licence. If the phrase here is genuinely "
+        f"innocent, that is a judgement call for a human - narrow the entry in "
+        f"LENGTH_LICENCES on purpose, do not delete it to get green."
     )
 
 
