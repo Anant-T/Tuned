@@ -1948,8 +1948,17 @@ def test_unkeyed_roles_names_the_role_and_the_env_vars(cfg, monkeypatch):
     # and cerebras (both free) and lightning (paid, the overflow). All three
     # keys are named because any one alone makes the role usable - the list is
     # the failover, and the ORDER of the refs is where the cost policy lives,
-    # not here.
-    assert gaps["generator"] == ("BAI_API_KEY", "CEREBRAS_API_KEY", "LIGHTNING_API_KEY")
+    # not here (it moved once already: bai led 2026-08-25 to 2026-08-27, then
+    # gpt-oss reclaimed the lead slot - see routing.generator's own comment).
+    # So the order asserted here is DERIVED from the live config's routing
+    # rather than a snapshot that the next reorder would silently outdate.
+    expected_generator_envs = []
+    for ref in cfg.routing_refs("generator"):
+        provider, _ = cfg.model_for(ref)
+        if provider.api_key_env not in expected_generator_envs:
+            expected_generator_envs.append(provider.api_key_env)
+    assert gaps["generator"] == tuple(expected_generator_envs)
+    assert set(gaps["generator"]) == {"BAI_API_KEY", "CEREBRAS_API_KEY", "LIGHTNING_API_KEY"}
     assert "GROQ_API_KEY" in gaps["judge"]
     # One key is enough to make a role usable: the rest is failover.
     monkeypatch.setenv("GROQ_API_KEY", "sk-test")
@@ -2693,15 +2702,19 @@ def test_the_tiebreak_slot_is_sized_by_its_own_prompt(cfg, keys):
         sized = pool_gaps(
             patched, needed_tokens=judge_needed, tiebreak_needed_tokens=tiebreak_needed
         )
-        # All three generator families now: deepseek (bai, since 2026-08-25)
-        # joins gpt-oss and secondgen because the paid backstop is spent on
-        # judge slot B for a mistral row and is therefore gone from its
-        # tiebreak too. What the test turns on is unchanged: every one of
-        # these flips on the pinned gap between the judge prompt and the
-        # tiebreak prompt.
+        # All three generator families now: deepseek (bai) joins gpt-oss and
+        # secondgen because the paid backstop is spent on judge slot B for a
+        # mistral row and is therefore gone from its tiebreak too. The ORDER
+        # here follows routing.generator: gpt-oss led 2026-08-18 to
+        # 2026-08-25, deepseek led 2026-08-25 to 2026-08-27, and gpt-oss is
+        # back in front since (Task 1) - so gpt-oss precedes deepseek again,
+        # with secondgen last because cfg_with_two_generator_families always
+        # appends it. What the test turns on is unchanged regardless of this
+        # order: every one of these flips on the pinned gap between the judge
+        # prompt and the tiebreak prompt.
         assert [(g.role, g.generator_family) for g in sized] == [
-            ("tiebreak", "deepseek"),
             ("tiebreak", "gpt-oss"),
+            ("tiebreak", "deepseek"),
             ("tiebreak", "secondgen"),
         ]
         # Sized by the JUDGE's number instead, that same model reads as big

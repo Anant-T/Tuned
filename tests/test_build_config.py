@@ -675,10 +675,21 @@ def test_live_config_has_no_recovery_or_harmony_experiment_knobs():
 _RECOVERY_SPEND_KEYS = ("usd_cap", "usd_per_1m_prompt", "usd_per_1m_completion")
 
 
-def test_live_openai_limits_have_no_recovery_spend_keys():
-    """Pin the reverted live-config leakage: experiment usd_cap/pricing
-    must not reappear on the frozen OpenAI backstop. Family stays gpt-oss
-    so live family separation still excludes those judges from gpt-oss rows.
+def test_live_openai_limits_carry_a_blocking_cap_not_the_recovery_wallet():
+    """The invariant this used to pin - the live OpenAI backstop carries NONE
+    of `_RECOVERY_SPEND_KEYS` - stopped holding on 2026-08-27 on purpose: a
+    deepseek lead generator made these two judges reachable through
+    `family_separation` on a config with no spend cap anywhere, so the live
+    block got its OWN usd_cap fence. That is not the leakage this test was
+    written against, and the distinction is checkable rather than asserted by
+    fiat: the live fence is a HARD BLOCK (usd_cap 0.0, which fails the first
+    positive-priced token) where the recovery experiment
+    (data_law_v1_exp_recovery.yaml) declares an ENABLING wallet (usd_cap 1.66,
+    which lets real spend through up to that amount) on a model relabelled
+    `family: gpt-5` for the opposite reason - so it is reachable from a
+    gpt-oss row rather than excluded from one. Family staying gpt-oss here is
+    still what keeps live family separation excluding these judges from a
+    gpt-oss generation.
     """
     cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
     provider, _ = cfg.model_for(ModelRef("openai", "gpt-5-mini"))
@@ -687,7 +698,8 @@ def test_live_openai_limits_have_no_recovery_spend_keys():
     for model in models.values():
         assert model.family == "gpt-oss", model.id
         for key in _RECOVERY_SPEND_KEYS:
-            assert key not in model.limits, (model.id, key)
+            assert key in model.limits, (model.id, key)
+        assert model.limits["usd_cap"] == 0.0, model.id
 
 
 def test_recovery_config_is_isolated_and_cerebras_only():

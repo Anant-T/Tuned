@@ -13,7 +13,22 @@ build:
   mix: {grounded_synthesis: 0.60, curated: 0.16, replay: 0.24}
   overgeneration: 2.0
   held_out_frac: 0.10
-  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 3000, answer_min: 120}
+  # think_max RAISED 3000 -> 4000 on 2026-08-27, measured over the 99 banked
+  # v4 (bai/deepseek-v4-flash) generations in
+  # data/build/exp_deepseek/state/law_v1.sqlite3:
+  #
+  #   #   think_max   length_band pass   blocked by total_max alone
+  #   #   3000              49.5%              4.0%
+  #   #   4000              60.6%             10.1%
+  #   #   4500              63.6%             16.2%
+  #   #   inf               64.6%             33.3%
+  #
+  # The gain saturates past 4000: the binding constraint becomes total_max
+  # (8192, the STUDENT's context - not moved by this or any config change),
+  # not think_max. 4000 is the point on the curve that buys most of the
+  # available pass-rate gain (49.5% -> 60.6%) before the marginal return
+  # drops off and the cost shifts to a ceiling this file cannot lift.
+  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 4000, answer_min: 120}
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
 
@@ -648,10 +663,33 @@ providers:
       # both refs sit LAST in routing.judge and routing.tiebreak, so every
       # free judge is tried first and these are reached only by rows nothing
       # free can serve.
+      # THE SPEND FENCE, added 2026-08-27 once a deepseek lead generator made
+      # these two reachable (family_separation only excludes {deepseek} on a
+      # deepseek row, not {deepseek, gpt-oss} - so a slot-B pool gap, the exact
+      # state a 2026-08-23 live drain stalled in with 34 judge_error, would
+      # reach a paid judge on a config that had NO usd_cap anywhere).
+      #
+      # usd_cap: 0.0 means the wallet is zero, so any POSITIVE per-token price
+      # fails generate._openai_usd_spent(...) + est_cost > usd_cap on the
+      # first call and blocks it before a token is sent.
+      #
+      # THE TRAP: usd_cap ALONE BLOCKS NOTHING. generate._usd_per_1m returns
+      # 0.0 for a missing usd_per_1m_prompt/usd_per_1m_completion key, so with
+      # only usd_cap set the check computes `0.0 + 0.0 > 0.0`, which is False
+      # forever - a cap with no prices reads as free. Both price keys must sit
+      # beside the cap for it to do anything; verified both ways (with and
+      # without the price keys) against this shipped config, see
+      # data/build/exp_gptoss_ctl/out/fence_check.txt.
+      #
+      # mini's published prices ($0.25 / $2.00 per 1M) are used for BOTH
+      # models below. That is not a claim that nano was priced the same - at
+      # usd_cap 0.0 the exact figure cannot matter, since any positive price
+      # blocks at the first token regardless of which one it is.
       - id: gpt-5-mini
         family: gpt-oss
         roles: [judge, tiebreak]
-        limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384}
+        limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
+                 usd_cap: 0.0, usd_per_1m_prompt: 0.25, usd_per_1m_completion: 2.0}
         params: {}
       - id: gpt-5-nano
         family: gpt-oss
@@ -659,7 +697,8 @@ providers:
         # The calibration candidate: ~5x cheaper than mini, and carried here
         # so the P5 gate can compare the two on real judgments rather than on
         # price alone.
-        limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384}
+        limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
+                 usd_cap: 0.0, usd_per_1m_prompt: 0.25, usd_per_1m_completion: 2.0}
         params: {}
 
 # Mistral rpm/tpm are console+header-verified 2026-08-14 and are no longer
@@ -814,15 +853,32 @@ routing:
   # providers rather than a second family: family separation still removes
   # gpt-oss from the judge pool for every row, and undersized_families still
   # takes the family's largest window.
-  # deepseek LEADS since 2026-08-25. Both it and cerebras are free, so the
-  # free-before-paid rule does not order them; what does is that cerebras
-  # carries `tpd: 1000000`, which against ~2,745 tokens per generated example
-  # is ~364 examples/day - a 15-20k corpus is a 41-55 DAY run on it. b.ai has
-  # no observed daily cap and is rate-bound at ~600 calls/hour instead.
-  # cerebras stays second because it is 35x faster per call (2.1 s vs 33 s) and
-  # is the right overflow when b.ai is cooling or throttled; lightning stays
-  # last because it is the only PAID ref and the free budget drains first.
-  generator: [bai/deepseek-v4-flash, cerebras/gpt-oss-120b,
+  # deepseek LED 2026-08-25 to 2026-08-27, DEMOTED BACK behind cerebras/gpt-oss
+  # on 2026-08-27. The throughput case for leading with it (below) was never
+  # wrong, but it was incomplete: `routing.family_separation` excludes only
+  # the GENERATOR's own family, and deepseek is the one generator family in
+  # this file that is not also sitting in the judge pool (see the bai provider
+  # block). With gpt-oss leading, separation excludes {gpt-oss} and the paid
+  # openai judges - also family gpt-oss, by deliberate design - are excluded
+  # right along with the generator. With deepseek leading, separation excludes
+  # only {deepseek}, and gpt-oss-family judges become REACHABLE on every row -
+  # on a config that, until the fence added above, had no usd_cap anywhere.
+  # The failover condition that would land on them is not hypothetical: a
+  # 2026-08-23 live drain stalled on a slot-B pool gap with 34 judge_error,
+  # which is exactly the state in which the pool reaches judge position 3
+  # (openai/gpt-5-mini). gpt-oss leads again so its own family lump keeps
+  # doing that job; the fence above is the second, independent guard now that
+  # a free non-gpt-oss generator is loose in this file at all.
+  #
+  # Both it and cerebras are free, so the free-before-paid rule does not order
+  # them; what did was that cerebras carries `tpd: 1000000`, which against
+  # ~2,745 tokens per generated example is ~364 examples/day - a 15-20k corpus
+  # is a 41-55 DAY run on it. b.ai has no observed daily cap and is rate-bound
+  # at ~600 calls/hour instead - still true, and still the reason it stays
+  # SECOND rather than being dropped: it is the throughput reserve for when
+  # cerebras's daily cap is the binding constraint. lightning stays last
+  # because it is the only PAID ref and the free budget drains first.
+  generator: [cerebras/gpt-oss-120b, bai/deepseek-v4-flash,
               lightning/lightning-ai/gpt-oss-120b]
   # JUDGE: qwen then gemma, the two free families, then the paid backstops -
   # which is the standing "every free judge is preferred to the paid one" rule.
@@ -853,6 +909,16 @@ routing:
   # do: mistral's probed window is 52,812, so on a row longer than that
   # undersized_families removes mistral and 20b's 131,072 is what stops the
   # tiebreak pool emptying.
+  # LEFT EXACTLY AS IS ON 2026-08-27, when gpt-oss reclaimed routing.generator's
+  # lead slot from deepseek - do NOT "tidy" this back to gpt-oss-20b-first.
+  # deepseek is still ref 2 in routing.generator, so deepseek-led generations
+  # still happen on every row cerebras is cooling or throttled for, and on
+  # exactly those rows gpt-oss-20b is still eligible-and-first the moment
+  # mistral is not ahead of it - the same silent seat change the 2026-08-25
+  # paragraph above describes, just now on a minority of rows instead of all
+  # of them. Mistral first costs nothing on a gpt-oss row (it never wins there
+  # either) and is what keeps a deepseek row's tiebreak off the family that
+  # scored 0/10 on IPC->BNS mapping.
   tiebreak: [mistral/mistral-large-latest, groq/openai/gpt-oss-20b,
              cerebras/gemma-4-31b,
              openai/gpt-5-mini, openai/gpt-5-nano]

@@ -1231,14 +1231,16 @@ def test_contract_from_config_reads_think_min_and_teacher(tmp_path):
     control_c = E.contract_from_config(live)
     treat_c = E.contract_from_config(recovery)
     assert control_c.think_min == treat_c.think_min == 500
-    # NOT a cross-config invariant since bai (family deepseek) took the live
-    # generator's lead spot on 2026-08-25: data_law_v1_exp_recovery.yaml's own
-    # header pins it to "Cerebras gpt-oss-120b is the only generator" as an
-    # ISOLATED, frozen experiment, so the live and recovery teachers are now
-    # expected to differ rather than required to match. Each side is read
-    # against its own config instead of against the other.
-    assert control_c.teacher_family == "deepseek"
-    assert control_c.teacher_model == "deepseek-v4-flash"
+    # NOT a cross-config invariant, even though both sides currently agree:
+    # data_law_v1_exp_recovery.yaml's own header pins it to "Cerebras
+    # gpt-oss-120b is the only generator" as an ISOLATED, frozen experiment,
+    # so it is read against ITSELF rather than against the live side. The live
+    # side cycled bai (family deepseek) through the lead generator slot
+    # 2026-08-25 to 2026-08-27 and back - see routing.generator's own comment
+    # in data_law_v1.yaml - so the two configs coincide here only because
+    # gpt-oss currently leads on both, not because anything requires it.
+    assert control_c.teacher_family == "gpt-oss"
+    assert control_c.teacher_model == "gpt-oss-120b"
     assert treat_c.teacher_family == "gpt-oss"
     assert treat_c.teacher_model == "gpt-oss-120b"
     assert control_c.gate_contract == tuple(GATE_ORDER)
