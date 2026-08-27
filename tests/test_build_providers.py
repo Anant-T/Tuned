@@ -77,6 +77,7 @@ from tuned.data.providers import (
     undersized_families,
     unkeyed_roles,
 )
+from tuned.data import providers  # noqa: E402 - module access for private hook internals below
 
 DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
 
@@ -409,7 +410,7 @@ def test_unknown_quirk_name_raises_at_construction():
 
 def test_resolve_quirks_composes_request_hooks_in_order():
     composed = resolve_quirks(("groq", "cerebras"))
-    clamped = composed.request_hook({"max_tokens": 99999}, _model())
+    clamped = composed.request_hook({"max_tokens": 99999}, _model(), "generator")
     assert clamped["max_tokens"] == 4096
     assert resolve_quirks(()) is QUIRKS["default"]
     assert resolve_quirks(("groq",)) is QUIRKS["groq"]
@@ -546,6 +547,20 @@ def test_bai_quirk_passes_through_a_complete_reply(monkeypatch):
     )
     assert partial.text == "Section 103 of the"
     assert partial.finish_reason == "length"
+
+
+def test_the_bai_hook_leaves_a_judge_reply_budget_alone():
+    model = _model(limits={"max_output": 16384})
+    payload = {"max_tokens": providers.DEFAULT_JUDGE_REPLY_TOKENS}
+    for role in ("judge", "tiebreak"):
+        out = providers._bai_request_hook(dict(payload), model, role)
+        assert out["max_tokens"] == providers.DEFAULT_JUDGE_REPLY_TOKENS, role
+
+
+def test_the_bai_hook_still_raises_a_generator_budget():
+    model = _model(limits={"max_output": 16384})
+    out = providers._bai_request_hook({"max_tokens": 4000}, model, "generator")
+    assert out["max_tokens"] == 16384
 
 
 # --- 3. retries -------------------------------------------------------------

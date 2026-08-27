@@ -255,7 +255,11 @@ class ChatResponse:
 # --- quirks -----------------------------------------------------------------
 
 
-def _default_request_hook(payload: dict, model: ModelCfg) -> dict:
+def _default_request_hook(payload: dict, model: ModelCfg, role: str | None) -> dict:
+    # role is unused: the default hook makes no provider-specific adjustment,
+    # so it has nothing to condition on. It is still part of the signature
+    # because every Quirk.request_hook is called uniformly by build_payload.
+    del role
     return payload
 
 
@@ -512,13 +516,18 @@ def _default_retry_after(response: object) -> float | None:
 
 @dataclass(frozen=True)
 class Quirk:
-    request_hook: Callable[[dict, ModelCfg], dict]
+    request_hook: Callable[[dict, ModelCfg, str | None], dict]
     response_hook: Callable[[dict], tuple[str, str | None]]
     retry_after: Callable[[object], float | None]
 
 
-def _cerebras_request_hook(payload: dict, model: ModelCfg) -> dict:
-    """Cerebras 400s on max_tokens above the model's own output ceiling."""
+def _cerebras_request_hook(payload: dict, model: ModelCfg, role: str | None) -> dict:
+    """Cerebras 400s on max_tokens above the model's own output ceiling.
+
+    role is unused: the ceiling is a property of the model, not of what the
+    call is for, so a judge call and a generator call clamp identically.
+    """
+    del role
     max_output = model.limits.get("max_output")
     requested = payload.get("max_tokens")
     if max_output is None or requested is None or requested <= max_output:
@@ -528,8 +537,12 @@ def _cerebras_request_hook(payload: dict, model: ModelCfg) -> dict:
     return clamped
 
 
-def _openai_request_hook(payload: dict, model: ModelCfg) -> dict:
+def _openai_request_hook(payload: dict, model: ModelCfg, role: str | None) -> dict:
     """The gpt-5 family rejects two fields every other provider here accepts.
+
+    role is unused: both the field rename and the temperature drop are wire
+    incompatibilities of the gpt-5 family itself, and apply the same way
+    whichever role placed the call.
 
     Both measured against the live API on 2026-08-15, and both came back 400 -
     not a warning, not a silently ignored field, so neither can be left to the
@@ -555,6 +568,7 @@ def _openai_request_hook(payload: dict, model: ModelCfg) -> dict:
     pool - which is right, and which makes this hook the only thing standing
     between a paid backstop and a judge role that 400s on every call.
     """
+    del role
     adjusted = dict(payload)
     adjusted.pop("temperature", None)
     if "max_tokens" not in adjusted:
@@ -574,7 +588,15 @@ def _openai_request_hook(payload: dict, model: ModelCfg) -> dict:
     return adjusted
 
 
-def _bai_request_hook(payload: dict, model: ModelCfg) -> dict:
+# The two roles a call to the judge fleet can carry. No shared constant named
+# this pairing existed anywhere in providers.py or judge.py - config.py's
+# _ROLES includes "generator" and "probe" too, and every other place that
+# lists ("judge", "tiebreak") does so as a bare inline tuple - so this is
+# introduced here rather than reused.
+JUDGING_ROLES = ("judge", "tiebreak")
+
+
+def _bai_request_hook(payload: dict, model: ModelCfg, role: str | None) -> dict:
     """The caller's budget is an ANSWER budget; b.ai's is a REPLY budget.
 
     This is the mirror image of ``_cerebras_request_hook``, and it exists for
@@ -599,7 +621,23 @@ def _bai_request_hook(payload: dict, model: ModelCfg) -> dict:
     ``max_output_tokens(cfg)``, a config value rather than what went on the
     wire, so an over-long answer is still caught by the gates while the model
     gets the room it needs to think.
+
+    All of the above is a GENERATION problem: reasoning is billed against
+    ``max_tokens`` and emitted first, so a generous-looking answer budget gets
+    eaten by thinking before the answer starts, and raising the ceiling gives
+    the answer room to appear.  A judge call is the opposite case - it is
+    called with a deliberately small reply budget
+    (``DEFAULT_JUDGE_REPLY_TOKENS``/``JUDGE_MAX_TOKENS``, 1024) because a
+    verdict is short by design, and raising that budget 16x to the model's
+    ceiling does not give an answer more room - it gives the model sixteen
+    times as much room to think instead of judge.  That is the exact failure
+    commit ``4bcf014`` ("a judge that spends its reply budget thinking is not
+    a judge") fixed once already; unconditionally raising here would
+    reintroduce it for every b.ai judge and tiebreak call.  So a call placed
+    in one of ``JUDGING_ROLES`` is left untouched.
     """
+    if role in JUDGING_ROLES:
+        return payload
     max_output = model.limits.get("max_output")
     requested = payload.get("max_tokens")
     if max_output is None or requested is None or requested >= max_output:
@@ -705,9 +743,9 @@ def resolve_quirks(names: Sequence[str]) -> Quirk:
     if len(quirks) == 1:
         return quirks[0]
 
-    def chained_request_hook(payload: dict, model: ModelCfg) -> dict:
+    def chained_request_hook(payload: dict, model: ModelCfg, role: str | None) -> dict:
         for quirk in quirks:
-            payload = quirk.request_hook(payload, model)
+            payload = quirk.request_hook(payload, model, role)
         return payload
 
     response_hook = next(
@@ -935,7 +973,7 @@ class ChatClient:
             payload.setdefault("stop", list(HARMONY_STOP))
             if req.max_tokens is not None:
                 payload["max_tokens"] = req.max_tokens
-            return self.quirk.request_hook(payload, self.model)
+            return self.quirk.request_hook(payload, self.model, req.role)
 
         payload: dict = {
             "model": self.model.id,
@@ -946,7 +984,7 @@ class ChatClient:
         }
         if req.max_tokens is not None:
             payload["max_tokens"] = req.max_tokens
-        return self.quirk.request_hook(payload, self.model)
+        return self.quirk.request_hook(payload, self.model, req.role)
 
     def _backoff(self, attempt: int) -> float:
         """Exponential base 1s capped at 60s with FULL jitter."""
