@@ -1418,6 +1418,48 @@ def test_openai_usd_cap_is_hard_and_shared_across_models(tmp_path, cfg):
         assert store.events("budget_probe_grant") == []
 
 
+def test_a_usd_cap_blocks_on_whichever_provider_declares_it(tmp_path, cfg):
+    """A usd_cap must be enforced no matter which provider declares it.
+
+    Before this change the fence only ever consulted the provider literally
+    named "openai" - _openai_usd_cap iterated cfg.providers and `continue`d
+    past every block whose name was not "openai", and the branch in
+    budget_ok that spent it was gated on `if provider == "openai":`. A
+    usd_cap declared on any other provider (lightning, in this build) was
+    therefore decoration: the config could express a fence that did not
+    exist. This mirrors test_openai_usd_cap_is_hard_and_shared_across_models
+    but prices a non-openai provider instead.
+    """
+    from dataclasses import replace
+
+    priced = []
+    for provider in cfg.providers:
+        if provider.name != "lightning":
+            priced.append(provider)
+            continue
+        models = tuple(
+            replace(
+                model,
+                limits={
+                    **model.limits,
+                    "usd_per_1m_prompt": 0.25,
+                    "usd_per_1m_completion": 2.0,
+                    "usd_cap": 0.0,
+                },
+            )
+            for model in provider.models
+        )
+        priced.append(replace(provider, models=models))
+    cfg = replace(cfg, providers=tuple(priced))
+
+    with open_store(tmp_path, n_seeds=0) as store:
+        budget_ok = budget_ok_for(store, cfg, quota=QuotaLedger())
+        assert (
+            budget_ok("lightning", "lightning-ai/gpt-oss-120b", est_tokens=100_000)
+            is False
+        )
+
+
 # --------------------------------------------------------------------------
 # The loop itself.
 # --------------------------------------------------------------------------

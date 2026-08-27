@@ -476,27 +476,49 @@ def _usd_per_1m(limits: Mapping, *, completion: bool) -> float:
     return float(limits.get(key) or 0.0)
 
 
-def _openai_usd_cap(cfg) -> float | None:
-    """Shared OpenAI wallet if the config declared one. None means uncapped."""
-    for provider in cfg.providers:
-        if provider.name != "openai":
+def _provider_usd_cap(cfg, provider: str) -> float | None:
+    """Shared USD wallet for `provider`, if the config declared one.
+
+    Formerly `_openai_usd_cap`, which iterated cfg.providers and `continue`d
+    past every block whose name was not literally "openai" - so a usd_cap
+    declared on any OTHER provider (lightning, in this build) was silently
+    unreachable: budget_ok never looked, and the config could express a
+    fence that did not exist. This takes the provider name as an argument
+    instead of hardcoding one, so whichever provider declares a cap gets it
+    enforced. Precedence is unchanged from the original: a `usd_cap`
+    attribute on the provider itself wins, otherwise the first model whose
+    `limits` carries `usd_cap`. None still means uncapped.
+    """
+    for p in cfg.providers:
+        if p.name != provider:
             continue
-        cap = getattr(provider, "usd_cap", None)
+        cap = getattr(p, "usd_cap", None)
         if cap is not None:
             return float(cap)
-        for model in provider.models:
+        for model in p.models:
             if "usd_cap" in model.limits:
                 return float(model.limits["usd_cap"])
     return None
 
 
-def _openai_usd_spent(store, cfg, *, day: str | None = None) -> float:
+def _provider_usd_spent(store, cfg, provider: str, *, day: str | None = None) -> float:
+    """Total spend to date against `provider`'s shared wallet.
+
+    Formerly `_openai_usd_spent`, hardcoded to the provider literally named
+    "openai" the same way `_provider_usd_cap` was. Sums across every model
+    under `provider` (not just the model being called) so a shared cap like
+    the openai gpt-5-mini/gpt-5-nano wallet stays shared for any provider,
+    not just that one. A missing usd_per_1m_prompt/usd_per_1m_completion key
+    still reads as 0.0 via `_usd_per_1m` - unchanged on purpose, since the
+    openai fence's correctness depends on both price keys being present
+    beside usd_cap rather than on a missing price failing loudly.
+    """
     spent = 0.0
-    for provider in cfg.providers:
-        if provider.name != "openai":
+    for p in cfg.providers:
+        if p.name != provider:
             continue
-        for model in provider.models:
-            used = store.usage_today("openai", model.id, day=day)
+        for model in p.models:
+            used = store.usage_today(provider, model.id, day=day)
             spent += (
                 used["prompt_tokens"]
                 * _usd_per_1m(model.limits, completion=False)
@@ -547,16 +569,19 @@ def budget_ok_for(store, cfg, *, quota=None):
         except KeyError:
             return True
 
-        if provider == "openai":
-            usd_cap = _openai_usd_cap(cfg)
-            if usd_cap is not None:
-                est_cost = (
-                    float(est_tokens)
-                    * _usd_per_1m(model_cfg.limits, completion=False)
-                    / 1_000_000.0
-                )
-                if _openai_usd_spent(store, cfg) + est_cost > usd_cap:
-                    return False
+        # Any provider that declares a usd_cap gets it enforced, not just the
+        # one literally named "openai" - see _provider_usd_cap's docstring
+        # for why the old `if provider == "openai":` gate was wrong: a cap
+        # declared elsewhere (lightning, in this build) was silently unreachable.
+        usd_cap = _provider_usd_cap(cfg, provider)
+        if usd_cap is not None:
+            est_cost = (
+                float(est_tokens)
+                * _usd_per_1m(model_cfg.limits, completion=False)
+                / 1_000_000.0
+            )
+            if _provider_usd_spent(store, cfg, provider) + est_cost > usd_cap:
+                return False
 
         local_ok = store.reserve_budget(
             provider, model, est_tokens, limits=model_cfg.limits

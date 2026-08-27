@@ -1046,7 +1046,7 @@ def test_the_deepseek_arm_config_is_fenced(tmp_path):
     1. The live generator list falls over bai -> cerebras/gpt-oss -> paid
        lightning; a 429 storm would turn a deepseek arm into a gpt-oss arm
        without anything noticing. The arm pins the single ref.
-    2. The live config declares no openai usd_cap, which _openai_usd_cap
+    2. The live config declares no openai usd_cap, which _provider_usd_cap
        reads as UNCAPPED, and gpt-5-mini/nano sit in judge and tiebreak as
        backstops. usd_cap 0.0 ALONE does not block either - _usd_per_1m
        returns 0.0 for a missing price, so est_cost is 0 and 0 > 0.0 is
@@ -1055,12 +1055,12 @@ def test_the_deepseek_arm_config_is_fenced(tmp_path):
     """
     import yaml
 
-    from tuned.data.generate import _openai_usd_cap
+    from tuned.data.generate import _provider_usd_cap
 
     cfg = load_build_config(DEEPSEEK_CONFIG, allow_unpinned=True)
     assert cfg.build.workdir == "data/build/exp_deepseek"
     assert list(cfg.routing.generator) == ["bai/deepseek-v4-flash"]
-    assert _openai_usd_cap(cfg) == 0.0
+    assert _provider_usd_cap(cfg, "openai") == 0.0
     openai = next(p for p in cfg.providers if p.name == "openai")
     for model in openai.models:
         assert model.limits["usd_cap"] == 0.0
@@ -1116,12 +1116,12 @@ def test_the_prompt_v5_arm_config_is_fenced_and_matches_its_control(tmp_path):
        the byte-level equality is asserted rather than trusted. If a future
        edit to either arm is deliberate, re-pair them here on purpose.
     """
-    from tuned.data.generate import _openai_usd_cap
+    from tuned.data.generate import _provider_usd_cap
 
     cfg = load_build_config(PROMPT_V5_CONFIG, allow_unpinned=True)
     assert cfg.build.workdir == "data/build/exp_prompt_v5"
     assert list(cfg.routing.generator) == ["bai/deepseek-v4-flash"]
-    assert _openai_usd_cap(cfg) == 0.0
+    assert _provider_usd_cap(cfg, "openai") == 0.0
     openai = next(p for p in cfg.providers if p.name == "openai")
     for model in openai.models:
         assert model.limits["usd_cap"] == 0.0
@@ -1211,7 +1211,7 @@ def test_the_gptoss_arms_are_fenced_and_differ_only_in_the_prompt_overlay():
     """
     import yaml
 
-    from tuned.data.generate import _openai_usd_cap
+    from tuned.data.generate import _provider_usd_cap
 
     live = load_build_config(
         Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
@@ -1226,7 +1226,7 @@ def test_the_gptoss_arms_are_fenced_and_differ_only_in_the_prompt_overlay():
         assert cfg.build.workdir == workdir
         assert cfg.build.prompt_overlay == overlay
         assert list(cfg.routing.generator) == ["cerebras/gpt-oss-120b"]
-        assert _openai_usd_cap(cfg) == 0.0
+        assert _provider_usd_cap(cfg, "openai") == 0.0
         openai = next(p for p in cfg.providers if p.name == "openai")
         for model in openai.models:
             assert model.limits["usd_cap"] == 0.0

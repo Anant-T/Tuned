@@ -2052,21 +2052,26 @@ def test_unkeyed_roles_names_the_role_and_the_env_vars(cfg, monkeypatch):
     _unset(monkeypatch, "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENAI_API_KEY")
     gaps = unkeyed_roles(cfg, ("generator", "judge"))
     assert set(gaps) == {"generator", "judge"}
-    # THREE providers on the generator role since bai joined 2026-08-25: bai
-    # and cerebras (both free) and lightning (paid, the overflow). All three
-    # keys are named because any one alone makes the role usable - the list is
-    # the failover, and the ORDER of the refs is where the cost policy lives,
-    # not here (it moved once already: bai led 2026-08-25 to 2026-08-27, then
-    # gpt-oss reclaimed the lead slot - see routing.generator's own comment).
-    # So the order asserted here is DERIVED from the live config's routing
-    # rather than a snapshot that the next reorder would silently outdate.
+    # TWO providers on the generator role since lightning was removed
+    # 2026-08-27: bai and cerebras (both free). Lightning - the sole paid ref
+    # this role ever had - carried no usd_cap, and a review found the fence
+    # only ever reached the provider literally named "openai"
+    # (generate._provider_usd_cap, née _openai_usd_cap), so it was pulled from
+    # routing rather than left reachable with nothing behind it. Both
+    # remaining keys are named because either alone makes the role usable -
+    # the list is the failover, and the ORDER of the refs is where the cost
+    # policy lives, not here (it moved once already: bai led 2026-08-25 to
+    # 2026-08-27, then gpt-oss reclaimed the lead slot - see
+    # routing.generator's own comment). So the order asserted here is DERIVED
+    # from the live config's routing rather than a snapshot that the next
+    # reorder would silently outdate.
     expected_generator_envs = []
     for ref in cfg.routing_refs("generator"):
         provider, _ = cfg.model_for(ref)
         if provider.api_key_env not in expected_generator_envs:
             expected_generator_envs.append(provider.api_key_env)
     assert gaps["generator"] == tuple(expected_generator_envs)
-    assert set(gaps["generator"]) == {"BAI_API_KEY", "CEREBRAS_API_KEY", "LIGHTNING_API_KEY"}
+    assert set(gaps["generator"]) == {"BAI_API_KEY", "CEREBRAS_API_KEY"}
     assert "GROQ_API_KEY" in gaps["judge"]
     # One key is enough to make a role usable: the rest is failover.
     monkeypatch.setenv("GROQ_API_KEY", "sk-test")
@@ -3520,47 +3525,46 @@ def test_the_judge_sizer_only_narrows_below_the_flat_worst_case(cfg, keys):
     assert windows["second-generator"] == SECOND_GENERATOR_CONTEXT
 
 
-def test_the_generator_prefers_the_free_provider_and_fails_over_to_the_paid_one(cfg, keys):
+def test_the_generator_prefers_the_free_provider_and_parks_once_all_are_ineligible(cfg, keys):
     """THE COST POLICY IS THE LIST ORDER, so it is pinned like one.
 
-    bai and cerebras are both free tiers; lightning is the sole paid provider.
-    Router.pick walks routing.generator in order and only moves on when a ref
-    is INELIGIBLE, so "every free ref before the paid one" is the whole of the
-    control that drains free quota before money is spent. This asserts the
-    ORDERING invariant rather than which specific provider sits first - that
-    has already changed once (bai overtook cerebras on 2026-08-25) and pinning
-    it by name would make this test re-break on the next free provider added
-    or reordered, without the cost policy itself having broken.
+    Lightning - the sole paid ref this role ever had - was removed from
+    routing.generator on 2026-08-27: a usd_cap declared on any provider but
+    the one literally named "openai" was silently unreachable
+    (generate._provider_usd_cap, née _openai_usd_cap, and the
+    `if provider == "openai":` gate around it), so lightning carried a paid
+    ref with no fence actually behind it. It is not replaced with another
+    paid ref here - that would just re-open the same hole with a different
+    name - so this role now has no paid overflow at all.
 
-    Both halves are asserted: the preference, and the failover that makes the
-    preference safe rather than merely cheap.
+    Router.pick walks routing.generator in order and only moves on when a
+    ref is INELIGIBLE. With nothing paid left to fail over to, once every
+    free ref is ineligible pick returns None and the row parks rather than
+    silently spending money - that is the intended trade
+    routing.generator's own comment records. This asserts the ORDERING
+    preference among whichever free refs are configured, and the parking
+    outcome, rather than pinning specific provider names - those have
+    already reordered once (bai overtook cerebras 2026-08-25) without the
+    cost policy itself breaking.
     """
-    paid = ModelRef("lightning", "lightning-ai/gpt-oss-120b")
     generator_refs = list(cfg.routing.generator)
-    assert generator_refs[-1] == "lightning/lightning-ai/gpt-oss-120b", (
-        "the paid provider must be listed last - every free ref must be tried first"
+    assert "lightning/lightning-ai/gpt-oss-120b" not in generator_refs, (
+        "lightning must stay out of routing.generator until it carries a "
+        "usd_cap with prices beside it - see the fence added 2026-08-27"
     )
-    assert len(generator_refs) > 1, "need at least one free ref ahead of the paid one"
-    free_refs = [ModelRef(*ref.split("/", 1)) for ref in generator_refs[:-1]]
+    refs = [ModelRef(*ref.split("/", 1)) for ref in generator_refs]
+    assert refs, "need at least one generator ref"
 
-    # Preference: with everything eligible, a free provider answers - never
-    # the paid one.
-    assert _router(cfg).pick("generator").ref in free_refs
+    # Preference: with everything eligible, a free provider answers.
+    assert _router(cfg).pick("generator").ref in refs
 
-    # Failover on BUDGET, which is the case the ordering exists for: every
-    # free tier's daily quota runs out and the paid overflow takes the row.
-    spent = _router(
-        cfg, budget_ok=lambda provider, model, tokens: provider == "lightning"
-    )
-    assert spent.pick("generator").ref == paid
-
-    # ...and on the other two transient reasons a ref is passed over: cool
-    # down every free ref and confirm the paid one still answers.
+    # ...and once every ref is cooling there is nothing left to fail over to
+    # - no paid overflow exists in this role any more - so the row parks.
     cooling = _router(cfg)
-    for free in free_refs:
+    for ref in refs:
         for _ in range(11):
-            cooling.report_failure(free)
-    assert cooling.pick("generator").ref == paid
+            cooling.report_failure(ref)
+    assert cooling.pick("generator") is None
 
 
 def test_the_lightning_reply_shape_needs_no_quirk_of_its_own(cfg):

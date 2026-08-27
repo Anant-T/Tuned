@@ -975,10 +975,32 @@ routing:
   # is a 41-55 DAY run on it. b.ai has no observed daily cap and is rate-bound
   # at ~600 calls/hour instead - still true, and still the reason it stays
   # SECOND rather than being dropped: it is the throughput reserve for when
-  # cerebras's daily cap is the binding constraint. lightning stays last
-  # because it is the only PAID ref and the free budget drains first.
-  generator: [cerebras/gpt-oss-120b, bai/deepseek-v4-flash,
-              lightning/lightning-ai/gpt-oss-120b]
+  # cerebras's daily cap is the binding constraint.
+  #
+  # LIGHTNING REMOVED 2026-08-27. It is PAID and carried no usd_cap, and a
+  # review found generate._openai_usd_cap (now _provider_usd_cap) only ever
+  # looked up the provider literally named "openai" - so a cap declared on
+  # lightning, or any other non-openai provider, was silently unreachable.
+  # There was no fence behind it: one failover from ref 1 or 2 could have run
+  # every remaining row through a paid model with nothing to stop it. It is
+  # pulled from routing rather than capped in place because it declares no
+  # prices either; removal is the immediate fix, re-adding it later is a
+  # config change, not a code change, now that Task 1 made the fence actually
+  # reach whichever provider declares it - re-adding it requires giving it a
+  # usd_cap with both usd_per_1m_prompt/usd_per_1m_completion beside it, the
+  # same way the openai block below does.
+  #
+  # CONSEQUENCE, STATED PLAINLY: ref 1 (cerebras/gpt-oss-120b) is currently
+  # returning HTTP 402 payment_required, so generation now depends on ref 2
+  # (bai/deepseek-v4-flash) alone. If its breaker trips there is no third ref
+  # left in this list - rows park rather than failing over to a paid model.
+  # That is the intended trade: parking a row costs nothing and is
+  # recoverable; failing over to an uncapped paid ref silently is the defect
+  # this file just closed.
+  #
+  # The lightning provider block itself stays below, unpinned rather than
+  # deleted, so its measured limits are not lost.
+  generator: [cerebras/gpt-oss-120b, bai/deepseek-v4-flash]
   # JUDGE: qwen then gemma, the two free families, then the paid backstops -
   # which is the standing "every free judge is preferred to the paid one" rule.
   # On a gpt-oss generation family separation removes both openai models, so
