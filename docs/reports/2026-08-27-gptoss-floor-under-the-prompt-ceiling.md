@@ -127,8 +127,11 @@ the same 90-row population in both arms.
 key in either arm config; `generate._usd_per_1m` returns `0.0` for a missing
 price regardless of token volume, verified directly against both arm configs'
 `cerebras` provider block (no `usd_per_1m_*` keys present on the `gpt-oss-120b`
-model). This is a genuine, non-vacuous PASS this time - n=90 in each arm, not
-the empty-population vacuous case the prior (blocked) attempt correctly
+model). The dollar half of this line is therefore structurally guaranteed:
+with no price keys configured it cannot read anything but $0, so it verifies
+configuration, not spend. The half with teeth is model identity - 90/90 rows
+per arm served by `gpt-oss-120b` with no failover, on a real n this time
+rather than the empty-population case the prior (blocked) attempt correctly
 refused to call PASS.
 
 ### Robustness check: first attempt only (not pass-line-registered, reported for context)
