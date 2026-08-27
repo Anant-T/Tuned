@@ -104,11 +104,16 @@ git commit -m "route the generator through b.ai and re-baseline the fixture anch
 ```bash
 ./.venv/Scripts/python.exe -c "
 from tuned.data.prompt_registry import all_ids, load
-import re
+def words(text):
+    # Must match tests/test_build_prompts.py::_word_count exactly. A regex like
+    # \w+ does NOT: these templates set clauses off with spaced em dashes and
+    # use hyphenated compounds, and \w+ counts those differently. Using the
+    # wrong counter reports gen_transition_v2 at 501/500 when the test sees 496.
+    return sum(1 for tok in text.split() if any(c.isalnum() for c in tok))
 for i in all_ids():
     if not i.startswith('gen_'): continue
-    u = load(i).user
-    print(f'{i:26s} sha={load(i).sha}  words={len(re.findall(chr(92)+chr(119)+chr(43), u))}')
+    t = load(i)
+    print(f'{i:26s} sha={t.sha}  words={words(t.user)}')
 "
 ```
 Keep this output. Step 6 compares against it.
