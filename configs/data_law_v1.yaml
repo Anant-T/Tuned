@@ -1152,12 +1152,57 @@ routing:
   # cerebras account is now metered (~$4.63 remaining, ~8M tokens as of
   # today) and the operator wants that balance spent on judging.
   #
-  # THE MEASURED BASIS: a paired A/B under the SHIPPED prompt templates
-  # (docs/reports/2026-08-27-gptoss-floor-under-the-prompt-ceiling.md,
-  # independently review-verified) put deepseek's length_band pass rate at
-  # 49.5% (n=99) against gpt-oss's 42.2% (n=90) on the same gate, same
-  # templates. deepseek beats gpt-oss under the prompts this file actually
-  # ships.
+  # THE MEASURED BASIS: CORRECTED 2026-08-28 (fix round 1) - the version
+  # this replaces cited one report for a number that report does not
+  # contain. See below for what was wrong; this paragraph states what is
+  # actually measured.
+  #
+  # On every SAME-TEMPLATE comparison, gpt-oss WINS length_band yield, not
+  # deepseek. Pre-edit (v4) templates: gpt-oss 55.6% (n=90,
+  # docs/reports/2026-08-27-gptoss-floor-under-the-prompt-ceiling.md,
+  # control arm) vs deepseek 49.5% (49/99,
+  # docs/reports/2026-08-27-generator-prompt-length-fix.md, control arm,
+  # banked 2026-08-26). Shipped (v5, post-286fd3a) templates: gpt-oss 42.2%
+  # (n=90, gptoss-floor-under-the-prompt-ceiling.md, treatment arm) vs
+  # deepseek 32% (30/94, generator-prompt-length-fix.md, treatment arm).
+  # gpt-oss leads both pairings; there is no reading of the evidence in
+  # which deepseek out-yields gpt-oss under a shared template version.
+  #
+  # DEEPSEEK'S OWN 32% SHIPPED-TEMPLATE FIGURE IS ITSELF UNCERTAIN, and is
+  # not asserted here as its true rate. generator-prompt-length-fix.md's two
+  # arms ran 13h41m apart with no provider-side upstream id in the response
+  # envelope, so the 49.5% -> 32% cross-arm drop is confounded by a possible
+  # upstream swap, not attributable to the prompt edit alone - and that same
+  # report's MATCHED attempt-1 pairs (the same 40 seeds run under both v4
+  # and v5) found prompt wording is NOT a lever on deepseek trace length at
+  # all (McNemar p=0.80-1.00 on length_band). If the edit is truly a no-op
+  # on deepseek, its real shipped-template rate sits nearer 49.5% than 32% -
+  # this is not resolved either way, and no single number is stated as
+  # deepseek's shipped rate.
+  #
+  # THE FLIP IS THEREFORE AN ALLOCATION DECISION, NOT A YIELD DECISION.
+  # Nothing measured above shows deepseek out-generating gpt-oss under any
+  # template version; what decides it is that cerebras is now a metered
+  # account (~$4.63 remaining, ~8M tokens - on the order of 1k rows of a
+  # 15-20k-row corpus) and the operator directed that balance to judging
+  # only (2026-08-28, see the operator directive above). A generator that
+  # cannot fund more than a small fraction of the corpus cannot be primary
+  # regardless of its per-row yield.
+  #
+  # SUPERSEDED 2026-08-28 (fix round 1), kept in place rather than deleted:
+  # the prior version of this paragraph claimed a single paired A/B
+  # (gptoss-floor-under-the-prompt-ceiling.md, "independently
+  # review-verified") measured deepseek at 49.5% (n=99) against gpt-oss's
+  # 42.2% (n=90) "on the same gate, same templates," and concluded "deepseek
+  # beats gpt-oss under the prompts this file actually ships." That report
+  # contains ONLY gpt-oss data in both arms and n=99 never appears in it;
+  # 49.5%/n=99 is deepseek's PRE-edit control from the OTHER report
+  # (generator-prompt-length-fix.md), paired against gpt-oss's POST-edit
+  # (shipped) number from a different report entirely - two different
+  # template versions, two different task pools, presented as one
+  # controlled measurement. The "review-verified" citation also only ever
+  # covered that report's own gpt-oss numbers, never a deepseek comparison.
+  # Found by task review; corrected here rather than merely noted.
   #
   # THE HONEST CAVEAT: under the PRE-edit prompts gpt-oss measured 55.6% and
   # would beat deepseek - the prompt-ceiling edit (286fd3a) is what dethroned
