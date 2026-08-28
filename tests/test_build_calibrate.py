@@ -872,16 +872,11 @@ def test_calibrate_has_no_sanity_fit_that_activates_the_locked_labels():
 
 
 def test_the_180_label_protocol_is_still_the_only_activation_path(cfg):
+    # The recovery-arm cross-check that used to sit here was retired with the
+    # experiment configs (2026-08-28, prev_rep.md); the live protocol pins stay.
     assert cfg.calibration.pilot_export == 180
     assert cfg.calibration.holdout >= 1
     assert cfg.calibration.folds >= 2
-    from tuned.data.config import load_build_config
-
-    recovery = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1_exp_recovery.yaml",
-        allow_unpinned=True,
-    )
-    assert recovery.calibration.pilot_export == 180
 
 
 def test_forty_six_gold_labels_are_not_rewritten_or_used_to_activate_rows(store, cfg):

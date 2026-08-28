@@ -1218,34 +1218,19 @@ def test_incomplete_permanent_gates_are_missing_gate_data(tmp_path):
 
 
 def test_contract_from_config_reads_think_min_and_teacher(tmp_path):
+    # The recovery-arm comparison half was retired with the experiment configs
+    # (2026-08-28, prev_rep.md); what stays is the live half of the property -
+    # the contract is READ from the config it is handed, not hard-coded.
     from tuned.data.config import load_build_config
 
     live = load_build_config(
         Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml",
         allow_unpinned=True,
     )
-    recovery = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1_exp_recovery.yaml",
-        allow_unpinned=True,
-    )
     control_c = E.contract_from_config(live)
-    treat_c = E.contract_from_config(recovery)
-    assert control_c.think_min == treat_c.think_min == 500
-    # NOT a cross-config invariant, and now they visibly disagree rather than
-    # coincide: data_law_v1_exp_recovery.yaml's own header pins it to
-    # "Cerebras gpt-oss-120b is the only generator" as an ISOLATED, frozen
-    # experiment, so it is read against ITSELF rather than against the live
-    # side. The live side cycled bai (family deepseek) through the lead
-    # generator slot 2026-08-25 to 2026-08-27, gpt-oss reclaimed it
-    # 2026-08-27, and on 2026-08-28 the operator made bai/deepseek-v4-flash
-    # the SOLE routing.generator ref outright (cerebras/gpt-oss-120b removed
-    # entirely, cerebras spends only on judging - see routing.generator's own
-    # comment in data_law_v1.yaml). The two configs no longer coincide
-    # because nothing ever required them to.
+    assert control_c.think_min == 500
     assert control_c.teacher_family == "deepseek"
     assert control_c.teacher_model == "deepseek-v4-flash"
-    assert treat_c.teacher_family == "gpt-oss"
-    assert treat_c.teacher_model == "gpt-oss-120b"
     assert control_c.gate_contract == tuple(GATE_ORDER)
 
 
@@ -1280,79 +1265,6 @@ def _cohort_selection(strata, *, n_per=20, gen_id_start=1):
         decision=None,
         reason="",
     )
-
-
-def test_require_pretreatment_manifest_enforces_recovery_configs_declared_strata(
-    tmp_path,
-):
-    """require_pretreatment_manifest (eval_matched.py:1219) is the seam that
-    connects configs/data_law_v1_exp_recovery.yaml's eval_cohort_strata to
-    validate_pretreatment_manifest, the production gate generate.main calls
-    before creating the recovery workdir. If getattr(cfg.build,
-    "eval_cohort_strata", None) at eval_matched.py:1240 were ever wrong, the
-    rest of the suite would still pass and the arm would still be silently
-    blocked (or silently NOT blocked) - this test is the only thing pinning
-    that one line against the real config.
-
-    Proves both directions: a manifest matching the recovery config's
-    3-stratum declaration is accepted, and the 4-stratum default is refused
-    by name (contract-mismatch:strata).
-    """
-    import dataclasses
-
-    from tuned.data.config import load_build_config
-
-    recovery = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1_exp_recovery.yaml",
-        allow_unpinned=True,
-    )
-    assert recovery.build.eval_cohort_strata == (
-        "irac_analysis",
-        "drafting",
-        "summarization",
-    )
-    contract = E.contract_from_config(recovery)
-
-    # -- Direction 1: a 60-pair / 3-strata manifest matching the config is
-    # accepted and returned as-is.
-    matching_manifest = E.cohort_manifest(
-        _cohort_selection(recovery.build.eval_cohort_strata),
-        contract=contract,
-        strata=recovery.build.eval_cohort_strata,
-    )
-    assert matching_manifest["n"] == 60
-    assert matching_manifest["strata"] == list(recovery.build.eval_cohort_strata)
-    matching_path = tmp_path / "matching-manifest.json"
-    matching_path.write_text(json.dumps(matching_manifest), encoding="utf-8")
-    assert matching_path.is_absolute()
-    accepted_cfg = dataclasses.replace(
-        recovery,
-        build=dataclasses.replace(
-            recovery.build, pretreatment_manifest=str(matching_path)
-        ),
-    )
-    result = E.require_pretreatment_manifest(accepted_cfg)
-    assert result == matching_manifest
-
-    # -- Direction 2: an 80-pair / 4-strata manifest (the eval_matched
-    # four-way default) is refused, and named as a strata mismatch - not
-    # silently swallowed into some other reason.
-    mismatched_manifest = E.cohort_manifest(
-        _cohort_selection(E.TASK_TYPES, gen_id_start=1000),
-        contract=contract,
-        strata=E.TASK_TYPES,
-    )
-    assert mismatched_manifest["n"] == 80
-    mismatched_path = tmp_path / "mismatched-manifest.json"
-    mismatched_path.write_text(json.dumps(mismatched_manifest), encoding="utf-8")
-    refused_cfg = dataclasses.replace(
-        recovery,
-        build=dataclasses.replace(
-            recovery.build, pretreatment_manifest=str(mismatched_path)
-        ),
-    )
-    with pytest.raises(ValueError, match="contract-mismatch:strata"):
-        E.require_pretreatment_manifest(refused_cfg)
 
 
 def test_live_style_store_event_is_seen_on_latest_unit(store):
