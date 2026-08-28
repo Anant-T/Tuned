@@ -61,28 +61,29 @@ DEFAULT_COUNTS = (800, 600, 300)
 #
 # Every task NOT in this dict is excluded by construction (allowlist
 # lookup fails closed) - this covers both tasks with a known-NC license
-# (Contract Clause Generation) and any task string this table doesn't
-# recognise at all (unknown -> exclude, per the brief). The gated dataset
-# means the exact runtime string values of the `task` column were not
-# independently re-verified against real rows (no HF_TOKEN was available/
-# authorized in this worktree - same constraint task 5's report hit for
-# the equally-gated Nemotron dataset); if real casing differs from the
-# card's table, every aalap_safe row is rejected "task_not_allowlisted"
-# and build_curated raises its shortfall RuntimeError loudly rather than
-# silently admitting anything - see the task-7 report for the flagged
-# follow-up.
+# (contract_clause_generation) and any task string this table doesn't
+# recognise at all (unknown -> exclude, per the brief).
+#
+# Keys are the VERIFIED runtime task FAMILIES, not the card's Title Case:
+# the flagged follow-up above fired on 2026-08-29 exactly as written -
+# every row rejected "task_not_allowlisted", shortfall raised at 0/600.
+# A 3,000-row authenticated stream showed the real `task` values are
+# snake_case with a `___variant` suffix (e.g. argument_generation___
+# petitioner, incomplete_instructions___opennyai_legal_tasks, and the
+# dataset's own spelling general_alap), so the lookup takes the prefix
+# before "___" and this table maps each family to the card's license.
 AALAP_SAFE_TASKS = {
-    "Issue Generation": "CC0-1.0",
-    "Argument Generation": "CC0-1.0",
-    "Event Timeline": "CC0-1.0",
-    "Combine Event Timeline": "CC0-1.0",
-    "Statute Ingredients": "CC0-1.0",
-    "Summary Generation": "CC0-1.0",
-    "Legal Open ORCA": "MIT",
-    "Legal NIv2 MCQ": "Apache-2.0",
-    "Constitution General Knowledge": "Apache-2.0",
-    "Incomplete Instructions": "CC0-1.0",
-    "General Aalap": "CC0-1.0",
+    "issue_generation": "CC0-1.0",
+    "argument_generation": "CC0-1.0",
+    "event_timeline": "CC0-1.0",
+    "combine_event_timeline": "CC0-1.0",
+    "statute_ingredients": "CC0-1.0",
+    "summary_generation": "CC0-1.0",
+    "legal_open_orca": "MIT",
+    "legal_niv2_mcq": "Apache-2.0",
+    "constitution_general_knowledge": "Apache-2.0",
+    "incomplete_instructions": "CC0-1.0",
+    "general_alap": "CC0-1.0",
 }
 
 # 169Pi/indian_law predates the 2024 IPC->BNS/BNSS/BSA transition (Apache-
@@ -180,7 +181,9 @@ def aalap_safe_row(raw: dict, think_open: str, think_close: str) -> tuple[dict |
     user_prompt/output_text/task/combined_input_prompt - has none, so this
     branch is defensive/forward-compatible rather than expected to fire).
     """
-    task = raw.get("task")
+    # The runtime task string carries a ___variant suffix; the family
+    # prefix is what the license table is keyed on (see AALAP_SAFE_TASKS).
+    task = (raw.get("task") or "").split("___", 1)[0]
     license_ = AALAP_SAFE_TASKS.get(task)
     if license_ is None:
         return None, "task_not_allowlisted"

@@ -106,7 +106,7 @@ def test_predex_prediction_row_native_id_none_when_case_name_missing():
 # aalap_safe_row
 # --------------------------------------------------------------------------
 
-def _aalap_raw(task="Issue Generation", combined=None, user_prompt=None, output=None, reasoning=None):
+def _aalap_raw(task="issue_generation", combined=None, user_prompt=None, output=None, reasoning=None):
     if combined is None:
         combined = "Given the following case excerpt, identify the key legal issues raised. " * 5
     if user_prompt is None:
@@ -154,20 +154,35 @@ def test_aalap_safe_row_accepts_every_allowlisted_task(task, expected_license):
 
 
 def test_aalap_safe_row_rejects_known_nc_task():
-    # Contract Clause Generation is documented cc-by-nc-4.0 on the HF card -
-    # must never be admitted regardless of content quality.
-    row, reason = aalap_safe_row(_aalap_raw(task="Contract Clause Generation"), "<think>", "</think>")
+    # contract_clause_generation is documented cc-by-nc-4.0 on the HF card -
+    # must never be admitted regardless of content quality. Real runtime
+    # value, ___variant suffix included (verified 2026-08-29).
+    row, reason = aalap_safe_row(
+        _aalap_raw(task="contract_clause_generation___generation"), "<think>", "</think>"
+    )
     assert row is None
     assert reason == "task_not_allowlisted"
 
 
 def test_aalap_safe_row_rejects_unestablished_license_task():
-    # Legalbench is licensed "Other" on the card - not an established
+    # legalbench is licensed "Other" on the card - not an established
     # non-NC license, so per the brief's "unknown -> exclude" rule it is
     # excluded even though it isn't the one known-NC task.
-    row, reason = aalap_safe_row(_aalap_raw(task="Legalbench"), "<think>", "</think>")
+    row, reason = aalap_safe_row(
+        _aalap_raw(task="legalbench___cuad_renewal_term"), "<think>", "</think>"
+    )
     assert row is None
     assert reason == "task_not_allowlisted"
+
+
+def test_aalap_safe_row_maps_the_variant_suffix_to_its_family():
+    # The runtime task strings carry ___variant suffixes the card's table
+    # never mentioned; the license is keyed on the family prefix.
+    row, reason = aalap_safe_row(
+        _aalap_raw(task="argument_generation___petitioner"), "<think>", "</think>"
+    )
+    assert reason is None
+    assert row["_prov"]["license"] == "CC0-1.0"
 
 
 def test_aalap_safe_row_rejects_unrecognized_task_string():
@@ -436,6 +451,6 @@ def test_module_importable_without_error():
 
 
 def test_aalap_safe_tasks_excludes_known_nc_and_unestablished_tasks():
-    assert "Contract Clause Generation" not in AALAP_SAFE_TASKS
-    assert "Legalbench" not in AALAP_SAFE_TASKS
+    assert "contract_clause_generation" not in AALAP_SAFE_TASKS
+    assert "legalbench" not in AALAP_SAFE_TASKS
     assert "cc-by-nc-4.0" not in AALAP_SAFE_TASKS.values()
