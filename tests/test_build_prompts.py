@@ -72,19 +72,32 @@ from tuned.data.gates import (
 # nobody on any measurement, so the operator reverted it. All fourteen
 # gen_* templates are back to their pre-2026-08-27 bytes, so the shas below
 # are the 2026-08-18 pins restored, not a new pin.
+#
+# RE-PINNED 2026-08-28 (anti-rehearsal clause shipped). The three-arm
+# clause/cap A/B (docs/reports/2026-08-28-deepseek-clause-and-cap-ab.md)
+# measured the clause's own irac_placement target FAIL (-4.46pp vs a >=15pp
+# bar) but a strong showing on everything else - length_band +16.05pp
+# (42.20% -> 58.25%), think p50 -18.7%, full-gate clean 11.0% -> 14.6%, no
+# metric worse - and the operator shipped it on that totality as a
+# think-length lever, not an irac-placement fix. Six templates changed by
+# exactly one clause each, inserted after "never opens a line with one of
+# those four words" and before the word-count sentence:
+# gen_irac_analysis_v1-v4 and gen_summarization_v1-v2. The other eight
+# gen_* and all three non-gen templates are untouched; their shas below are
+# unchanged from the 2026-08-18/2026-08-18-restored pins.
 EXPECTED_SHAS = {
     'gen_drafting_v1': '48534e3010f5',
     'gen_drafting_v2': '618b240ab03e',
-    'gen_irac_analysis_v1': '97185cd2068e',
-    'gen_irac_analysis_v2': 'b43d2e4afa38',
-    'gen_irac_analysis_v3': '09e8c6ffaf80',
-    'gen_irac_analysis_v4': '509cbb93c08c',
+    'gen_irac_analysis_v1': 'f2b4a76489cb',
+    'gen_irac_analysis_v2': 'a5e62bd4bb3f',
+    'gen_irac_analysis_v3': 'c4922e9d298c',
+    'gen_irac_analysis_v4': '78f0e8944ae1',
     'gen_statute_qa_v1': '94e43b22bf48',
     'gen_statute_qa_v2': '4d04338ba007',
     'gen_statute_qa_v3': '5888a6c4461d',
     'gen_statute_qa_v4': '713a9060835e',
-    'gen_summarization_v1': 'a0f723fb731e',
-    'gen_summarization_v2': '651dca540f34',
+    'gen_summarization_v1': '52fdcf8dbd04',
+    'gen_summarization_v2': '3b9eefc64d33',
     'gen_transition_v1': '113813116cfb',
     'gen_transition_v2': '2f28a53e5259',
     'judge_pointwise_v1': 'cd552205602e',
@@ -606,8 +619,16 @@ def test_generator_user_block_is_the_intended_size(prompt_id):
     # at 104,858 routing tokens - two orders of magnitude clear. generate.py
     # still routes a seed away when it does not fit; nothing this build
     # produces gets near it.
+    #
+    # 500 -> 600 on 2026-08-28: the anti-rehearsal clause shipped into six
+    # templates (see EXPECTED_SHAS above) adds ~85 words each, and five of
+    # the six landed over the old 500-word ceiling (gen_irac_analysis_v1/v2/
+    # v3 and gen_summarization_v1/v2; v4 landed exactly at 500). Measured
+    # post-ship max is gen_summarization_v1 at 574 words. The context
+    # rationale is unaffected at this size for the same reason as the prior
+    # bump - still two orders of magnitude clear of the routing cliff.
     words = _word_count(reg.load(prompt_id).user)
-    assert 250 <= words <= 500, f"{prompt_id} user block is {words} words"
+    assert 250 <= words <= 600, f"{prompt_id} user block is {words} words"
 
 
 @pytest.mark.parametrize("task_type", sorted(EXPECTED_VARIANT_COUNTS))

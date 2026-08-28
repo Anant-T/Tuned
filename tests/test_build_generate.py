@@ -808,7 +808,21 @@ def test_a_permanent_gate_still_decides_an_over_budget_reply(tmp_path, cfg, path
     fabricated citation is a statement about the law and burns the seed.
     Nothing here promotes the second back into a retry."""
     with make_store(tmp_path) as store:
-        long_fabrication = FABRICATED_ANSWER + " " + OVERSIZE_ANSWER
+        # Trimmed 2,000 chars off the tail of OVERSIZE_ANSWER's filler on
+        # 2026-08-28: the anti-rehearsal clause shipped into the irac_analysis
+        # templates that day added ~915 prompt_est tokens (up from a smaller
+        # figure pre-clause), and the untrimmed FABRICATED_ANSWER + OVERSIZE_
+        # ANSWER combination pushed total_est to 8,223 against total_max 8,192
+        # - length_band started firing alongside citations, defeating the
+        # point of this test (a permanent gate deciding while length_band
+        # stays clean, the same "shape length_band cannot see" premise
+        # OVERSIZE_THINK/OVERSIZE_ANSWER exist for). The trim only shortens
+        # repeated filler, never the fabricated citation or the shape that
+        # trips reply_budget: still ~3,833 answer_est tokens (comfortably
+        # over answer_min) and ~27,232 reply chars against a 22,000-char
+        # reply_budget_chars(cfg), with total_est back down to ~7,723 -
+        # headroom restored under total_max.
+        long_fabrication = FABRICATED_ANSWER + " " + OVERSIZE_ANSWER[:-2000]
         router = FakeRouter(cfg, {"generator": [chat_response(long_fabrication, OVERSIZE_THINK)]})
         run(store, cfg, router, paths)
         task = only_task(store)

@@ -84,6 +84,13 @@ build:
   # The substance here is unchanged: gpt-oss is not generating, the
   # 1,281-row measurement stays historical, and this file's think_max
   # reasoning still has not been re-evaluated against deepseek.
+  #
+  # Anti-rehearsal clause shipped 2026-08-28 into the 6 irac/summarization
+  # generator templates (gen_irac_analysis_v1-v4, gen_summarization_v1-v2)
+  # after a three-arm A/B: length_band pass +16.05pp (42.20% -> 58.25%),
+  # think p50 -18.7%, no behaviour change here. Its own pre-registered
+  # irac_placement target missed (-4.46pp vs a >=15pp bar) - see
+  # docs/reports/2026-08-28-deepseek-clause-and-cap-ab.md.
   length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 3000, answer_min: 120}
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
