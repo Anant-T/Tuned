@@ -423,6 +423,19 @@ class Store:
             "SELECT COUNT(*) FROM seed WHERE source_id = ?", (source_id,)
         ).fetchone()[0]
 
+    def source_licenses(self) -> dict[str, str]:
+        """source_id -> license, for the whole table.
+
+        Read once and held by the caller: the assembly pass needs a licence
+        per ROW and there are tens of thousands of rows against a handful of
+        sources, so a SELECT apiece would be the same answer bought over and
+        over. Same reasoning as artifact_index.
+        """
+        return {
+            row["source_id"]: row["license"]
+            for row in self._conn.execute("SELECT source_id, license FROM source").fetchall()
+        }
+
     def get_seed(self, seed_id: str) -> dict | None:
         row = self._conn.execute("SELECT * FROM seed WHERE seed_id = ?", (seed_id,)).fetchone()
         return dict(row) if row is not None else None

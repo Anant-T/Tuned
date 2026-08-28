@@ -2797,6 +2797,14 @@ def generated_rows(store, cfg=None, *, state: str = "accepted") -> Iterator[dict
     """
     think_open = getattr(cfg, "think_open", "<think>")
     think_close = getattr(cfg, "think_close", "</think>")
+    # THE LICENCE TRAVELS WITH THE GROUNDING. A generated row is the model's
+    # words over one seed's text, and it is that seed's source whose terms
+    # the dataset card has to state - exactly as curated.py and replay.py
+    # stamp theirs. Omitting it (until 2026-08-29) left every synthesis row
+    # licence-less, which stats' `license` gate refuses: "the dataset card
+    # cannot be written over them". Read once; there are a handful of
+    # sources and tens of thousands of rows.
+    licenses = store.source_licenses()
     for gen in store.latest_generations(state):
         seed = store.get_seed(gen["seed_id"]) or {}
         think, answer = gen.get("think") or "", gen.get("answer") or ""
@@ -2814,6 +2822,7 @@ def generated_rows(store, cfg=None, *, state: str = "accepted") -> Iterator[dict
             ],
             "_prov": {
                 "source": gen.get("stream"),
+                "license": licenses.get(seed.get("source_id")),
                 "native_id": seed.get("native_id"),
                 "cnr": seed.get("cnr"),
                 "neutral_citation": seed.get("neutral_citation"),

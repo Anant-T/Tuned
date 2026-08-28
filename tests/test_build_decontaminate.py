@@ -4777,3 +4777,41 @@ def test_row_form_falls_back_through_the_identity_fields():
     assert row_form(row("x", task_type="b")) == "b"
     assert row_form(row("x")) == "test"  # the stream/source
     assert row_form({"messages": []}) == ""
+
+
+def test_generated_rows_carry_their_seed_source_licence(tmp_path):
+    """stats' `license` gate refuses a row whose terms the dataset card
+    cannot state, and until 2026-08-29 EVERY synthesis row was licence-less:
+    generated_rows built _prov without the key at all, so the gate stayed
+    red no matter how much the corpus grew. The licence travels with the
+    grounding - the seed's source - exactly as curated.py and replay.py
+    stamp theirs."""
+    from tuned.data.decontaminate import generated_rows
+
+    store = open_store(tmp_path, n_seeds=1)
+    source_id = store.get_seed("seed000")["source_id"]
+    store.upsert_source(source_id, "CC-BY-4.0")
+    _accept_generation(store, seed_id="seed000", think="reasoning", answer="the answer")
+    rows = list(generated_rows(store, state="accepted"))
+    store.close()
+
+    assert len(rows) == 1
+    assert rows[0]["_prov"]["license"] == "CC-BY-4.0"
+
+
+def test_the_generated_licence_is_read_from_the_source_table_not_assumed(tmp_path):
+    """It must follow the seed's OWN source, not a default: the corpus draws
+    on sources under different terms (CC-BY-4.0 judgments, Apache-2.0
+    PredEx/TathyaNyaya/InJudgements), and a card that states one licence over
+    rows carrying another is worse than the refusal it replaced."""
+    from tuned.data.decontaminate import generated_rows
+
+    store = open_store(tmp_path, n_seeds=1)
+    source_id = store.get_seed("seed000")["source_id"]
+    _accept_generation(store, seed_id="seed000", think="x", answer="y")
+
+    store.upsert_source(source_id, "Apache-2.0")
+    assert next(iter(generated_rows(store, state="accepted")))["_prov"]["license"] == "Apache-2.0"
+    store.upsert_source(source_id, "CC-BY-4.0")
+    assert next(iter(generated_rows(store, state="accepted")))["_prov"]["license"] == "CC-BY-4.0"
+    store.close()
