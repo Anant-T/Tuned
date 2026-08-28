@@ -27,17 +27,20 @@
 # "..."}}` - that is THEIR serving stack's convention, not something
 # docs.b.ai states for its own gateway, and is not assumed here.
 #
-# THE BINDING TESTED HERE is `reasoning_effort: think_low` as a bare
-# top-level param - the same KEY the bai/deepseek-v4-flash block below
-# already uses successfully on this identical endpoint (b.ai's gateway
-# clearly normalizes `reasoning_effort` per model rather than passing one
-# fixed enum to every backend: deepseek accepts low/high/default/max, the
-# separately-documented gpt-5.6-sol model accepts
-# none/low/medium/high/xhigh/max), given as the VALUE the string hy3's own
-# page uses for its tier name. This is an informed guess, not a documented
-# fact, and this run's own evidence - does content differ, does a `think_low`
-# call look "low" against est-token counts, does the API 400 on the value at
-# all - is the qualification test itself, not the docs.
+# THE BINDING TESTED HERE is `reasoning_effort: low` as a bare top-level
+# param - the same KEY the bai/deepseek-v4-flash block below already uses
+# successfully on this identical endpoint. It is NOT hy3's own tier name:
+# a live probe (see the `hy3` model entry's own comment below) sent
+# `reasoning_effort: think_low` first, matching the doc's vocabulary
+# verbatim, and got HTTP 400 - the API's error names the real accepted enum
+# as `no_think, none, off, minimal, low, medium, high, xhigh, max`, the same
+# generic ladder every other model in this file uses (plus `no_think` kept
+# as its own value). `low` was then confirmed live: HTTP 200, a real
+# reasoning trace present. So the qualification-relevant fact this file
+# records is itself a docs-vs-API divergence - hy3's page names three modes
+# that do not appear verbatim as API values, and a caller that trusted the
+# doc's own vocabulary literally would have blocked on a 400 before
+# generating a single row.
 #
 # LIMITS ARE DOC-STATED, NOT LIVE-PROBED like deepseek-v4-flash's measured
 # 800000/16384. hy3's page: "Context window: 256K tokens | Maximum input:
@@ -396,7 +399,28 @@ providers:
         family: hy
         roles: [generator]
         limits: {rpm: 8, max_context: 192000, max_output: 16384}
-        params: {temperature: 0.7, top_p: 0.95, reasoning_effort: think_low}
+        # CORRECTED 2026-08-28 BY A LIVE 400, before any generation ran.
+        # `reasoning_effort: think_low` (the doc's own tier name, guessed
+        # above before this was probed) is REJECTED outright:
+        #
+        #     HTTP 400 {"error":{"message":"The request is invalid:
+        #     reasoning_effort must be one of: no_think, none, off, minimal,
+        #     low, medium, high, xhigh, max. ..."}}
+        #
+        # So hy3's page names its native modes no_think/think_low/think_high,
+        # but b.ai's gateway does NOT expose those two "think_*" strings as
+        # API values - it folds hy3 into the SAME generic ladder every other
+        # model in this file uses (deepseek: low/high/default/max; gpt-5.6
+        # sol: none/low/medium/high/xhigh/max), plus `no_think` kept as its
+        # own accepted value. Live-probed both ends with a one-token check
+        # call (`python -m tuned.data.providers --check --ref bai/hy3`,
+        # `reasoning_effort=low` and `=no_think` each direct-called via
+        # ChatClient): `low` -> HTTP 200, 23 reasoning tokens on a trivial
+        # "reply OK" prompt (message.reasoning populated, same field shape
+        # `_default_response_hook` already reads); `no_think` -> HTTP 200, 0
+        # reasoning tokens, `reasoning` empty. `low` is therefore the value
+        # this file uses for the documented LOW tier.
+        params: {temperature: 0.7, top_p: 0.95, reasoning_effort: low}
   - name: cerebras
     base_url: https://api.cerebras.ai/v1
     api_key_env: CEREBRAS_API_KEY

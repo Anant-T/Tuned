@@ -1623,7 +1623,7 @@ def test_the_hy3_probe_config_is_fenced_and_carries_the_new_model():
     assert hy3.params == {
         "temperature": 0.7,
         "top_p": 0.95,
-        "reasoning_effort": "think_low",
+        "reasoning_effort": "low",
     }
 
     assert list(cfg.routing.generator) == ["bai/hy3"]
