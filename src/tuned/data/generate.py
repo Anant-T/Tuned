@@ -1312,7 +1312,12 @@ TRUNCATION_REASONS = frozenset({"length", "max_tokens"})
 _REPAIR_HINTS = {
     "think_format": "The reply must contain exactly one well-formed reasoning block.",
     "length_band": "Keep the reasoning and the answer inside the length band.",
-    "irac_placement": "Do not put IRAC headings in the reasoning.",
+    "irac_placement": (
+        "The earlier attempt decided to write the answer but then kept "
+        "drafting the labelled sections inside the reasoning. The reasoning "
+        "must end at that decision; the sections are written once, in the "
+        "answer."
+    ),
     "verbatim_overlap": "Do not copy long runs of source wording into the reasoning.",
     "banned_meta": "Do not refer to the materials as a named object of the reasoning.",
     "prompt_echo": "Do not restate the instruction packet in the reasoning.",
