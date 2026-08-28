@@ -22,6 +22,7 @@ venv/
 /outputs/
 /runs/
 /wandb/
+/pulled/
 
 # --- Secrets ---
 .env

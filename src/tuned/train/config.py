@@ -63,6 +63,9 @@ class TrainCfg:
 @dataclass
 class HubCfg:
     checkpoint_repo: str | None
+    dataset_repo: str | None = None       # private HF DATASET repo, e.g. tantan01/tuned-law-v1-data
+    dataset_revision: str | None = None   # pinned by scripts/pin_dataset.py
+    dataset_sha256: str | None = None     # optional integrity pin of law_v1.jsonl
 
 
 @dataclass

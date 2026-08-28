@@ -152,3 +152,8 @@ hub:
   # cross-loading on --resume. The notebook re-homes the NAMESPACE per session
   # (see the re-home cell); the repo NAME here is the live contract.
   checkpoint_repo: tantan01/tuned-law-v1-qwen8b-ckpt-ddp
+  # M5 (task 15 fix round 1): the pin handoff push.py -> scripts/pin_dataset.py
+  # needs to be connected to the same repo push.py's own config
+  # (configs/data_law_v1.yaml's push.repo_id) writes to, or pin_dataset.py has
+  # nothing to pin.
+  dataset_repo: tantan01/tuned-law-v1-data
