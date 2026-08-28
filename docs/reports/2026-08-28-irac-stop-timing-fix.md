@@ -395,3 +395,217 @@ length-passing generation.
 3. `verbatim_overlap` now fails ~60% of summarization rows in BOTH arms and
    is the single largest remaining blocker on the clean rate. It is
    untouched by this work and is the obvious next target.
+
+---
+
+# F2-only confirm (same investigation, second pair)
+
+Section 11 above recommended shipping F2 and dropping F1, and named the
+follow-up that would have to justify it: **re-run the pair with F2 alone**,
+on the prediction that dropping F1 would recover most of the `length_band`
+cost while keeping the -58.64pp. That run is below. **The prediction was
+wrong**, and the pre-registered decision rule therefore does not return a
+ship.
+
+## 12. Apparatus
+
+Two new arms, `data/build/exp_irac_ctl3` and `data/build/exp_irac_f2only`,
+registered in `paths.ISOLATED_WORKDIR_SIBLINGS` with three new tests
+(`test_the_irac_ctl3_arm_is_an_isolated_workdir`,
+`test_the_irac_f2only_arm_is_an_isolated_workdir`,
+`test_the_f2only_confirm_arms_are_fenced_and_differ_only_in_the_prompt_overlay`).
+Suite: **164 passed, 0 failed**.
+
+Configs `configs/data_law_v1_exp_irac_ctl3.yaml` and
+`configs/data_law_v1_exp_irac_f2only.yaml`, both cloned from
+`configs/data_law_v1_exp_irac_ctl.yaml`. **Neither arm carries judge
+routing** - the format question was settled by the first run's spot-check at
+10/11 accept - so unlike the first pair these two differ in `workdir` and
+`prompt_overlay` and nothing else, and the pairing test asserts full
+line-level equality on the rest.
+
+Overlay `data/build/exp_irac_f2only/prompts_f2only`: all 14 current base
+`gen_*.md`, with ONLY `gen_summarization_v1.md` and `_v2.md` changed, by
+exactly the F2 answer-format rewrite printed in section 2. The F1 sentences
+appear nowhere in it.
+
+| check | result |
+|---|---|
+| 12 of 14 byte-identical to base | PASS |
+| 2 differing, and only by the F2 rewrite | PASS |
+| re-applying F1 to those 2 reproduces the combined overlay byte for byte | **PASS** |
+| the 8 files neither edit touches identical in both overlays | PASS |
+| the 4 irac_analysis files are base copies here, F1-carrying there | PASS |
+| all 14 LF-only, floor sentence "450 to 700 words of deliberation is normal" intact | PASS |
+
+The third row is the load-bearing one: it proves this arm differs from the
+combined arm by exactly F1, rather than merely asserting it.
+
+The two summarization overlay shas are `b7c53ce9254f`
+(`gen_summarization_v1.md`) and `21155223e534` (`_v2.md`); the other twelve
+carry their base shas from the table in section 3. The arm stores' own
+`prompt_sha` values confirm it live: **all four `gen_irac_analysis_*` shas
+are identical across the two arms**, and only the two summarization shas
+differ.
+
+Apparatus commit `7402ee1`, made before any generation.
+
+## 13. Run
+
+Seeded and planned exactly as the first pair (`--seed 3407 --per-source
+200`, 600 seeds each, same three stratified `tasks` commands, 40 tasks per
+arm = 22 irac_analysis + 18 summarization, identical task ids across arms).
+
+| arm | window (UTC) | wall | gap before | batches | claimed | gen-ok | errors |
+|---|---|---|---|---|---|---|---|
+| ctl3 | 06:16:21.161 - 06:43:38.185 | 27.3 min | - | 22 | 100 | 100 | 0 |
+| f2only | 06:44:21.190 - 07:18:28.444 | 34.1 min | **43.0 s** | 20 | 91 | 91 | 0 |
+
+## 14. The five pre-registered lines
+
+| # | measurement | ctl3 | f2only | delta | line | verdict |
+|---|---|---|---|---|---|---|
+| 1 | **summarization irac_placement fail** | 72.73% (32/44) | **7.89% (3/38)** | **-64.83pp** | <= -30pp | **PASS** |
+| 2 | **summarization length_band pass** | 65.91% (29/44) | 50.00% (19/38) | **-15.91pp** | >= -5pp | **FAIL** |
+| 3 | irac_analysis, every gate | see below | see below | 2 of 12 outside band | +-5pp | **FAIL - drift warning** |
+| 4 | full-gate clean rate | 16.00% (16/100) | 19.78% (18/91) | +3.78pp | >= 0 | **PASS** |
+| 5 | all deepseek, bai-only ledger, fingerprint | 100/100, bai only | 91/91, bai only | - | hard | **PASS** |
+
+n counts every generation attempt: ctl3 n=100, f2only n=91.
+
+### Line 1 - F2 survives alone, and then some
+
+72.73% -> 7.89%, **-64.83pp** against a -30pp bar. The combined arm managed
+-58.64pp with F1 alongside; F2 by itself does slightly better. The mechanism
+tracks it: rows with a line-initial IRAC label inside `<think>` go 65.91%
+(29/44) -> **5.26% (2/38)** on summarization, while the untreated
+irac_analysis templates sit still at 55.36% -> 58.49%.
+
+**F1 contributed nothing to the win.** That is now measured twice.
+
+### Line 2 - and F2 also owns the cost
+
+This is the line the follow-up existed to test, and it fails, harder than in
+the combined arm:
+
+| pair | summarization length_band pass | delta |
+|---|---|---|
+| combined (F1+F2) | 56.25% -> 41.46% | -14.79pp |
+| **F2 alone** | 65.91% -> 50.00% | **-15.91pp** |
+
+Removing F1 did not recover the length cost - it left it exactly where it
+was. **The `length_band` regression belongs to F2, not to F1.** Section 11's
+reading, that F1 was "the change most likely to be carrying the guard
+breach", is disproved by this run and should not be relied on.
+
+The overall (both task types) length_band pass rate tells the same story:
+-8.86pp in the combined pair, -8.14pp here.
+
+### Line 3 - ARM NOISE WARNING, flag raised
+
+The four `gen_irac_analysis_*` templates are byte-identical across these two
+arms, so every irac_analysis difference below is drift in b.ai's hidden
+upstream pool between 06:16 and 07:18, not a treatment effect.
+
+| gate | ctl3 (n=56) | f2only (n=53) | delta | within +-5pp |
+|---|---|---|---|---|
+| **prompt_echo** | 10.71% (6/56) | 28.30% (15/53) | **+17.59pp** | **NO - DRIFT** |
+| **verbatim_overlap** | 55.36% (31/56) | 41.51% (22/53) | **-13.85pp** | **NO - DRIFT** |
+| statutory_grounding | 12.50% (7/56) | 7.55% (4/53) | -4.95pp | yes |
+| think_format | 0.00% (0/56) | 3.77% (2/53) | +3.77pp | yes |
+| self_verification | 7.14% (4/56) | 9.43% (5/53) | +2.29pp | yes |
+| irac_placement | 60.71% (34/56) | 58.49% (31/53) | -2.22pp | yes |
+| citations | 1.79% (1/56) | 0.00% (0/53) | -1.79pp | yes |
+| length_band | 60.71% (34/56) | 62.26% (33/53) | **+1.55pp** | yes |
+| banned_meta | 16.07% (9/56) | 15.09% (8/53) | -0.98pp | yes |
+| answer_key / statutory_quotation / temporal | 0.00% | 0.00% | 0.00pp | yes |
+
+**Two gates drifted by 13-18 points on templates that did not change.** That
+is a real measurement-validity finding and it is why this line was
+pre-registered. Read it as follows, and no further:
+
+- The drift is **gate-specific, not global**. It hit `prompt_echo` and
+  `verbatim_overlap`. It did not hit either gate the treatment lines are
+  scored on.
+- **The noise floor under line 1 is 2.22pp.** A -64.83pp effect is roughly
+  29x it. Line 1 is not in question.
+- **The noise floor under line 2 is 1.55pp.** A -15.91pp cost is roughly 10x
+  it, and it reproduces the combined arm's -14.79pp to within 1.1pp on a
+  different pool draw. Line 2's failure is not noise either.
+- What the drift DOES contaminate is any absolute cross-pair comparison of
+  `prompt_echo`, `verbatim_overlap`, and the full-gate clean rate that
+  depends on them. Line 4's +3.78pp should be treated as soft for that
+  reason.
+
+## 15. Secondaries
+
+| metric | ctl3 | f2only | delta |
+|---|---|---|---|
+| think est-tokens (chars/4) p50 | 2,718 | 3,109 | +14.4% |
+| think est-tokens p90 | 6,784 | 6,757 | -0.4% |
+| - summarization est p50 | 2,255 | 2,792 | **+23.8%** |
+| - irac_analysis est p50 (untreated) | 3,436 | 3,633 | +5.7% |
+| **completion tokens per length-passing row** | 7,430.3 (378,944/51) | **9,051.8 (353,021/39)** | **+21.8%** |
+| summarization answer chars p50 | 4,473 | 4,788 | +7.0% |
+| tasks reaching `judging` (of 40) | 16 | 18 | +2 |
+| - summarization | 6 | **10** | +4 |
+| - irac_analysis (untreated) | 10 | 8 | -2 |
+
+The shape of the cost is now unambiguous. F2 makes the model deliberate
+longer on summarization (+23.8% at p50) and write a slightly longer answer
+(+7.0%), and both land inside the same 8,192-token band. The p90 barely
+moved, so this is the middle of the distribution shifting right rather than
+a tail of runaway traces.
+
+Run economics: ctl3 263,825 prompt / 378,944 completion / 100 requests / 0
+429s; f2only 240,744 / 353,021 / 91 / 0. All spend is `bai`, which is free.
+
+## 16. Verdict
+
+| # | line | verdict |
+|---|---|---|
+| 1 | summarization irac fail, f2only <= ctl3 - 30pp | **PASS** (-64.83pp, 2.2x the bar) |
+| 2 | summarization length_band pass, f2only >= ctl3 - 5pp | **FAIL** (-15.91pp, 3.2x over) |
+| 3 | irac_analysis every gate within +-5pp | **FAIL** (prompt_echo +17.59pp, verbatim_overlap -13.85pp - upstream drift, flagged) |
+| 4 | full-gate clean rate, f2only >= ctl3 | **PASS** (+3.78pp, soft - see line 3) |
+| 5 | integrity | **PASS** |
+
+Ship rule as pre-registered: lines 1, 2 and 4 must all pass. **Line 2 fails.**
+
+### Recommendation: NO-SHIP for F2 as it stands.
+
+Not because the edit does not work - it works better isolated than combined,
+and the -64.83pp is the largest, cleanest effect measured anywhere in this
+investigation. It is a no-ship because the follow-up asked one question,
+"is the length cost F1's?", and the answer came back **no, it is F2's**. The
+combined arm's guard breach was never F1's to carry, so removing F1 buys
+nothing on that front, and F2 cannot ship on the strength of a guard that
+fails identically with or without it.
+
+What this pair did settle, and it is worth the run:
+
+1. **F2 is the entire treatment effect.** Measured twice now: -58.64pp with
+   F1 alongside, -64.83pp without it.
+2. **F1 is dead.** It contributes nothing to the win in either pair and
+   should not appear in any future arm.
+3. **The length cost is F2's and is structural**, not incidental: taking the
+   four headings away makes the model deliberate longer in prose. It
+   reproduces across two independent pairs to within 1.1pp.
+
+### Named next step
+
+One lever, and it is no longer a prompt lever - three of those are already
+exhausted on this provider. F2's win is large enough to be worth buying, and
+what it costs is band headroom on summarization specifically. The next arm
+should pair F2 with a **summarization-specific `length_band`**, pre-registered
+on whether the clean rate and the usable-row count rise together once the
+band stops charging F2 for the deliberation it causes. Note that
+summarization tasks reaching `judging` already rose 6 -> 10 in this pair
+despite the band cost, which is the first direct evidence that the trade may
+be worth making explicit.
+
+A second, cheaper practice worth keeping: the `prompt_echo` and
+`verbatim_overlap` drift in section 14 was large. Any future arm on this
+provider should keep an untreated task type in the design purely as a noise
+channel - it cost nothing here, and it is the only reason line 2's failure
+can be called real rather than atmospheric.
