@@ -19,7 +19,7 @@
 - Never pass `--config configs/data_law_v1.yaml` to any command that writes.
 - Worktree trap: always invoke `./.venv/Scripts/python.exe` inside `.claude/worktrees/law-v1-data-pipeline`. The shell's bare `python` resolves to the main checkout's venv, which lacks `openai_harmony`. Symptom of getting this wrong: 12 failures and the skip count dropping 19 → 4, which reads as a code regression but is an environment error.
 - Set `PYTHONIOENCODING=utf-8` before printing any corpus or model text. The Windows cp1252 console renders curly quotes as U+FFFD and fakes "encoding corruption" — check bytes, never console glyphs.
-- No Claude/Anthropic attribution in any commit message, file, or artifact.
+- No AI-assistant attribution in any commit message, file, or artifact.
 - `.git` is a FILE in this linked worktree — writing `.git/<tmpfile>` for a commit message fails. Use `git commit -m` or a temp file elsewhere.
 
 ---
