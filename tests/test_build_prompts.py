@@ -85,6 +85,26 @@ from tuned.data.gates import (
 # gen_irac_analysis_v1-v4 and gen_summarization_v1-v2. The other eight
 # gen_* and all three non-gen templates are untouched; their shas below are
 # unchanged from the 2026-08-18/2026-08-18-restored pins.
+#
+# RE-PINNED AGAIN 2026-08-28, gen_summarization_v1/v2 ONLY (F2 shipped). The
+# root-cause A/B (docs/reports/2026-08-28-irac-stop-timing-fix.md) found
+# summarization's irac_placement failures were a template/gate drift: both
+# templates still mandated a four-headed ANSWER that
+# gates.IRAC_ANSWER_TASK_TYPES (src/tuned/data/gates.py:116) had already
+# stopped requiring, and that mandate seeded the think-side rehearsal the
+# gate then failed. F2 replaces the ENTIRE four-headings answer-format
+# paragraph (the one the anti-rehearsal clause above had just been added to)
+# with prose in the genre's own voice - a headnote as a law report prints
+# one, a note as a letter goes - carrying no heading mandate, with its own
+# anti-rehearsal sentence adapted to the new prose contract. Measured
+# (F2-only confirm pair): summarization irac_placement fail 72.73% -> 7.89%
+# (-64.83pp), tasks reaching judging +67% (6->10 of 40), format
+# judge-approved 10/11. Shipped on that totality despite the pre-registered
+# ship rule failing on cost: summarization length_band pass -15.91pp, an
+# honest, known follow-up (a summarization-specific length_band) rather than
+# a blocker. The four gen_irac_analysis_* templates and all twelve other
+# templates are byte-identical to the pins directly above; only these two
+# lines moved.
 EXPECTED_SHAS = {
     'gen_drafting_v1': '48534e3010f5',
     'gen_drafting_v2': '618b240ab03e',
@@ -96,8 +116,8 @@ EXPECTED_SHAS = {
     'gen_statute_qa_v2': '4d04338ba007',
     'gen_statute_qa_v3': '5888a6c4461d',
     'gen_statute_qa_v4': '713a9060835e',
-    'gen_summarization_v1': '52fdcf8dbd04',
-    'gen_summarization_v2': '3b9eefc64d33',
+    'gen_summarization_v1': 'b7c53ce9254f',
+    'gen_summarization_v2': '21155223e534',
     'gen_transition_v1': '113813116cfb',
     'gen_transition_v2': '2f28a53e5259',
     'judge_pointwise_v1': 'cd552205602e',
@@ -161,6 +181,17 @@ IRAC_PLACEMENT_CLAUSE = "never inside your reasoning"
 # reasoning looked like. gates._IRAC_HEADING_RE matches a LINE-INITIAL heading
 # word, so that is the shape the template now prohibits by name.
 IRAC_LINE_START_CLAUSE = "never opens a line with one of those four words"
+
+# gen_summarization_v1/v2's OWN wording for the same reasoning-side
+# prohibition, since 2026-08-28 (F2, docs/reports/2026-08-28-irac-stop-timing-
+# fix.md). Summarization is not in gates.IRAC_ANSWER_TASK_TYPES, so F2 dropped
+# the four-headings ANSWER mandate entirely and rewords IRAC_PLACEMENT_CLAUSE /
+# IRAC_LINE_START_CLAUSE together into one sentence naming the four words
+# directly rather than "those four words" - verbatim-identical between the two
+# summarization templates.
+SUMMARIZATION_REASONING_PROHIBITION_CLAUSE = (
+    "are not words your reasoning may put at the head of a line either"
+)
 
 ANSWER_LENGTH_CLAUSE = "250 to 450 words"
 
@@ -490,15 +521,32 @@ def test_generator_hands_over_the_cues_as_prose_not_an_inventory(prompt_id):
 
 @pytest.mark.parametrize("prompt_id", GEN_IDS)
 def test_generator_states_the_irac_answer_contract(prompt_id):
+    """The four-heading ANSWER mandate is checked only where the gate wants it.
+
+    RE-BASELINED 2026-08-28 (F2). gen_summarization_v1/v2 no longer mandate
+    the four headings in the answer at all - gates.IRAC_ANSWER_TASK_TYPES
+    (src/tuned/data/gates.py:116) never required it for summarization, and
+    the old templates mandating it anyway was the template/gate drift
+    docs/reports/2026-08-28-irac-stop-timing-fix.md traces the irac_placement
+    failures to. What both templates keep is the REASONING-side prohibition -
+    the four words may still not open a line inside the trace - just worded
+    for the new prose answer instead of the old headed one. The bare-word
+    check (Issue/Rule/Application/Conclusion appear somewhere) still holds
+    for every template: summarization names all four to forbid them as
+    headings, it just never mandates them as one.
+    """
     rendered = _rendered(prompt_id)
     for heading in ("Issue", "Rule", "Application", "Conclusion"):
         assert heading in rendered, heading
-    # IRAC in the answer only - the other half of gates.check_irac_placement.
-    assert IRAC_PLACEMENT_CLAUSE in rendered
-    # ...and in the line-initial shape the gate's regex actually matches.
-    assert IRAC_LINE_START_CLAUSE in rendered
     assert ANSWER_LENGTH_CLAUSE in rendered
     assert REASONING_FLOOR_CLAUSE in rendered
+    if prompt_id.startswith("gen_summarization"):
+        assert SUMMARIZATION_REASONING_PROHIBITION_CLAUSE in rendered
+    else:
+        # IRAC in the answer only - the other half of gates.check_irac_placement.
+        assert IRAC_PLACEMENT_CLAUSE in rendered
+        # ...and in the line-initial shape the gate's regex actually matches.
+        assert IRAC_LINE_START_CLAUSE in rendered
 
 
 def test_every_instruction_echo_span_still_occurs_in_a_live_template():
@@ -624,9 +672,11 @@ def test_generator_user_block_is_the_intended_size(prompt_id):
     # templates (see EXPECTED_SHAS above) adds ~85 words each, and five of
     # the six landed over the old 500-word ceiling (gen_irac_analysis_v1/v2/
     # v3 and gen_summarization_v1/v2; v4 landed exactly at 500). Measured
-    # post-ship max is gen_summarization_v1 at 574 words. The context
-    # rationale is unaffected at this size for the same reason as the prior
-    # bump - still two orders of magnitude clear of the routing cliff.
+    # post-ship max was gen_summarization_v1 at 574 words, THEN 585 after F2
+    # (2026-08-28) rewrote its answer-format paragraph in prose - still the
+    # longest template and still comfortably inside the 600 ceiling. The
+    # context rationale is unaffected at this size for the same reason as the
+    # prior bump - still two orders of magnitude clear of the routing cliff.
     words = _word_count(reg.load(prompt_id).user)
     assert 250 <= words <= 600, f"{prompt_id} user block is {words} words"
 
