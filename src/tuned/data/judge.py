@@ -173,6 +173,14 @@ ERROR_STATE = "judge_error"
 # judges that did answer and arrive at the same wall, so it parks at once.
 UNROUTABLE_STATE = "judge_unroutable"
 
+# routing.judge_mode == "audit" (2026-08-29): with one groq key the dual
+# fleet decides ~35-40 rows/UTC-day, so dual-judging every row cannot keep
+# pace with generation. In audit mode only a hash-sampled fraction of rows
+# buys the full dual treatment; the rest exit here, gate-clean but unjudged,
+# and the sample's accept rate is the quality evidence for the whole batch.
+AUDIT_ACCEPT_DISPOSITION = "audit:gate-accept"
+DEFAULT_AUDIT_SAMPLE = 0.05
+
 # Defined in generate.py and re-exported here: the startup preflight sizes
 # the judge's largest possible call with the SAME renderer this worker uses,
 # and generate.py is the module both fleets' preflight lives in.
@@ -1045,6 +1053,19 @@ def _lost_lease(store, task_id: str, worker_id, stats: "JudgeStats", where: str)
     return LOST_LEASE
 
 
+def audit_sampled(task_id: str, fraction: float) -> bool:
+    """Is this row in the audit sample? Deterministic and monotone in fraction.
+
+    Hashing the task_id (itself a content hash) rather than rolling a die
+    means a row's fate never flips between claims - a re-claimed sampled row
+    is still sampled, so a half-judged row cannot exit as an audit-accept -
+    and raising the fraction later only ADDS rows to the sample, never
+    silently un-judges one. Uniform over task_ids, so the sample is
+    proportionally stratified across task types and streams for free.
+    """
+    return int(task_id[:8], 16) / 0xFFFFFFFF < fraction
+
+
 def _outcome_from_row(cfg, slot: str, row: Mapping) -> SlotOutcome | None:
     """Rebuild a slot's outcome from a judgement already in the DB.
 
@@ -1096,6 +1117,7 @@ async def judge_task(
     worker_id: str,
     day: str | None = None,
     stats: JudgeStats | None = None,
+    audit_sample: float = DEFAULT_AUDIT_SAMPLE,
     _regenerating: bool = False,
 ) -> str:
     """Judge one generation and move the task to its outcome state.
@@ -1135,6 +1157,27 @@ async def judge_task(
         return _park(
             store, task, SKIPPED_STATE, "missing-seed", worker_id=worker_id, stats=stats
         )
+
+    # Audit mode: rows outside the sample exit here - gate-clean, unjudged,
+    # zero calls. Placed AFTER the free guards above (an empty trace or a
+    # missing generation must park, never audit-accept) and BEFORE any
+    # rendering or routing. The counters follow the WRITE, same as every
+    # decision below.
+    if cfg.routing.judge_mode == "audit" and not audit_sampled(task_id, audit_sample):
+        if not _set_state(
+            store, task_id, ACCEPTED_STATE, AUDIT_ACCEPT_DISPOSITION, worker_id=worker_id
+        ):
+            stats.lost_leases += 1
+            return LOST_LEASE
+        store.log_event(
+            "audit_gate_accept",
+            {"task_id": task_id, "gen_id": int(gen["gen_id"]), "sample": audit_sample},
+        )
+        stats.decided += 1
+        stats.accepted += 1
+        stats.outcomes["audit-accept"] = stats.outcomes.get("audit-accept", 0) + 1
+        return ACCEPTED_STATE
+
     try:
         # The judge sees the materials the generator saw - same builder, same
         # concatenation (contract 1) - plus, on the transition stream only,
@@ -1458,7 +1501,8 @@ async def judge_task(
     # Clean regeneration: judge it once more, with the cap now spent.
     return await judge_task(
         store, cfg, router, task,
-        paths=paths, worker_id=worker_id, day=day, stats=stats, _regenerating=True,
+        paths=paths, worker_id=worker_id, day=day, stats=stats,
+        audit_sample=audit_sample, _regenerating=True,
     )
 
 
@@ -1491,6 +1535,7 @@ async def run_judges(
     day: str | None = None,
     idle_sleep_s: float = 5.0,
     sleeper=asyncio.sleep,
+    audit_sample: float = DEFAULT_AUDIT_SAMPLE,
 ) -> dict:
     """Claim 'judging' tasks and decide them, bounded the same way as generate.py.
 
@@ -1521,6 +1566,7 @@ async def run_judges(
                     await judge_task(
                         store, cfg, router, task,
                         paths=paths, worker_id=worker_id, day=day, stats=stats,
+                        audit_sample=audit_sample,
                     )
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                     raise
@@ -1594,10 +1640,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="start even though a judge slot cannot be filled for long rows",
     )
+    parser.add_argument(
+        "--audit-sample",
+        type=float,
+        default=DEFAULT_AUDIT_SAMPLE,
+        help="audit mode only: fraction of rows that buy the full dual treatment",
+    )
     args = parser.parse_args(argv)
+    if not 0.0 <= args.audit_sample <= 1.0:
+        parser.error(f"--audit-sample must be in [0, 1], got {args.audit_sample}")
 
     cfg = load_build_config(args.config)
     print(f"loaded {load_dotenv_keys()} key(s) from .env")
+    if cfg.routing.judge_mode == "audit":
+        print(f"judge_mode=audit audit_sample={args.audit_sample}")
+    else:
+        print(f"judge_mode={cfg.routing.judge_mode} (--audit-sample ignored)")
     # The generator role is in here because a borderline pair buys ONE
     # rationale-fed regeneration through generate_once - a judge fleet that
     # cannot generate would park those rows half-decided.
@@ -1626,6 +1684,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 forever=args.forever,
                 max_batches=args.max_batches,
                 paths=paths,
+                audit_sample=args.audit_sample,
             )
         finally:
             await router.aclose()

@@ -1,0 +1,36 @@
+# Assembly of the shipped dataset from the bundle repo's current state:
+# verify -> decontaminate -> dedupe -> split -> assemble -> stats, then
+# push.py only if stats is green. Dispatched by the operator (browser or
+# phone); shares the data-build concurrency group so it serializes against
+# a running worker instead of racing it for the baton.
+name: data-assemble
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: data-build
+  cancel-in-progress: false
+
+jobs:
+  assemble:
+    if: github.repository == 'Anant-T/Tuned'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e ".[build]"
+      - name: Assemble and push
+        env:
+          BAI_API_KEY: ${{ secrets.BAI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: >
+          python data/scripts/actions_worker.py --phase assemble
+          --hf-repo tantan01/tuned-law-state

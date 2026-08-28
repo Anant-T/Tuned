@@ -514,6 +514,16 @@ def test_the_three_new_blocks_are_absent_from_the_minimal_fixture(tmp_path):
     assert cfg.difficulty is None
 
 
+def test_the_shipped_judge_mode_is_audit():
+    # audit since 2026-08-29: one groq key caps the dual fleet at ~35-40
+    # decided rows/day, so the shipped config accepts unsampled gate-clean
+    # rows and dual-judges only the --audit-sample fraction. Flipping this
+    # back to dual is a deliberate operator decision (judge capacity
+    # returned), not drift - hence the pin.
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    assert cfg.routing.judge_mode == "audit"
+
+
 def test_the_shipped_config_carries_all_three_blocks():
     cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
     assert cfg.transition == TransitionCfg(sample=1100, eval_reserve=150)

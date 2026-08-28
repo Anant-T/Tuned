@@ -1310,4 +1310,11 @@ routing:
              cerebras/gemma-4-31b, bai/deepseek-v4-flash]
   probe: [groq/openai/gpt-oss-20b]
   family_separation: true
-  judge_mode: dual        # dual | audit
+  # audit since 2026-08-29: one groq key caps the dual fleet at ~35-40
+  # decided rows/UTC-day (qwen + gpt-oss each tpd 200k vs ~5.5k-token judge
+  # calls), which cannot keep pace with generation. In audit mode only a
+  # hash-sampled fraction of rows (judge --audit-sample, default 0.05) buys
+  # the dual treatment; the rest are accepted on gates with disposition
+  # "audit:gate-accept", and the sample's accept rate is the batch's quality
+  # evidence. Flip back to dual when judge capacity returns.
+  judge_mode: audit       # dual | audit

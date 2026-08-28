@@ -1,0 +1,46 @@
+# Remote dataset-build worker: generate + audit-judge on a cron baton.
+#
+# State (SQLite snapshot + raw NDJSON + streams) lives in a PRIVATE HF
+# dataset repo; each run restores it, works ~5.25h, and pushes it back
+# (and every 15 min in between). The concurrency group is the fence that
+# keeps two runs from ever working the baton at once - the generator's
+# rate bucket is account-level, so exactly ONE generating host may exist.
+#
+# The default GITHUB_TOKEN cannot trigger workflow runs, so the chain is
+# cron, not self-dispatch. Logs on a public repo are PUBLIC: no step may
+# echo the environment.
+name: data-worker
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: data-build
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    if: github.repository == 'Anant-T/Tuned'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e ".[build]"
+      - name: Run the worker
+        env:
+          BAI_API_KEY: ${{ secrets.BAI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          # gemma answers 402 at completion time but its ref is still routed;
+          # the preflight checks the KEY, so it must be present.
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: >
+          python data/scripts/actions_worker.py --phase worker
+          --hf-repo tantan01/tuned-law-state --minutes 315

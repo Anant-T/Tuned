@@ -57,7 +57,15 @@ from tuned.data.tasks import plan_wave, reopen_tasks
 
 @pytest.fixture
 def cfg():
-    return build_cfg()
+    # The shipped judge_mode is "audit" (2026-08-29), under which an
+    # unsampled row exits before the slot machinery this suite exercises.
+    # These tests pin the DUAL path deliberately - it is exactly what an
+    # audit-SAMPLED row buys, so it must keep working - and the audit gate
+    # has its own tests (test_audit_* below) that run the shipped mode.
+    from dataclasses import replace
+
+    base = build_cfg()
+    return replace(base, routing=replace(base.routing, judge_mode="dual"))
 
 
 @pytest.fixture
@@ -2230,3 +2238,111 @@ def test_ground_faithfulness_is_read_as_the_grounding_axis():
     scores = parse_judge_reply(reply)
     assert (scores.grounding, scores.validity, scores.coverage) == (4, 3, 5)
     assert scores.rationale == "sound"
+
+
+# --------------------------------------------------------------------------
+# The audit gate (judge_mode == "audit", 2026-08-29).
+# --------------------------------------------------------------------------
+
+def _audit(cfg):
+    """The dual-pinned fixture, flipped back to the shipped audit mode."""
+    from dataclasses import replace
+
+    return replace(cfg, routing=replace(cfg.routing, judge_mode="audit"))
+
+
+def test_audit_unsampled_row_accepts_on_gates_with_zero_judge_calls(tmp_path, cfg, paths):
+    """The whole point of audit mode: a row outside the sample must exit
+    accepted without buying a single judge call - the script below is live
+    bait, and touching it is the failure."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
+        totals = run_judge(store, _audit(cfg), router, paths, audit_sample=0.0)
+
+        assert router.calls == []
+        task = only_task(store)
+        assert task["state"] == "accepted"
+        assert task["disposition"] == "audit:gate-accept"
+        assert (totals["decided"], totals["accepted"]) == (1, 1)
+        assert totals["outcomes"] == {"audit-accept": 1}
+        event = json.loads(store.events("audit_gate_accept")[-1]["detail_json"])
+        assert event["task_id"] == task["task_id"]
+        assert event["sample"] == 0.0
+
+
+def test_audit_sampled_row_buys_the_full_dual_treatment(tmp_path, cfg, paths):
+    """A sampled row is judged exactly as dual mode would judge it - same
+    slots, same decision, same disposition - so the sample's accept rate can
+    stand in for the batch's."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5), judge_reply(5, 5, 5)]})
+        totals = run_judge(store, _audit(cfg), router, paths, audit_sample=1.0)
+
+        assert len(router.calls) == 2
+        task = only_task(store)
+        assert task["state"] == "accepted"
+        assert task["disposition"] == "judge:accept"
+        assert totals["outcomes"] == {"accept": 1}
+        assert store.events("audit_gate_accept") == []
+
+
+def test_audit_sampling_is_deterministic_and_monotone():
+    """A row's fate must never flip between claims (deterministic), and
+    raising the fraction may only ADD rows to the sample (monotone) - a row
+    judged at 0.05 that fell out of the sample at 0.10 would un-judge itself."""
+    import hashlib
+
+    ids = [hashlib.sha256(str(i).encode()).hexdigest()[:16] for i in range(200)]
+    for task_id in ids:
+        assert judge_mod.audit_sampled(task_id, 0.3) == judge_mod.audit_sampled(task_id, 0.3)
+        if judge_mod.audit_sampled(task_id, 0.3):
+            assert judge_mod.audit_sampled(task_id, 0.7)
+        assert not judge_mod.audit_sampled(task_id, 0.0)
+    # ~30% of a uniform hash lands under 0.3; a broken hash (all-in or
+    # all-out) fails these bounds long before flakiness could.
+    sampled = sum(judge_mod.audit_sampled(t, 0.3) for t in ids)
+    assert 30 <= sampled <= 90
+
+
+def test_dual_mode_ignores_the_audit_gate(tmp_path, cfg, paths):
+    """audit_sample rides along on every call; in dual mode it must be inert
+    - a fraction of 0.0 under dual still judges every row."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5), judge_reply(5, 5, 5)]})
+        totals = run_judge(store, cfg, router, paths, audit_sample=0.0)
+
+        assert len(router.calls) == 2
+        assert only_task(store)["disposition"] == "judge:accept"
+        assert totals["outcomes"] == {"accept": 1}
+        assert store.events("audit_gate_accept") == []
+
+
+def test_audit_accept_is_lease_fenced(tmp_path, cfg, paths):
+    """A stale worker's audit-accept must no-op like every other late write:
+    the steal lands after the free guards, so the fenced state write is the
+    only thing left to stop it."""
+    with judged_store(tmp_path, paths, cfg) as store:
+        task = _claimed(store)
+        proxy = StealsTheLease(store, at="get_seed")
+        router = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5)]})
+        stats = JudgeStats()
+
+        ended = asyncio.run(
+            judge_task(
+                proxy, _audit(cfg), router, task,
+                paths=paths, worker_id="worker-a", stats=stats, audit_sample=0.0,
+            )
+        )
+
+        assert (ended, proxy.stolen) == ("lost-lease", True)
+        assert router.calls == []
+        assert stats.lost_leases == 1
+        assert only_task(store)["state"] == JUDGE_STATE_TO
+        assert store.events("audit_gate_accept") == []
+
+
+def test_audit_sample_cli_flag_refuses_a_fraction_outside_the_unit_interval():
+    with pytest.raises(SystemExit):
+        judge_main(["--audit-sample", "1.5"])
+    with pytest.raises(SystemExit):
+        judge_main(["--audit-sample", "-0.1"])
