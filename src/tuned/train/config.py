@@ -64,7 +64,7 @@ class TrainCfg:
 class HubCfg:
     checkpoint_repo: str | None
     dataset_repo: str | None = None       # private HF DATASET repo, e.g. tantan01/tuned-law-v1-data
-    dataset_revision: str | None = None   # pinned by scripts/pin_dataset.py
+    dataset_revision: str | None = None   # pinned by training/scripts/pin_dataset.py
     dataset_sha256: str | None = None     # optional integrity pin of law_v1.jsonl
 
 
@@ -92,6 +92,6 @@ def load_config(path: str | Path, *, allow_unpinned: bool = False) -> Config:
     )
     if cfg.model.revision is None and not allow_unpinned:
         raise ValueError(
-            "model.revision is null - run scripts/pin_revision.py and commit the pin"
+            "model.revision is null - run training/scripts/pin_revision.py and commit the pin"
         )
     return cfg

@@ -450,7 +450,7 @@ def test_targets_for_an_unknown_profile_raises_rather_than_defaulting():
 
 def test_hub_dataset_fields_default_none(tmp_path):
     # Task 15 fix round 1 (M5) gave the SHIPPED config a real dataset_repo -
-    # the pin handoff push.py -> scripts/pin_dataset.py needs the value set
+    # the pin handoff push.py -> training/scripts/pin_dataset.py needs the value set
     # there. This test is about HubCfg's own default, not that config's
     # content, so it builds a config that legitimately omits the field
     # rather than asserting an absence the shipped file no longer has.

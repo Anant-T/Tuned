@@ -306,8 +306,9 @@ difficulty:
 
 # --------------------------------------------------------------------------
 # push.py: the HF dataset repo the training lane pins against (HubCfg.
-# dataset_repo in configs/law_v1_8b_ddp.yaml, via scripts/pin_dataset.py -
-# push.py's own job ends at "repo exists, revision printed").
+# dataset_repo in training/configs/law_v1_8b_ddp.yaml, via
+# training/scripts/pin_dataset.py - push.py's own job ends at "repo exists,
+# revision printed").
 # --------------------------------------------------------------------------
 push:
   repo_id: tantan01/tuned-law-v1-data

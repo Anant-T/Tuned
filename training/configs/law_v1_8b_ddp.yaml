@@ -28,7 +28,7 @@
 # data, not layers. Launch:
 #
 #   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 -m tuned.train.sft \
-#       --config configs/law_v1_8b_ddp.yaml --mode smoke
+#       --config training/configs/law_v1_8b_ddp.yaml --mode smoke
 #
 # ga=2: at 8B the per-token memory footprint is small enough to spend the
 # budget on sequence length rather than throughput. 8192 x 1 x 2 x 2 ranks =
@@ -49,7 +49,7 @@
 # OOM fallback ladder, in order:
 #   1. swap model.repo to unsloth/Qwen3-8B-bnb-4bit (standard quant, not the
 #      "-unsloth-" dynamic quant) - saves exactly 1.31 GiB; re-pin revision
-#      via scripts/pin_revision.py before using it, do not guess a sha.
+#      via training/scripts/pin_revision.py before using it, do not guess a sha.
 #   2. drop max_seq_length to 6144 (still keeps most judgments intact - the
 #      corpus p50 is 2,438 tokens and p90 4,094).
 # ALREADY SPENT, not a lever left to pull: UNSLOTH_CE_LOSS_N_CHUNKS is at 32
@@ -152,8 +152,8 @@ hub:
   # cross-loading on --resume. The notebook re-homes the NAMESPACE per session
   # (see the re-home cell); the repo NAME here is the live contract.
   checkpoint_repo: tantan01/tuned-law-v1-qwen8b-ckpt-ddp
-  # M5 (task 15 fix round 1): the pin handoff push.py -> scripts/pin_dataset.py
-  # needs to be connected to the same repo push.py's own config
-  # (configs/data_law_v1.yaml's push.repo_id) writes to, or pin_dataset.py has
+  # M5 (task 15 fix round 1): the pin handoff push.py -> training/scripts/
+  # pin_dataset.py needs to be connected to the same repo push.py's own config
+  # (data/configs/data_law_v1.yaml's push.repo_id) writes to, or pin_dataset.py has
   # nothing to pin.
   dataset_repo: tantan01/tuned-law-v1-data

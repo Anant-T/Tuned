@@ -5,7 +5,7 @@ stats.py graded - plus stats' own report (`out/stats.json`) and the manifest
 chain that report was built from. Output is a private (by default) HuggingFace
 dataset repo carrying those two files, a `README.md` dataset card and a
 `build_manifest.json`, plus the repo's resulting revision (commit sha) printed
-for `scripts/pin_dataset.py` to pick up. push.py's own job ends there - pinning
+for `training/scripts/pin_dataset.py` to pick up. push.py's own job ends there - pinning
 the revision into the training config is that script's job, not this one's.
 
 THE TERMINAL GATE GATES THE PUSH

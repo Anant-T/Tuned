@@ -1,6 +1,6 @@
 """Resolve the current commit hash of the base-model repo and pin it in the config.
 
-Usage: python scripts/pin_revision.py [config_path]
+Usage: python training/scripts/pin_revision.py [config_path]
 Requires: pip install huggingface_hub (present in the [train] extra; also fine standalone).
 """
 
