@@ -78,10 +78,12 @@ build:
   # 402'ing behind it - deepseek is the SOLE ref, not "ref 2". "If ref 1
   # comes back" now means "if cerebras/gpt-oss-120b is re-added to
   # routing.generator", which per that same comment also requires reverting
-  # the 286fd3a prompt-ceiling edit first. The substance is unchanged: gpt-
-  # oss is not generating, the 1,281-row measurement stays historical, and
-  # this file's think_max reasoning still has not been re-evaluated against
-  # deepseek.
+  # the 286fd3a prompt-ceiling edit first (that comment's own
+  # SUPERSEDED 2026-08-28 (prompt-ceiling revert) note records that this WAS
+  # done, the same day - see routing.generator below for the citations).
+  # The substance here is unchanged: gpt-oss is not generating, the
+  # 1,281-row measurement stays historical, and this file's think_max
+  # reasoning still has not been re-evaluated against deepseek.
   length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 3000, answer_min: 120}
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
@@ -1211,6 +1213,26 @@ routing:
   # rates stay confounded - see THE MEASURED BASIS above; not settled either
   # way). Re-adding gpt-oss as a generator requires reverting
   # that edit first; it does not qualify on the prompts as currently shipped.
+  #
+  # SUPERSEDED 2026-08-28 (prompt-ceiling revert), kept in place rather than
+  # deleted: "requires reverting that edit first" named an unmet precondition
+  # when this paragraph was written; it was met the same day. The 286fd3a
+  # edit is proven harmful to gpt-oss (paired A/B, 4 pre-registered fails,
+  # docs/reports/2026-08-27-gptoss-floor-under-the-prompt-ceiling.md) and
+  # at-best-wash for deepseek (clean rerun,
+  # docs/reports/2026-08-28-deepseek-prompt-era-rerun.md: +4.97pp for
+  # pre-edit, full-gate clean 16.5% vs 8.5%, 17% cheaper per passing row) -
+  # helping nobody on any measurement - so the operator reverted it: all
+  # fourteen gen_* templates are back to their pre-286fd3a bytes. THE
+  # MEASURED BASIS above's "Shipped (v5, post-286fd3a) templates" row now
+  # names a version nothing ships under; the live comparison is the
+  # "Pre-edit (v4)" row on both sides. The gpt-oss prompt-ceiling
+  # precondition is therefore satisfied. This does NOT reopen routing:
+  # generator stays bai/deepseek-v4-flash alone and cerebras stays
+  # judging-only, per the 2026-08-28 operator directive above, for the
+  # allocation reason stated there (metered account, balance directed to
+  # judging) - a reason independent of gpt-oss's prompt-ceiling
+  # qualification. Routing is unchanged by this annotation.
   #
   # THE CONSEQUENCES:
   # (a) A single generator ref means no failover: a bai breaker trip now

@@ -59,26 +59,34 @@ from tuned.data.gates import (
 # line-initial shape the gate actually matches. No metric computed under the
 # old shas describes these prompts.
 #
-# RE-PINNED 2026-08-27 (generator reasoning ceiling). Every gen_* template
-# changed on one line: the clause licensing the reasoning to run as long as
-# it liked was deleted, and the 450-700 band was given an explicit upper
-# stop. Nothing else moved. No metric computed under the old shas describes
-# these prompts.
+# RE-PINNED 2026-08-27 (generator reasoning ceiling), then REVERTED
+# 2026-08-28. The 2026-08-27 edit changed every gen_* template on one line -
+# the clause licensing the reasoning to run as long as it liked was deleted,
+# and the 450-700 band was given an explicit upper stop - and re-pinned the
+# shas below to match. It is proven harmful to gpt-oss (paired A/B, 4
+# pre-registered fails,
+# docs/reports/2026-08-27-gptoss-floor-under-the-prompt-ceiling.md) and
+# at-best-wash for deepseek (clean rerun,
+# docs/reports/2026-08-28-deepseek-prompt-era-rerun.md: +4.97pp for pre-edit,
+# full-gate clean 16.5% vs 8.5%, 17% cheaper per passing row) - helping
+# nobody on any measurement, so the operator reverted it. All fourteen
+# gen_* templates are back to their pre-2026-08-27 bytes, so the shas below
+# are the 2026-08-18 pins restored, not a new pin.
 EXPECTED_SHAS = {
-    'gen_drafting_v1': '81c32d92dc4e',
-    'gen_drafting_v2': 'ce93f92f0407',
-    'gen_irac_analysis_v1': 'e5be81e7722b',
-    'gen_irac_analysis_v2': 'f8cc2833f697',
-    'gen_irac_analysis_v3': '63b7780879f2',
-    'gen_irac_analysis_v4': '2a45e85db800',
-    'gen_statute_qa_v1': 'cc51aafecf90',
-    'gen_statute_qa_v2': 'c4fbc1ecd5ca',
-    'gen_statute_qa_v3': '26ffcf6e5cfa',
-    'gen_statute_qa_v4': '1c10b3fcecb5',
-    'gen_summarization_v1': 'cff4bd7f2f61',
-    'gen_summarization_v2': '8ec09bd8abed',
-    'gen_transition_v1': '1228ef95517a',
-    'gen_transition_v2': '7e941b37e54e',
+    'gen_drafting_v1': '48534e3010f5',
+    'gen_drafting_v2': '618b240ab03e',
+    'gen_irac_analysis_v1': '97185cd2068e',
+    'gen_irac_analysis_v2': 'b43d2e4afa38',
+    'gen_irac_analysis_v3': '09e8c6ffaf80',
+    'gen_irac_analysis_v4': '509cbb93c08c',
+    'gen_statute_qa_v1': '94e43b22bf48',
+    'gen_statute_qa_v2': '4d04338ba007',
+    'gen_statute_qa_v3': '5888a6c4461d',
+    'gen_statute_qa_v4': '713a9060835e',
+    'gen_summarization_v1': 'a0f723fb731e',
+    'gen_summarization_v2': '651dca540f34',
+    'gen_transition_v1': '113813116cfb',
+    'gen_transition_v2': '2f28a53e5259',
     'judge_pointwise_v1': 'cd552205602e',
     'judge_tiebreak_v1': 'a34456f4918b',
     'probe_answer_v1': '8370e47920ee',
@@ -159,16 +167,16 @@ ANSWER_LENGTH_CLAUSE = "250 to 450 words"
 # The band VALUES are untouched - this moves the instruction onto the band, not
 # the band onto the instruction.
 #
-# CEILING ADDED 2026-08-27, and the constant trimmed to match. The floor
-# alone was only half a band: each template capped the reasoning here and
-# then, in the same sentence, licensed it to run as long as the matter
-# needed. gpt-oss obeyed the cap; deepseek-v4-flash obeyed the licence and
-# wrote a median 1,727 words, which is ~80% of all gate failures. The
-# licence is gone and every template now names 700 as a stop, in its own
-# wording - so the shared literal ends at `deliberation` and the trailing
-# " is normal" no longer exists anywhere. The band is now defended from
-# both sides: think_min 500 below, an instructed 700-word stop above.
-REASONING_FLOOR_CLAUSE = "450 to 700 words of deliberation"
+# CEILING ADDED 2026-08-27, REVERTED 2026-08-28. The 2026-08-27 edit deleted
+# the licence clause from all fourteen templates and trimmed this constant to
+# "450 to 700 words of deliberation" to match. It is proven harmful to
+# gpt-oss (docs/reports/2026-08-27-gptoss-floor-under-the-prompt-ceiling.md,
+# 4 pre-registered fails) and at-best-wash for deepseek
+# (docs/reports/2026-08-28-deepseek-prompt-era-rerun.md: +4.97pp for the
+# pre-edit prompts, clean full-gate 16.5% vs 8.5%, 17% cheaper per passing
+# row) - so the operator reverted it. The licence clause is back in every
+# template and this constant is back to its full 2026-08-18 form.
+REASONING_FLOOR_CLAUSE = "450 to 700 words of deliberation is normal"
 
 # A "defuser" is the clause that stops an instruction from reading as a
 # script. Two families, defending different failure modes, and both are
@@ -198,67 +206,6 @@ RITUAL_DEFUSERS = (
     "not a section of it",
     "not a part of the advice",
     "saving it for the end",
-)
-
-# The counterpart list for the LENGTH band, and the same idiom for the same
-# reason: an accepted-phrasing list rather than free text, so the property
-# cannot drift back out of a template during an edit.
-#
-# These are LICENCES - phrasings that permit the reasoning to exceed the cap
-# the same sentence just set. All four pre-edit surface forms were built on
-# "as long as" ("runs as long as the matter needs", "takes as long as the
-# question deserves", ...), but that single surface is not the property. A
-# review on 2026-08-27 defeated an "as long as"-only guard with:
-#
-#   "...450 to 700 words of deliberation, and 700 is merely typical --
-#    continue further if the matter genuinely requires more depth."
-#
-# which contains no "as long as", puts 700 after the marker, and restores the
-# permission completely. So the list covers four families: (a) restating the
-# cap as merely descriptive - which is what the pre-edit templates literally
-# did, "is normal for a matter of any substance"; (b) open-ended permission;
-# (c) permission to continue past the stop; (d) conditional exemption.
-#
-# Two entries are deliberate judgement calls. "more depth" is the weakest -
-# on its own it describes depth rather than licensing overrun - and is kept
-# because it is the tail of the known counterexample and no legitimate
-# template wording has needed it. Bare "exceed" is deliberately NOT here: it
-# collides with gen_statute_qa_v4's own ceiling, "700 is not to be exceeded",
-# where the word is doing the opposite job.
-#
-# This list NARROWS the hole; it does not close it. See
-# test_generator_caps_the_band_from_above_and_grants_no_licence.
-LENGTH_LICENCES = (
-    # (a) restates the cap as merely descriptive
-    "is normal",
-    "is typical",
-    "merely typical",
-    "only typical",
-    "rough guide",
-    "guideline",
-    # (b) open-ended permission
-    "as long as",
-    "however long",
-    "whatever length",
-    "no upper limit",
-    "no hard limit",
-    "not a hard limit",
-    "not a strict limit",
-    # (c) permission to continue past the stop
-    "continue further",
-    "go further",
-    "go beyond",
-    "run longer",
-    "longer if",
-    "keep going",
-    "need not stop",
-    # (d) conditional exemption
-    "unless the matter",
-    "genuinely requires",
-    "if it requires",
-    "if the matter requires",
-    "if the point requires",
-    "more depth",
 )
 
 # What an enumeration ITEM looks like: an interrogative opening a list item,
@@ -541,78 +488,6 @@ def test_generator_states_the_irac_answer_contract(prompt_id):
     assert REASONING_FLOOR_CLAUSE in rendered
 
 
-@pytest.mark.parametrize("prompt_id", GEN_IDS)
-def test_generator_caps_the_band_from_above_and_grants_no_licence(prompt_id):
-    """The band is a band, not a floor. 700 must be restated as a stop.
-
-    ADDED 2026-08-27 with the ceiling, because REASONING_FLOOR_CLAUSE cannot
-    carry this property and never could. That constant was trimmed to
-    "450 to 700 words of deliberation" when the fourteen tails diverged, and
-    that substring is present in the PRE-ceiling wording too - the old tail
-    read "450 to 700 words of deliberation is normal for a matter of any
-    substance". So the assertion above passes on both the wording this task
-    removed and the wording it installed, which leaves the entire edit
-    unguarded: restoring the licence tomorrow keeps the suite green.
-
-    Two independent things are checked, because the failure had two halves.
-
-    CEILING: only the text AFTER the band marker counts. The marker contains
-    "700" itself, so partitioning on it is what makes the pre-ceiling wording
-    fail rather than pass by accident (a naive `"700" in user` returns True on
-    the pre-edit text).
-
-    LICENCE: every one of the fourteen templates capped the reasoning and
-    then, in the same sentence, licensed it past the cap. gpt-oss obeyed the
-    cap; deepseek-v4-flash obeyed the licence and wrote a median 1,727 words,
-    ~80% of all gate failures. Checked against LENGTH_LICENCES.
-
-    WHAT THIS DOES NOT DO, stated plainly, because the honest limits matter
-    more than the coverage:
-
-    The ceiling assert is NOT a reliable backstop for a reworded licence. It
-    verifies that the digit 700 is PRESENT after the marker; it cannot verify
-    that 700 BINDS. "700 is merely typical -- continue further if the matter
-    genuinely requires more depth" satisfies it completely while restoring the
-    permission in full. An earlier version of this docstring called the
-    ceiling assert the backstop for exactly that case. It is not, and a review
-    was right to say so.
-
-    The licence assert is a PHRASE LIST, so it is evaded by any wording not on
-    it. It is also brittle in a specific way worth knowing: matching is plain
-    substring, so an inserted adverb defeats a long entry - "if the matter
-    genuinely requires" does not contain "if the matter requires". The list
-    leans on short, family-level phrases for that reason, but the weakness is
-    structural, not a gap to be patched away.
-
-    Between them these two narrow the hole; neither closes it, and together
-    they do not close it either. Prose cannot be tested for permissiveness -
-    a licence can always be written in words nobody listed. What this test
-    buys is that the KNOWN regressions, including the one a reviewer actually
-    constructed, cannot land silently. The next edit to this sentence is not
-    safe merely because the suite is green; it still needs a human to read it.
-    """
-    user = reg.load(prompt_id).user or ""
-    _, marker, after = user.partition(REASONING_FLOOR_CLAUSE)
-    assert marker, f"{prompt_id} lost the band marker entirely"
-    ceiling_sentence = after.split(".")[0]
-    assert "700" in ceiling_sentence, (
-        f"{prompt_id} names the band but never closes it: {ceiling_sentence!r}. "
-        f"The upper bound has to be restated as a stop AFTER the band - naming "
-        f"450 to 700 and then leaving the length open is the exact wording that "
-        f"produced a median 1,727-word trace."
-    )
-    lowered = _norm_ws(user).lower()
-    licences = sorted(phrase for phrase in LENGTH_LICENCES if phrase in lowered)
-    assert not licences, (
-        f"{prompt_id} licenses the reasoning past its own cap: {licences}. "
-        f"Capping the reasoning and then permitting it to run past the cap in "
-        f"the same breath is the 2026-08-27 regression; the cap is the "
-        f"instruction, not the licence. If the phrase here is genuinely "
-        f"innocent, that is a judgement call for a human - narrow the entry in "
-        f"LENGTH_LICENCES on purpose, do not delete it to get green."
-    )
-
-
 def test_every_instruction_echo_span_still_occurs_in_a_live_template():
     """A stale echo span fails SILENTLY, so the suite has to hold it.
 
@@ -620,9 +495,10 @@ def test_every_instruction_echo_span_still_occurs_in_a_live_template():
     a teacher parroting its own instructions back. Nothing matches it against
     the prompts, so a span whose wording has been edited out of every template
     can never fire: check_prompt_echo simply stops detecting that class, with
-    no error and a green suite. The 2026-08-27 ceiling edit is exactly how
+    no error and a green suite. The 2026-08-27 ceiling edit was exactly how
     that happens - it deleted " is normal" from all fourteen templates, and
-    the span read "450 to 700 words of deliberation is normal".
+    the span read "450 to 700 words of deliberation is normal" (that edit was
+    reverted 2026-08-28; see EXPECTED_SHAS above for why).
 
     check_prompt_echo compares against _norm_ws(think).lower(), so both sides
     are normalised the same way here.
@@ -631,7 +507,7 @@ def test_every_instruction_echo_span_still_occurs_in_a_live_template():
     template". Coverage today is uneven and legitimately so:
 
         14 - never write as though the matter had been handed to you as a text
-        14 - 450 to 700 words of deliberation
+        14 - 450 to 700 words of deliberation is normal
         14 - let me check this, or actually, that does not follow, ...
          2 - those headings belong to the answer and never inside your reasoning
          1 - work it out before you commit to anything (gen_irac_analysis_v1)
