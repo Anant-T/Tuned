@@ -43,6 +43,11 @@ def test_the_assembly_chain_runs_in_order_and_stats_gates_last():
         "tuned.data.split", "tuned.data.assemble", "tuned.data.stats",
     ]
     assert argvs[-1][-2:] == ["--profile", "v1.0-MVP"]
+    # Without an index the verify step must NOT pass --index (verify warns
+    # UNVERIFIED); with one, the existence half arms.
+    assert "--index" not in argvs[0]
+    armed = actions_worker.assemble_argvs("cfg.yaml", citation_index=Path("x/citation_index.txt"))
+    assert armed[0][-2:] == ["--index", str(Path("x/citation_index.txt"))]
 
 
 def _tiny_db(path: Path, marker: str) -> None:
@@ -78,10 +83,18 @@ def test_stage_and_restore_round_trip_the_baton(tmp_path):
     (root / "streams").mkdir()
     (root / "streams" / "replay.jsonl").write_text('{"row":1}\n')
 
+    # The citation index rides along as ONE file; the corpus dir's source
+    # text must never enter the baton.
+    (root / actions_worker.INDEX_RELPATH).parent.mkdir(parents=True)
+    (root / actions_worker.INDEX_RELPATH).write_text("2023 insc 45\n")
+    (root / "corpus" / "extraction.jsonl").write_text('{"big":"source text"}\n')
+
     staging = actions_worker.stage_bundle(root, tmp_path / "staging")
     assert (staging / actions_worker.DB_RELPATH).is_file()
     assert (staging / "raw" / "gen" / "2026-08-29" / "gen.ndjson").is_file()
     assert (staging / "streams" / "replay.jsonl").is_file()
+    assert (staging / actions_worker.INDEX_RELPATH).is_file()
+    assert not (staging / "corpus" / "extraction.jsonl").exists()
 
     root2 = tmp_path / "build2"
     root2.mkdir()
@@ -100,3 +113,4 @@ def test_stage_and_restore_round_trip_the_baton(tmp_path):
     conn.close()
     assert (root2 / "streams" / "replay.jsonl").read_text() == '{"row":1}\n'
     assert (root2 / "raw" / "gen" / "2026-08-29" / "gen.ndjson").is_file()
+    assert (root2 / actions_worker.INDEX_RELPATH).is_file()

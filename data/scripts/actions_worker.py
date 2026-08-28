@@ -59,10 +59,18 @@ def child_argvs(config: str, *, n_workers: int, audit_sample: float) -> list[lis
     ]
 
 
-def assemble_argvs(config: str) -> list[list[str]]:
-    """The assembly chain, in order. stats is last and gates push.py."""
+def assemble_argvs(config: str, citation_index: Path | None = None) -> list[list[str]]:
+    """The assembly chain, in order. stats is last and gates push.py.
+
+    citation_index arms verify's existence half - without it every row ships
+    citation-UNVERIFIED (verify warns loudly). The bundle carries the index
+    when the operator has built it (tuned.data.citations --build).
+    """
+    verify_step = ["verify"] + (
+        ["--index", str(citation_index)] if citation_index else []
+    )
     chain = [
-        ["verify"], ["decontaminate"], ["dedupe"], ["split"], ["assemble"],
+        verify_step, ["decontaminate"], ["dedupe"], ["split"], ["assemble"],
         ["stats", "--profile", "v1.0-MVP"],
     ]
     return [
@@ -87,8 +95,15 @@ def snapshot_db(state_db: Path, dest: Path) -> None:
         conn.close()
 
 
+INDEX_RELPATH = Path("corpus") / "citation_index.txt"
+
+
 def stage_bundle(root: Path, staging: Path) -> Path:
-    """Copy everything the baton carries into a clean staging tree."""
+    """Copy everything the baton carries into a clean staging tree.
+
+    The citation index rides along when it exists - ONE file, never the
+    corpus dir (1.9 GB of source text the remote worker has no use for).
+    """
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
@@ -97,6 +112,10 @@ def stage_bundle(root: Path, staging: Path) -> Path:
         src = root / sub
         if src.is_dir():
             shutil.copytree(src, staging / sub)
+    index = root / INDEX_RELPATH
+    if index.is_file():
+        (staging / INDEX_RELPATH).parent.mkdir(parents=True)
+        shutil.copy2(index, staging / INDEX_RELPATH)
     return staging
 
 
@@ -105,7 +124,7 @@ def restore_bundle(bundle: Path, root: Path) -> None:
     bundle's copy of a file wins, and any stale -wal/-shm beside the DB is
     dropped (the snapshot is self-contained; a leftover WAL from a previous
     life would be replayed over it)."""
-    for sub in ("state", "raw", "streams"):
+    for sub in ("state", "raw", "streams", "corpus"):
         src = bundle / sub
         if not src.is_dir():
             continue
@@ -247,8 +266,12 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
             time.sleep(30)
             waited += 30
 
+    index = root / INDEX_RELPATH
+    if not index.is_file():
+        index = None
+        print("no citation index in the bundle - verify's existence half stays UNVERIFIED")
     rc = 0
-    for argv in assemble_argvs(args.config):
+    for argv in assemble_argvs(args.config, citation_index=index):
         step = argv[3].rsplit(".", 1)[-1]
         print(f"== {step} ==")
         rc = subprocess.run(argv).returncode
