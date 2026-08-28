@@ -1,33 +1,22 @@
-# Isolated v5-prompt TREATMENT arm (2026-08-27). Not the live control.
-# The paired half of an A/B whose CONTROL is data/build/exp_deepseek
-# (n=99 generations, v4 prompt text, banked 2026-08-26 under
-# configs/data_law_v1_exp_deepseek.yaml). The generator, the seeds, the
-# task plan and every routing/limit value are held fixed; the ONLY
-# variable is the generator prompt text on disk, which now caps the
-# reasoning band from above - see
-# docs/superpowers/specs/2026-08-27-generator-prompt-length-fix-design.md.
-#
-# This file is configs/data_law_v1_exp_deepseek.yaml with build.workdir
-# changed and this header swapped in. Nothing else differs, and a test
-# asserts that byte-for-byte: a third difference between the two arms
-# would confound the comparison silently.
-#
-# The two cost fences carry over from the control and are load-bearing:
-#   * routing.generator -> [bai/deepseek-v4-flash] ALONE. The live list
-#     falls over to cerebras/gpt-oss and then paid lightning when b.ai is
-#     cooling, and a 429 storm would turn this arm into a gpt-oss arm
-#     without anything noticing. The report asserts every generation is
-#     deepseek.
-#   * openai usd_cap 0.0 WITH prices on both gpt-5 models. The live
-#     config declares no cap, which generate._openai_usd_cap reads as
-#     UNCAPPED, and gpt-5-mini/nano sit in judge and tiebreak as
-#     backstops. The price is load-bearing: _usd_per_1m returns 0.0 for a
-#     missing price, so a bare usd_cap 0.0 computes 0 + 0 > 0.0 == False
-#     and blocks nothing.
-# No harmony_* or prompt_overlay keys: that overlay is gpt-oss's Harmony
-# chat format and must not reach a deepseek generation. No pretreatment
-# manifest: a gate-rate arm, not a matched-cohort eval. Generate only -
-# judging is out of scope for this measurement.
+# Isolated law-v1 judging-repair measurement arm. Not the live control.
+# Task 6 of the judge-calibration-and-yield plan: re-runs the SAME 60
+# pre-registered pairs (configs/pre-registration/law-v1-recovery-cohort-
+# manifest.json) that exp_recovery already ran, under the repaired judge
+# instruments from Tasks 1-3 (judge_tiebreak_v1's restored low-score
+# exemplar, judge_pointwise_v1's split grounding_faithfulness bands, and
+# drafting parked to weight 0.00 in SYNTHESIS_MIX for NEW planning only -
+# none of which touches this already-fixed cohort). Purpose is to isolate
+# the judging repair from every other variable: this arm is otherwise
+# IDENTICAL to configs/data_law_v1_exp_s1.yaml (same think_min 500, same
+# prompt overlay, same harmony_s1_continue: true) except workdir and the
+# gpt-5 usd_cap, both dropped to 0.0 - a lenient paid judge in slot B is
+# exactly the confound this measurement removes, and a zero cap also makes
+# spend on this arm impossible outright. Judging therefore runs entirely on
+# the free fleet (groq/qwen, cerebras/gemma, mistral tiebreak).
+# workdir is data/build/exp_measure; load_build_config refuses this file
+# if workdir is pointed at data/build or the live law_v1.sqlite3.
+# Cerebras gpt-oss-120b is the only generator. Harmony prompt overlays are
+# explicit (src/tuned/data/prompts_harmony).
 #
 # law_v1 dataset-curation build config. This file is churn-heavy (API
 # providers/models/limits change weekly) so it lives separately from the
@@ -38,7 +27,7 @@
 
 build:
   train_config: configs/law_v1_8b_ddp.yaml
-  workdir: data/build/exp_prompt_v5
+  workdir: data/build/exp_measure
   target_total: 18000
   mvp_total: 10300
   mix: {grounded_synthesis: 0.60, curated: 0.16, replay: 0.24}
@@ -47,6 +36,38 @@ build:
   length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 4000, answer_min: 120}
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
+  harmony_completions: true
+  harmony_prefill: "I start from the facts. "
+  harmony_s1_continue: true
+  prompt_overlay: src/tuned/data/prompts_harmony
+  require_pretreatment_manifest: true
+  pretreatment_manifest: configs/pre-registration/law-v1-recovery-cohort-manifest.json
+
+  # THREE STRATA, NOT FOUR, AND THE MISSING ONE IS A DATA FACT NOT A CHOICE.
+  # eval_matched.statute_section_eligible requires a seed whose
+  # meta_json.section_text differs from the seed body. Measured 2026-08-23 on
+  # the read-only control store: 270 statute_qa tasks, 0 eligible seeds - no
+  # seed in that database carries provision text at all, so the stratum
+  # cannot be filled and select_cohort blocks with
+  # underfilled-stratum:statute_qa before anything is spent.
+  #
+  # Filling it needs official Gazette Act bodies attached to seeds (the
+  # gazette.py work on branch law-v1-foundation, whose manifest holds
+  # identities only), and attaching them would mean WRITING to the control
+  # store, which this arm may not do.
+  #
+  # Consequence, recorded here so the report cannot forget it: the cohort is
+  # 60 pairs, not 80. McNemar runs on a smaller discordant pool, and this arm
+  # may make NO claim about statute_qa - which is also the stream whose live
+  # accepts went 0 -> 2 under the corrected prompts, so the gap is real.
+  #
+  # THE ORDER OF THIS LIST IS PART OF THE DECLARATION, not just its contents:
+  # validate_pretreatment_manifest compares the manifest's persisted strata
+  # tuple to this list positionally (eval_matched.py:1189, `tuple(...) !=
+  # wanted`), so reordering these three names refuses an existing
+  # pre-treatment manifest even though the cohort it names is unchanged -
+  # re-run write-manifest after any reorder here.
+  eval_cohort_strata: [irac_analysis, drafting, summarization]
 
 # --------------------------------------------------------------------------
 # The assembly tail: split.py -> assemble.py -> stats.py.
@@ -224,7 +245,7 @@ difficulty:
 # push.py's own job ends at "repo exists, revision printed").
 # --------------------------------------------------------------------------
 push:
-  repo_id: tantan01/tuned-law-v1-data
+  repo_id: tantan01/tuned-law-v1-data-recovery
   private: true
 
 providers:
@@ -282,69 +303,6 @@ providers:
   # no spin, no deadlock, and next_wait() agrees with acquire(). No per-call
   # ceiling is needed and none was added; the provider's own 429 handling with
   # backoff takes it from there.
-  # b.ai, added 2026-08-25. Free tier, and the ONLY new FAMILY in this file:
-  # everything else here is gpt-oss/gemma/qwen/mistral, so deepseek is the one
-  # generator family that is not also sitting in the judge pool.
-  #
-  # THE RATE LIMIT IS A REQUEST-COUNTED BUCKET OF 10 - not a token budget and
-  # not a concurrency cap. Measured three ways on 2026-08-25:
-  #   * 24 requests back-to-back admitted 10; 24 fired simultaneously admitted
-  #     12. A 17x difference in overlap moved the count by two, so it is NOT
-  #     an in-flight cap.
-  #   * ~41 req/min carrying only ~650 tok/min throttled, while ~4.5 req/min
-  #     carrying ~4,700 tok/min ran clean. 7x the tokens passes and 9x the
-  #     requests does not, so it is NOT token-weighted.
-  #   * every saturating test admitted exactly ten, and recovery from a drained
-  #     bucket to first success took 40.5 s.
-  # REJECTED CALLS CONSUME SLOTS TOO: 15 deliberately-invalid requests drained
-  # it and the next VALID call came back 429. That is why rpm is 8 and not 10.
-  #
-  # The corollary that matters for cost: a cheap call and an expensive call
-  # consume the same one slot, so batching large prompts is free and chatty
-  # small calls are the wasteful shape here.
-  #
-  # tpm IS DELIBERATELY ABSENT, and this comment is the fence against adding it
-  # back. TokenBucket charges `context_est_tokens + max_tokens` per call
-  # (generate.py est_tokens -> bucket.acquire), so a tpm here is a SECOND,
-  # client-side limiter measured not to exist on the server. A tpm of 18000
-  # against ~6,800 est-tokens per call refills for ~23 s and throttles this ref
-  # to ~2.6 requests/min - one sixth of the real ceiling - and because acquire()
-  # holds its lock across the wait, it serialises every worker behind it.
-  # limits.get("tpm") returning None disables that dimension, which is exactly
-  # what a request-counted bucket needs.
-  #
-  # tpd/rpd are OMITTED rather than guessed: no daily cap was reached across
-  # ~4.6M tokens, and store._cap reads a missing cap as unlimited, which is the
-  # honest state rather than a number nobody measured.
-  #
-  # max_context 800000 is inside a MEASURED bracket, not a claim: 844,701
-  # prompt tokens returned 200 and 900,000 returned 400 "Input token exceed the
-  # limit". The 18,752 figure in the first day's notes was never a context
-  # measurement at all - it was the rate limiter interfering with the probe.
-  #
-  # reasoning_effort low IS A RELIABILITY SETTING, not a quality preference.
-  # Reasoning is billed against max_tokens and emitted first, and the ladder
-  # measures low 2,097 / high 4,300 / default 6,576 / max 12,573 tokens. At
-  # default the call averages 73 s and at max 99.3 s - against a Cloudflare
-  # origin timeout of ~100 s that killed 2 of 4 max-effort calls with HTTP 524.
-  # SSE streaming fixes that completely (4/4, one running 172 s), but
-  # ChatClient has no streaming path, so until it does, low is the setting that
-  # finishes: 33.4 s per call, and still ~3x the reasoning trace that
-  # gpt-oss-120b's 668 tokens produce.
-  - name: bai
-    base_url: https://api.b.ai/v1
-    api_key_env: BAI_API_KEY
-    quirks: [bai]
-    models:
-      - id: deepseek-v4-flash
-        family: deepseek
-        roles: [generator]
-        # max_output 16384 is a REPLY ceiling, not an answer ceiling: the bai
-        # request hook raises a smaller caller budget up to it, because
-        # reasoning is billed here and emitted first. 4096 measured 10/20 empty
-        # on the real synthesis prompt; 12288 measured 0/4.
-        limits: {rpm: 8, max_context: 800000, max_output: 16384}
-        params: {temperature: 0.7, top_p: 0.95, reasoning_effort: low}
   - name: cerebras
     base_url: https://api.cerebras.ai/v1
     api_key_env: CEREBRAS_API_KEY
@@ -452,7 +410,7 @@ providers:
       # not a separation concern.
       - id: openai/gpt-oss-20b
         family: gpt-oss
-        roles: [judge, tiebreak, probe]
+        roles: [tiebreak, probe]
         limits: {rpm: 30, tpm: 8000, tpd: 200000, rpd: 1000, max_context: 131072, max_output: 65536}
         params: {temperature: 0.2}
   - name: mistral
@@ -656,44 +614,79 @@ providers:
     api_key_env: OPENAI_API_KEY
     quirks: [openai]
     models:
-      # Both are declared family gpt-oss, which is NOT what the model card
-      # says: it is a deliberate, conservative lump so that OpenAI never
-      # grades its own lab's gpt-oss-120b rows. Family separation is what
-      # keeps a judge honest about a generator, and the cheap direction to
-      # be wrong in is "too separate".
+      # Family is gpt-5, not gpt-oss: lumping them as gpt-oss made OPENAI_API_KEY
+      # unusable on gpt-oss-120b rows (family separation skipped every call).
+      # Operator 2026-08-21: OpenAI may judge those rows under a $2 TOTAL hard
+      # usd_cap shared by mini and nano. The cap is the spend brake; these
+      # refs still sit LAST in routing.judge / routing.tiebreak so every free
+      # judge is tried first.
+      # THE NUMBER HERE IS 1.66, NOT 2.00, AND THAT IS NOT A TYPO. usd_cap is
+      # enforced by generate._openai_usd_spent, which sums budget_ledger from
+      # THE STORE IT IS GIVEN - and budget_ledger is per-workdir. A brand-new
+      # exp_recovery store starts at zero however much has been spent
+      # elsewhere, so declaring 2.00 here would authorise a SECOND full wallet.
+      # Measured 2026-08-23 on data/build/exp_harmony/state/law_v1.sqlite3:
+      # gpt-5-mini, 124 requests, 377,537 prompt + 122,607 completion tokens
+      # = $0.3396 at the prices below. 2.00 - 0.3396 = 1.6604, rounded DOWN.
+      # Any future store recomputes the remainder the same way; the arithmetic
+      # belongs to the operator's total, not to this file.
+      #
+      # A SECOND DIMENSION, NOT JUST THE STORE: budget_ledger's primary key is
+      # (day, provider, model) (store.py:129-133). generate._openai_usd_spent
+      # sums store.usage_today(provider, model, day=day) per openai model
+      # (generate.py:493-509), and budget_ok_for calls it as
+      # _openai_usd_spent(store, cfg) with no day override (generate.py:558),
+      # so `day` is None and usage_today resolves it via utcday(None) to
+      # TODAY'S UTC CALENDAR DATE (store.py:1339-1344). So 1.66 is enforced as
+      # a per-store, PER-UTC-DAY ceiling, not a per-store running total. A
+      # judge pass started today and resumed after 00:00 UTC (05:30 IST) reads
+      # an empty ledger row for the new day and is re-authorised for another
+      # 1.66 on top of whatever the previous UTC day already spent. Before
+      # resuming a probe that crosses a UTC-day boundary, recompute the
+      # remainder from budget_ledger summed across every day this arm has run
+      # - do not assume 1.66 is still what is left.
       #
       # Neither block carries `temperature`: the gpt-5 family accepts the
       # default and 400s on any other value (measured 2026-08-15). The
       # `openai` quirk in providers.py drops it from the payload regardless,
       # because judge.py sends its own per-call temperature and that would
       # otherwise arrive here through build_payload.
-      #
-      # NO tpd on either block, and that is a decision rather than an
-      # omission: operator's call 2026-08-15, this provider runs UNCAPPED. An
-      # absent cap reads as unlimited (store._cap treats a missing key as
-      # infinity), the same way the cerebras blocks leave rpd absent. The
-      # rpm/tpm below are real RATE limits - OpenAI's actual tier limits - and
-      # not spend controls, so nothing in this file brakes spend. Any spend
-      # brake lives server-side in the OpenAI billing dashboard, where a
-      # config edit cannot remove it. Uncapped is not the same as preferred:
-      # both refs sit LAST in routing.judge and routing.tiebreak, so every
-      # free judge is tried first and these are reached only by rows nothing
-      # free can serve.
       - id: gpt-5-mini
-        family: gpt-oss
+        family: gpt-5
         roles: [judge, tiebreak]
         limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
                  usd_cap: 0.0, usd_per_1m_prompt: 0.25, usd_per_1m_completion: 2.0}
         params: {}
+        # gpt-5 bills REASONING against max_completion_tokens, and judge.py's
+        # reply allowance is a fleet-wide 1,024 it cannot raise per model
+        # (build_payload assigns max_tokens after this merge). Measured on
+        # exp_harmony 2026-08-21: mean completion 989 tokens/request, and 95
+        # of 96 parse failures were EMPTY replies - the model spent the whole
+        # budget thinking and never reached the verdict. 'minimal' is the
+        # lowest effort this family accepts; the free qwen seat carries the
+        # same fix as reasoning_effort 'none'.
+        role_params:
+          judge: {reasoning_effort: 'minimal'}
+          tiebreak: {reasoning_effort: 'minimal'}
       - id: gpt-5-nano
-        family: gpt-oss
+        family: gpt-5
         roles: [judge, tiebreak]
-        # The calibration candidate: ~5x cheaper than mini, and carried here
-        # so the P5 gate can compare the two on real judgments rather than on
-        # price alone.
+        # The cheaper sibling: ~5x mini. Shares mini's usd_cap: 1.66 wallet,
+        # not a separate $2 - see the comment on the block above.
         limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
-                 usd_cap: 0.0, usd_per_1m_prompt: 0.25, usd_per_1m_completion: 2.0}
+                 usd_cap: 0.0, usd_per_1m_prompt: 0.05, usd_per_1m_completion: 0.40}
         params: {}
+        # gpt-5 bills REASONING against max_completion_tokens, and judge.py's
+        # reply allowance is a fleet-wide 1,024 it cannot raise per model
+        # (build_payload assigns max_tokens after this merge). Measured on
+        # exp_harmony 2026-08-21: mean completion 989 tokens/request, and 95
+        # of 96 parse failures were EMPTY replies - the model spent the whole
+        # budget thinking and never reached the verdict. 'minimal' is the
+        # lowest effort this family accepts; the free qwen seat carries the
+        # same fix as reasoning_effort 'none'.
+        role_params:
+          judge: {reasoning_effort: 'minimal'}
+          tiebreak: {reasoning_effort: 'minimal'}
 
 # Mistral rpm/tpm are console+header-verified 2026-08-14 and are no longer
 # placeholders. The workspace limit is 50 rpm / 50k tpm and BOTH models draw
@@ -733,7 +726,7 @@ providers:
 # ever spent on rows nothing free can serve.
 #
 # What made it qualify, and the bar any replacement must clear:
-# max_context >= 29708. That is not a round number because it is not a
+# max_context >= 29661. That is not a round number because it is not a
 # preference - it is required_context(worst-case judge call), and the
 # preflight prints the same number it enforces. In practice that means a 32k
 # model. A 16k model is NOT enough - and that is worth saying because most
@@ -746,15 +739,9 @@ providers:
 # the judge is shown a subset of that plus its own rubric. Sized in the
 # ROUTING currency (providers.context_estimate: per-turn template overhead,
 # and Indic script at 1.5 chars/token rather than 4) the largest judge call
-# this build can produce is 23,767 tokens, and CONTEXT_SAFETY_MARGIN turns
-# that into 29,708 of declared window. Devanagari is what makes it large,
+# this build can produce is 23,729 tokens, and CONTEXT_SAFETY_MARGIN turns
+# that into 29,661 of declared window. Devanagari is what makes it large,
 # and this corpus is largely Devanagari.
-#
-# THIS NUMBER MOVED 29,661 -> 29,708 ON 2026-08-24 (judge-calibration Task 2),
-# when the grounding_faithfulness rubric's bands were split to stop band 2
-# swallowing band 3's territory - a prose-only change to judge_pointwise_v1
-# that lengthened its longest axis line. Nothing about the judge pool or the
-# length band moved; only the prompt got longer.
 #
 # What the fatal gap WAS, kept because any future edit to routing.judge can
 # re-open it. A long prompt is routed past the cerebras generator to
@@ -816,14 +803,10 @@ providers:
 #
 # IF IT COMES BACK - any edit to routing.tiebreak, or a model retirement -
 # closing it takes one more tiebreak in a family that is none of
-# gpt-oss/mistral/qwen/gemma, with max_context >= 29666. That number is
-# UNCHANGED since the judge threshold above moved: this file never touched
-# judge_tiebreak_v1, only judge_pointwise_v1. The two used to differ the
-# other way - the tiebreak prompt a few tokens longer than the judge prompt,
-# so 29,661 bought a judge and 29,666 a tiebreak - and the 2026-08-24
-# grounding-band split reversed which one leads: 29,708 now buys a judge and
-# 29,666 still buys a tiebreak, the preflight sizing the two separately
-# either way.
+# gpt-oss/mistral/qwen/gemma, with max_context >= 29666. The five over
+# the judge threshold are real and not a typo: the tiebreak prompt is a
+# little longer than the judge prompt and the preflight sizes the two
+# separately, so 29,661 buys a judge and 29,666 buys a tiebreak.
 #
 # NOT an option: letting a judge share the generator's family when the pool
 # runs out. Family separation is a data-quality invariant, not a preference.
@@ -847,48 +830,30 @@ routing:
   # providers rather than a second family: family separation still removes
   # gpt-oss from the judge pool for every row, and undersized_families still
   # takes the family's largest window.
-  # deepseek LEADS since 2026-08-25. Both it and cerebras are free, so the
-  # free-before-paid rule does not order them; what does is that cerebras
-  # carries `tpd: 1000000`, which against ~2,745 tokens per generated example
-  # is ~364 examples/day - a 15-20k corpus is a 41-55 DAY run on it. b.ai has
-  # no observed daily cap and is rate-bound at ~600 calls/hour instead.
-  # cerebras stays second because it is 35x faster per call (2.1 s vs 33 s) and
-  # is the right overflow when b.ai is cooling or throttled; lightning stays
-  # last because it is the only PAID ref and the free budget drains first.
-  # ARM FENCE: the single ref. See the header.
-  generator: [bai/deepseek-v4-flash]
+  generator: [cerebras/gpt-oss-120b]
   # JUDGE: qwen then gemma, the two free families, then the paid backstops -
   # which is the standing "every free judge is preferred to the paid one" rule.
-  # On a gpt-oss generation family separation removes both openai models, so
-  # the two slots really are qwen (A) and gemma (B).
-  # added 2026-08-28 for judge calibration continuity; rows judged by this pair are a NON-PRODUCTION pair (gpt-oss-20b scored 0/10 on ungrounded IPC->BNS recall; grounded judging may differ - unvalidated)
-  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b, groq/openai/gpt-oss-20b,
+  # STALE AS OF TASKS 1-2: this used to say family separation removes both
+  # openai models on a gpt-oss generation, back when these refs declared
+  # family: gpt-oss (see the openai provider block above). They now declare
+  # family: gpt-5, which is NOT in the {gpt-oss, qwen, gemma} exclusion set a
+  # gpt-oss row judged by qwen and gemma produces - so gpt-5-mini and
+  # gpt-5-nano ARE reachable and billable here. qwen/gemma are just tried
+  # first because free budget drains before paid; when both are cooling or
+  # exhausted, the openai refs are what actually get called and charged
+  # against usd_cap, which is the entire premise of Tasks 1-2.
+  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,
           openai/gpt-5-mini, openai/gpt-5-nano]
   # TIEBREAK: mistral sits third, ahead of the paid backstops and behind the
   # two free families that separation will usually have spent already. On a
   # gpt-oss row judged by qwen and gemma the exclusion set is
-  # {gpt-oss, qwen, gemma} and mistral is the ONE family left - which is what
-  # keeps the third opinion free rather than paid.
-  # REORDERED 2026-08-25, and ONLY because the generator changed. The list
-  # above was written when every generation was gpt-oss: the exclusion set was
-  # {gpt-oss, qwen, gemma}, gpt-oss-20b was excluded on every row, and mistral
-  # was the one family left. Listing gpt-oss-20b first cost nothing because it
-  # never won.
-  #
-  # On a DEEPSEEK generation the exclusion set is {deepseek, qwen, gemma} and
-  # gpt-oss-20b is suddenly ELIGIBLE AND FIRST - so the seat silently changed
-  # hands. That seat is not an ordinary vote: with three verdicts the tiebreak
-  # decides outright (judge_policy.resolve), so it would have handed every
-  # contested row to the family measured at 0/10 on IPC->BNS mapping, which
-  # states the BNS has 447 sections and that S103 is perjury.
-  #
-  # mistral first restores the model that actually held this seat. gpt-oss-20b
-  # stays ahead of the paid backstops because it still has one job it alone can
-  # do: mistral's probed window is 52,812, so on a row longer than that
-  # undersized_families removes mistral and 20b's 131,072 is what stops the
-  # tiebreak pool emptying.
-  tiebreak: [mistral/mistral-large-latest, groq/openai/gpt-oss-20b,
-             cerebras/gemma-4-31b,
+  # {gpt-oss, qwen, gemma}; mistral (family mistral) is the first NON-excluded
+  # option there, not the ONLY one - same staleness as the judge comment
+  # above: the openai refs (family gpt-5, not gpt-oss) are not excluded
+  # either, they simply sit after mistral in this list, so the paid backstops
+  # remain reachable here too if mistral is unavailable.
+  tiebreak: [groq/openai/gpt-oss-20b, cerebras/gemma-4-31b,
+             mistral/mistral-large-latest,
              openai/gpt-5-mini, openai/gpt-5-nano]
   probe: [groq/openai/gpt-oss-20b]
   family_separation: true

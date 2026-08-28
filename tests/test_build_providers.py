@@ -461,8 +461,11 @@ def test_bai_quirk_raises_the_reply_budget_to_the_models_ceiling(monkeypatch):
     a 4000-token budget is not 4000 tokens of answer - it is 4000 tokens of
     reasoning-then-answer, and the measured empty-content rate at 4096 was
     10/20 on a real synthesis prompt while at 12288 it was 0/4. Sending the
-    caller's number unchanged puts the shipped GENERATION_OUTPUT_TOKENS (4000)
-    exactly on the 50% empty point.
+    caller's number unchanged put the THEN-shipped GENERATION_OUTPUT_TOKENS
+    (4000) exactly on the 50% empty point. (Since 2026-08-28 the shipped
+    constant IS 16384 - aligned with what this hook was sending - so on the
+    live config the raise is a no-op; the hook stays as the floor for any
+    caller that arrives with less.)
 
     The hook is the ONLY place this can be fixed: build_payload applies
     req.max_tokens AFTER merging model params, so neither params nor
@@ -2546,6 +2549,13 @@ def test_the_advice_never_falls_below_the_flat_worst_case(cfg, monkeypatch):
     # 2026-08-19, so slot B fills at every size and the gap under test here
     # cannot occur. See cfg_without_the_promoted_judge.
     cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
+    # The 2026-08-28 alignment (GENERATION_OUTPUT_TOKENS 16384, the sole
+    # generator's real reply ceiling) puts the reply term alone above the band
+    # ceiling, so per-family narrowing is unreachable at ANY window on the
+    # shipped constant. The narrowing ALGORITHM is the subject here - it is
+    # what any future narrow-window generator rests on - so it runs at the
+    # pre-alignment budget where the cliff is reachable.
+    monkeypatch.setattr("tuned.data.generate.GENERATION_OUTPUT_TOKENS", 4000)
     flat = required_context(worst_case_judge_tokens(cfg))
 
     def advice_with(*set_envs):
@@ -2780,7 +2790,7 @@ def test_pool_gaps_walks_the_generator_role_through_the_routers_own_filter(cfg, 
     ]
 
 
-def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg, keys):
+def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg, keys, monkeypatch):
     """A NARROW generator cannot be handed the longest row the length band
     permits - `undersized_families` diverts it long before - so checking its
     judge slots at that length invents a gap. Sized at what its own window
@@ -2814,6 +2824,11 @@ def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg
             cfg_with_gpt_oss_reinstated_as_generator(cfg_with_two_generator_families(cfg))
         )
     )
+    # The 2026-08-28 alignment (GENERATION_OUTPUT_TOKENS 16384) makes the
+    # narrowing unreachable at any window on the shipped constant - the
+    # ALGORITHM is the subject, so it runs at the pre-alignment budget. See
+    # test_the_advice_never_falls_below_the_flat_worst_case.
+    monkeypatch.setattr("tuned.data.generate.GENERATION_OUTPUT_TOKENS", 4000)
     # 26k, not 20k: correcting the reply conversion (2026-08-18, review round
     # 2 / I6) raised the 8k-window check from 15,104 to 19,104 tokens, i.e.
     # 23,880 of required context, so a 20k judge no longer demonstrates the
@@ -2865,9 +2880,16 @@ def test_the_family_window_bound_never_sizes_above_the_flat_worst_case(cfg, keys
     # at 4.0 while reply_over_budget had already been corrected to the
     # measured 5.5. The two have to use one constant or the sizing budgets
     # for a smaller candidate than enforcement permits.
+    #
+    # SINCE 2026-08-28 the reply term ALONE (16384 x 5.5 = 90,112 chars)
+    # exceeds the band ceiling (total_max * 4 = 32,768), so the min clamps to
+    # the flat worst case at EVERY window - the zero-material case included -
+    # and window narrowing is retired on the shipped config. The load-bearing
+    # property is unchanged and still what this test pins: the hook can only
+    # ever make a check SMALLER than the flat number, never larger.
     reply_chars = max_output_tokens(cfg) * REPLY_BUDGET_CHARS_PER_TOKEN
-    reply_only = judge_needed_tokens(judge_messages(WORST_CASE_CHAR * int(reply_chars), "", ""))
-    assert judge_tokens_for_generator_window(cfg, max_output_tokens(cfg)) == reply_only
+    assert int(reply_chars) > cfg.build.length_band.total_max * 4
+    assert judge_tokens_for_generator_window(cfg, max_output_tokens(cfg)) == worst_case_judge_tokens(cfg)
     # ...and a hook that answers nonsense narrows nothing: the gap set is the
     # flat one, not a wider check nobody asked for.
     flat = pool_gaps(cfg, needed_tokens=worst_case_judge_tokens(cfg))
@@ -3056,7 +3078,7 @@ def test_a_generator_familys_window_is_the_largest_model_it_offers(cfg, keys):
     assert window(None) is None
 
 
-def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_checked_at(cfg, keys):
+def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_checked_at(cfg, keys, monkeypatch):
     """What the rule above costs when it is wrong, at the only place it is
     spent. The operator adds a 128k variant beside a narrow one in an existing
     generator family; the family can now produce the longest row the band
@@ -3083,6 +3105,11 @@ def test_a_bigger_model_in_a_generator_family_raises_the_size_its_judges_are_che
     cfg = _narrow_generator(
         cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     )
+    # The 2026-08-28 alignment (GENERATION_OUTPUT_TOKENS 16384) makes the
+    # narrowing unreachable at any window on the shipped constant - the
+    # ALGORITHM is the subject, so it runs at the pre-alignment budget. See
+    # test_the_advice_never_falls_below_the_flat_worst_case.
+    monkeypatch.setattr("tuned.data.generate.GENERATION_OUTPUT_TOKENS", 4000)
     small = cfg_with_context(cfg, family="qwen", role="judge", max_context=26000)
     sizer, flat = judge_sizer(small), worst_case_judge_tokens(small)
 
@@ -3647,7 +3674,7 @@ def test_a_tiebreak_resolves_to_mistral_for_a_row_qwen_and_gemma_judged(cfg, key
     ) is None
 
 
-def test_the_judge_sizer_only_narrows_below_the_flat_worst_case(cfg, keys):
+def test_the_judge_sizer_only_narrows_below_the_flat_worst_case(cfg, keys, monkeypatch):
     """WHERE THE PER-FAMILY NARROWING ACTUALLY TURNS ON, measured.
 
     `needed_for_window` exists so a generator family too small to produce the
@@ -3662,6 +3689,12 @@ def test_the_judge_sizer_only_narrows_below_the_flat_worst_case(cfg, keys):
     was pretending to give.
     """
     two = cfg_with_two_generator_families(cfg)
+    # The 2026-08-28 alignment (GENERATION_OUTPUT_TOKENS 16384) makes the
+    # narrowing unreachable at any window on the shipped constant - the
+    # cliff itself is the subject here, so the curve is pinned at the
+    # pre-alignment budget where it exists. See
+    # test_the_advice_never_falls_below_the_flat_worst_case.
+    monkeypatch.setattr("tuned.data.generate.GENERATION_OUTPUT_TOKENS", 4000)
     sizer, flat = judge_sizer(two), worst_case_judge_tokens(two)
 
     # At and above the cliff the hook is a no-op...

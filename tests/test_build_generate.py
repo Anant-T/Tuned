@@ -626,10 +626,11 @@ def test_a_fabricated_citation_is_a_permanent_reject(tmp_path, cfg, paths):
         assert store.gates_for(gen["gen_id"])["citations"] is False
 
 
-# The shape the length band cannot see: a trace at the band's own think_max
-# and an answer built from the remainder. Every gate passes and the reply is
-# still more than twice the max_tokens the call asked for - which is the
-# premise the per-generator-window judge sizing rests on.
+# A trace near the band's ceiling and an answer built from the remainder.
+# Until 2026-08-28 this shape passed every gate while breaching the 22,000-char
+# reply budget - the judge-sizing premise's one hole. Since the deepseek
+# re-fit (GENERATION_OUTPUT_TOKENS 16384, budget 90,112 chars) it sits INSIDE
+# the budget, and the test below pins that closure instead of the breach.
 OVERSIZE_THINK = (CLEAN_THINK * 5)[:11_900]
 OVERSIZE_ANSWER = CLEAN_ANSWER + " " + (
     "The gap in the chain is the point to press, and it is the point on which this turns. " * 190
@@ -684,16 +685,19 @@ def test_the_generation_budget_covers_the_largest_gate_legal_reply(cfg):
     tokens for the same text. Raising think_max now fails here instead of
     quietly re-pricing the fleet.
     """
-    # Measured minimum over the pilot; see GENERATION_OUTPUT_TOKENS.
-    measured_min_chars_per_token = 4.24
+    # Measured minimum over the 1,086 stored deepseek generations
+    # (2026-08-28) - tighter than the 4.24 the gpt-oss pilot measured, and
+    # deepseek is the sole generator; see GENERATION_OUTPUT_TOKENS.
+    measured_min_chars_per_token = 3.93
     worst_case_tokens = legal_reply_chars(cfg) / measured_min_chars_per_token
     assert max_output_tokens(cfg) >= worst_case_tokens
     # ...and it is not derived from the band any more, so moving the band does
     # not move it.
     assert max_output_tokens(cfg) == GENERATION_OUTPUT_TOKENS
-    # The primary generator's declared ceiling, above which the cerebras
-    # request hook would clamp us without saying so.
-    assert max_output_tokens(cfg) <= 4096
+    # The sole generator's declared reply ceiling (bai/deepseek-v4-flash
+    # max_output 16384), which _bai_request_hook enforces as a floor and any
+    # returning gpt-oss ref's cerebras hook would clamp down from.
+    assert max_output_tokens(cfg) <= 16384
 
 
 def test_the_generation_budget_does_not_move_when_the_band_moves(tmp_path):
@@ -707,10 +711,12 @@ def test_the_generation_budget_does_not_move_when_the_band_moves(tmp_path):
 
     So the coincidence has to be broken: move think_max in a real config and
     assert the CALL budget does not follow it. Under the old derivation this
-    reads 2500; under the new one it stays 4000.
+    reads 2500; under the new one it stays put (4000 when this was written,
+    16384 since the 2026-08-28 deepseek re-fit - the decoupling is the
+    subject here, not the number).
     """
     raw = DATA_CONFIG.read_text(encoding="utf-8")
-    moved = raw.replace("think_min: 500, think_max: 3000", "think_min: 500, think_max: 1500")
+    moved = raw.replace("think_min: 500, think_max: 4000", "think_min: 500, think_max: 1500")
     assert moved != raw, "the length_band line moved; update this fixture"
     path = tmp_path / "band_moved.yaml"
     path.write_text(moved, encoding="utf-8")
@@ -719,11 +725,11 @@ def test_the_generation_budget_does_not_move_when_the_band_moves(tmp_path):
     assert shifted.build.length_band.think_max == 1500
     # The old derivation would give 1500 + 1000 = 2500.
     assert shifted.build.length_band.think_max + ANSWER_TOKEN_ALLOWANCE == 2500
-    assert max_output_tokens(shifted) == 4000
+    assert max_output_tokens(shifted) == 16384
     # ...and the inequality that replaced the identity now BINDS: a band this
     # small is comfortably covered, and the test above is what fails if the
     # band is ever raised past what the budget can carry.
-    assert max_output_tokens(shifted) >= legal_reply_chars(shifted) / 4.24
+    assert max_output_tokens(shifted) >= legal_reply_chars(shifted) / 3.93
 
 
 def test_the_reply_budget_is_the_max_tokens_the_call_actually_sent(cfg):
@@ -741,7 +747,10 @@ def test_the_reply_budget_is_the_max_tokens_the_call_actually_sent(cfg):
     """
     budget = reply_budget_chars(cfg)
     assert budget == int(max_output_tokens(cfg) * REPLY_BUDGET_CHARS_PER_TOKEN)
-    assert REPLY_BUDGET_CHARS_PER_TOKEN > 5.13, "must clear the measured maximum"
+    # 5.13 was gpt-oss's measured max; deepseek re-measured 2026-08-28 at
+    # 5.44 over 1,086 generations, still under the constant. The floor is
+    # the loosest MEASURED value so the margin that remains is real.
+    assert REPLY_BUDGET_CHARS_PER_TOKEN > 5.44, "must clear the measured maximum"
     assert reply_over_budget(cfg, "a" * budget, "") == 0
     assert reply_over_budget(cfg, "a" * (budget - 1), "b") == 0
     assert reply_over_budget(cfg, "a" * budget, "b") == 1
@@ -750,21 +759,29 @@ def test_the_reply_budget_is_the_max_tokens_the_call_actually_sent(cfg):
     assert reply_over_budget(cfg, CLEAN_THINK, CLEAN_ANSWER) == 0
 
 
-def test_a_reply_the_gates_pass_can_still_break_the_judge_sizing_premise(tmp_path, cfg, paths):
+def test_a_reply_the_gates_pass_can_no_longer_break_the_judge_sizing_premise(tmp_path, cfg, paths):
     """The premise behind judge_tokens_for_generator_window - "the candidate is
-    at most max_output_tokens of reply" - is not something check_length_band
-    tests. It bounds prompt + think + answer in chars/4 and the trace on its
-    own; a short prompt leaves the whole remainder for the reply. This row
-    passes all nine gates with a reply of more than twice the budget, and it is
-    exactly the shape a provider that does not bill its reasoning channel
-    against max_tokens would return. It goes back for a regeneration."""
+    at most max_output_tokens of reply" - held by ENFORCEMENT until 2026-08-28
+    and holds BY CONSTRUCTION since.
+
+    This fixture used to pass all nine gates with ~30k reply characters
+    against a 22,000-char budget and go back for a regeneration - the exact
+    window the pre-2026-08-28 version of this test pinned. That budget was a
+    fiction: it derived from a GENERATION_OUTPUT_TOKENS (4000) sized to
+    cerebras/gpt-oss-120b while _bai_request_hook sent 16384 on the wire, and
+    the fiction billed real money - 347 reply_over_budget regenerations
+    across the 11 deepseek experiment arms, every one a reply the provider
+    was billing correctly inside the budget the call actually carried.
+
+    Aligning the constant with the wire (16384) flips the structural
+    inequality: the reply budget (90,112 chars) now sits far ABOVE the band
+    ceiling (total_max * 4 = 32,768), so a gates-passing row cannot reach it
+    and the premise cannot be broken from inside the gates. The enforcement
+    stays for the one shape that can still breach it - a reasoning channel
+    not billed against max_tokens returning more than the wire permits -
+    which is by definition not a gates-question. The same fixture now sails
+    to judging with no event, and this test pins the closure."""
     with make_store(tmp_path) as store:
-        # RE-BASELINED 2026-08-28: bai/deepseek-v4-flash is the SOLE
-        # routing.generator ref now (operator directive - deepseek is the
-        # sole generator, cerebras spends only on judging), so excluding
-        # bai's key leaves nothing to fall over to; cerebras/gpt-oss-120b is
-        # pinned directly so it is the one that actually answers.
-        cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
         router = FakeRouter(
             cfg, {"generator": [chat_response(OVERSIZE_ANSWER, OVERSIZE_THINK)]},
         )
@@ -772,62 +789,52 @@ def test_a_reply_the_gates_pass_can_still_break_the_judge_sizing_premise(tmp_pat
         task = only_task(store)
         gen = store.latest_generation(task["task_id"])
 
-        # The gates - all of them - are happy with it.
+        # The gates - all of them - are happy with it, exactly as before.
         assert store.gates_for(gen["gen_id"]) == {gate: True for gate in gates.GATE_ORDER}
-        # ...and the reply is most of the way to twice what was asked for. The
-        # headroom is structural, not a fixture trick: the band's ceiling on
-        # prompt + think + answer is total_max * 4 characters, and the reply
-        # budget is a fraction of it, so any row with a short prompt has room
-        # to spare.
+        # The structural inversion: the band ceiling is now UNDER the reply
+        # budget, so gate-legal replies cannot breach it. This is the line
+        # that fails if anyone re-shrinks the budget below what the band
+        # admits - the pre-2026-08-28 defect coming back.
+        assert cfg.build.length_band.total_max * 4 < reply_budget_chars(cfg)
         reply_chars = len(gen["think"]) + len(gen["answer"])
-        assert reply_chars > reply_budget_chars(cfg)
-        # The headroom NARROWED on 2026-08-18 and the assertions say so rather
-        # than being loosened quietly: correcting the chars/token premise from
-        # 4.0 to the measured 5.5 raised the budget 16,000 -> 22,000 against an
-        # unchanged band ceiling of total_max * 4 = 32,768 characters, so the
-        # window in which a gates-passing row can still breach the premise went
-        # from ~1.79x the budget to ~1.30x on this fixture (28,627 reply
-        # characters against 16,000 then and 22,000 now - the earlier "~1.5x"
-        # here was written from the band ratio rather than measured, M-5). It
-        # is a window, not a gap: the shape
-        # this test exists for is still reachable, which is why the test still
-        # has something to catch.
-        assert cfg.build.length_band.total_max * 4 > reply_budget_chars(cfg)
-        over = reply_over_budget(cfg, gen["think"], gen["answer"])
+        assert reply_chars < reply_budget_chars(cfg)
+        assert reply_over_budget(cfg, gen["think"], gen["answer"]) == 0
 
-        assert task["state"] == "pending"
-        assert task["disposition"] == f"regenerate:{REPLY_BUDGET_GATE}"
-        event = json.loads(store.events("reply_over_budget")[0]["detail_json"])
-        assert event["over_by"] == over
-        assert event["budget_chars"] == reply_budget_chars(cfg)
-        assert event["ref"] == "cerebras/gpt-oss-120b"
+        # ...so the row is judged, not regenerated, and no event fires.
+        assert task["state"] == "judging"
+        assert task["disposition"] is None
+        assert store.events("reply_over_budget") == []
 
 
 def test_a_permanent_gate_still_decides_an_over_budget_reply(tmp_path, cfg, paths):
     """An over-long reply is a shape problem and asks for a regeneration; a
     fabricated citation is a statement about the law and burns the seed.
-    Nothing here promotes the second back into a retry."""
+    Nothing here promotes the second back into a retry.
+
+    RESIZED 2026-08-28 with the reply budget (22,000 -> 90,112 chars, see the
+    sibling test above): breaching the budget now takes a reply no band-legal
+    answer can carry, so the fixture is a deliberate monster and length_band
+    fails BESIDE citations - the pre-2026-08-28 version's careful trim that
+    kept length_band clean is no longer constructible on the shipped budget,
+    and the isolation it bought is not what this test decides. What it
+    decides is precedence: reject beats every regenerate-class failure in
+    the same result, reply_budget included."""
     with make_store(tmp_path) as store:
-        # Trimmed 2,000 chars off the tail of OVERSIZE_ANSWER's filler on
-        # 2026-08-28: the anti-rehearsal clause shipped into the irac_analysis
-        # templates that day added ~915 prompt_est tokens (up from a smaller
-        # figure pre-clause), and the untrimmed FABRICATED_ANSWER + OVERSIZE_
-        # ANSWER combination pushed total_est to 8,223 against total_max 8,192
-        # - length_band started firing alongside citations, defeating the
-        # point of this test (a permanent gate deciding while length_band
-        # stays clean, the same "shape length_band cannot see" premise
-        # OVERSIZE_THINK/OVERSIZE_ANSWER exist for). The trim only shortens
-        # repeated filler, never the fabricated citation or the shape that
-        # trips reply_budget: still ~3,833 answer_est tokens (comfortably
-        # over answer_min) and ~27,232 reply chars against a 22,000-char
-        # reply_budget_chars(cfg), with total_est back down to ~7,723 -
-        # headroom restored under total_max.
-        long_fabrication = FABRICATED_ANSWER + " " + OVERSIZE_ANSWER[:-2000]
+        filler = (
+            "The gap in the chain is the point to press, and it is the point "
+            "on which this turns. "
+        ) * 1000
+        long_fabrication = FABRICATED_ANSWER + " " + filler
         router = FakeRouter(cfg, {"generator": [chat_response(long_fabrication, OVERSIZE_THINK)]})
         run(store, cfg, router, paths)
         task = only_task(store)
+        gen = store.latest_generation(task["task_id"])
+        # The reply really is over even the aligned budget...
+        assert reply_over_budget(cfg, gen["think"], gen["answer"]) > 0
+        # ...and the permanent gate still decides the row.
         assert task["state"] == "rejected"
-        assert task["disposition"].startswith("reject:citations")
+        assert task["disposition"].startswith("reject:")
+        assert "citations" in task["disposition"]
         assert REPLY_BUDGET_GATE in task["disposition"]
 
 
@@ -1665,7 +1672,12 @@ def test_a_short_prompt_excludes_no_generator(tmp_path, cfg, paths):
         router = FakeRouter(cfg)
         run(store, cfg, router, paths)
         call = router.calls_for("generator")[0]
-        assert call["est_tokens"] <= 8192
+        # The estimate is prompt + reply budget. The prompt half is what
+        # "short" bounds (<= 4192 est tokens, the same headroom the old
+        # `<= 8192` left over a 4000 budget); the reply half tracks
+        # GENERATION_OUTPUT_TOKENS, which moved to the sole generator's real
+        # ceiling on 2026-08-28.
+        assert call["est_tokens"] <= max_output_tokens(cfg) + 4192
         assert call["exclude_families"] == frozenset()
         assert call["ref"] == ModelRef("cerebras", "gpt-oss-120b")
 
@@ -1972,7 +1984,7 @@ def test_a_plain_payload_400_costs_attempts_not_the_row(tmp_path, cfg, paths):
 
 
 def test_the_context_estimate_routes_devanagari_past_a_generator_latin_fits(
-    tmp_path, cfg, paths
+    tmp_path, cfg, paths, monkeypatch
 ):
     """Same character count, different script: chars/4 says both fit, and for
     the Devanagari one that is a 400 nobody fails over.
@@ -1983,6 +1995,12 @@ def test_the_context_estimate_routes_devanagari_past_a_generator_latin_fits(
     The shipped 131k window is cleared by both, so at the shipped size this
     test would pass while measuring nothing.
     """
+    # The 2026-08-28 alignment (GENERATION_OUTPUT_TOKENS 16384) adds the same
+    # 16k reply term to BOTH scripts' estimates, pushing both past the fixture
+    # window and measuring nothing again. The subject is the script-aware
+    # PROMPT estimate, so the reply term runs at the pre-alignment budget the
+    # fixture window was straddled around.
+    monkeypatch.setattr("tuned.data.generate.GENERATION_OUTPUT_TOKENS", 4000)
     narrow = _narrow_generator(cfg)
     latin = "the accused was convicted under section 302 of the code " * 90
     devanagari = "अभियुक्त को भारतीय दंड संहिता की धारा तीन सौ दो के अंतर्गत " * 90

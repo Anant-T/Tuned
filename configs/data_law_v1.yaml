@@ -98,7 +98,39 @@ build:
   # A/B, with a known -15.9pp summarization length_band cost shipped
   # honestly alongside it; follow-up = a summarization-specific length_band.
   # See docs/reports/2026-08-28-irac-stop-timing-fix.md.
-  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 3000, answer_min: 120}
+  #
+  # think_max RAISED 3000 -> 4000 on 2026-08-28 (operator directive: strip
+  # the gpt-oss-era calibrations, re-fit for deepseek). The "STAYS 3000"
+  # fence at the top of this block is SUPERSEDED, kept in place rather than
+  # deleted, and it is superseded on ITS OWN terms - both of the conditions
+  # it set are now met:
+  #   * "the raise only becomes coherent again if a generator with a LARGER
+  #     output ceiling leads routing.generator" - bai/deepseek-v4-flash
+  #     (max_output 16384) is the SOLE routing.generator since the
+  #     2026-08-28 operator directive above; the 4,096 cerebras ceiling that
+  #     made the cost side incoherent no longer binds any routed generator.
+  #   * the cost-side arithmetic was re-derived the same day, not ignored:
+  #     GENERATION_OUTPUT_TOKENS moved 4000 -> 16384 (generate.py, the wire
+  #     value the bai hook was already sending), so the worst-case gate-legal
+  #     reply at think_max 4000 (~5,089 real tokens at the measured deepseek
+  #     minimum 3.93 chars/token) is covered with 3x margin, and the pinning
+  #     test converts at the deepseek-measured minimum rather than gpt-oss's
+  #     4.24.
+  # The benefit side was re-measured at n=1,086 (all 11 deepseek arms, not
+  # the 99-row sweep the 2026-08-27 fence rested on): length_band pass
+  # 42.1% -> 51.7% on irac_analysis and 50.8% -> 59.8% on summarization,
+  # with the curve flattening past 4000 (4500 buys +2.3/+3.1pp more, 5000
+  # +2.0/+1.0pp, while total_max-alone blockage grows) - and the median irac
+  # trace (think_est 3,227) FAILED the 3000 ceiling, i.e. the old value
+  # rejected this generator's typical deliberation, the same defect class
+  # the verbatim_overlap 120 -> 500 re-fit closed the same day. This raise
+  # also retires the F2 follow-up above: a summarization-specific band is
+  # unnecessary once the shared ceiling stops binding the median trace
+  # (post-F2 summarization clean 21.5% -> 44.3% jointly with the verbatim
+  # re-fit). Evidence: docs/reports/2026-08-28-deepseek-recalibration.md.
+  # gpt-oss's own failure mode (think < think_min at 29.7%) is a FLOOR
+  # problem and is unmoved by this ceiling, exactly as the fence records.
+  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 4000, answer_min: 120}
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
 

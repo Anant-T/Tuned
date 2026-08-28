@@ -65,7 +65,15 @@ SOURCE = (
     "guilt of the accused. The trial court had relied on the recovery of a "
     "blood-stained weapon at the instance of the accused and on the testimony "
     "of a single eye witness who deposed four days after the incident. "
-    "The appellant stands convicted under Section 302 IPC."
+    "The appellant stands convicted under Section 302 IPC. "
+    # Extended 2026-08-28 so SOURCE_RUN_LONG can slice DEFAULT_MAX_RUN (500)
+    # contiguous characters from offset 80. Deliberately inert prose: no
+    # citation, no section number, no quotation marks - nothing that would
+    # widen grounded_refs or the citation index the other fixtures pin.
+    "The High Court had earlier declined to interfere, observing that the "
+    "appreciation of the recovered articles and of the witness statements was "
+    "a matter squarely within the province of the court of first instance, "
+    "and that no perversity had been shown in the way that court weighed them."
 )
 
 INDEX_ENTRIES = ["(2008) 1 SCC 1", "2023 INSC 45", "AIR 1973 SC 1461"]
@@ -1570,6 +1578,19 @@ def test_verbatim_overlap_naming_the_case_and_the_statute_is_not_transcription()
     50:55%, 60:42%, 80:24%, 100:16%, 120:13%, 150:11%. 120 clears the median
     incidental overlap by better than 2x while still catching the six genuine
     copies, which measured 167-335 characters.
+
+    RAISED AGAIN 120 -> 500 on 2026-08-28, by the same method on the current
+    generator. 120 was fitted on gpt-oss pilot traces; bai/deepseek-v4-flash
+    (the SOLE routing.generator since 2026-08-28) quotes the sentence under
+    analysis inside otherwise self-authored deliberation, and its longest
+    shared run measures p50 127 over 1,086 stored generations - the old
+    threshold sat AT the median incidental overlap, the exact position the
+    30 -> 120 re-audit condemned. The deepseek failure-rate curve ran 120:52%,
+    200:29%, 300:15%, 400:7%, 500:4%, 600:3%, flattening at 500; the failing
+    traces' copied coverage was p50 2.1% of the trace (max 19%), i.e. quotes,
+    not the transcription this gate exists to catch. Evidence beside
+    DEFAULT_MAX_RUN in gates.py and in
+    docs/reports/2026-08-28-verbatim-overlap-drafting-drift.md.
     """
     think = f"Working through it: {SOURCE_RUN_35} and so the link holds."
     result = check_verbatim_overlap(think, _ctx())
@@ -1590,7 +1611,7 @@ def test_verbatim_overlap_threshold_is_pinned_to_the_measured_sweep():
     """A bare pin, so moving the number is a deliberate act with a re-audit
     attached rather than a tuning nudge. The evidence is in gates.py beside the
     constant and in the test above."""
-    assert DEFAULT_MAX_RUN == 120
+    assert DEFAULT_MAX_RUN == 500
 
 
 def test_verbatim_overlap_same_run_in_the_answer_only_passes():
@@ -1625,7 +1646,7 @@ def test_verbatim_overlap_short_or_missing_trace_passes():
 _ALIGNMENT_TEXT = (
     "the accused walked to Fort Kochi that morning and waited by the ferry "
     "until the tide turned, saying nothing to anyone who passed him there. "
-) * 3
+) * 5
 
 
 @pytest.mark.parametrize("offset", range(SHINGLE_STEP))

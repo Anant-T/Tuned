@@ -467,7 +467,49 @@ SHINGLE_STEP = 10
 # before it is called a reproduction, so the flag will read `false` more often
 # on the transition stream and must not be read as "fabrication rose". Verify
 # against raw text before drawing anything from that field.
-DEFAULT_MAX_RUN = 120
+#
+# RAISED AGAIN 120 -> 500 on 2026-08-28, by the re-audit's own method applied
+# to the generator that actually generates. 120 was fitted on 55 gpt-oss pilot
+# drafting traces; bai/deepseek-v4-flash has been the SOLE routing.generator
+# since the 2026-08-28 operator directive, and against its traces the fitted
+# value stopped being a calibration. Measured over all 1,086 stored deepseek
+# generations (11 experiment arms, irac_analysis + summarization, grounding
+# re-derived byte-exact from seed.text), longest run shared with the source:
+#
+#     p25 63   p50 127   p75 218   p90 355   p99 936   max 1,340
+#
+#     max_run   120   150   200   250   300   350   400   450   500   600   800
+#     fails     52%   42%   29%   20%   15%   11%    7%    6%    4%    3%    2%
+#
+# 120 sat AT the median incidental overlap - the exact position the 30 -> 120
+# note above condemns 30 for. The curve flattens at 500 (the per-100-char drop
+# collapses from 7.8pp/100 over 300-400 to 1.3pp/100 past 500). What 120 was
+# failing is quotation, not transcription: the 567 failing traces carried a
+# median 2.1% of their text (max 19%) inside >=120-char shared runs - the
+# operative sentences of the passage under analysis, quoted inside otherwise
+# self-authored deliberation - and the fail rate was length-compounded (17% in
+# the shortest think-quartile, 83% in the longest) because one run anywhere
+# fails an existence test. Retries re-rolled a ~50/50 property (P(pass|fail)
+# 43%, P(pass|pass) 63%), burning calls without selecting. At 500 the residual
+# 4% is genuine multi-sentence copying. Full evidence:
+# docs/reports/2026-08-28-verbatim-overlap-drafting-drift.md and the
+# recalibration report beside it.
+#
+# The SECOND CONSUMER above is DECOUPLED by this raise rather than dragged
+# along: 500 is fitted to trace-side incidental overlap, but a quoted span
+# attributed to a section is one sentence by nature, so at 500 the
+# reproduces_grounding label could never fire again and the diagnostic would
+# die silently. It keeps the last value the two consumers shared - see
+# QUOTATION_REPRODUCTION_RUN below.
+DEFAULT_MAX_RUN = 500
+
+# check_statutory_quotation's reproduces_grounding threshold, formerly
+# DEFAULT_MAX_RUN itself. Frozen at the 2026-08-18 value when the gate
+# threshold moved to 500 (2026-08-28): the label asks "did this QUOTED SPAN
+# come from the build's own grounding", the span is sentence-sized, and a
+# threshold fitted to whole-trace incidental overlap is the wrong instrument
+# for it. Diagnostic only, exactly as before - not part of any verdict.
+QUOTATION_REPRODUCTION_RUN = 120
 
 # A QUOTATION ATTRIBUTED TO A SECTION, which on the transition stream is a
 # thing no row may carry. This repository holds no bare-act corpus: what a
@@ -1488,12 +1530,13 @@ def check_statutory_quotation(content: str, ctx: GateContext) -> GateResult:
     nowhere, which is worth counting over a pilot; both are refused, because
     with no bare-act corpus neither can be verified as the section's words.
 
-    IT READS DEFAULT_MAX_RUN, so it moved on 2026-08-18 when that constant went
-    30 -> 120 for check_verbatim_overlap's sake. The VERDICT is unaffected -
-    this field has never been part of it - but the threshold for calling a
-    quotation a reproduction is now four times longer, so the flag turns
-    `false` more readily and a drop in it means nothing about fabrication. See
-    the note beside DEFAULT_MAX_RUN.
+    IT READ DEFAULT_MAX_RUN until 2026-08-28, so it moved on 2026-08-18 when
+    that constant went 30 -> 120 for check_verbatim_overlap's sake. When the
+    gate threshold moved again (120 -> 500, fitted to deepseek trace overlap)
+    this field was DECOUPLED onto QUOTATION_REPRODUCTION_RUN, frozen at 120: a
+    quoted span is sentence-sized, and at 500 the label could never fire. The
+    VERDICT is unaffected - this field has never been part of it. See the
+    notes beside both constants.
     """
     if ctx.stream != TRANSITION_STREAM:
         return GateResult("statutory_quotation", True, {"skipped": "not-transition"})
@@ -1515,7 +1558,9 @@ def check_statutory_quotation(content: str, ctx: GateContext) -> GateResult:
             {
                 "quoted": quoted[:80],
                 "attribution": (between.strip() or window[-40:].strip())[:60],
-                "reproduces_grounding": find_verbatim_run(quoted, source, DEFAULT_MAX_RUN)
+                "reproduces_grounding": find_verbatim_run(
+                    quoted, source, QUOTATION_REPRODUCTION_RUN
+                )
                 is not None,
             }
         )

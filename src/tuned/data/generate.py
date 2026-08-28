@@ -250,7 +250,34 @@ ANSWER_TOKEN_ALLOWANCE = 1000
 # move numbers it cannot measure. test_generation_budget_covers_a_legal_reply
 # pins the inequality, so raising think_max now FAILS a test instead of quietly
 # re-pricing the fleet.
-GENERATION_OUTPUT_TOKENS = 4000
+#
+# RAISED 4000 -> 16384 on 2026-08-28 (the deepseek re-fit), and this is an
+# ALIGNMENT, not a re-pricing: 16384 is what every generation call has ACTUALLY
+# been sending since 2026-08-25, because 4000 was sized to a generator that no
+# longer generates and a hook was quietly correcting for it.
+#
+#   * The 4000 derivation above priced the reply against cerebras/
+#     gpt-oss-120b's max_output 4,096 - a ref the 2026-08-28 operator
+#     directive REMOVED from routing.generator. The sole generator,
+#     bai/deepseek-v4-flash, declares max_output 16384, bills its reasoning
+#     against max_tokens and emits it first, so _bai_request_hook has been
+#     raising the caller's 4000 to 16384 on the wire since the provider
+#     landed (4096 measured 10/20 empty replies; 12288, 0/4).
+#   * The caller's fiction was not free. reply_budget_chars derives from THIS
+#     number, so the enforcement bound sat at 22,000 chars while the wire
+#     allowed ~90,000 - and deepseek's billed, legitimate replies tripped
+#     reply_over_budget 347 times across the 11 experiment arms (~a third of
+#     calls), each one a wasted `regenerate` on a reply the call had actually
+#     permitted. Even a fully band-legal reply could trip it.
+#   * The worst-case gate-legal reply still fits with room: at think_max 4000
+#     (raised the same day, see the yaml) it is 20,000 chars = ~5,089 real
+#     tokens at the measured deepseek MINIMUM 3.93 chars/token (n=1,086,
+#     tighter than the 4.24 gpt-oss pilot minimum the old test converted at).
+#
+# If a gpt-oss generator ever returns, _cerebras_request_hook clamps this to
+# the model's own 4,096 ceiling on the wire, exactly as before - the constant
+# is the SOLE generator's declared reply ceiling, not a universal claim.
+GENERATION_OUTPUT_TOKENS = 16384
 
 # Chars-per-token for the REPLY BUDGET only - see reply_budget_chars.
 #
@@ -270,6 +297,12 @@ GENERATION_OUTPUT_TOKENS = 4000
 # 22,000-char bound. Deliberately NOT applied to providers.CHARS_PER_TOKEN_LATIN
 # - that constant feeds context_estimate and the 29,661/29,666 judge preflight
 # numbers, which are a separate re-audit (ledgered 2026-08-18).
+#
+# RE-MEASURED ON DEEPSEEK 2026-08-28 and it HOLDS: over all 1,086 stored
+# bai/deepseek-v4-flash generations, chars/completion_token ran p50 4.92,
+# p90 5.12, p99 5.31, max 5.44 - under the 5.5 ceiling, with thinner margin
+# than gpt-oss's 5.13. The value stays; the pinning test's floor moved
+# 5.13 -> 5.44 so the margin that remains is the measured one.
 REPLY_BUDGET_CHARS_PER_TOKEN = 5.5
 
 # The slots that are MATERIAL - what the teacher may cite, and therefore what
@@ -723,6 +756,15 @@ def judge_tokens_for_generator_window(
       `check_length_band` bounds `prompt + think + answer` in chars/4 and a
       short prompt leaves room for a reply of twice this budget, at which
       point the number below is no narrowing at all.
+
+      SINCE 2026-08-28 the premise also holds BY CONSTRUCTION on the shipped
+      config: GENERATION_OUTPUT_TOKENS moved to the sole generator's real
+      reply ceiling (16384), whose reply term alone (16384 x 5.5 = 90,112
+      chars) exceeds the band ceiling (total_max x 4 = 32,768), so the `min`
+      below clamps to band_chars at EVERY window and a gates-passing row can
+      no longer out-size the flat worst case. The enforcement stays for the
+      shape it has always existed for - an unbilled reasoning channel
+      returning more than the wire budget permits.
 
     Converting the reply back into characters is the one step that is not a
     rearrangement of numbers the code already enforces, and it must charge
@@ -1390,6 +1432,15 @@ def reply_budget_chars(cfg) -> int:
     check therefore fired on 53 calls that were inside their token budget -
     including 34 that reported completion_tokens exactly equal to the
     max_tokens sent. See REPLY_BUDGET_CHARS_PER_TOKEN.
+
+    IT UNDER-STATED A SECOND TIME, in the other factor, and that is the
+    failure the 2026-08-28 raise of GENERATION_OUTPUT_TOKENS fixes: the
+    caller's 4000 was sized to cerebras/gpt-oss-120b while _bai_request_hook
+    sent 16384 on the wire, so this bound sat at 22,000 chars against calls
+    that were permitted ~90,000 - and fired 347 times across the 11 deepseek
+    experiment arms on replies the provider was billing correctly. Same
+    defect, one layer up: a bound derived from a number the call no longer
+    sends.
     """
     return int(max_output_tokens(cfg) * REPLY_BUDGET_CHARS_PER_TOKEN)
 

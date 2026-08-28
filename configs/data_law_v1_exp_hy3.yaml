@@ -89,7 +89,7 @@ build:
   mix: {grounded_synthesis: 0.60, curated: 0.16, replay: 0.24}
   overgeneration: 2.0
   held_out_frac: 0.10
-  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 3000, answer_min: 120}
+  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 4000, answer_min: 120}
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
 

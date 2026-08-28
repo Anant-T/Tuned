@@ -1345,7 +1345,7 @@ def test_the_ds_rerun_arms_are_fenced_and_differ_only_in_the_prompt_overlay():
             assert model.limits["usd_per_1m_prompt"] > 0
             assert model.limits["usd_per_1m_completion"] > 0
         assert cfg.build.length_band == live.build.length_band
-        assert cfg.build.length_band.think_max == 3000
+        assert cfg.build.length_band.think_max == 4000
         assert cfg.build.length_band.total_max == 8192
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         for key in ("harmony_completions", "harmony_prefill", "harmony_s1_continue",
@@ -1475,7 +1475,7 @@ def _assert_ds_ab_common_fences(cfg, path: Path, live) -> None:
         assert model.limits["usd_per_1m_prompt"] > 0
         assert model.limits["usd_per_1m_completion"] > 0
     assert cfg.build.length_band == live.build.length_band
-    assert cfg.build.length_band.think_max == 3000
+    assert cfg.build.length_band.think_max == 4000
     assert cfg.build.length_band.total_max == 8192
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     for key in ("harmony_completions", "harmony_prefill", "harmony_s1_continue",
@@ -1603,7 +1603,7 @@ def test_the_hy3_probe_config_is_fenced_and_carries_the_new_model():
         assert model.limits["usd_per_1m_prompt"] > 0
         assert model.limits["usd_per_1m_completion"] > 0
     assert cfg.build.length_band == live.build.length_band
-    assert cfg.build.length_band.think_max == 3000
+    assert cfg.build.length_band.think_max == 4000
     assert cfg.build.length_band.total_max == 8192
     raw = yaml.safe_load(HY3_CONFIG.read_text(encoding="utf-8"))
     for key in ("harmony_completions", "harmony_prefill", "harmony_s1_continue",
