@@ -444,7 +444,7 @@ providers:
       # not a separation concern.
       - id: openai/gpt-oss-20b
         family: gpt-oss
-        roles: [tiebreak, probe]
+        roles: [judge, tiebreak, probe]
         limits: {rpm: 30, tpm: 8000, tpd: 200000, rpd: 1000, max_context: 131072, max_output: 65536}
         params: {temperature: 0.2}
   - name: mistral
@@ -853,7 +853,8 @@ routing:
   # which is the standing "every free judge is preferred to the paid one" rule.
   # On a gpt-oss generation family separation removes both openai models, so
   # the two slots really are qwen (A) and gemma (B).
-  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,
+  # added 2026-08-28 for judge calibration continuity; rows judged by this pair are a NON-PRODUCTION pair (gpt-oss-20b scored 0/10 on ungrounded IPC->BNS recall; grounded judging may differ - unvalidated)
+  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b, groq/openai/gpt-oss-20b,
           openai/gpt-5-mini, openai/gpt-5-nano]
   # TIEBREAK: mistral sits third, ahead of the paid backstops and behind the
   # two free families that separation will usually have spent already. On a
