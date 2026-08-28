@@ -366,7 +366,15 @@ def cfg_without_the_paid_judges(cfg: BuildConfig) -> BuildConfig:
     # quietly empty the tiebreak pool and make every rule below pass for a
     # reason nobody chose.
     assert "groq/openai/gpt-oss-20b" in patched.routing.tiebreak
-    assert len(patched.routing.judge) == len(cfg.routing.judge) - 2
+    # SINCE 2026-08-28 the shipped lists carry no openai refs at all (the paid
+    # backstops were deleted with their provider block - free fleet only), so
+    # this helper is an identity on the live config and the "pool that runs
+    # out" it used to construct IS the shipped pool. Kept so the rules it
+    # serves keep working if a paid backstop ever returns.
+    assert len(patched.routing.judge) in (
+        len(cfg.routing.judge),
+        len(cfg.routing.judge) - 2,
+    )
     return patched
 
 

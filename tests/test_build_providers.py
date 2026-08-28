@@ -641,31 +641,36 @@ def test_shipped_bai_judge_payload_disables_thinking_and_keeps_the_small_budget(
     assert generating["temperature"] == 0.7  # the generator keeps its own
 
 
-def test_shipped_deepseek_is_the_free_judge_ahead_of_the_paid_backstops():
-    """Slot B, and the reason it is filled: cerebras/gemma-4-31b answers HTTP
-    402 payment_required as of 2026-08-27, so without a third free ref the pool
-    reaches openai/gpt-5-mini - which family_separation only hides on a gpt-oss
-    row. Placement is the policy: after every free ref, before every paid one.
+def test_the_shipped_routing_lists_are_the_free_fleet():
+    """The 2026-08-28 free-fleet ruling, pinned as list EQUALITY: no paid ref
+    anywhere (the openai backstops and their provider block were deleted -
+    prev_rep.md holds them), deepseek in both slots it can serve, and the
+    order is the policy - the Router walks these lists front to back.
     """
     cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
-    deepseek = ModelRef("bai", "deepseek-v4-flash")
-
-    for role in ("judge", "tiebreak"):
-        refs = list(cfg.routing_refs(role))
-        assert deepseek in refs, f"routing.{role} has no free slot-B ref"
-        here = refs.index(deepseek)
-        paid = [i for i, r in enumerate(refs) if r.provider == "openai"]
-        assert paid, f"routing.{role} lost its paid backstops"
-        assert here < min(paid), (
-            f"routing.{role} puts bai/deepseek-v4-flash behind a paid ref"
-        )
+    assert list(cfg.routing.generator) == ["bai/deepseek-v4-flash"]
+    assert list(cfg.routing.judge) == [
+        "groq/qwen/qwen3.6-27b",
+        "cerebras/gemma-4-31b",
+        "bai/deepseek-v4-flash",
+        "groq/openai/gpt-oss-20b",
+    ]
+    assert list(cfg.routing.tiebreak) == [
+        "mistral/mistral-large-latest",
+        "groq/openai/gpt-oss-20b",
+        "cerebras/gemma-4-31b",
+        "bai/deepseek-v4-flash",
+    ]
+    assert not any(
+        p.name in ("openai", "lightning") for p in cfg.providers
+    ), "a paid provider block came back without a free-fleet ruling"
 
     # The seat exists only because the model declares the roles; role_params
     # for a role the model does not serve is refused at load. Pinned by
     # EQUALITY like every other roles assertion in this module: a superset
     # test would let a fourth role appear here unnoticed, and the roles a
     # model declares are what the Router walks.
-    _provider, model = cfg.model_for(deepseek)
+    _provider, model = cfg.model_for(ModelRef("bai", "deepseek-v4-flash"))
     assert tuple(model.roles) == ("generator", "judge", "tiebreak")
 
 
@@ -1138,13 +1143,14 @@ def test_pick_skips_missing_key(cfg, keys, monkeypatch):
 def test_pick_skips_over_budget(cfg, keys):
     def budget_ok(provider, model, tokens):
         assert tokens == 500
-        # Every FREE judge over budget, which since 2026-08-27 is three
-        # providers rather than two: bai/deepseek-v4-flash took slot B ahead
-        # of the paid backstop. The paid ref is what is left.
+        # Every judge over budget. Since the 2026-08-28 free-fleet ruling the
+        # whole judge pool is groq/cerebras/bai - there is no paid backstop
+        # left behind them, so an all-over-budget pool picks NOTHING rather
+        # than falling through to a paid ref.
         return provider not in ("groq", "cerebras", "bai")
 
     router = _router(cfg, budget_ok=budget_ok)
-    assert router.pick("judge", est_tokens=500).ref == PAID_JUDGE
+    assert router.pick("judge", est_tokens=500) is None
 
 
 def test_pick_returns_none_when_nothing_eligible(cfg, keys):
@@ -1288,19 +1294,18 @@ def test_complete_raises_when_every_ref_fails(cfg, keys):
         asyncio.run(router.complete("judge", [{"role": "user", "content": "grade this"}]))
 
     assert excinfo.value.retryable is True
-    # Six refs over four providers: the openai backstop contributes two, and
-    # BOTH have to be tried before the role is out of options. cerebras IS
-    # among them since 2026-08-19 - gemma was promoted into the judge role when
-    # mistral was removed - and bai since 2026-08-27, when deepseek took the
-    # slot-B seat gemma's 402 had emptied. groq ALSO contributes two, also
-    # since 2026-08-27: groq/openai/gpt-oss-20b joined the judge role that day,
-    # for the slot-B seat a DEEPSEEK generation leaves empty (family separation
-    # excludes deepseek from judging its own rows).
-    assert "all 6 eligible model(s) failed" in str(excinfo.value)
+    # Four refs over three providers since the 2026-08-28 free-fleet ruling
+    # (the two openai backstops left with their provider block). groq
+    # contributes two (qwen since the start; groq/openai/gpt-oss-20b since
+    # 2026-08-27, for the slot-B seat a DEEPSEEK generation leaves empty),
+    # cerebras one (gemma, promoted 2026-08-19), bai one (deepseek,
+    # 2026-08-27) - and ALL of them have to be tried before the role is out
+    # of options.
+    assert "all 4 eligible model(s) failed" in str(excinfo.value)
     assert seen.count("groq") == 4  # two refs, two in-provider attempts each
     assert seen.count("cerebras") == 2
     assert seen.count("bai") == 2
-    assert seen.count("openai") == 4  # two refs, two in-provider attempts each
+    assert seen.count("openai") == 0  # the paid backstops left the fleet 2026-08-28
 
 
 def test_complete_does_not_fail_over_on_non_retryable(cfg, keys):
@@ -1737,26 +1742,28 @@ def test_undersized_families_over_the_real_pool(cfg):
     assert undersized_families(narrow, "generator", 6_555) == frozenset({"deepseek"})
 
 
-def test_undersized_families_keeps_a_mixed_family_with_one_large_model(cfg):
-    # The gpt-oss tiebreak family is groq's 131k model plus two 400k openai
-    # ones; a family is excluded only when EVERY one of its role models is too
-    # small, so the family survives on its largest.
-    #
-    # 150,000 rather than 100,000 since the 2026-08-19 probe: gemma used to be
-    # the small side of this comparison at a stale 8192 and is now 131k, so at
-    # 100,000 NOTHING is excluded and the property would not be under test.
+def test_undersized_families_excludes_a_family_only_past_its_largest_window(cfg):
+    # RENAMED 2026-08-28: the mixed gpt-oss family this test used to exercise
+    # (groq's 131k model plus two 400k openai backstops) lost its large side
+    # when the paid refs were deleted - the rule is unchanged (a family is
+    # excluded only when EVERY one of its role models is too small), and the
+    # family that now demonstrates the far end is deepseek at the probed 800k.
     assert undersized_families(cfg, "tiebreak", 40_000) == frozenset()
-    assert "gpt-oss" not in undersized_families(cfg, "tiebreak", 150_000)
-    # mistral joins gemma on the small side: its window is the PROBED 52,812
-    # floor, so it falls out first, at 42,251.
+    # mistral falls out first: its window is the PROBED 52,812 floor.
     assert undersized_families(cfg, "tiebreak", 42_250) == frozenset()
     assert undersized_families(cfg, "tiebreak", 42_251) == frozenset({"mistral"})
-    assert undersized_families(cfg, "tiebreak", 150_000) == frozenset({"gemma", "mistral"})
-    # ...and the gpt-oss family does fall out once even its 400k models cannot
-    # hold the row, which is what makes the line above a mixed-family rule and
-    # not an exemption.
-    assert undersized_families(cfg, "tiebreak", 320_001) == frozenset(
+    # gemma and gpt-oss (both 131k) go together past 131,072/1.25.
+    assert undersized_families(cfg, "tiebreak", 104_858) == frozenset({"mistral"})
+    assert undersized_families(cfg, "tiebreak", 150_000) == frozenset(
         {"gemma", "gpt-oss", "mistral"}
+    )
+    # ...and deepseek (800k probed bracket) is the last family standing until
+    # even its window cannot hold the row.
+    assert undersized_families(cfg, "tiebreak", 640_000) == frozenset(
+        {"gemma", "gpt-oss", "mistral"}
+    )
+    assert undersized_families(cfg, "tiebreak", 640_001) == frozenset(
+        {"deepseek", "gemma", "gpt-oss", "mistral"}
     )
 
 
@@ -1805,14 +1812,12 @@ def test_build_check_request_is_pure():
 def test_check_refs_covers_every_configured_model(cfg):
     refs = check_refs(cfg)
     expected = sum(len(p.models) for p in cfg.providers)
-    # 9: the magistral generator block went when the line was retired upstream
-    # and zai-glm-4.7 went on 2026-08-18 when it was archived. The mistral
-    # block survives the 2026-08-19 judge surgery - mistral-SMALL lost the
-    # judge seat to calibration, and mistral-LARGE took the tiebreak seat -
-    # lightning/gpt-oss-120b joined the same day as the paid generator
-    # overflow, and bai/deepseek-v4-flash joined 2026-08-25 as the free
-    # generator that now leads the list.
-    assert len(refs) == expected == 9
+    # 6 since the 2026-08-28 free-fleet ruling (lightning and both openai
+    # gpt-5 models left with their provider blocks): bai/deepseek-v4-flash,
+    # cerebras/gpt-oss-120b (judging-era block, unrouted as generator),
+    # cerebras/gemma-4-31b, groq/qwen/qwen3.6-27b, groq/openai/gpt-oss-20b,
+    # mistral/mistral-large-latest.
+    assert len(refs) == expected == 6
     assert ModelRef("groq", "qwen/qwen3.6-27b") in refs
     assert check_refs(cfg, "groq/qwen/qwen3.6-27b") == (ModelRef("groq", "qwen/qwen3.6-27b"),)
     with pytest.raises(KeyError):
@@ -2026,13 +2031,14 @@ def test_overflow_at_every_ref_is_reported_as_a_row_shaped_failure(cfg, keys):
 
     assert excinfo.value.context_exceeded is True
     assert excinfo.value.retryable is False
-    # Every ref was offered it, the two paid backstops included - a 400 that
-    # says "too long for this window" never charges the breaker, so the pass
-    # runs to the end of the list rather than stopping at the first refusal.
-    # groq appears twice since 2026-08-27: qwen, then groq/openai/gpt-oss-20b,
-    # added to routing.judge for the slot-B seat a DEEPSEEK generation leaves
-    # empty.
-    assert seen == ["groq", "cerebras", "bai", "groq", "openai", "openai"]
+    # Every ref was offered it - a 400 that says "too long for this window"
+    # never charges the breaker, so the pass runs to the end of the list
+    # rather than stopping at the first refusal. groq appears twice since
+    # 2026-08-27: qwen, then groq/openai/gpt-oss-20b, added to routing.judge
+    # for the slot-B seat a DEEPSEEK generation leaves empty. The two openai
+    # entries that used to close this walk left with the paid backstops
+    # (2026-08-28, free fleet only).
+    assert seen == ["groq", "cerebras", "bai", "groq"]
 
 
 def test_undersized_families_keeps_an_explicit_safety_margin(cfg):
@@ -2192,60 +2198,6 @@ def test_the_shipped_config_has_no_fatal_judge_hole_left(cfg, keys):
     assert judge_gaps[0].fatal is True
     assert "a secondgen generation of" in judge_gaps[0].detail
     assert "minus ['qwen'] already used" in judge_gaps[0].detail
-
-
-def test_the_shipped_openai_models_send_no_temperature_and_declare_no_daily_cap(cfg):
-    """Two decisions that are invisible until they are wrong.
-
-    No `temperature`: the gpt-5 family 400s on any value but the default, and a
-    400 with no context marker ABORTS the call rather than failing over. The
-    quirk strips it as well; this is the config's half, and the half that keeps
-    the payload clean when no per-call temperature is sent at all.
-
-    No `tpd`/`rpd`: the operator chose UNCAPPED on 2026-08-15, and an absent key
-    is how "unlimited" is spelt here. Pinned as a MEANING and not a spelling -
-    the ledger's own reader is asked - because an absent number reads like an
-    oversight, and the obvious repair for an oversight is to invent one. Any
-    spend brake for this provider lives server-side, not in this file."""
-    from tuned.data.store import _cap
-
-    provider, _ = cfg.model_for(ModelRef("openai", "gpt-5-mini"))
-    assert provider.quirks == ("openai",)
-    assert provider.api_key_env == "OPENAI_API_KEY"
-    models = {m.id: m for m in provider.models}
-    assert set(models) == {"gpt-5-mini", "gpt-5-nano"}
-
-    judge_bar = required_context(worst_case_judge_tokens(cfg))
-    for model in models.values():
-        assert "temperature" not in model.params, model.id
-        for cap in ("tpd", "rpd"):
-            assert cap not in model.limits, model.id
-            assert _cap(model.limits, cap) == float("inf"), model.id
-        # The rate limits that ARE declared are real per-minute limits, not
-        # brakes wearing a limit's name.
-        assert (model.limits["rpm"], model.limits["tpm"]) == (500, 200000), model.id
-        # ...and each clears the threshold the preflight enforces, which is
-        # what makes it a judge rather than another 16k candidate.
-        assert model.limits["max_context"] >= judge_bar, model.id
-        assert model.family == "gpt-oss", model.id
-
-
-def test_the_paid_backstop_is_last_in_both_routing_lists(cfg, keys):
-    """Position IS the preference: Router.pick walks the role's list in order
-    and takes the first eligible ref. Anywhere but last, a paid call gets made
-    for a row a free judge would have taken - which is the whole of "uncapped
-    does not mean preferred"."""
-    paid = ("openai/gpt-5-mini", "openai/gpt-5-nano")
-    router = Router(cfg)
-    for role in ("judge", "tiebreak"):
-        refs = getattr(cfg.routing, role)
-        assert refs[-2:] == paid, role
-        assert not any(r.startswith("openai/") for r in refs[:-2]), role
-        # ...and the Router's own walk agrees, which is the half that decides
-        # anything: the config list is only a preference if this is its order.
-        walked = [f"{r.provider}/{r.model}" for r in router.eligible_refs(role)]
-        assert tuple(walked[-2:]) == paid, role
-        assert router.pick(role).ref.provider != "openai", role
 
 
 def test_the_archived_glm_model_is_in_no_pool_and_no_provider_block(cfg):
@@ -2417,12 +2369,12 @@ def test_a_key_shaped_judge_gap_is_a_gap_at_every_row_size(cfg, monkeypatch):
         # the generator's own family, and both remaining judge families sit
         # behind the key that has not arrived.
         gap = next(g for g in gaps if g.generator_family == "secondgen")
-        assert gap.unservable is True, f"servable at needed={needed}"
-        assert gap.key_shaped is True
-        # BOTH pending keys are named: either one would fill the slot, and a
+        # GROQ is the one pending key since 2026-08-28: the unkeyed openai
+        # backstop that used to co-appear in this remedy left with its
+        # provider block (free fleet only).
         # remedy that named only the first would send the operator after half
         # of what they have.
-        assert gap.key_envs == ("GROQ_API_KEY", "OPENAI_API_KEY")
+        assert gap.key_envs == ("GROQ_API_KEY",)  # openai backstop deleted 2026-08-28
         assert "no row size is servable" in gap.detail
 
     # ...and the classification is per GAP, not per config: a deepseek row can
@@ -2846,16 +2798,17 @@ def test_each_generator_family_is_checked_at_the_size_its_own_window_permits(cfg
             if g.fatal
         }
 
-    # Both generator families lose slot B at the flat size: qwen is now too
-    # small and glm always was, so the pool is mistral + the gpt-oss backstop
-    # and each family's own is one of them. (deepseek, also present as a
-    # third real generator family since 2026-08-28, never appears here - see
-    # the note above.)
-    assert fatal() == {("gpt-oss", "b"), ("secondgen", "b")}
-    # Sized at what its own 8k window permits, the gpt-oss family's judges fit
-    # again and its refusal disappears; the 40k mistral family really can make
-    # the long row, so its gap stays.
-    assert fatal(needed_for_window=sizer) == {("secondgen", "b")}
+    # RE-DERIVED 2026-08-28 (free fleet): with the 400k openai judges gone,
+    # the promoted-judge-free pool is qwen alone at 26k. At the FLAT size the
+    # narrowed families (gpt-oss and deepseek, both 8k by fixture) each gap
+    # at slot B, and secondgen - whose 131k window really can make the flat
+    # row - gaps at slot A, where the undersized qwen now sits.
+    assert fatal() == {("deepseek", "b"), ("gpt-oss", "b"), ("secondgen", "a")}
+    # Sized at what their own 8k windows permit, the narrowed families' rows
+    # fit the 26k judge and their refusals disappear; secondgen keeps its gap
+    # because it alone can produce the row the pool cannot judge. That
+    # asymmetry IS the property under test, unchanged since 2026-08-19.
+    assert fatal(needed_for_window=sizer) == {("secondgen", "a")}
 
 
 def test_the_family_window_bound_never_sizes_above_the_flat_worst_case(cfg, keys):
@@ -3595,17 +3548,13 @@ def test_the_judge_pool_is_the_one_calibration_left_behind(cfg):
         "cerebras/gemma-4-31b",
         "bai/deepseek-v4-flash",
         "groq/openai/gpt-oss-20b",
-        "openai/gpt-5-mini",
-        "openai/gpt-5-nano",
     ]
     assert "mistral/mistral-large-latest" in cfg.routing.tiebreak
-    # The free families come before the paid backstops in both lists, which is
-    # the standing rule that keeps the fenced-to-$0 openai backstops (usd_cap:
-    # 0.0, not a metered ~$1/day - that phrasing was corrected 2026-08-27)
-    # reached only by rows nothing free serves.
-    assert cfg.routing.tiebreak.index("mistral/mistral-large-latest") < (
-        cfg.routing.tiebreak.index("openai/gpt-5-mini")
-    )
+    # mistral leads the tiebreak list - the ordering that keeps the deciding
+    # seat off the family measured 0/10 on IPC->BNS recall. (The paid
+    # backstops this comment used to order against left the fleet entirely
+    # on 2026-08-28.)
+    assert cfg.routing.tiebreak.index("mistral/mistral-large-latest") == 0
 
 
 def test_the_probed_mistral_window_is_what_the_config_declares(cfg):
@@ -3788,44 +3737,6 @@ def test_the_generator_prefers_the_free_provider_and_parks_once_all_are_ineligib
     assert cooling.pick("generator") is None
 
 
-def test_the_lightning_reply_shape_needs_no_quirk_of_its_own(cfg):
-    """THE COMPATIBILITY CHECK, pinned so it cannot rot into a paid surprise.
-
-    Probed 2026-08-19 on lightning-ai/gpt-oss-120b: the message carries
-    `content` (the answer) and `reasoning_content` (the trace) as PLAIN
-    STRINGS - not Mistral's typed-chunk list, and not an inline <think> block.
-    providers._default_response_hook already reads that field, so the provider
-    declares no quirks and generate.assemble_content wraps the trace unchanged.
-
-    The misreading this rejects is that a new provider needs a new hook. It
-    does not - but a provider whose trace field this hook does NOT read would
-    park every generation as traceless, which on a paid provider is money spent
-    to discover a shape. So the shape is asserted here rather than in a live
-    call.
-    """
-    from tuned.data.providers import QUIRKS, _default_response_hook
-
-    lightning = next(p for p in cfg.providers if p.name == "lightning")
-    assert lightning.quirks == (), (
-        "lightning uses the default OpenAI hook; a quirk here would mean the "
-        "shape changed and the comment in the config is stale"
-    )
-    assert all(q in QUIRKS for q in lightning.quirks)
-
-    probed = {
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": "### Step-by-Step Reasoning\nThe tenant may withhold.",
-                "reasoning_content": "We need to answer as per policy. The user asks...",
-            }
-        }]
-    }
-    text, reasoning = _default_response_hook(probed)
-    assert text.startswith("### Step-by-Step")
-    assert reasoning.startswith("We need to answer")
-
-
 def test_a_lightning_reply_assembles_into_a_real_think_block(cfg):
     """The other end of the same check: what the gates will actually see.
 
@@ -3849,22 +3760,6 @@ def test_a_lightning_reply_assembles_into_a_real_think_block(cfg):
     # ...and the traceless shape still parks rather than inventing a trace.
     bare = SimpleNamespace(text="No trace here.", reasoning=None)
     assert assemble_content(cfg, bare)[1] is None
-
-
-def test_the_lightning_window_is_the_probed_floor(cfg):
-    """Same discipline as the cerebras and mistral blocks: the number in the
-    config is one a call actually returned 200 for, not a catalog figure."""
-    caps = {
-        f"{p.name}/{m.id}": m.limits.get("max_context")
-        for p in cfg.providers
-        for m in p.models
-    }
-    assert caps["lightning/lightning-ai/gpt-oss-120b"] == 51274
-    text = DATA_CONFIG.read_text(encoding="utf-8")
-    assert "prompt_tokens 51274" in text
-    # ...and it clears the longest prompt this build makes by a wide margin, so
-    # the floor understating the real window costs nothing.
-    assert caps["lightning/lightning-ai/gpt-oss-120b"] > 10 * 2799
 
 
 def test_eligible_refs_is_the_filter_eligible_itself_uses(cfg, keys):

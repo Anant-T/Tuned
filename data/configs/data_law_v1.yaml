@@ -785,146 +785,11 @@ providers:
         params: {}
         role_params:
           tiebreak: {temperature: 0.2}
-  # LIGHTNING IS THE PAID OVERFLOW FOR THE GENERATOR, AND IT IS SECOND IN
-  # routing.generator ON PURPOSE - see the cost ruling there. Added 2026-08-19.
-  #
-  # THE REPLY SHAPE WAS CHECKED BEFORE THE BLOCK WAS WRITTEN, because a silent
-  # mismatch would park every Lightning generation as traceless and we would
-  # have paid to discover it. Probed 2026-08-19 on lightning-ai/gpt-oss-120b:
-  #
-  #     message keys   ['content', 'reasoning_content', 'role']
-  #     content            str, the answer
-  #     reasoning_content  str, the trace - a PLAIN STRING, not Mistral's
-  #                        typed-chunk list and not an inline <think> block
-  #
-  # providers._default_response_hook already reads exactly that field
-  # (`message.get("reasoning") or message.get("reasoning_content")`), so this
-  # provider needs NO quirk of its own and generate.assemble_content wraps the
-  # trace in the trainer's tags unchanged. That is why `quirks` is empty below
-  # rather than absent-by-oversight, and a test pins the shape.
-  #
-  # max_context 51274 IS A MEASURED FLOOR, on the same discipline the cerebras
-  # block records: probed 2026-08-19, one call, max_tokens 16, temperature 0 ->
-  # HTTP 200, prompt_tokens 51274, finish_reason stop. The catalog advertises
-  # 128K; this file records what was asked for and got a 200. It only has to
-  # clear the longest prompt this build makes (measured 1,445-2,799 routing
-  # tokens), which it does by more than an order of magnitude.
-  #
-  # rpm 60 / tpm 500000 / tpd 50000000 ARE INVENTED FLOORS, not measurements,
-  # and they are deliberately generous because this provider is PAID: the
-  # binding constraint on it is the operator's wallet and the cost ruling in
-  # routing.generator, not a rate limit. Nothing here probed them.
-  #
-  # THIS PROVIDER DECLARES NEITHER A PRICE NOR A usd_cap, stated plainly here
-  # because a reader meeting this block should not have to read all the way
-  # down to routing.generator's comment to learn it: it is PAID and it is
-  # UNFENCED. The only thing protecting the build from it today is that it is
-  # absent from every routing list (removed from routing.generator 2026-08-27
-  # - see that comment for the incident: a usd_cap declared on any provider
-  # but the one literally named "openai" was silently unreachable, so this
-  # provider carried a paid ref with no fence actually behind it while it was
-  # routed). Absence from a routing list is not a fence and does not survive
-  # a careless re-add. RE-ADDING THIS TO ANY ROUTING LIST REQUIRES DECLARING
-  # usd_cap HERE FIRST, WITH BOTH usd_per_1m_prompt AND usd_per_1m_completion
-  # beside it - a bare usd_cap blocks nothing (see THE TRAP in the openai
-  # provider block) - or the exact defect that was removed comes back.
-  #
-  # LICENSING / ToS: lightning-ai/* are OPEN WEIGHTS (gpt-oss is Apache-2.0)
-  # SELF-HOSTED by Lightning, so the upstream vendor is not a party to this
-  # transaction and only Lightning's own terms apply. THOSE TERMS HAVE NOT BEEN
-  # VERIFIED HERE - the operator has been asked to skim them and had not
-  # reported back when this landed. Recorded as pending rather than clean,
-  # because the generator's output is what ships in the dataset and its terms
-  # are the ones that bind.
-  - name: lightning
-    base_url: https://lightning.ai/api/v1
-    api_key_env: LIGHTNING_API_KEY
-    quirks: []
-    models:
-      - id: lightning-ai/gpt-oss-120b
-        family: gpt-oss
-        roles: [generator]
-        limits: {rpm: 60, tpm: 500000, tpd: 50000000, max_context: 51274, max_output: 4096}
-        params: {temperature: 0.7, top_p: 0.95, reasoning_effort: medium}
-  - name: openai
-    base_url: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
-    quirks: [openai]
-    models:
-      # Both are declared family gpt-oss, which is NOT what the model card
-      # says: it is a deliberate, conservative lump so that OpenAI never
-      # grades its own lab's gpt-oss-120b rows. Family separation is what
-      # keeps a judge honest about a generator, and the cheap direction to
-      # be wrong in is "too separate".
-      #
-      # Neither block carries `temperature`: the gpt-5 family accepts the
-      # default and 400s on any other value (measured 2026-08-15). The
-      # `openai` quirk in providers.py drops it from the payload regardless,
-      # because judge.py sends its own per-call temperature and that would
-      # otherwise arrive here through build_payload.
-      #
-      # NO tpd on either block, and that is a decision rather than an
-      # omission: operator's call 2026-08-15. An absent cap reads as
-      # unlimited (store._cap treats a missing key as infinity), the same way
-      # the cerebras blocks leave rpd absent. The rpm/tpm below are real RATE
-      # limits - OpenAI's actual tier limits, still true today.
-      #
-      # SUPERSEDED 2026-08-27, kept in place rather than deleted: this
-      # paragraph used to end here with "...and not spend controls, so
-      # nothing in this file brakes spend. Any spend brake lives server-side
-      # in the OpenAI billing dashboard, where a config edit cannot remove
-      # it. Uncapped is not the same as preferred: both refs sit LAST in
-      # routing.judge and routing.tiebreak..." That was true THEN, when this
-      # file carried no usd_cap anywhere - see THE SPEND FENCE immediately
-      # below, added the same day. It is false NOW: THIS FILE DOES BRAKE
-      # SPEND for this provider, from right here, via usd_cap: 0.0 on both
-      # models below - and it works only because usd_per_1m_prompt and
-      # usd_per_1m_completion sit beside it (a bare usd_cap blocks nothing,
-      # see THE TRAP below). The billing-dashboard brake still exists as a
-      # second, independent line of defence, but it is no longer the ONLY
-      # one, and a config edit can now remove the one described here. What is
-      # still true and worth keeping: both refs sit LAST in routing.judge and
-      # routing.tiebreak, so every free judge is tried first and these are
-      # reached, and billed, only by rows nothing free can serve - the fence
-      # below is what stops that path from ever costing more than $0.
-      #
-      # THE SPEND FENCE, added 2026-08-27 once a deepseek lead generator made
-      # these two reachable (family_separation only excludes {deepseek} on a
-      # deepseek row, not {deepseek, gpt-oss} - so a slot-B pool gap, the exact
-      # state a 2026-08-23 live drain stalled in with 34 judge_error, would
-      # reach a paid judge on a config that had NO usd_cap anywhere).
-      #
-      # usd_cap: 0.0 means the wallet is zero, so any POSITIVE per-token price
-      # fails generate._provider_usd_spent(...) + est_cost > usd_cap on the
-      # first call and blocks it before a token is sent.
-      #
-      # THE TRAP: usd_cap ALONE BLOCKS NOTHING. generate._usd_per_1m returns
-      # 0.0 for a missing usd_per_1m_prompt/usd_per_1m_completion key, so with
-      # only usd_cap set the check computes `0.0 + 0.0 > 0.0`, which is False
-      # forever - a cap with no prices reads as free. Both price keys must sit
-      # beside the cap for it to do anything; verified both ways (with and
-      # without the price keys) against this shipped config, see
-      # data/build/exp_gptoss_ctl/out/fence_check.txt.
-      #
-      # mini's published prices ($0.25 / $2.00 per 1M) are used for BOTH
-      # models below. That is not a claim that nano was priced the same - at
-      # usd_cap 0.0 the exact figure cannot matter, since any positive price
-      # blocks at the first token regardless of which one it is.
-      - id: gpt-5-mini
-        family: gpt-oss
-        roles: [judge, tiebreak]
-        limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
-                 usd_cap: 0.0, usd_per_1m_prompt: 0.25, usd_per_1m_completion: 2.0}
-        params: {}
-      - id: gpt-5-nano
-        family: gpt-oss
-        roles: [judge, tiebreak]
-        # The calibration candidate: ~5x cheaper than mini, and carried here
-        # so the P5 gate can compare the two on real judgments rather than on
-        # price alone.
-        limits: {rpm: 500, tpm: 200000, max_context: 400000, max_output: 16384,
-                 usd_cap: 0.0, usd_per_1m_prompt: 0.25, usd_per_1m_completion: 2.0}
-        params: {}
+  # The lightning (paid gpt-oss overflow) and openai (gpt-5-mini/nano paid
+  # judge backstop) provider blocks were DELETED 2026-08-28 with the free-
+  # fleet ruling: no paid ref anywhere. Their full blocks - measured limits,
+  # spend-fence history and THE TRAP note - are archived verbatim in
+  # prev_rep.md; re-adding any paid provider starts from there.
 
 # Mistral rpm/tpm are console+header-verified 2026-08-14 and are no longer
 # placeholders. The workspace limit is 50 rpm / 50k tpm and BOTH models draw
@@ -1384,9 +1249,11 @@ routing:
   # has been run. Placed last among the free refs, immediately before the
   # paid backstops, so any revived or already-trusted free ref is still
   # chosen ahead of it.
+  # The two openai/gpt-5-* refs that used to close this list (fenced to $0,
+  # unreachable by design) were DELETED 2026-08-28 with their provider block
+  # - free fleet only. See prev_rep.md for the blocks and the fence history.
   judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,
-          bai/deepseek-v4-flash, groq/openai/gpt-oss-20b,
-          openai/gpt-5-mini, openai/gpt-5-nano]
+          bai/deepseek-v4-flash, groq/openai/gpt-oss-20b]
   # TIEBREAK: mistral sits third, ahead of the paid backstops and behind the
   # two free families that separation will usually have spent already. On a
   # gpt-oss row judged by qwen and gemma the exclusion set is
@@ -1439,8 +1306,7 @@ routing:
   # family and both judged slots' families before this list is walked - so on
   # a deepseek-generated row, or one deepseek already judged, it is not here.
   tiebreak: [mistral/mistral-large-latest, groq/openai/gpt-oss-20b,
-             cerebras/gemma-4-31b, bai/deepseek-v4-flash,
-             openai/gpt-5-mini, openai/gpt-5-nano]
+             cerebras/gemma-4-31b, bai/deepseek-v4-flash]
   probe: [groq/openai/gpt-oss-20b]
   family_separation: true
   judge_mode: dual        # dual | audit

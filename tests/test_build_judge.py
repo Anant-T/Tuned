@@ -433,8 +433,13 @@ def test_undersized_families_excludes_the_judges_too_small_for_the_row(cfg):
     assert undersized_families(cfg, "judge", 20000) == frozenset()
     assert undersized_families(cfg, "judge", 40000) == frozenset()
     # The smallest judge window is 131,072, so the first exclusion is there.
+    # gpt-oss joined the excluded set on 2026-08-28: the family's 400k openai
+    # models left with the paid backstops, so groq's 131k gpt-oss-20b is its
+    # largest judge model now. deepseek (800k probed bracket) survives.
     assert undersized_families(cfg, "judge", 104_858) == frozenset()
-    assert undersized_families(cfg, "judge", 104_859) == frozenset({"gemma", "qwen"})
+    assert undersized_families(cfg, "judge", 104_859) == frozenset(
+        {"gemma", "gpt-oss", "qwen"}
+    )
 
 
 def test_generation_family_falls_back_to_the_config(cfg):

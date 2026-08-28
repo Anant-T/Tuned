@@ -1420,47 +1420,6 @@ def test_budget_ok_falls_back_to_the_daily_ledger_when_nothing_is_observed(tmp_p
         assert budget_ok("nowhere", "nothing", 10**9) is True
 
 
-def test_openai_usd_cap_is_hard_and_shared_across_models(tmp_path, cfg):
-    """OpenAI judging is a $2 TOTAL hard cap, not a per-model token tpd.
-
-    Mini and nano share the same wallet. The tpd probe grant must not fire:
-    a hard dollar cap that lets one extra paid call through is not a hard cap.
-    """
-    from dataclasses import replace
-
-    priced = []
-    for provider in cfg.providers:
-        if provider.name != "openai":
-            priced.append(provider)
-            continue
-        models = tuple(
-            replace(
-                model,
-                limits={
-                    **model.limits,
-                    "usd_per_1m_prompt": 0.25 if model.id == "gpt-5-mini" else 0.05,
-                    "usd_per_1m_completion": 2.0 if model.id == "gpt-5-mini" else 0.40,
-                    "usd_cap": 2.0,
-                },
-            )
-            for model in provider.models
-        )
-        priced.append(replace(provider, models=models))
-    cfg = replace(cfg, providers=tuple(priced))
-
-    with open_store(tmp_path, n_seeds=0) as store:
-        budget_ok = budget_ok_for(store, cfg, quota=QuotaLedger())
-        assert budget_ok("openai", "gpt-5-mini", 1000) is True
-        # gpt-5-mini prompt is $0.25 / 1M: 8,000,000 tokens = $2.00 exactly.
-        store.record_usage(
-            "openai", "gpt-5-mini",
-            prompt_tokens=8_000_000, completion_tokens=0,
-        )
-        assert budget_ok("openai", "gpt-5-mini", 1) is False
-        assert budget_ok("openai", "gpt-5-nano", 1) is False
-        assert store.events("budget_probe_grant") == []
-
-
 def test_a_usd_cap_blocks_on_whichever_provider_declares_it(tmp_path, cfg):
     """A usd_cap must be enforced no matter which provider declares it.
 
@@ -1468,16 +1427,20 @@ def test_a_usd_cap_blocks_on_whichever_provider_declares_it(tmp_path, cfg):
     named "openai" - _openai_usd_cap iterated cfg.providers and `continue`d
     past every block whose name was not "openai", and the branch in
     budget_ok that spent it was gated on `if provider == "openai":`. A
-    usd_cap declared on any other provider (lightning, in this build) was
-    therefore decoration: the config could express a fence that did not
-    exist. This mirrors test_openai_usd_cap_is_hard_and_shared_across_models
-    but prices a non-openai provider instead.
+    usd_cap declared on any other provider was therefore decoration: the
+    config could express a fence that did not exist.
+
+    RETARGETED 2026-08-28: the lightning block this test used to price left
+    the config with the free-fleet ruling, so the cap is now declared on
+    mistral - a FIXTURE mutation, not a claim about the live mistral block,
+    which stays uncapped. The property is unchanged: whichever provider
+    declares the cap, the fence fires there.
     """
     from dataclasses import replace
 
     priced = []
     for provider in cfg.providers:
-        if provider.name != "lightning":
+        if provider.name != "mistral":
             priced.append(provider)
             continue
         models = tuple(
@@ -1498,7 +1461,7 @@ def test_a_usd_cap_blocks_on_whichever_provider_declares_it(tmp_path, cfg):
     with open_store(tmp_path, n_seeds=0) as store:
         budget_ok = budget_ok_for(store, cfg, quota=QuotaLedger())
         assert (
-            budget_ok("lightning", "lightning-ai/gpt-oss-120b", est_tokens=100_000)
+            budget_ok("mistral", "mistral-large-latest", est_tokens=100_000)
             is False
         )
 
@@ -2396,50 +2359,6 @@ def test_allow_pool_gaps_cannot_override_a_gap_no_row_size_escapes(cfg, monkeypa
     # about the key and not about the flag.
     monkeypatch.setenv("GROQ_API_KEY", "sk-test")
     assert preflight_messages(widened, GENERATOR_PREFLIGHT_ROLES) == ([], [])
-
-
-def test_a_two_generator_judge_gap_is_a_key_the_override_cannot_cover(cfg, monkeypatch):
-    """The other half of R4-C1, INVERTED on 2026-08-18 - and kept inverted
-    rather than deleted, because the inversion is what an operator assembling
-    this pool has to know.
-
-    It used to read: this gap is a MODEL the operator is sourcing, not a key,
-    so short rows really do route and `--allow-pool-gaps` opens a pilot. What
-    made those short rows route was cerebras/zai-glm-4.7 - a keyed 8k judge
-    that could take slot B on a short row from the mistral generator - and it
-    was retired as archived. With it gone the slot is empty at EVERY row size
-    for an operator who has not funded OPENAI_API_KEY, so the override cannot
-    open a pilot on this pool any more. The key can.
-
-    NOT THE SHIPPED CONFIG'S GAP, and the name used to say it was. Measured
-    2026-08-18: the shipped one-generator config with CEREBRAS/MISTRAL/GROQ
-    keyed and OPENAI_API_KEY unset returns 0 refusals and 1 tiebreak warning.
-    The gap below is reachable only from a MISTRAL generation, which is what
-    removes mistral from the judge pool and empties slot B, and mistral has
-    been judge-only since that day - so the second generator family is
-    supplied by the fixture and the gap belongs to the fixture, not to what
-    ships."""
-    # See cfg_with_two_generator_families: this property is about the ALGORITHM
-    # that walks generator families, and one family cannot exercise it.
-    # DROPPING THE PROMOTED JUDGE IS WHAT MAKES THE GAP REACHABLE. Until
-    # 2026-08-19 the free judge pool was one family (qwen) plus mistral, so
-    # withholding OPENAI_API_KEY emptied slot B on a second-family generation.
-    # gemma was promoted into the judge role that day, so the paid backstop is
-    # no longer what fills slot B and withholding it leaves the pool whole.
-    # See cfg_without_the_promoted_judge.
-    cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
-    for env in ("CEREBRAS_API_KEY", "GROQ_API_KEY"):
-        monkeypatch.setenv(env, "sk-test")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    refusals, _ = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)
-    assert any("routing.judge slot b" in line for line in refusals)
-    forced, _ = preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES, allow_pool_gaps=True)
-    assert any("no row size is servable" in line for line in forced)
-    assert any("OPENAI_API_KEY" in line for line in forced)
-    # ...and the key really is the fix, so the refusal is about the pool and
-    # not about the flag.
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    assert preflight_messages(cfg, GENERATOR_PREFLIGHT_ROLES)[0] == []
 
 
 def test_the_preflight_advises_one_model_that_closes_every_gap_it_reports(cfg, monkeypatch):
