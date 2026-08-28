@@ -114,3 +114,42 @@ def test_stage_and_restore_round_trip_the_baton(tmp_path):
     assert (root2 / "streams" / "replay.jsonl").read_text() == '{"row":1}\n'
     assert (root2 / "raw" / "gen" / "2026-08-29" / "gen.ndjson").is_file()
     assert (root2 / actions_worker.INDEX_RELPATH).is_file()
+
+
+import audit_readout  # noqa: E402  (same data/scripts sys.path as above)
+
+
+def test_audit_readout_computes_the_sample_accept_rate(tmp_path):
+    db = tmp_path / "law_v1.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE task (task_id TEXT, state TEXT, disposition TEXT)")
+    rows = (
+        [("a%d" % i, "accepted", "audit:gate-accept") for i in range(7)]
+        + [("s%d" % i, "accepted", "judge:accept") for i in range(3)]
+        + [("r0", "rejected", "judge:reject")]
+        + [("p0", "pending", None)]
+    )
+    conn.executemany("INSERT INTO task VALUES (?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+    ro = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    s = audit_readout.summarize(ro)
+    ro.close()
+    assert s["audit_accepts"] == 7
+    assert (s["sampled_decided"], s["sampled_accepted"]) == (4, 3)
+    assert abs(s["sample_accept_rate"] - 0.75) < 1e-9
+    assert s["states"] == {"accepted": 10, "pending": 1, "rejected": 1}
+
+
+def test_audit_readout_survives_an_unjudged_store(tmp_path):
+    db = tmp_path / "law_v1.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE task (task_id TEXT, state TEXT, disposition TEXT)")
+    conn.commit()
+    conn.close()
+    ro = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    s = audit_readout.summarize(ro)
+    ro.close()
+    assert s["sample_accept_rate"] is None
+    assert s["audit_accepts"] == 0

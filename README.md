@@ -88,12 +88,34 @@ every session, no lane switches left to flip. A Kaggle T4x2 session bills
 history — including the Ministral, Qwen3-14B single-GPU, 2048-DDP, and 14B
 model-parallel lanes this one replaced — and detailed metrics.
 
-## Next milestone
+## Dataset build: unattended on GitHub Actions
 
-The lane is qualified end to end; the only blocker for a main run is the
-Indian-law dataset build, which is in progress in `data/` (free-fleet
-synthesis: deepseek generates, a qwen/gemma/gpt-oss judge fleet accepts).
-History, retired experiment arms, and the design record live in `prev_rep.md`.
+The build runs itself (since 2026-08-29): `.github/workflows/data-worker.yml`
+launches a ~5.5 h generate+judge job every 6 hours, resuming from a state
+baton in the private HF dataset repo `tantan01/tuned-law-state` (SQLite
+snapshot + raw NDJSON + streams, pushed back every 15 min). Judging runs in
+**audit mode** — a 5% hash-sample gets the full dual-judge treatment, the
+rest of the gate-clean rows ship as `audit:gate-accept`.
+
+Operator surface:
+
+- **Watch**: the repo's Actions tab; per-job logs also land in the baton
+  (`logs/gen.log`, `logs/judge.log`).
+- **Ship a dataset cut**: Actions -> `data-assemble` -> Run workflow. It
+  reconciles, verifies, assembles, and pushes to the HF dataset repo only if
+  `stats` is green; the `out/` artifacts upload to the baton either way.
+- **Ship gate**: `python data/scripts/audit_readout.py <store>` prints the
+  dual-judged sample's accept rate — the quality evidence for the whole
+  audit-accepted batch. Read it before publishing.
+- **One generator, ever**: the deepseek rate bucket is account-level. Never
+  run `tuned.data.generate` locally while the cron is active, and never
+  re-run `--phase seed-push` once the remote owns the baton (it would
+  clobber the remote state with the stale local copy — single files go up
+  via `HfApi.upload_file` instead).
+
+The lane is qualified end to end; the dataset build is the only blocker for
+the main run. History, retired experiment arms, and the design record live
+in `prev_rep.md`.
 
 ## Rules that keep adapters swappable
 
