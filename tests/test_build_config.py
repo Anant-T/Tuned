@@ -1363,3 +1363,186 @@ def test_the_ds_rerun_arms_are_fenced_and_differ_only_in_the_prompt_overlay():
                 and not ln.startswith("  prompt_overlay:")]
 
     assert _body(DS_V4RERUN_CONFIG) == _body(DS_V5RERUN_CONFIG)
+
+
+def test_the_ds_ctl2_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_ds_ctl2 is an experiment sibling, not the live control.
+
+    The shared control for the 2026-08-28 three-arm clause/cap A/B: two
+    independent levers (a prompt-overlay clause, a lowered bai max_output)
+    are each measured against this ONE time-local control, run back to
+    back, so neither measurement is confounded by b.ai's hidden
+    multi-upstream pool drifting between arms - the lesson of the 13h41m
+    v4-vs-v5 confound this rerun family already paid for once. This arm
+    sets no overlay and no limit override, so it reads the current shipped
+    src/tuned/data/prompts/ templates and the live max_output.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_ds_ctl2") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_ds_ctl2"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_ds_ctl2"
+    assert cfg.build.prompt_overlay is None
+
+
+def test_the_ds_clause_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_ds_clause is an experiment sibling, not the live control.
+
+    The clause-treatment half of the three-arm A/B. Carries `prompt_overlay`,
+    which makes it a RECOVERY experiment (config._is_recovery_experiment),
+    and a recovery config aimed at the live workdir is refused outright - so
+    an unlisted name under data/build would make the arm unloadable, not
+    merely misread as the frozen control.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_ds_clause") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_ds_clause"
+    doc["build"]["prompt_overlay"] = "data/build/exp_ds_clause/prompts_clause"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_ds_clause"
+    assert cfg.build.prompt_overlay == "data/build/exp_ds_clause/prompts_clause"
+
+
+def test_the_ds_cap_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_ds_cap is an experiment sibling, not the live control.
+
+    The cap-treatment half of the three-arm A/B. Sets no overlay - the lever
+    under test here is the bai model's max_output limit, not the prompts -
+    so the only fence it needs is this one.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_ds_cap") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_ds_cap"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_ds_cap"
+    assert cfg.build.prompt_overlay is None
+
+
+DS_CTL2_CONFIG = (
+    Path(__file__).parent.parent / "configs" / "data_law_v1_exp_ds_ctl2.yaml"
+)
+DS_CLAUSE_CONFIG = (
+    Path(__file__).parent.parent / "configs" / "data_law_v1_exp_ds_clause.yaml"
+)
+DS_CAP_CONFIG = (
+    Path(__file__).parent.parent / "configs" / "data_law_v1_exp_ds_cap.yaml"
+)
+
+
+def _assert_ds_ab_common_fences(cfg, path: Path, live) -> None:
+    """The four invariants every arm of the 2026-08-28 clause/cap A/B shares:
+    single-ref deepseek generator, the openai cost fence, the live band, and
+    LF-only bytes. Factored out so both pairing tests below check the same
+    ground before comparing the one key each is allowed to differ on."""
+    import yaml
+
+    from tuned.data.generate import _provider_usd_cap
+
+    assert list(cfg.routing.generator) == ["bai/deepseek-v4-flash"]
+    assert _provider_usd_cap(cfg, "openai") == 0.0
+    openai = next(p for p in cfg.providers if p.name == "openai")
+    for model in openai.models:
+        assert model.limits["usd_cap"] == 0.0
+        assert model.limits["usd_per_1m_prompt"] > 0
+        assert model.limits["usd_per_1m_completion"] > 0
+    assert cfg.build.length_band == live.build.length_band
+    assert cfg.build.length_band.think_max == 3000
+    assert cfg.build.length_band.total_max == 8192
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    for key in ("harmony_completions", "harmony_prefill", "harmony_s1_continue",
+                "require_pretreatment_manifest", "pretreatment_manifest"):
+        assert key not in raw["build"], key
+    assert path.read_bytes().count(b"\r") == 0
+
+
+def test_the_ds_ctl2_and_clause_arms_are_fenced_and_differ_only_in_the_prompt_overlay():
+    """The shared control and the clause treatment differ in ONE key.
+
+    E2 of the 2026-08-28 clause/cap A/B: does one added sentence, folding the
+    model's own "have I covered all four parts" self-check into the prose it
+    is already writing rather than a labelled Issue/Rule/Application/
+    Conclusion rehearsal inside <think>, cut the irac_placement gate failure
+    this rehearsal causes (E2-offline: 122/123 of that gate's failures).
+    Same three properties as the v4/v5 rerun pairing test above - single-ref
+    generator, the openai cost fence, the live band - plus the pairing
+    itself: prompt_overlay is the ONLY intended difference from the control,
+    so line-level equality is asserted rather than trusted.
+    """
+    live = load_build_config(
+        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        allow_unpinned=True,
+    )
+    for path, workdir, overlay in (
+        (DS_CTL2_CONFIG, "data/build/exp_ds_ctl2", None),
+        (DS_CLAUSE_CONFIG, "data/build/exp_ds_clause",
+         "data/build/exp_ds_clause/prompts_clause"),
+    ):
+        cfg = load_build_config(path, allow_unpinned=True)
+        assert cfg.build.workdir == workdir
+        assert cfg.build.prompt_overlay == overlay
+        _assert_ds_ab_common_fences(cfg, path, live)
+        bai = next(p for p in cfg.providers if p.name == "bai")
+        assert bai.models[0].limits["rpm"] == 8
+        assert bai.models[0].limits["max_output"] == 16384
+
+    def _body(path: Path) -> list[str]:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        first_key = next(i for i, ln in enumerate(lines) if not ln.startswith("#"))
+        return [ln for ln in lines[first_key:]
+                if not ln.startswith("  workdir:")
+                and not ln.startswith("  prompt_overlay:")]
+
+    assert _body(DS_CTL2_CONFIG) == _body(DS_CLAUSE_CONFIG)
+
+
+def test_the_ds_ctl2_and_cap_arms_are_fenced_and_differ_only_in_the_bai_max_output():
+    """The shared control and the cap treatment differ in ONE key.
+
+    E1 of the 2026-08-28 clause/cap A/B: does lowering the bai model's reply
+    ceiling 16384 -> 5000 raise real completion tokens per length-passing
+    row without moving the length_band pass rate. Neither arm carries a
+    prompt_overlay - the lever under test is the limit, not the prompts -
+    so the pairing is asserted on the bai model's max_output specifically,
+    and line-level equality on everything else.
+    """
+    live = load_build_config(
+        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        allow_unpinned=True,
+    )
+    expected_max_output = {"data/build/exp_ds_ctl2": 16384, "data/build/exp_ds_cap": 5000}
+    for path, workdir in (
+        (DS_CTL2_CONFIG, "data/build/exp_ds_ctl2"),
+        (DS_CAP_CONFIG, "data/build/exp_ds_cap"),
+    ):
+        cfg = load_build_config(path, allow_unpinned=True)
+        assert cfg.build.workdir == workdir
+        assert cfg.build.prompt_overlay is None
+        _assert_ds_ab_common_fences(cfg, path, live)
+        bai = next(p for p in cfg.providers if p.name == "bai")
+        assert bai.models[0].limits["rpm"] == 8
+        assert bai.models[0].limits["max_output"] == expected_max_output[workdir]
+
+    # The bai limits line is the only one this pairing may differ on -
+    # matched by its unique prefix (rpm 8 + max_context 800000 belong to no
+    # other model block) rather than by the max_output value itself, so a
+    # coincidental "max_output: 16384" on an unrelated model (groq/qwen,
+    # both openai gpt-5 models) is never mistaken for the lever under test.
+    bai_limits_prefix = "        limits: {rpm: 8, max_context: 800000, max_output:"
+
+    def _body(path: Path) -> list[str]:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        first_key = next(i for i, ln in enumerate(lines) if not ln.startswith("#"))
+        return [ln for ln in lines[first_key:]
+                if not ln.startswith("  workdir:")
+                and not ln.startswith(bai_limits_prefix)]
+
+    assert _body(DS_CTL2_CONFIG) == _body(DS_CAP_CONFIG)
