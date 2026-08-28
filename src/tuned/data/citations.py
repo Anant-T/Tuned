@@ -405,21 +405,42 @@ def novel_citations(text: str, allowed_context: str, index: CitationIndex) -> li
 # Corpus ingestion (CLI only - no network at import time).
 # --------------------------------------------------------------------------
 
+# KanoonGPT's citation columns write two shapes the prose extractor was
+# never aimed at: neutral citations spaceless ("1950INSC1") and law-report
+# years in square brackets ("[1950] 1 S.C.R. 1008"). Both defeated
+# extraction on EVERY row of the 2026-08-29 index build, so the opaque
+# fallback stored all 76,238 entries in forms the gate can never match -
+# the gate's currency is extract_citations' canonical output, and contains()
+# normalizes the QUERY, not the stored key. The repair rewrites those two
+# column shapes into extractable prose and retries; the opaque fallback
+# still catches genuinely unknown reporters.
+_BRACKET_YEAR = re.compile(r"\[\s*(\d{4})\s*\]")
+_SPACELESS_NEUTRAL = re.compile(r"(?<![A-Za-z0-9])(\d{4})(INSC)0*(\d+)(?!\d)", re.IGNORECASE)
+
+
+def _repair_column_value(value: str) -> str:
+    v = _BRACKET_YEAR.sub(r"(\1)", value)
+    return _SPACELESS_NEUTRAL.sub(
+        lambda m: f"{m.group(1)} {m.group(2).upper()} {m.group(3)}", v
+    )
+
+
 def citations_from_row(row: dict) -> list[str]:
     """Citation strings carried by one corpus row.
 
     Reads ONLY _CITATION_COLUMNS. headnote_text is copyrighted editorial
     matter and is never touched, here or anywhere else. A column value that
     parses as one or more known formats contributes those; a value that
-    parses as none contributes its opaque normalized form (a real citation in
-    a reporter we do not model yet is still worth having in the index).
+    parses as none is retried through _repair_column_value, and only then
+    contributes its opaque normalized form (a real citation in a reporter we
+    do not model yet is still worth having in the index).
     """
     out: list[str] = []
     for column in _CITATION_COLUMNS:
         value = row.get(column)
         if not isinstance(value, str) or not value.strip():
             continue
-        found = extract_citations(value)
+        found = extract_citations(value) or extract_citations(_repair_column_value(value))
         out.extend(found if found else [normalize(value)])
     return out
 

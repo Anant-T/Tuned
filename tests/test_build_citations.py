@@ -257,6 +257,26 @@ def test_citations_from_row_splits_multiple_citations_in_one_cell():
     assert citations_from_row(row) == ["(2008) 1 SCC 1", "AIR 2008 SC 12"]
 
 
+def test_citations_from_row_repairs_the_real_kanoongpt_column_shapes(tmp_path):
+    # The 2026-08-29 index build stored ALL 76,238 entries opaque because
+    # KanoonGPT writes neutral citations spaceless and law-report years in
+    # square brackets - shapes the prose extractor never sees. Both must
+    # land in the gate's canonical currency, or the index matches nothing.
+    row = {
+        "neutral_citation": "1950INSC1",
+        "law_report_citation": "[1950] 1 S.C.R. 1008",
+    }
+    assert citations_from_row(row) == ["1950 INSC 1", "(1950) 1 SCR 1008"]
+    # Leading zeros in the spaceless form canonicalize away like the spaced
+    # form's do.
+    assert citations_from_row({"neutral_citation": "2023INSC0045"}) == ["2023 INSC 45"]
+    # And the repaired keys round-trip: what the builder stores is what the
+    # gate's query normalizes to.
+    index = CitationIndex.build(citations_from_row(row), tmp_path / "ix.txt")
+    assert "1950 INSC 1" in index
+    assert "(1950) 1 SCR 1008" in index
+
+
 def test_headnote_column_is_declared_forbidden_and_never_ingested():
     import tuned.data.citations as citations
 
