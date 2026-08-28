@@ -190,7 +190,7 @@ Secondaries (report only):
 |---|---|---|---|
 | think est-tokens (chars/4) p50 | 2,974 | 2,418 | -556 (-18.7%) |
 | think est-tokens p90 | 6,564 | 5,814 | -750 (-11.4%) |
-| think est-tokens mean | 3,571 | 3,041 | -530 (-14.8%) |
+| think real-tokens mean (provider-billed, not the chars/4 estimate the rest of this table uses; label corrected post-review) | 3,571 | 3,041 | -530 (-14.8%) |
 | full-gate clean rate (all non-diagnostic gates) | 11.01% (12/109) | 14.56% (15/103) | +3.55pp |
 | rows with a line-initial Issue/Rule/Application/Conclusion heading in `<think>` | 80/109 (73.4%) | 68/103 (66.0%) | -7.3pp |
 
