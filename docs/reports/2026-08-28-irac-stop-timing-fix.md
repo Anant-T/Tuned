@@ -609,3 +609,25 @@ A second, cheaper practice worth keeping: the `prompt_echo` and
 provider should keep an untreated task type in the design purely as a noise
 channel - it cost nothing here, and it is the only reason line 2's failure
 can be called real rather than atmospheric.
+
+## Ship record (appended post-review)
+
+The F2-only confirm returned NO-SHIP by its pre-registered rule (line 2, the summarization
+`length_band` guard, failed at −15.91pp against a −5pp allowance). The operator overrode that
+verdict on end-to-end totality and F2 shipped in `ebde9a7`: summarization irac_placement fail
+−64.83pp (~29× the run's measured noise floor), tasks reaching the judges 6→10 (+67%), the
+new prose format judge-accepted 10/11, and the edit closes a real defect — the templates
+mandated a four-heading answer that `gates.IRAC_ANSWER_TASK_TYPES` deliberately stopped
+requiring. The −15.91pp band cost ships with it, known and structural (prose deliberation
+runs longer at the median; p90 flat).
+
+Dispositions: **F2 shipped** (`ebde9a7`, two summarization templates byte-identical to the
+f2only overlay). **F1 closed** — twice measured inert on its own task type and expensive
+(think p50 +23.7%). **F3 kept** — the rewritten retry note remains inert at converting
+failures (within the historical 22–39% band) but is better aimed and harmless; the prompt,
+not the note, is what stabilizes placement.
+
+Recorded follow-ups: a summarization-specific `length_band` (code + config feature) to
+recover the band cost; `verbatim_overlap` (~60% summarization fail in both arms) as the next
+gate frontier; `gen_drafting_v1/v2` carry the same four-heading-mandate drift outside
+`IRAC_ANSWER_TASK_TYPES`, unmeasured today and needing its own arm before any edit.
