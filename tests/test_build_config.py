@@ -1427,6 +1427,26 @@ def test_the_ds_cap_arm_is_an_isolated_workdir(tmp_path):
     assert cfg.build.prompt_overlay is None
 
 
+def test_the_hy3_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_hy3 is an experiment sibling, not the live control.
+
+    The 2026-08-28 hy3 think_low qualification probe: can b.ai's free `hy3`
+    model (Tencent Hunyuan) serve as a second generator family, tested at
+    its documented LOW thinking tier. Isolated the same way every other
+    single-arm probe this week was - no overlay, no shared state with the
+    live control.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_hy3") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_hy3"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_hy3"
+    assert cfg.build.prompt_overlay is None
+
+
 DS_CTL2_CONFIG = (
     Path(__file__).parent.parent / "configs" / "data_law_v1_exp_ds_ctl2.yaml"
 )
@@ -1546,3 +1566,69 @@ def test_the_ds_ctl2_and_cap_arms_are_fenced_and_differ_only_in_the_bai_max_outp
                 and not ln.startswith(bai_limits_prefix)]
 
     assert _body(DS_CTL2_CONFIG) == _body(DS_CAP_CONFIG)
+
+
+HY3_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1_exp_hy3.yaml"
+
+
+def test_the_hy3_probe_config_is_fenced_and_carries_the_new_model():
+    """The 2026-08-28 hy3 think_low qualification probe apparatus.
+
+    Single-ref generator on a NEW family (`hy`, distinct from every family
+    already in the fleet), the same cost/band fences every isolated arm this
+    week carries, and the deepseek-v4-flash entry left declared-but-unused
+    in the same bai block (routing.generator names only bai/hy3, so it is
+    never called this run).
+    """
+    import yaml
+
+    from tuned.data.generate import _provider_usd_cap
+
+    live = load_build_config(
+        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        allow_unpinned=True,
+    )
+    cfg = load_build_config(HY3_CONFIG, allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_hy3"
+    assert cfg.build.prompt_overlay is None
+
+    # The same non-generator invariants _assert_ds_ab_common_fences checks
+    # for the clause/cap arms - reimplemented rather than reused, because
+    # that helper hardcodes the deepseek single-ref generator this arm
+    # deliberately does not carry.
+    assert _provider_usd_cap(cfg, "openai") == 0.0
+    openai = next(p for p in cfg.providers if p.name == "openai")
+    for model in openai.models:
+        assert model.limits["usd_cap"] == 0.0
+        assert model.limits["usd_per_1m_prompt"] > 0
+        assert model.limits["usd_per_1m_completion"] > 0
+    assert cfg.build.length_band == live.build.length_band
+    assert cfg.build.length_band.think_max == 3000
+    assert cfg.build.length_band.total_max == 8192
+    raw = yaml.safe_load(HY3_CONFIG.read_text(encoding="utf-8"))
+    for key in ("harmony_completions", "harmony_prefill", "harmony_s1_continue",
+                "require_pretreatment_manifest", "pretreatment_manifest"):
+        assert key not in raw["build"], key
+    assert HY3_CONFIG.read_bytes().count(b"\r") == 0
+
+    bai = next(p for p in cfg.providers if p.name == "bai")
+    ids = {m.id: m for m in bai.models}
+    assert set(ids) == {"deepseek-v4-flash", "hy3"}
+
+    hy3 = ids["hy3"]
+    assert hy3.family == "hy"
+    assert hy3.family not in {"deepseek", "gpt-oss", "gemma", "qwen", "mistral"}
+    assert hy3.roles == ("generator",)
+    assert hy3.limits == {"rpm": 8, "max_context": 192000, "max_output": 16384}
+    assert hy3.params == {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "reasoning_effort": "think_low",
+    }
+
+    assert list(cfg.routing.generator) == ["bai/hy3"]
+    assert cfg.routing.family_separation is True
+    # This arm is generate-only (see header) and was forked from the older
+    # data_law_v1_exp_deepseek.yaml lineage rather than today's live
+    # data_law_v1.yaml, so its judge/tiebreak/probe lists are not asserted
+    # against the live config's - they were never meant to track it.
