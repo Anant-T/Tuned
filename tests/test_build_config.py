@@ -1757,3 +1757,99 @@ def test_the_irac_arms_are_fenced_and_differ_only_in_the_overlay_and_judge_seat(
                                        "roles: [judge, tiebreak, probe]"}]
 
     assert _body(IRAC_CTL_CONFIG) == _body(IRAC_FIX_CONFIG)
+
+
+def test_the_irac_ctl3_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_irac_ctl3 is an experiment sibling, not the live control.
+
+    The control half of the F2-only confirm pair - the follow-up the first
+    stop-timing A/B's own report asked for, which re-runs F2 without F1 so
+    the length_band cost can be attributed to one edit or the other.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_irac_ctl3") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_irac_ctl3"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_irac_ctl3"
+    assert cfg.build.prompt_overlay is None
+
+
+def test_the_irac_f2only_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_irac_f2only is an experiment sibling, not the live control.
+
+    The treatment half of the F2-only confirm pair. Carries `prompt_overlay`,
+    which makes it a RECOVERY experiment (config._is_recovery_experiment),
+    and a recovery config aimed at the live workdir is refused outright - so
+    an unlisted name under data/build would make the arm unloadable, not
+    merely misread as the frozen control.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_irac_f2only") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_irac_f2only"
+    doc["build"]["prompt_overlay"] = "data/build/exp_irac_f2only/prompts_f2only"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_irac_f2only"
+    assert cfg.build.prompt_overlay == "data/build/exp_irac_f2only/prompts_f2only"
+
+
+IRAC_CTL3_CONFIG = (
+    Path(__file__).parent.parent / "configs" / "data_law_v1_exp_irac_ctl3.yaml"
+)
+IRAC_F2ONLY_CONFIG = (
+    Path(__file__).parent.parent / "configs" / "data_law_v1_exp_irac_f2only.yaml"
+)
+
+
+def test_the_f2only_confirm_arms_are_fenced_and_differ_only_in_the_prompt_overlay():
+    """The F2-only confirm pair differs in ONE key.
+
+    Stricter than the first stop-timing pairing, which had to allow a second
+    difference for its judge seat: this measurement dispatches no judge at
+    all - the format question was answered by the first run's spot-check
+    (10/11 accept on the new summarization form) - so both arms keep the
+    identical generate-only routing and `prompt_overlay` is the only
+    intended divergence.
+
+    The four gen_irac_analysis templates are byte-identical across the two
+    arms by construction, which is what makes irac_analysis the untreated
+    task type and its gate rates a measurement of arm noise rather than of
+    any treatment.
+    """
+    live = load_build_config(
+        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        allow_unpinned=True,
+    )
+    for path, workdir, overlay in (
+        (IRAC_CTL3_CONFIG, "data/build/exp_irac_ctl3", None),
+        (IRAC_F2ONLY_CONFIG, "data/build/exp_irac_f2only",
+         "data/build/exp_irac_f2only/prompts_f2only"),
+    ):
+        cfg = load_build_config(path, allow_unpinned=True)
+        assert cfg.build.workdir == workdir
+        assert cfg.build.prompt_overlay == overlay
+        _assert_ds_ab_common_fences(cfg, path, live)
+        bai = next(p for p in cfg.providers if p.name == "bai")
+        assert bai.models[0].limits["rpm"] == 8
+        assert bai.models[0].limits["max_output"] == 16384
+
+    # Generate-only: neither arm may carry the judge seat the combined
+    # stop-timing treatment needed for its spot-check.
+    ctl3 = load_build_config(IRAC_CTL3_CONFIG, allow_unpinned=True)
+    f2only = load_build_config(IRAC_F2ONLY_CONFIG, allow_unpinned=True)
+    assert list(ctl3.routing.judge) == list(f2only.routing.judge)
+    assert list(ctl3.routing.tiebreak) == list(f2only.routing.tiebreak)
+
+    def _body(path: Path) -> list[str]:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        first_key = next(i for i, ln in enumerate(lines) if not ln.startswith("#"))
+        return [ln for ln in lines[first_key:]
+                if not ln.startswith("  workdir:")
+                and not ln.startswith("  prompt_overlay:")]
+
+    assert _body(IRAC_CTL3_CONFIG) == _body(IRAC_F2ONLY_CONFIG)
