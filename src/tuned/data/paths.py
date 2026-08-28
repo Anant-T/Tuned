@@ -30,6 +30,8 @@ ISOLATED_WORKDIR_SIBLINGS = frozenset(
         "exp_ds_clause",
         "exp_ds_cap",
         "exp_hy3",
+        "exp_irac_ctl",
+        "exp_irac_fix",
     }
 )
 

@@ -1632,3 +1632,128 @@ def test_the_hy3_probe_config_is_fenced_and_carries_the_new_model():
     # data_law_v1_exp_deepseek.yaml lineage rather than today's live
     # data_law_v1.yaml, so its judge/tiebreak/probe lists are not asserted
     # against the live config's - they were never meant to track it.
+
+
+def test_the_irac_ctl_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_irac_ctl is an experiment sibling, not the live control.
+
+    The control half of the 2026-08-28 irac stop-timing A/B. Sets no
+    overlay - it reads the shipped templates, which is what makes it the
+    baseline - so this fence is the only one it needs.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_irac_ctl") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_irac_ctl"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_irac_ctl"
+    assert cfg.build.prompt_overlay is None
+
+
+def test_the_irac_fix_arm_is_an_isolated_workdir(tmp_path):
+    """data/build/exp_irac_fix is an experiment sibling, not the live control.
+
+    The treatment half of the 2026-08-28 irac stop-timing A/B. Carries
+    `prompt_overlay`, which makes it a RECOVERY experiment
+    (config._is_recovery_experiment), and a recovery config aimed at the live
+    workdir is refused outright - so an unlisted name under data/build would
+    make the arm unloadable, not merely misread as the frozen control.
+    """
+    from tuned.data.paths import is_live_control_workdir
+
+    assert is_live_control_workdir("data/build/exp_irac_fix") is False
+    assert is_live_control_workdir("data/build") is True
+    doc = _base_doc()
+    doc["build"]["workdir"] = "data/build/exp_irac_fix"
+    doc["build"]["prompt_overlay"] = "data/build/exp_irac_fix/prompts_stop_timing"
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.build.workdir == "data/build/exp_irac_fix"
+    assert (
+        cfg.build.prompt_overlay == "data/build/exp_irac_fix/prompts_stop_timing"
+    )
+
+
+IRAC_CTL_CONFIG = (
+    Path(__file__).parent.parent / "configs" / "data_law_v1_exp_irac_ctl.yaml"
+)
+IRAC_FIX_CONFIG = (
+    Path(__file__).parent.parent / "configs" / "data_law_v1_exp_irac_fix.yaml"
+)
+
+
+def test_the_irac_arms_are_fenced_and_differ_only_in_the_overlay_and_judge_seat():
+    """The stop-timing control and treatment differ in exactly two things.
+
+    The lever is `prompt_overlay` (F1: the how-to-think paragraph of the six
+    IRAC-answer templates now names WHEN the thinking stops; F2: the two
+    summarization templates ask for the genre's own prose form instead of
+    the four headings `gates.IRAC_ANSWER_TASK_TYPES` already stopped
+    requiring of a summarization answer).
+
+    The SECOND difference is deliberate and is not part of the lever: only
+    the treatment arm is judged, because F2 changes the shape of the
+    summarization answer and a spot-check has to confirm the free fleet
+    still accepts it. So the treatment restores
+    data_law_v1_exp_deepseek.yaml's judge list and the groq gpt-oss-20b
+    `roles` line that goes with it, while the control keeps ds_ctl2's
+    generate-only pair. Both are asserted here rather than trusted, and
+    line-level equality is asserted on everything else - a third difference
+    would be a confound, and this test is what makes one impossible to
+    introduce silently.
+    """
+    live = load_build_config(
+        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        allow_unpinned=True,
+    )
+    for path, workdir, overlay in (
+        (IRAC_CTL_CONFIG, "data/build/exp_irac_ctl", None),
+        (IRAC_FIX_CONFIG, "data/build/exp_irac_fix",
+         "data/build/exp_irac_fix/prompts_stop_timing"),
+    ):
+        cfg = load_build_config(path, allow_unpinned=True)
+        assert cfg.build.workdir == workdir
+        assert cfg.build.prompt_overlay == overlay
+        _assert_ds_ab_common_fences(cfg, path, live)
+        bai = next(p for p in cfg.providers if p.name == "bai")
+        assert bai.models[0].limits["rpm"] == 8
+        assert bai.models[0].limits["max_output"] == 16384
+
+    # The judge seat, stated as values rather than left to the line filter
+    # below. qwen leads (slot A) and gemma follows (slot B) in both arms;
+    # the treatment additionally carries gpt-oss-20b behind them so a qwen
+    # tpd exhaustion cannot empty slot B, and mistral holds the tiebreak in
+    # both.
+    ctl = load_build_config(IRAC_CTL_CONFIG, allow_unpinned=True)
+    fix = load_build_config(IRAC_FIX_CONFIG, allow_unpinned=True)
+    deepseek = load_build_config(
+        Path(__file__).parent.parent / "configs" / "data_law_v1_exp_deepseek.yaml",
+        allow_unpinned=True,
+    )
+    assert list(ctl.routing.judge) == [
+        "groq/qwen/qwen3.6-27b", "cerebras/gemma-4-31b",
+        "openai/gpt-5-mini", "openai/gpt-5-nano",
+    ]
+    assert list(fix.routing.judge) == list(deepseek.routing.judge)
+    assert list(fix.routing.judge)[:2] == [
+        "groq/qwen/qwen3.6-27b", "cerebras/gemma-4-31b",
+    ]
+    assert list(fix.routing.tiebreak) == list(ctl.routing.tiebreak)
+    assert list(fix.routing.tiebreak)[0] == "mistral/mistral-large-latest"
+
+    # Everything outside the two intended differences is equal line for
+    # line. The four filtered prefixes are exactly the keys named in the two
+    # arm headers; a fifth divergence fails this test.
+    def _body(path: Path) -> list[str]:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        first_key = next(i for i, ln in enumerate(lines) if not ln.startswith("#"))
+        return [ln for ln in lines[first_key:]
+                if not ln.startswith("  workdir:")
+                and not ln.startswith("  prompt_overlay:")
+                and not ln.startswith("  judge:")
+                and not ln.startswith("  # added 2026-08-28 for judge")
+                and ln.strip() not in {"roles: [tiebreak, probe]",
+                                       "roles: [judge, tiebreak, probe]"}]
+
+    assert _body(IRAC_CTL_CONFIG) == _body(IRAC_FIX_CONFIG)
