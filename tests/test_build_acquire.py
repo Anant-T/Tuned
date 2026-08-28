@@ -1023,3 +1023,48 @@ def test_a_verify_pass_does_not_call_re_reading_the_corpus_an_adoption(tmp_path,
     out = capsys.readouterr().out
     assert "re-hashed" in out
     assert "adopted" not in out
+
+
+# --------------------------------------------------------------------------
+# rebase_under_corpus: an absolute local_path outlives the checkout it names.
+# --------------------------------------------------------------------------
+
+def test_rebase_recovers_an_eval_set_from_a_deleted_worktree(tmp_path):
+    """The real 2026-08-29 failure: every hf eval set was indexed inside
+    .claude/worktrees/law-v1-data-pipeline, the restructure deleted it, and
+    decontaminate refused to run because it could not read a set it is
+    measured against. The files never moved relative to `corpus`."""
+    from tuned.data.acquire import rebase_under_corpus
+
+    corpus = tmp_path / "data" / "build" / "corpus"
+    key = "data/train-00000-of-00001.parquet"
+    landed = corpus / "hf" / "aibe" / key
+    landed.parent.mkdir(parents=True)
+    landed.write_bytes(b"parquet")
+
+    recorded = (
+        r"C:\Users\Anant\Desktop\projects\tuned\.claude\worktrees"
+        r"\law-v1-data-pipeline\data\build\corpus\hf\aibe\data"
+        r"\train-00000-of-00001.parquet"
+    )
+    assert rebase_under_corpus(recorded, key, corpus) == landed
+    # The sub-root under corpus/ is preserved, not guessed: an sc/ object
+    # must not be re-rooted into hf/.
+    sc_key = "metadata/year=2018/x.parquet"
+    sc_recorded = Path("/kaggle/working/data/build/corpus/sc") / sc_key
+    assert rebase_under_corpus(sc_recorded, sc_key, corpus) == corpus / "sc" / sc_key
+
+
+def test_rebase_leaves_a_live_path_alone_and_never_invents_one(tmp_path):
+    from tuned.data.acquire import rebase_under_corpus
+
+    corpus = tmp_path / "corpus"
+    live = corpus / "hf" / "bbl" / "a.parquet"
+    live.parent.mkdir(parents=True)
+    live.write_bytes(b"x")
+    # An existing path is returned untouched - no re-rooting, no stat games.
+    assert rebase_under_corpus(live, "a.parquet", corpus) == live
+    # A path with no `corpus` component cannot be re-rooted: return it
+    # unchanged so the caller reports the same missing file it would have.
+    orphan = tmp_path / "somewhere" / "else" / "a.parquet"
+    assert rebase_under_corpus(orphan, "a.parquet", corpus) == orphan

@@ -2778,3 +2778,46 @@ def test_recovery_filename_without_knobs_does_not_require_manifest(
     assert "preflight" in hits
     assert "ensure" not in hits
     assert _base_doc()["build"].get("require_pretreatment_manifest") in (None, False)
+
+
+def test_one_batch_runs_every_stream_concurrently(tmp_path, cfg, paths):
+    """The gather is a BARRIER, so gathering per stream paid the slowest
+    call's tail once PER STREAM against one shared rate bucket. Claiming
+    every stream first and running the union in one gather amortises that
+    tail across all of them - observable as in-flight concurrency that
+    SPANS streams rather than peaking at n_workers per stream."""
+    import asyncio as _asyncio
+
+    class CountsInFlight:
+        """FakeRouter, plus a high-water mark of simultaneous calls."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.in_flight = 0
+            self.peak = 0
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def complete(self, *a, **kw):
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            try:
+                # Yield so every coroutine admitted in this batch is counted
+                # before any of them finishes.
+                await _asyncio.sleep(0)
+                return await self._inner.complete(*a, **kw)
+            finally:
+                self.in_flight -= 1
+
+    with make_store(tmp_path, n_seeds=8, n_tasks=3) as store:
+        plan_wave(store, cfg, "curated_c2", 3, task_type_mix={"summarization": 1.0})
+        router = CountsInFlight(FakeRouter(cfg))
+        run(
+            store, cfg, router, paths,
+            streams=["synthesis", "curated_c2"], n_workers=3, max_batches=1,
+        )
+        # Both streams' work landed in the SAME batch...
+        assert store.task_counts().get("pending", 0) == 0
+        # ...and ran together: a per-stream gather could never exceed 3.
+        assert router.peak > 3

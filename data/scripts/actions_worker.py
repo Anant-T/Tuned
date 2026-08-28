@@ -266,6 +266,19 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
             time.sleep(30)
             waited += 30
 
+    # The eval sets decontaminate screens against (~1 GB of hub parquet) are
+    # deliberately NOT in the baton - they are public and re-fetchable, and a
+    # gigabyte per checkpoint would dominate every push. Fetch them here, on
+    # the runner, before the chain: decontaminate REFUSES outright if an eval
+    # set it is measured against cannot be read, which is the correct
+    # behaviour and would otherwise fail this job at its first step.
+    print("== acquire eval sets ==")
+    subprocess.run(
+        [sys.executable, "-u", "-m", "tuned.data.acquire", "--kind", "hf",
+         "--config", args.config],
+        check=False,
+    )
+
     index = root / INDEX_RELPATH
     if not index.is_file():
         index = None
@@ -304,7 +317,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--hf-repo", required=True, help="private HF dataset repo for the bundle")
     parser.add_argument("--minutes", type=float, default=315)
     parser.add_argument("--push-every", type=float, default=900)
-    parser.add_argument("--n-workers", type=int, default=8)
+    # 12 per stream x 3 streams = 36 calls in one gather. Admission runs at
+    # the generator bucket's rate (~7.5 s/call at rpm 8), so the last call is
+    # admitted at ~270 s and runs at most ~120 s: ~390 s against a 900 s
+    # lease. Raising this further buys less and less - the bucket, not
+    # concurrency, is the ceiling (Little's law puts saturation at ~5
+    # in-flight); what it actually buys is amortising the gather's tail
+    # stall over more work.
+    parser.add_argument("--n-workers", type=int, default=12)
     parser.add_argument("--audit-sample", type=float, default=0.05)
     args = parser.parse_args(argv)
 

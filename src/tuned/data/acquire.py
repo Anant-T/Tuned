@@ -319,6 +319,41 @@ def local_path_for(root: str | Path, key: str) -> Path:
     return dest
 
 
+def rebase_under_corpus(recorded: str | Path, object_key: str, corpus_dir: str | Path) -> Path:
+    """Where `object_key` lives NOW, given where it lived when it was indexed.
+
+    `artifact.local_path` is written ABSOLUTE at acquisition time, so it is
+    only meaningful on the machine and in the checkout that wrote it. Both
+    assumptions have already broken: the 2026-08-28 single-project
+    restructure deleted the worktree every hf eval set was acquired under, so
+    every recorded path pointed into `.claude/worktrees/law-v1-data-pipeline/`
+    and decontaminate refused to run at all - correctly, because a pass that
+    cannot read an eval set must not report clean. The same break happens on
+    any CI runner, where the checkout root is different again.
+
+    The layout is what makes the repair safe rather than a guess: acquire
+    writes every object at `<corpus>/<sub-root>/<object_key>` (hf/<key> for a
+    hub snapshot, sc/... for the bucket), so the recorded path always ENDS
+    with its own object_key and everything between `corpus` and that key is
+    the sub-root. Re-rooting keeps the sub-root and swaps only the part that
+    moved. A recorded path that still exists is returned untouched, and a
+    path this cannot re-root is returned unchanged so the caller reports the
+    same missing-file it would have reported anyway.
+    """
+    recorded = Path(recorded)
+    if recorded.exists():
+        return recorded
+    corpus_dir = Path(corpus_dir)
+    key_parts = Path(object_key).parts
+    root_parts = recorded.parts[: len(recorded.parts) - len(key_parts)]
+    if not key_parts or len(root_parts) >= len(recorded.parts):
+        return recorded
+    for i in range(len(root_parts) - 1, -1, -1):
+        if root_parts[i] == corpus_dir.name:
+            return corpus_dir.joinpath(*root_parts[i + 1:], *key_parts)
+    return recorded
+
+
 def sha256_file(path: str | Path, block: int = _READ_BLOCK) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:

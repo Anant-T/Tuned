@@ -277,7 +277,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tuned.data.acquire import HF_SOURCES
+from tuned.data.acquire import HF_SOURCES, rebase_under_corpus
 from tuned.data.citations import extract_citations
 from tuned.data.select import landmark_key
 
@@ -1095,7 +1095,7 @@ def select_split_files(spec: EvalSet, paths: Sequence[tuple[str, Path]]):
     return selected, record
 
 
-def eval_corpus(store, spec: EvalSet, *, reader=read_rows) -> EvalCorpus:
+def eval_corpus(store, spec: EvalSet, *, reader=read_rows, corpus_dir=None) -> EvalCorpus:
     """Load one eval set from what acquire.py landed, or say exactly why not.
 
     Read through the store's artifact index rather than a directory walk, for
@@ -1108,8 +1108,16 @@ def eval_corpus(store, spec: EvalSet, *, reader=read_rows) -> EvalCorpus:
     index = store.artifact_index(spec.source_id)
     if not index:
         return EvalCorpus(spec, EVAL_NOT_ACQUIRED, detail="nothing indexed under this source id")
+    # The recorded local_path is absolute and acquisition-time; re-root it
+    # under THIS checkout's corpus dir when it no longer resolves (see
+    # acquire.rebase_under_corpus - the worktree it was indexed under is
+    # gone, and a CI runner's root differs again).
     paths = [
-        (key, Path(row["local_path"]))
+        (
+            key,
+            Path(row["local_path"]) if corpus_dir is None
+            else rebase_under_corpus(row["local_path"], key, corpus_dir),
+        )
         for key, row in sorted(index.items())
         if Path(key).suffix.lower() in _READABLE_SUFFIXES
     ]
@@ -1208,11 +1216,11 @@ def eval_corpus(store, spec: EvalSet, *, reader=read_rows) -> EvalCorpus:
 
 
 def eval_corpora(store, *, allow_missing: Iterable[str] = (), reader=read_rows,
-                 keys: Iterable[str] | None = None) -> dict[str, EvalCorpus]:
+                 keys: Iterable[str] | None = None, corpus_dir=None) -> dict[str, EvalCorpus]:
     allowed = set(allow_missing)
     out: dict[str, EvalCorpus] = {}
     for key in (sorted(EVAL_SETS) if keys is None else list(keys)):
-        corpus = eval_corpus(store, EVAL_SETS[key], reader=reader)
+        corpus = eval_corpus(store, EVAL_SETS[key], reader=reader, corpus_dir=corpus_dir)
         corpus.allowed_missing = not corpus.ok and key in allowed
         out[key] = corpus
     return out
@@ -3102,7 +3110,10 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
 
     store = Store.open(paths.state_db)
     try:
-        corpora = eval_corpora(store, allow_missing=args.allow_missing_eval, reader=reader)
+        corpora = eval_corpora(
+            store, allow_missing=args.allow_missing_eval, reader=reader,
+            corpus_dir=paths.corpus_dir,
+        )
         blocked = refusals(corpora)
         if blocked:
             print(REFUSAL_HEADER)

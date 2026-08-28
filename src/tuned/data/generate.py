@@ -2105,11 +2105,28 @@ async def run_workers(
 
     while max_batches is None or batches < max_batches:
         stats = BatchStats()
+        # CLAIM EVERY STREAM FIRST, THEN RUN THE UNION IN ONE GATHER.
+        #
+        # A gather is a barrier: it returns when the SLOWEST call in it
+        # returns, and the generator's rate bucket sits idle for that tail.
+        # Gathering per stream paid that tail once PER STREAM - with three
+        # streams carrying work (2026-08-29: synthesis, transition and
+        # curated_c2 all non-empty) that was three stalls per batch for the
+        # same one bucket, and the bucket is the only thing that limits us.
+        # One barrier over the union amortises the tail across every stream's
+        # work instead. Claim size stays n_workers PER STREAM, so a stream
+        # cannot starve the others.
+        #
+        # In-flight is bounded by n_workers * len(streams), which must stay
+        # well inside DEFAULT_LEASE_S: admission runs at the bucket's rate
+        # (~7.5 s/call at rpm 8), so 3 streams x 16 = 48 in flight admits its
+        # last call at ~360 s and that call runs at most ~120 s - ~480 s
+        # against a 900 s lease.
+        claimed: list = []
         for stream in streams:
-            claimed = store.claim_tasks(worker_id, n_workers, stream=stream)
-            stats.claimed += len(claimed)
-            if not claimed:
-                continue
+            claimed.extend(store.claim_tasks(worker_id, n_workers, stream=stream))
+        stats.claimed = len(claimed)
+        if claimed:
             # return_exceptions: one task that raises something nobody
             # anticipated must not take the other n-1 paid calls in this
             # batch down with it. Its lease simply expires and it is
