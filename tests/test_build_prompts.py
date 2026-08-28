@@ -282,7 +282,6 @@ JUDGE_LEAKS = ("correct answer", "gold", "expected outcome")
 # through the registry, since it inspects source text rather than rendered
 # output).
 PROMPTS = reg.PROMPTS_DIR
-HARMONY = Path(__file__).parent.parent / "src" / "tuned" / "data" / "prompts_harmony"
 
 
 def _slot_values(prompt_id: str) -> dict:
@@ -778,7 +777,7 @@ def test_grounding_bands_are_mutually_exclusive():
     judgements into a failing band. Band 2 must now require a MISSTATEMENT,
     not mere absence.
     """
-    for root in (PROMPTS, HARMONY):
+    for root in (PROMPTS,):  # harmony overlay retired 2026-08-28, prev_rep.md
         text = (root / "judge_pointwise_v1.md").read_text(encoding="utf-8")
         line = next(ln for ln in text.splitlines() if ln.startswith("grounding_faithfulness"))
         band2 = line.split("2:")[1].split("1:")[0]
@@ -891,13 +890,30 @@ def test_pick_variant_separates_samples_of_one_seed():
 
 
 # --------------------------------------------------------------------------
-# Recovery overlay isolation. Live bytes stay the control.
+# Overlay isolation. Live bytes stay the control.
 # --------------------------------------------------------------------------
+# The prompts_harmony overlay these tests used to run against was retired
+# 2026-08-28 with the gpt-oss experiment lane (its templates are archived
+# verbatim in prev_rep.md). The overlay MACHINERY stays - prompt_overlay is
+# how any future A/B arm ships treated templates - so the isolation tests
+# now run against a throwaway overlay built from the live base.
 
-_OVERLAY_DIR = Path(__file__).parent.parent / "src" / "tuned" / "data" / "prompts_harmony"
+
+def _tmp_overlay(tmp_path, prompt_ids):
+    """A minimal overlay: each id copied from the base with one line added."""
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    for prompt_id in prompt_ids:
+        text = (reg.PROMPTS_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
+        (overlay / f"{prompt_id}.md").write_text(
+            text + "\nOverlay marker line for the isolation test.\n",
+            encoding="utf-8",
+        )
+    return overlay
 
 
-def test_live_prompt_files_are_untouched_when_the_overlay_is_armed():
+def test_live_prompt_files_are_untouched_when_the_overlay_is_armed(tmp_path):
+    _OVERLAY_DIR = _tmp_overlay(tmp_path, ["gen_irac_analysis_v1"])
     live_before = {
         prompt_id: (reg.PROMPTS_DIR / f"{prompt_id}.md").read_bytes()
         for prompt_id in EXPECTED_SHAS
@@ -916,7 +932,8 @@ def test_live_prompt_files_are_untouched_when_the_overlay_is_armed():
     assert reg.load("gen_irac_analysis_v1").sha == EXPECTED_SHAS["gen_irac_analysis_v1"]
 
 
-def test_live_judge_sha_stays_put_when_recovery_overlay_is_armed():
+def test_live_judge_sha_stays_put_when_an_overlay_is_armed(tmp_path):
+    _OVERLAY_DIR = _tmp_overlay(tmp_path, list(JUDGE_IDS))
     live_bytes = {
         prompt_id: (reg.PROMPTS_DIR / f"{prompt_id}.md").read_bytes()
         for prompt_id in JUDGE_IDS
@@ -933,125 +950,34 @@ def test_live_judge_sha_stays_put_when_recovery_overlay_is_armed():
         assert reg.load(prompt_id).sha == EXPECTED_SHAS[prompt_id]
 
 
-# Overlay drift. An ACCIDENTAL base edit is already caught above by
-# test_template_sha_is_pinned - the pin stops matching and forces a look.
-# What these tests catch is narrower: a DELIBERATE base edit, where the
-# author moves the sha pin on purpose and forgets to carry the same change
-# into the overlay copy. The overlay is sixteen near-copies of prompts/ and
-# must stay copies: prompt_sha is sha256 of RAW FILE BYTES, so a generated
-# overlay would have no bytes to hash and the exp_harmony rows would stop
-# being comparable.
-
 _PACKET_MARKERS = ("450 to 700 words", "Let me check this, or actually")
 
-# RE-PINNED 2026-08-24 (task 1, judge calibration): judge_tiebreak_v1 overlay
-# had its worked exemplar (validity 2) restored - the earlier removal is what
-# saturated the tiebreak arbiter to 18/18 accepts. judge_pointwise_v1 is
-# unaffected and keeps dropping its example verdict.
-_EXPECTED_OVERLAY_SHAS = {
-    "gen_drafting_v1": "609834efa759",
-    "gen_drafting_v2": "ea66b7bba577",
-    "gen_irac_analysis_v1": "088c0442f674",
-    "gen_irac_analysis_v2": "5fa4ce5dba19",
-    "gen_irac_analysis_v3": "d3635ee18266",
-    "gen_irac_analysis_v4": "5bc40d3c1bef",
-    "gen_statute_qa_v1": "bf49860e80dc",
-    "gen_statute_qa_v2": "aaaaec660f01",
-    "gen_statute_qa_v3": "9d2859618af8",
-    "gen_statute_qa_v4": "598deaeafd23",
-    "gen_summarization_v1": "42ee72ab542c",
-    "gen_summarization_v2": "84e8a00c5425",
-    "gen_transition_v1": "717e0c99aea7",
-    "gen_transition_v2": "73a97936afa1",
-    "judge_pointwise_v1": "dec02ad95f7b",
-    "judge_tiebreak_v1": "09100c3f704f",
-}
 
-
-def test_every_overlay_file_has_a_pinned_sha():
-    on_disk = {path.stem for path in _OVERLAY_DIR.glob("*.md")}
-    assert on_disk == set(_EXPECTED_OVERLAY_SHAS)
-
-
-def test_every_base_gen_prompt_has_an_overlay_counterpart():
-    # test_every_overlay_file_has_a_pinned_sha (above) only walks the overlay
-    # side: it would catch a stray addition to prompts_harmony/, but not a
-    # stray addition to prompts/. And prompt_registry._template_path() falls
-    # back to the base file whenever the overlay has none for that id -
-    # silently, no error, no test failure at the registry level. So a new
-    # gen_*.md dropped into prompts/ with no overlay counterpart would ship
-    # rendered under exp_harmony with the recovery-packet markers still in
-    # it, and every drift test in this section (all keyed off
-    # _EXPECTED_OVERLAY_SHAS) would keep passing regardless. This pins the
-    # base and overlay gen_* id sets equal so that gap cannot open unnoticed.
-    base_gen_ids = {p.stem for p in reg.PROMPTS_DIR.glob("gen_*.md")}
-    overlay_gen_ids = {p for p in _EXPECTED_OVERLAY_SHAS if p.startswith("gen_")}
-    assert base_gen_ids == overlay_gen_ids
-
-
-def test_overlay_bytes_are_pinned_like_the_live_bytes_are():
-    for prompt_id, expected in sorted(_EXPECTED_OVERLAY_SHAS.items()):
-        raw = (_OVERLAY_DIR / f"{prompt_id}.md").read_bytes()
-        actual = hashlib.sha256(raw).hexdigest()[:12]
-        assert actual == expected, (
-            f"{prompt_id} overlay changed: {actual} != {expected}. An overlay "
-            f"edit is deliberate or it is drift - move the pin on purpose."
-        )
-
-
-def test_generator_overlays_differ_from_their_base_in_exactly_two_lines():
-    ids = [p for p in _EXPECTED_OVERLAY_SHAS if p.startswith("gen_")]
-    assert len(ids) == 14
-    for prompt_id in sorted(ids):
-        base = (reg.PROMPTS_DIR / f"{prompt_id}.md").read_text(encoding="utf-8").splitlines()
-        over = (_OVERLAY_DIR / f"{prompt_id}.md").read_text(encoding="utf-8").splitlines()
-        assert len(base) == len(over), f"{prompt_id}: overlay changed line count"
-        changed = [i for i, (b, o) in enumerate(zip(base, over)) if b != o]
-        assert len(changed) == 2, (
-            f"{prompt_id}: {len(changed)} lines differ from the base, expected 2 "
-            f"(the two packet-marker lines). This only counts changed lines - it "
-            f"does not by itself prove the packet markers are gone; "
-            f"test_the_packet_is_in_every_base_and_in_no_generator_overlay checks "
-            f"that."
-        )
-
-
-def test_the_packet_is_in_every_base_and_in_no_generator_overlay():
-    ids = [p for p in _EXPECTED_OVERLAY_SHAS if p.startswith("gen_")]
-    for prompt_id in sorted(ids):
-        base = (reg.PROMPTS_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
-        over = (_OVERLAY_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
+def test_the_packet_is_in_every_base_generator_template():
+    # The overlay half of this property (the recovery packet stripped from
+    # every harmony copy) retired with that overlay; the live half is still
+    # real - every base generator template carries the length sentence and
+    # the verification-cue handover.
+    for path in sorted(reg.PROMPTS_DIR.glob("gen_*.md")):
+        base = path.read_text(encoding="utf-8")
         for marker in _PACKET_MARKERS:
-            assert marker in base, f"{prompt_id}: base lost {marker!r}"
-            assert marker not in over, (
-                f"{prompt_id}: overlay carries {marker!r} - stripping the packet "
-                f"is the whole reason this overlay exists"
-            )
+            assert marker in base, f"{path.stem}: base lost {marker!r}"
 
 
-def test_tiebreak_templates_carry_a_low_score_anchor():
-    """Both tiebreak overlays must show the model a failing exemplar.
+def test_tiebreak_template_carries_a_low_score_anchor():
+    """The tiebreak template must show the model a failing exemplar.
 
     Removing the worked example that contained `"validity": 2` saturated
     mistral-large to 18/18 accepts at validity 5.00, against 2.75 for the
     same model in the same seat on the frozen store. An arbiter that has
     never seen a low score does not produce one.
     """
-    for root in (reg.PROMPTS_DIR, _OVERLAY_DIR):
-        text = (root / "judge_tiebreak_v1.md").read_text(encoding="utf-8")
-        scores = [int(n) for n in re.findall(r'"(?:grounding|validity|coverage)":\s*(\d)', text)]
-        assert scores, f"{root.name}: tiebreak template has no exemplar verdict at all"
-        assert min(scores) <= 2, (
-            f"{root.name}: lowest exemplar score is {min(scores)}; "
-            "the arbiter needs a failing anchor or it saturates upward"
-        )
+    text = (reg.PROMPTS_DIR / "judge_tiebreak_v1.md").read_text(encoding="utf-8")
+    scores = [int(n) for n in re.findall(r'"(?:grounding|validity|coverage)":\s*(\d)', text)]
+    assert scores, "tiebreak template has no exemplar verdict at all"
+    assert min(scores) <= 2, (
+        f"lowest exemplar score is {min(scores)}; "
+        "the arbiter needs a failing anchor or it saturates upward"
+    )
 
 
-def test_judge_overlays_drop_the_example_verdict():
-    for prompt_id in ("judge_pointwise_v1",):
-        base = (reg.PROMPTS_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
-        over = (_OVERLAY_DIR / f"{prompt_id}.md").read_text(encoding="utf-8")
-        assert '"grounding": 4' in base
-        assert '"grounding": 4' not in over
-        assert "no example verdict" in over
-        assert len(over.splitlines()) == len(base.splitlines()) - 2

@@ -1557,25 +1557,8 @@ def test_manifest_records_strata_and_sizes_n_from_them(tmp_path, store):
     assert manifest["strata"] == list(strata)
     assert manifest["n"] == 60
     assert len(manifest["pairs"]) == 60
-    ok, reasons = E.validate_pretreatment_manifest(
-        manifest, treatment=_contract(), strata=strata
-    )
-    assert ok, reasons
+    # The validate_pretreatment_manifest round-trip that closed this test
+    # retired with the recovery-arm gate (2026-08-28); write_manifest's own
+    # record of strata and sizes is the property that stays.
 
-
-def test_manifest_written_for_three_strata_is_refused_against_four(store, tmp_path):
-    """A 60-pair cohort must not validate as the 80-pair contract."""
-    _eligible_pool(store, per_type=25)
-    strata = ("irac_analysis", "drafting", "summarization")
-    with Store.open(tmp_path / "treat" / "law_v1.sqlite3") as treatment:
-        manifest = E.write_manifest(
-            tmp_path / "cohort.json",
-            store,
-            treatment_store=treatment,
-            contract=_contract(),
-            strata=strata,
-        )
-    ok, reasons = E.validate_pretreatment_manifest(manifest, treatment=_contract())
-    assert ok is False
-    assert "contract-mismatch:strata" in reasons
 

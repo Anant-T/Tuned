@@ -251,8 +251,10 @@ BANNED_META = (
     "in the given text",
 )
 
-# Openings of an instruction-packet restatement. Shared with harmony.parse
-# so token-1 restatement and the stored-think gate cannot drift.
+# Openings of an instruction-packet restatement, shared vocabulary for the
+# stored-think gate. (Until 2026-08-28 the retired harmony prefill scorer read
+# the same list so its token-1 restatement check could not drift from this
+# gate; that consumer left with the gpt-oss experiment lane - prev_rep.md.)
 RESTATEMENT_OPENINGS = (
     "we need to produce",
     "we need to write",

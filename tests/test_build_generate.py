@@ -2284,8 +2284,7 @@ def test_generate_cli_refuses_a_recovery_config_on_the_live_workdir(tmp_path):
 
     doc = _base_doc()
     doc["build"]["workdir"] = "data/build"
-    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts_harmony"
-    doc["build"]["harmony_completions"] = True
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts"
     path = _write(tmp_path, doc)
     with pytest.raises(ValueError, match="live workdir"):
         generate_main(["--config", str(path), "--max-batches", "1"])
@@ -2767,10 +2766,7 @@ def _isolated_experiment_doc(tmp_path, *, require=True, manifest_path=None, s1=F
 
     doc = _base_doc()
     doc["build"]["workdir"] = str(tmp_path / "exp_recovery")
-    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts_harmony"
-    doc["build"]["harmony_completions"] = True
-    doc["build"]["harmony_prefill"] = "I start from the facts. "
-    doc["build"]["harmony_s1_continue"] = s1
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts"
     if require:
         doc["build"]["require_pretreatment_manifest"] = True
         doc["build"]["pretreatment_manifest"] = str(
@@ -2833,104 +2829,6 @@ def _trap_generate_side_effects(monkeypatch):
         lambda path=None: hits.append("dotenv") or 0,
     )
     return hits
-
-
-def test_recovery_generate_refuses_missing_pretreatment_manifest_before_ensure(
-    tmp_path, monkeypatch
-):
-    from test_build_config import _write
-
-    hits = _trap_generate_side_effects(monkeypatch)
-    path = _write(tmp_path, _isolated_experiment_doc(tmp_path, require=True))
-    with pytest.raises(ValueError, match="pretreatment|manifest"):
-        generate_main(["--config", str(path), "--max-batches", "1"])
-    assert "ensure" not in hits
-    assert "router" not in hits
-    assert "preflight" not in hits
-    assert not (tmp_path / "exp_recovery").exists()
-
-
-def test_recovery_generate_refuses_partial_pretreatment_manifest_before_ensure(
-    tmp_path, monkeypatch
-):
-    from test_build_config import _write
-    from tuned.data.eval_matched import TASK_TYPES
-    from tuned.data.gates import GATE_ORDER
-
-    hits = _trap_generate_side_effects(monkeypatch)
-    man = tmp_path / "partial-cohort.json"
-    pairs = [
-        {
-            "seed_id": f"{task_type}-{i:03d}",
-            "task_type": task_type,
-            "control_task_id": f"{task_type}-{i:03d}:t",
-            "control_gen_id": i + 1,
-            "control_attempt": 1,
-        }
-        for task_type in TASK_TYPES[:3]
-        for i in range(20)
-    ]
-    man.write_text(
-        json.dumps(
-            {
-                "n": 60,
-                "n_per_stratum": 20,
-                "task_types": list(TASK_TYPES[:3]),
-                "think_min": 500,
-                "teacher_family": "fam-gen",
-                "teacher_model": "gen1",
-                "gate_contract": list(GATE_ORDER),
-                "pairs": pairs,
-            }
-        ),
-        encoding="utf-8",
-    )
-    path = _write(tmp_path, _isolated_experiment_doc(tmp_path, manifest_path=man))
-    with pytest.raises(ValueError, match="pretreatment|manifest|underfill|n="):
-        generate_main(["--config", str(path), "--max-batches", "1"])
-    assert "ensure" not in hits
-    assert "router" not in hits
-    assert not (tmp_path / "exp_recovery").exists()
-
-
-def test_recovery_generate_refuses_mismatched_pretreatment_manifest_before_ensure(
-    tmp_path, monkeypatch
-):
-    from test_build_config import _write
-
-    hits = _trap_generate_side_effects(monkeypatch)
-    cfg_path = _write(tmp_path, _isolated_experiment_doc(tmp_path, require=False))
-    cfg = load_build_config(cfg_path, allow_unpinned=True)
-    man = tmp_path / "mismatch-cohort.json"
-    payload = _complete_pretreatment_manifest(man, cfg)
-    payload["think_min"] = 200
-    payload["gate_contract"] = list(payload["gate_contract"])[:-1]
-    man.write_text(json.dumps(payload), encoding="utf-8")
-    path = _write(tmp_path, _isolated_experiment_doc(tmp_path, manifest_path=man))
-    with pytest.raises(ValueError, match="contract|think_min|gate"):
-        generate_main(["--config", str(path), "--max-batches", "1"])
-    assert "ensure" not in hits
-    assert "router" not in hits
-    assert not (tmp_path / "exp_recovery").exists()
-
-
-def test_complete_pretreatment_manifest_reaches_preflight_not_ensure(
-    tmp_path, monkeypatch
-):
-    from test_build_config import _write
-
-    hits = _trap_generate_side_effects(monkeypatch)
-    cfg_path = _write(tmp_path, _isolated_experiment_doc(tmp_path, require=False))
-    cfg = load_build_config(cfg_path, allow_unpinned=True)
-    man = tmp_path / "complete-cohort.json"
-    _complete_pretreatment_manifest(man, cfg)
-    path = _write(tmp_path, _isolated_experiment_doc(tmp_path, manifest_path=man))
-    with pytest.raises(AssertionError, match="print_preflight"):
-        generate_main(["--config", str(path), "--max-batches", "1"])
-    assert "preflight" in hits
-    assert "ensure" not in hits
-    assert "router" not in hits
-    assert not (tmp_path / "exp_recovery").exists()
 
 
 def test_harmony_generate_does_not_require_pretreatment_manifest(tmp_path, monkeypatch):

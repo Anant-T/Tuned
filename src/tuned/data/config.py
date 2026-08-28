@@ -39,22 +39,12 @@ class BuildCfg:
     length_band: LengthBand
     difficulty_target: dict[str, float]
     appointed_day: str
-    # Completions-path Harmony analysis prefill (gpt-oss). Off on the live
-    # wave. Isolated experiment yaml sets both; generate.py then posts to
-    # /v1/completions instead of chat/completions.
-    harmony_prefill: str | None = None
-    harmony_completions: bool = False
-    # Second Completions call appending s1's " Wait" when the first analysis
-    # continuation has no verification cue. Off on the live wave.
-    harmony_s1_continue: bool = False
     # Optional directory of *.md templates that override `prompts/` by stem.
     # Live SHAs stay pinned; experiment yaml points here. Relative to repo root.
+    # (The harmony Completions-prefill and pretreatment-manifest knobs that
+    # used to sit beside this were retired 2026-08-28 with the gpt-oss
+    # experiment lane - see prev_rep.md.)
     prompt_overlay: str | None = None
-    # Opt-in generate.main gate: a complete persisted 80-pair pre-treatment
-    # manifest must exist before the recovery workdir is created. Off unless
-    # a yaml sets the flag; Harmony stays off until it opts in.
-    require_pretreatment_manifest: bool = False
-    pretreatment_manifest: str | None = None
     # Which task-type strata the matched evaluator's cohort draws from.
     # None = every stratum eval_matched knows (the four-way default), which
     # is what the live wave declares by saying nothing.
@@ -852,16 +842,11 @@ def _difficulty_of(raw: dict) -> DifficultyCfg | None:
 
 
 def _is_recovery_experiment(build: BuildCfg) -> bool:
-    return bool(
-        build.prompt_overlay
-        or build.harmony_completions
-        or build.harmony_prefill
-        or build.harmony_s1_continue
-    )
+    return bool(build.prompt_overlay)
 
 
 def _refuse_recovery_on_live_store(build: BuildCfg, repo_root: Path) -> None:
-    """Recovery/Harmony knobs may not target the frozen live workdir or DB.
+    """Experiment knobs (prompt_overlay) may not target the live workdir or DB.
 
     Checked before the train-config pin so a recovery-capable CLI refuses
     the live store even when the referenced trainer yaml is unpinned.
@@ -882,25 +867,6 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
 
     build_raw = dict(raw["build"])
     length_band = LengthBand(**build_raw.pop("length_band"))
-    require_manifest = build_raw.pop("require_pretreatment_manifest", False)
-    if not isinstance(require_manifest, bool):
-        raise ValueError(
-            "build.require_pretreatment_manifest must be a YAML boolean "
-            f"(true/false), got {require_manifest!r}. Not coerced."
-        )
-    pretreatment_manifest = build_raw.pop("pretreatment_manifest", None)
-    if pretreatment_manifest is not None:
-        if not isinstance(pretreatment_manifest, str) or not pretreatment_manifest.strip():
-            raise ValueError(
-                "build.pretreatment_manifest must be a non-empty string path, "
-                f"got {pretreatment_manifest!r}"
-            )
-        pretreatment_manifest = pretreatment_manifest.strip()
-    if require_manifest and not pretreatment_manifest:
-        raise ValueError(
-            "build.pretreatment_manifest is required when "
-            "require_pretreatment_manifest is true"
-        )
     strata = build_raw.pop("eval_cohort_strata", None)
     if strata is not None:
         if not isinstance(strata, list) or not strata:
@@ -921,8 +887,6 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
             )
     build = BuildCfg(
         length_band=length_band,
-        require_pretreatment_manifest=require_manifest,
-        pretreatment_manifest=pretreatment_manifest,
         eval_cohort_strata=strata,
         **build_raw,
     )

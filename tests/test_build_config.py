@@ -663,12 +663,10 @@ def test_live_config_has_no_recovery_or_harmony_experiment_knobs():
     assert "pretreatment_manifest" not in raw["build"]
     cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
     assert cfg.build.workdir == "data/build"
-    assert cfg.build.harmony_prefill is None
-    assert cfg.build.harmony_completions is False
-    assert cfg.build.harmony_s1_continue is False
+    # The harmony/pretreatment knobs themselves were deleted 2026-08-28 (a
+    # yaml carrying them now refuses to load at all); prompt_overlay is the
+    # one surviving experiment knob and the live wave must not set it.
     assert cfg.build.prompt_overlay is None
-    assert cfg.build.require_pretreatment_manifest is False
-    assert cfg.build.pretreatment_manifest is None
 
 
 _RECOVERY_SPEND_KEYS = ("usd_cap", "usd_per_1m_prompt", "usd_per_1m_completion")
@@ -704,20 +702,10 @@ def test_live_openai_limits_carry_a_blocking_cap_not_the_recovery_wallet():
 LIVE_PUSH_REPO = "tantan01/tuned-law-v1-data"
 
 
-def test_require_pretreatment_manifest_must_be_a_yaml_boolean(tmp_path):
-    doc = _base_doc()
-    doc["build"]["workdir"] = "data/build/exp_recovery"
-    doc["build"]["require_pretreatment_manifest"] = "true"
-    doc["build"]["pretreatment_manifest"] = "cohort.json"
-    with pytest.raises(ValueError, match="require_pretreatment_manifest"):
-        load_build_config(_write(tmp_path, doc), allow_unpinned=True)
-
-
 def test_a_recovery_config_that_points_at_the_live_workdir_is_refused(tmp_path):
     doc = _base_doc()
     doc["build"]["workdir"] = "data/build"
-    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts_harmony"
-    doc["build"]["harmony_completions"] = True
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts"
     with pytest.raises(ValueError, match="live workdir"):
         load_build_config(_write(tmp_path, doc), allow_unpinned=True)
 
@@ -726,7 +714,7 @@ def test_a_recovery_config_that_resolves_to_the_live_database_is_refused(tmp_pat
     repo_root = Path(__file__).parent.parent.resolve()
     doc = _base_doc()
     doc["build"]["workdir"] = str(repo_root / "data" / "build")
-    doc["build"]["harmony_prefill"] = "I start from the facts. "
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts"
     with pytest.raises(ValueError, match="live"):
         load_build_config(_write(tmp_path, doc), allow_unpinned=True)
 
@@ -734,8 +722,7 @@ def test_a_recovery_config_that_resolves_to_the_live_database_is_refused(tmp_pat
 def test_a_recovery_config_on_an_isolated_workdir_is_accepted(tmp_path):
     doc = _base_doc()
     doc["build"]["workdir"] = "data/build/exp_recovery"
-    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts_harmony"
-    doc["build"]["harmony_completions"] = True
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts"
     cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
     assert cfg.build.workdir == "data/build/exp_recovery"
 
@@ -743,8 +730,7 @@ def test_a_recovery_config_on_an_isolated_workdir_is_accepted(tmp_path):
 def _recovery_on(workdir: str) -> dict:
     doc = _base_doc()
     doc["build"]["workdir"] = workdir
-    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts_harmony"
-    doc["build"]["harmony_completions"] = True
+    doc["build"]["prompt_overlay"] = "src/tuned/data/prompts"
     return doc
 
 

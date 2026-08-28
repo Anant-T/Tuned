@@ -1690,26 +1690,6 @@ async def generate_once(
     # exclusion below never needed changing; only the beliefs about it did.
     too_small = undersized_families(cfg, "generator", est_tokens)
     params_for_ref = effort_params_for_ref(attempt)
-    harmony_on = bool(getattr(cfg.build, "harmony_completions", False))
-    prefill = getattr(cfg.build, "harmony_prefill", None) or ""
-    harmony_prompt = None
-    if harmony_on:
-        from tuned.data.harmony import DEFAULT_PREFILL, render_for_analysis_prefill
-
-        prefill = prefill or DEFAULT_PREFILL
-        effort = "medium"
-        gen_refs = cfg.routing_refs("generator")
-        if gen_refs:
-            effort = str(
-                (cfg.model_for(gen_refs[0])[1].params or {}).get("reasoning_effort")
-                or "medium"
-            )
-        harmony_prompt = render_for_analysis_prefill(
-            bundle.messages,
-            prefill,
-            reasoning_effort=effort,
-            current_date=date.today().isoformat(),
-        )
 
     try:
         ref, response = await router.complete(
@@ -1720,7 +1700,6 @@ async def generate_once(
             est_tokens=est_tokens,
             exclude_families=too_small,
             on_attempt=usage_recorder(store, day),
-            prompt=harmony_prompt,
         )
     except ProviderError as exc:
         # Every attempt this call made is already ledgered by on_attempt,
@@ -1772,65 +1751,6 @@ async def generate_once(
     result.ref = ref
     result.prompt_tokens = int(response.prompt_tokens or 0)
     result.completion_tokens = int(response.completion_tokens or 0)
-
-    if harmony_on:
-        from tuned.data.harmony import (
-            DEFAULT_PREFILL,
-            S1_WAIT,
-            needs_s1_continue,
-            parse_completion,
-            stitch_s1,
-        )
-
-        used_prefill = prefill or DEFAULT_PREFILL
-        parsed = parse_completion(response.text, used_prefill)
-        if getattr(cfg.build, "harmony_s1_continue", False) and needs_s1_continue(parsed):
-            first_cont = parsed.analysis_continuation
-            s1_prompt = (harmony_prompt or "") + first_cont + S1_WAIT
-            try:
-                _, response2 = await router.complete(
-                    "generator",
-                    bundle.messages,
-                    params_for_ref=params_for_ref,
-                    max_tokens=max_tokens,
-                    est_tokens=est_tokens,
-                    exclude_families=too_small,
-                    on_attempt=usage_recorder(store, day),
-                    prompt=s1_prompt,
-                )
-            except ProviderError as exc:
-                store.log_event(
-                    "s1_continue_error",
-                    {
-                        "task_id": task["task_id"],
-                        "attempt": attempt,
-                        "status": exc.status,
-                        "error": str(exc)[:500],
-                    },
-                )
-            else:
-                parsed = stitch_s1(
-                    parsed, parse_completion(response2.text, ""), used_prefill
-                )
-                result.prompt_tokens += int(response2.prompt_tokens or 0)
-                result.completion_tokens += int(response2.completion_tokens or 0)
-                response.prompt_tokens = result.prompt_tokens
-                response.completion_tokens = result.completion_tokens
-                # Truncation is a fact about the last provider call. A first
-                # Completions hit that ended on length can still s1-continue
-                # into a complete stitch; a second call that is still
-                # length/max_tokens must stay non-accepting.
-                response.finish_reason = response2.finish_reason
-                store.log_event(
-                    "s1_continue",
-                    {
-                        "task_id": task["task_id"],
-                        "attempt": attempt,
-                        "first_cont_chars": len(first_cont),
-                    },
-                )
-        response.reasoning = parsed.think or None
-        response.text = parsed.final
 
     _, model_cfg = cfg.model_for(ref)
     # What was actually sent - resolved against the ref that answered, which
@@ -2286,9 +2206,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cfg = load_build_config(args.config)
-    from tuned.data.eval_matched import require_pretreatment_manifest
-
-    require_pretreatment_manifest(cfg)
     print(f"loaded {load_dotenv_keys()} key(s) from .env")
     # Before anything is claimed: a role with no key, or a judge slot no
     # model can fill, is knowable now and costs paid rows to discover later.

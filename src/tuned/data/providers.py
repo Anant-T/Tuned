@@ -45,19 +45,6 @@ import httpx
 from tuned.data.config import BuildConfig, ModelCfg, ModelRef, ProviderCfg
 
 _CHAT_PATH = "chat/completions"
-_COMPLETIONS_PATH = "completions"
-# Chat-only fields that 400 on Cerebras /v1/completions (probed against the
-# Completions schema: prompt/model/max_tokens/temperature/top_p/stop, no
-# reasoning_effort). Dropped when ChatRequest.prompt is set so a gpt-oss
-# generator's model.params can keep reasoning_effort for the chat path.
-_COMPLETIONS_DROP = (
-    "reasoning_effort",
-    "reasoning_format",
-    "messages",
-    "tools",
-    "tool_choice",
-    "response_format",
-)
 _BACKOFF_BASE_S = 1.0
 _BACKOFF_CAP_S = 60.0
 # TOTAL seconds one call may spend parked in backoff/Retry-After sleeps.  A
@@ -233,11 +220,6 @@ class ChatRequest:
     # different sampling, and the role is known only to the caller. None means
     # "no role-specific layer", which is what a direct client call gets.
     role: str | None = None
-    # When set, the client posts to /v1/completions with this string as
-    # `prompt` instead of sending `messages` to chat/completions. Harmony
-    # analysis prefill for gpt-oss uses this; chat-only params are stripped
-    # in build_payload.
-    prompt: str | None = None
 
 
 @dataclass
@@ -270,13 +252,6 @@ def _default_response_hook(data: dict) -> tuple[str, str | None]:
     text = message.get("content") or ""
     reasoning = message.get("reasoning") or message.get("reasoning_content")
     return text, reasoning
-
-
-def _completions_response_hook(data: dict) -> tuple[str, str | None]:
-    """Text Completions shape: the continuation is ``choices[0].text``."""
-    choices = data.get("choices") or []
-    text = (choices[0].get("text") or "") if choices else ""
-    return text, None
 
 
 def _flatten_chunk_text(body: object) -> str:
@@ -958,23 +933,6 @@ class ChatClient:
         sampling on every judge call, since nothing downstream pins a judge
         temperature - judge.py sends no per-call params at all.
         """
-        if req.prompt is not None:
-            from tuned.data.harmony import HARMONY_STOP
-
-            payload = {
-                "model": self.model.id,
-                "prompt": req.prompt,
-                **dict(self.model.params or {}),
-                **dict((self.model.role_params or {}).get(req.role or "", {})),
-                **dict(req.params or {}),
-            }
-            for key in _COMPLETIONS_DROP:
-                payload.pop(key, None)
-            payload.setdefault("stop", list(HARMONY_STOP))
-            if req.max_tokens is not None:
-                payload["max_tokens"] = req.max_tokens
-            return self.quirk.request_hook(payload, self.model, req.role)
-
         payload: dict = {
             "model": self.model.id,
             "messages": [dict(m) for m in req.messages],
@@ -1065,8 +1023,7 @@ class ChatClient:
             retry_after: float | None = None
             started = self._clock()
             try:
-                path = _COMPLETIONS_PATH if req.prompt is not None else _CHAT_PATH
-                response = await self._client.post(path, json=payload, headers=headers)
+                response = await self._client.post(_CHAT_PATH, json=payload, headers=headers)
             except httpx.HTTPError as exc:
                 last_status = None
                 last_detail = f"transport error {type(exc).__name__}: {exc}"
@@ -1095,7 +1052,6 @@ class ChatClient:
                             data,
                             status=status,
                             latency_ms=latency_ms,
-                            completions=req.prompt is not None,
                         )
                 else:
                     last_status = status
@@ -1154,12 +1110,9 @@ class ChatClient:
         )
 
     def _to_response(
-        self, data: dict, *, status: int, latency_ms: int, completions: bool = False
+        self, data: dict, *, status: int, latency_ms: int
     ) -> ChatResponse:
-        if completions:
-            text, reasoning = _completions_response_hook(data)
-        else:
-            text, reasoning = self.quirk.response_hook(data)
+        text, reasoning = self.quirk.response_hook(data)
         usage = data.get("usage") or {}
         choices = data.get("choices") or []
         finish_reason = choices[0].get("finish_reason") if choices else None
@@ -1916,7 +1869,6 @@ class Router:
         est_tokens: int = 0,
         exclude_families: frozenset[str] = frozenset(),
         on_attempt: Callable[[ModelRef, int | None, dict | None], None] | None = None,
-        prompt: str | None = None,
     ) -> tuple[ModelRef, ChatResponse]:
         """One pass down the role's preference list; returns (ref, response).
 
@@ -1972,7 +1924,6 @@ class Router:
                 # So build_payload can apply this model's role_params. The
                 # Router is the only layer that knows which role is calling.
                 role=role,
-                prompt=prompt,
             )
             attempt_hook = (
                 None
