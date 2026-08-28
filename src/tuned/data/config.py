@@ -1,4 +1,4 @@
-"""Typed loader for configs/data_law_v1.yaml, the dataset-curation build config.
+"""Typed loader for data/configs/data_law_v1.yaml, the dataset-curation build config.
 
 This config is churn-heavy (API providers/models/limits change weekly) so it
 lives separately from the training config and only ever REFERENCES it
@@ -293,7 +293,7 @@ class BuildConfig:
     routing: RoutingCfg
     assembly: AssemblyCfg
     # Resolved from the referenced train config at load time - never
-    # duplicated in configs/data_law_v1.yaml itself.
+    # duplicated in data/configs/data_law_v1.yaml itself.
     think_open: str
     think_close: str
     model_repo: str

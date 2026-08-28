@@ -652,7 +652,7 @@ def _real_pinned_tokenizer():
     records are the counts the real tokenizer produces. Skipping it here
     means it never runs anywhere.
     """
-    cfg = load_build_config("configs/data_law_v1.yaml")
+    cfg = load_build_config("data/configs/data_law_v1.yaml")
     try:
         import transformers
     except ImportError:

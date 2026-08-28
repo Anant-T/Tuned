@@ -33,7 +33,7 @@
 # result and the pre-registered lines the treatment is graded against.
 #
 build:
-  train_config: configs/law_v1_8b_ddp.yaml
+  train_config: training/configs/law_v1_8b_ddp.yaml
   workdir: data/build/exp_irac_ctl
   target_total: 18000
   mvp_total: 10300

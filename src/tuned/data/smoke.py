@@ -104,7 +104,7 @@ if __name__ == "__main__":
     from tuned.train.config import load_config
 
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/law_v1_8b_ddp.yaml")
+    p.add_argument("--config", default="training/configs/law_v1_8b_ddp.yaml")
     p.add_argument("--out", default=None)
     args = p.parse_args()
 

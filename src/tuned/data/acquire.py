@@ -47,7 +47,7 @@ traceback.
 boto3/huggingface_hub are imported lazily inside the seams, never at module
 import time, matching replay.py/seeds.py.
 
-Build:  python -m tuned.data.acquire --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.acquire --config data/configs/data_law_v1.yaml
         [--kind metadata|pdf|hf|all] [--years 2010-2025] [--language english]
         [--limit N] [--verify] [--dry-run] [--hf-source injudgements]
 """
@@ -734,7 +734,7 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument(
         "--kind",
         default="all",

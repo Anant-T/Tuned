@@ -67,7 +67,7 @@ WHAT IS DELIBERATELY NOT HERE
 Regional-language judgments are handled here, as a metadata question
 (`available_languages`), rather than downstream as an extraction problem.
 
-Build:  python -m tuned.data.select --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.select --config data/configs/data_law_v1.yaml
         [--years 2010-2025] [--limit N] [--out PATH] [--no-landmarks]
 """
 
@@ -727,7 +727,7 @@ def main(argv: Sequence[str] | None = None, *, rows=None, landmarks=_UNSET) -> i
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--years", default=None, help=f"default {DEV_YEARS[0]}-{DEV_YEARS[-1]}")
     parser.add_argument(
         "--limit",

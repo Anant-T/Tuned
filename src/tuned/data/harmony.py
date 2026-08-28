@@ -307,7 +307,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.providers import ChatClient, ChatRequest, ProviderError, load_dotenv_keys
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--max-tokens", type=int, default=80)
     parser.add_argument("--prefill", default=DEFAULT_PREFILL)
     parser.add_argument(

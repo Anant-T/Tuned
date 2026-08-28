@@ -44,7 +44,7 @@ rather than disguised by a call that does not exist. Wiring it into `_prov` is
 a one-line change in decontaminate.py and deliberately not made here: that
 module owns the dataset row's provenance schema and this task does not.
 
-Build:  python -m tuned.data.difficulty --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.difficulty --config data/configs/data_law_v1.yaml
         [--probe] [--dry-run]
 """
 
@@ -482,7 +482,7 @@ def main(argv=None) -> int:  # pragma: no cover - the live probe path
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument(
         "--probe",
         action="store_true",

@@ -52,7 +52,7 @@ are strictly reads; every WRITE still goes through the store API
 (create_tasks / log_event), so the transaction discipline that module owns
 is untouched.
 
-Plan:  python -m tuned.data.tasks --config configs/data_law_v1.yaml
+Plan:  python -m tuned.data.tasks --config data/configs/data_law_v1.yaml
        --stream synthesis --n 300 [--arm unscripted] [--mix irac_analysis=0.5,...]
 """
 
@@ -739,7 +739,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     # No default, so that "was it passed?" is answerable: --stream is honoured
     # by the PLANNER and ignored by the re-open, and a --reopen-only command
     # that names one is asking for a filter it will not get.

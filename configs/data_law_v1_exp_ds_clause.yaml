@@ -30,7 +30,7 @@
 # out of scope for this measurement.
 #
 build:
-  train_config: configs/law_v1_8b_ddp.yaml
+  train_config: training/configs/law_v1_8b_ddp.yaml
   workdir: data/build/exp_ds_clause
   prompt_overlay: data/build/exp_ds_clause/prompts_clause
   target_total: 18000

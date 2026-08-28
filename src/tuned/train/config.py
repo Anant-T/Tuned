@@ -1,4 +1,4 @@
-"""Typed loader for configs/law_v1_8b_ddp.yaml. The revision pin is enforced here."""
+"""Typed loader for training/configs/law_v1_8b_ddp.yaml. The revision pin is enforced here."""
 
 from dataclasses import dataclass
 from pathlib import Path

@@ -12,7 +12,7 @@ import pytest
 
 from tuned.train.config import load_config
 
-CONFIG = Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml"
+CONFIG = Path(__file__).parent.parent / "training" / "configs" / "law_v1_8b_ddp.yaml"
 
 
 def test_markers_and_think_tags_render():

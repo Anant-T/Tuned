@@ -23,7 +23,7 @@ from tuned.data.config import BuildConfig, ModelCfg, ModelRef, ProviderCfg, load
 from tuned.data.providers import TRANSIENT_SKIPS, ChatResponse, ProviderError
 from tuned.data.store import Store
 
-DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
+DATA_CONFIG = Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml"
 
 _CFG: BuildConfig | None = None
 

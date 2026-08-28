@@ -20,7 +20,7 @@ from tuned.data import calibrate as C
 from tuned.data.config import load_build_config
 from tuned.data.store import Store
 
-DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
+DATA_CONFIG = Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml"
 CALIBRATE_SRC = Path(C.__file__)
 
 

@@ -26,7 +26,7 @@ build_curated, not the converters.
 datasets/pyarrow imports are lazy (inside the streaming helpers, never at
 module import time).
 
-Build:  python -m tuned.data.curated --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.curated --config data/configs/data_law_v1.yaml
         [--out PATH] [--counts 800,600,300]
 """
 
@@ -364,7 +364,7 @@ if __name__ == "__main__":
     from tuned.data.config import load_build_config
 
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/data_law_v1.yaml")
+    p.add_argument("--config", default="data/configs/data_law_v1.yaml")
     p.add_argument("--out", default=None)
     p.add_argument("--counts", default=None, help="predex,aalap,pi169")
     args = p.parse_args()

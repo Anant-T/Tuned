@@ -1,4 +1,4 @@
-"""scripts/seed_exp_store.py - copy source + a seed sample out of a live
+"""data/scripts/seed_exp_store.py - copy source + a seed sample out of a live
 store, read-only, into an isolated arm store."""
 import json
 import sqlite3
@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-SCRIPTS = Path(__file__).parent.parent / "scripts"
+SCRIPTS = Path(__file__).parent.parent / "data" / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
@@ -109,7 +109,7 @@ def test_cli_refuses_a_live_control_workdir(tmp_path, monkeypatch, capsys):
     # A minimal build: block fails load_build_config's own schema checks
     # (e.g. the required length_band) before it ever reaches the workdir
     # check, so use a full real config with only the workdir overridden.
-    doc = yaml.safe_load(Path("configs/data_law_v1.yaml").read_text())
+    doc = yaml.safe_load(Path("data/configs/data_law_v1.yaml").read_text())
     doc["build"]["workdir"] = "data/build"
     yaml_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
     rc = seed_exp_store.main(["--config", str(yaml_path), "--from", str(live)])

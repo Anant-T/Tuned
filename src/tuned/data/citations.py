@@ -15,7 +15,7 @@ Index file format: sorted, newline-delimited, utf-8 text (LF). Deliberately
 not JSON or sqlite - it diffs, greps, streams line-by-line, and survives a
 hand edit.
 
-Build:  python -m tuned.data.citations --build --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.citations --build --config data/configs/data_law_v1.yaml
         [--source kanoongpt] [--out PATH]
 """
 
@@ -446,7 +446,7 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="Build the citation-existence index.")
     p.add_argument("--build", action="store_true", help="build the index (the only mode)")
-    p.add_argument("--config", default="configs/data_law_v1.yaml")
+    p.add_argument("--config", default="data/configs/data_law_v1.yaml")
     p.add_argument("--source", default="kanoongpt", choices=sorted(_SOURCES))
     p.add_argument("--out", default=None)
     args = p.parse_args()

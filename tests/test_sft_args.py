@@ -3,7 +3,7 @@ from pathlib import Path
 from tuned.train.config import load_config
 from tuned.train.sft import build_sft_config
 
-CONFIG = Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml"
+CONFIG = Path(__file__).parent.parent / "training" / "configs" / "law_v1_8b_ddp.yaml"
 # main() is unimportable without the GPU stack, so everything it does inline
 # (prints, step-0 gates, the resume path) is asserted against its source.
 SFT = Path(__file__).parent.parent / "src" / "tuned" / "train" / "sft.py"

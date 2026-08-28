@@ -1315,7 +1315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.paths import build_paths
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--control-config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--control-config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--treatment-config", default="configs/data_law_v1_exp_recovery.yaml")
     sub = parser.add_subparsers(dest="command", required=True)
     write = sub.add_parser(

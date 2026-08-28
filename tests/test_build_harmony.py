@@ -528,7 +528,7 @@ def test_loading_the_live_config_clears_a_prior_harmony_overlay():
     load_build_config(root / "configs" / "data_law_v1_exp_harmony.yaml", allow_unpinned=True)
     overlaid = reg.load("gen_irac_analysis_v1")
     assert "450 to 700" not in (overlaid.user or "")
-    load_build_config(root / "configs" / "data_law_v1.yaml", allow_unpinned=True)
+    load_build_config(root / "data" / "configs" / "data_law_v1.yaml", allow_unpinned=True)
     live = reg.load("gen_irac_analysis_v1")
     assert live.sha == EXPECTED_SHAS["gen_irac_analysis_v1"]
     assert "450 to 700" in (live.user or "")
@@ -549,7 +549,7 @@ def test_live_prompt_sha_is_stable_after_a_prior_harmony_config_load():
     overlaid = reg.load("gen_irac_analysis_v1")
     assert overlaid.sha != EXPECTED_SHAS["gen_irac_analysis_v1"]
     assert "450 to 700" not in (overlaid.user or "")
-    load_build_config(root / "configs" / "data_law_v1.yaml", allow_unpinned=True)
+    load_build_config(root / "data" / "configs" / "data_law_v1.yaml", allow_unpinned=True)
     live = reg.load("gen_irac_analysis_v1")
     assert live.sha == EXPECTED_SHAS["gen_irac_analysis_v1"]
     assert "450 to 700" in (live.user or "")
@@ -708,7 +708,7 @@ def test_recovery_config_has_matched_think_min_and_disables_s1():
     cfg = load_build_config(
         root / "configs" / "data_law_v1_exp_recovery.yaml", allow_unpinned=True
     )
-    live = load_build_config(root / "configs" / "data_law_v1.yaml", allow_unpinned=True)
+    live = load_build_config(root / "data" / "configs" / "data_law_v1.yaml", allow_unpinned=True)
     assert cfg.build.harmony_s1_continue is False
     assert cfg.build.length_band.think_min == 500
     assert cfg.build.length_band.think_min == live.build.length_band.think_min

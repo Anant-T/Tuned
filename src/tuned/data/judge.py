@@ -107,7 +107,7 @@ appended too, but under kind="judge_error" rather than "judgement", so that
 store.reconcile_raw skips it: recovering it as a judgement would write a row
 with three NULL scores that later reads as a judgement nobody made.
 
-Run:  python -m tuned.data.judge --config configs/data_law_v1.yaml
+Run:  python -m tuned.data.judge --config data/configs/data_law_v1.yaml
       --stream synthesis --n-workers 4 [--forever] [--max-batches N]
 """
 
@@ -1584,7 +1584,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--stream", action="append", default=None, help="repeatable")
     parser.add_argument("--n-workers", type=int, default=4)
     parser.add_argument("--forever", action="store_true")

@@ -30,7 +30,7 @@ from tuned.data.statutes import (
 )
 from tuned.data.store import Store
 
-DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
+DATA_CONFIG = Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml"
 TRANSITION_SRC = Path(T.__file__)
 
 

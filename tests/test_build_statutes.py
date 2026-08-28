@@ -41,7 +41,7 @@ def test_appointed_day_constant():
 
 
 def test_config_appointed_day_matches_the_module_constant():
-    cfg = load_build_config("configs/data_law_v1.yaml", allow_unpinned=True)
+    cfg = load_build_config("data/configs/data_law_v1.yaml", allow_unpinned=True)
     assert date.fromisoformat(cfg.build.appointed_day) == APPOINTED_DAY
 
 

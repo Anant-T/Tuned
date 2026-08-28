@@ -50,7 +50,7 @@ from tuned.data.stats import REPORT_FILENAME, SUMMARY_FILENAME
 from tuned.data.stats import main as stats_main
 
 PUSH_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "push.py"
-DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
+DATA_CONFIG = Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml"
 
 
 # --------------------------------------------------------------------------
@@ -192,7 +192,7 @@ def test_the_train_configs_pin_target_matches_pushs_own_repo():
 
     cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
     train_cfg = load_config(
-        Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml", allow_unpinned=True,
+        Path(__file__).parent.parent / "training" / "configs" / "law_v1_8b_ddp.yaml", allow_unpinned=True,
     )
     assert train_cfg.hub.dataset_repo == cfg.push.repo_id
 

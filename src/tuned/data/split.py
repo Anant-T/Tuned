@@ -83,7 +83,7 @@ grouping, ordered by date and hash, and the target is filled by walking that
 order, so nothing in the decision can see what line a row arrived on. Pinned in
 both directions by the shuffle test.
 
-Build:  python -m tuned.data.split --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.split --config data/configs/data_law_v1.yaml
         [--in PATH] [--out-train PATH] [--out-eval PATH]
 """
 
@@ -672,7 +672,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--in", dest="input", default=None,
                         help=f"default out/{DEDUPE_OUT_FILENAME} (dedupe.py's output)")
     parser.add_argument("--out-train", default=None, help=f"default out/{TRAIN_FILENAME}")

@@ -1,4 +1,4 @@
-"""The production lane (configs/law_v1_8b_ddp.yaml): Qwen3-8B under plain
+"""The production lane (training/configs/law_v1_8b_ddp.yaml): Qwen3-8B under plain
 2x T4 data-parallel via torchrun. Qualified at seq 8192 on 2026-08-08 - all
 four gates green (PROBE 12.80/13.00 GiB, SAVETEST, SMOKE 60/60 at 74.7 s/step
 with peaks 12.98/13.18 GiB, RESUME). A 12288 raise was tried on 2026-08-26 and
@@ -11,7 +11,7 @@ from pathlib import Path
 
 from tuned.train.config import load_config
 
-CONFIGS = Path(__file__).parent.parent / "configs"
+CONFIGS = Path(__file__).parent.parent / "training" / "configs"
 
 
 def test_model_repo_and_revision_pinned():

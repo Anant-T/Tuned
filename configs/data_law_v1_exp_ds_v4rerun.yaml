@@ -37,7 +37,7 @@
 # from the referenced training config at load time.
 
 build:
-  train_config: configs/law_v1_8b_ddp.yaml
+  train_config: training/configs/law_v1_8b_ddp.yaml
   workdir: data/build/exp_ds_v4rerun
   prompt_overlay: data/build/exp_gptoss_ctl/prompts_preedit
   target_total: 18000

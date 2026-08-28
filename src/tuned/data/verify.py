@@ -40,7 +40,7 @@ The CLI refuses to start while any lease is live, and every demotion
 re-checks its OWN row's lease immediately before writing - the opening check
 is a snapshot, and a sweep over tens of thousands of rows outlives it.
 
-Run:  python -m tuned.data.verify --config configs/data_law_v1.yaml
+Run:  python -m tuned.data.verify --config data/configs/data_law_v1.yaml
       [--index data/build/corpus/citations.txt] [--state accepted]
 """
 
@@ -336,7 +336,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--index", default=None, help="path to the citation index")
     parser.add_argument("--state", default=None, help="only re-gate tasks in this state")
     parser.add_argument(

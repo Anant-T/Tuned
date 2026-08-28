@@ -133,7 +133,7 @@ swap of that function and nothing else. Everything above it is pure text
 over `list[str]`, one string per page, which is also why the whole module is
 testable without a PDF.
 
-Build:  python -m tuned.data.extract --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.extract --config data/configs/data_law_v1.yaml
         [--limit N] [--force] [--audit N] [--selection PATH]
 """
 
@@ -2455,7 +2455,7 @@ def main(argv: Sequence[str] | None = None, *, reader=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--selection", default=None, help=f"default corpus/{SELECTION_FILENAME}")
     parser.add_argument("--out", default=None, help=f"default corpus/{EXTRACTION_FILENAME}")
     parser.add_argument(

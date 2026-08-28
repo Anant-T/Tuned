@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-NB = Path(__file__).parent.parent / "notebooks" / "kaggle_smoke.ipynb"
+NB = Path(__file__).parent.parent / "training" / "notebooks" / "kaggle_smoke.ipynb"
 
 
 def test_notebook_is_valid_and_complete():
@@ -23,10 +23,10 @@ def test_notebook_is_valid_and_complete():
     assert "re-attach before running" in joined
     assert joined.count("qwen3-8b-staged/REVISION.txt") == 2
     assert joined.count('get_secret("HF_TOKEN")') == 2
-    # ONE lane: the notebook IS configs/law_v1_8b_ddp.yaml. No lane flags, no
+    # ONE lane: the notebook IS training/configs/law_v1_8b_ddp.yaml. No lane flags, no
     # config ternary - the config, the GPU mask and the launcher are fixed and
     # can no longer drift apart from each other.
-    assert 'CONFIG = "configs/law_v1_8b_ddp.yaml"' in joined
+    assert 'CONFIG = "training/configs/law_v1_8b_ddp.yaml"' in joined
     # every rank must see BOTH GPUs (rank N places itself on cuda:N): a leaked
     # single-GPU mask killed rank 1 with "invalid device ordinal" on 2026-08-06
     assert 'os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"' in joined
@@ -159,7 +159,7 @@ def test_stage_model_notebook_matches_the_8b_pin():
     stage = json.loads((NB.parent / "stage_model.ipynb").read_text(encoding="utf-8"))
     src = "\n".join("".join(c["source"]) for c in stage["cells"])
     cfg = yaml.safe_load(
-        (Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml").read_text(encoding="utf-8")
+        (Path(__file__).parent.parent / "training" / "configs" / "law_v1_8b_ddp.yaml").read_text(encoding="utf-8")
     )
     # the staging notebook must stage EXACTLY the lane's pinned repo+revision -
     # a drifted pin would make the fast path silently fall back (or worse,

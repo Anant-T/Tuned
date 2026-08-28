@@ -87,7 +87,7 @@ _CFG = None
 def _cfg():
     global _CFG
     if _CFG is None:
-        _CFG = load_build_config("configs/data_law_v1.yaml", allow_unpinned=True)
+        _CFG = load_build_config("data/configs/data_law_v1.yaml", allow_unpinned=True)
     return _CFG
 
 

@@ -260,7 +260,7 @@ WHAT THIS MODULE CANNOT SEE (read before trusting a green run)
   the first real build this level rests entirely on identifiers found in the
   row text and on `_prov`.
 
-Build:  python -m tuned.data.decontaminate --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.decontaminate --config data/configs/data_law_v1.yaml
         [--in PATH]... [--out PATH] [--allow-missing-eval KEY]...
         [--no-generated] [--no-case-id-from-text] [--require-semantic]
 """
@@ -3073,7 +3073,7 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
     from tuned.data.store import TASK_STATES, Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--in", dest="inputs", action="append", default=None,
                         help="stream JSONL to screen (repeatable; default every *.jsonl "
                              "in the streams dir)")

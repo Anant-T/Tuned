@@ -9,7 +9,7 @@ the anchor collapses back into another agreement measurement.
 import json
 import sqlite3
 
-from scripts.export_calibration_set import build_rows
+from data.scripts.export_calibration_set import build_rows
 
 
 def _make_fake_store():

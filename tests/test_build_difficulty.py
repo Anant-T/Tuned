@@ -20,7 +20,7 @@ from tuned.data import difficulty as D
 from tuned.data.config import load_build_config
 from tuned.data.store import Store
 
-DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
+DATA_CONFIG = Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml"
 DIFFICULTY_SRC = Path(D.__file__)
 
 

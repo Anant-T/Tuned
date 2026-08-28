@@ -1221,7 +1221,7 @@ def test_contract_from_config_reads_think_min_and_teacher(tmp_path):
     from tuned.data.config import load_build_config
 
     live = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml",
         allow_unpinned=True,
     )
     recovery = load_build_config(

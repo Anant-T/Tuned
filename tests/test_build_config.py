@@ -15,11 +15,11 @@ from tuned.data.config import (
 )
 from tuned.train.config import load_config
 
-DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
+DATA_CONFIG = Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml"
 RECOVERY_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1_exp_recovery.yaml"
-TRAIN_CONFIG = Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml"
+TRAIN_CONFIG = Path(__file__).parent.parent / "training" / "configs" / "law_v1_8b_ddp.yaml"
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "training" / "scripts"))
 from pin_dataset import rewrite_dataset_revision  # noqa: E402
 
 
@@ -63,7 +63,7 @@ def test_model_for_unknown_ref_raises_keyerror():
 def _base_doc() -> dict:
     return {
         "build": {
-            "train_config": "configs/law_v1_8b_ddp.yaml",
+            "train_config": "training/configs/law_v1_8b_ddp.yaml",
             "workdir": "data/build",
             "target_total": 100,
             "mvp_total": 50,
@@ -487,7 +487,7 @@ def test_hub_dataset_fields_load_when_set(tmp_path):
 
 
 def _shipped_blocks() -> dict:
-    """The three blocks AS SHIPPED, read out of configs/data_law_v1.yaml.
+    """The three blocks AS SHIPPED, read out of data/configs/data_law_v1.yaml.
 
     Copied rather than retyped so the validation table below cannot pass
     against a fixture that has drifted from the config an operator actually
@@ -962,7 +962,7 @@ def test_gpt5_judge_and_tiebreak_calls_carry_minimal_reasoning_effort():
 
 
 def test_eval_cohort_strata_defaults_to_none_on_the_live_config():
-    cfg = load_build_config("configs/data_law_v1.yaml", allow_unpinned=True)
+    cfg = load_build_config("data/configs/data_law_v1.yaml", allow_unpinned=True)
     assert cfg.build.eval_cohort_strata is None
 
 
@@ -1072,7 +1072,7 @@ def test_the_deepseek_arm_config_is_fenced(tmp_path):
         assert key not in raw["build"], key
     # The judge/tiebreak order used to be asserted as EQUAL to the live
     # config's. That made a committed test depend on a file's uncommitted
-    # working state - configs/data_law_v1.yaml carries the bai block and the
+    # working state - data/configs/data_law_v1.yaml carries the bai block and the
     # reordered tiebreak as unstaged edits, so the equality passes here and
     # fails on anyone else's checkout. The INVARIANT is asserted directly on
     # the arm config instead, and it is the one this arm's header spells out:
@@ -1214,7 +1214,7 @@ def test_the_gptoss_arms_are_fenced_and_differ_only_in_the_prompt_overlay():
     from tuned.data.generate import _provider_usd_cap
 
     live = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml",
         allow_unpinned=True,
     )
     for path, workdir, overlay in (
@@ -1326,7 +1326,7 @@ def test_the_ds_rerun_arms_are_fenced_and_differ_only_in_the_prompt_overlay():
     from tuned.data.generate import _provider_usd_cap
 
     live = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml",
         allow_unpinned=True,
     )
     for path, workdir, overlay in (
@@ -1498,7 +1498,7 @@ def test_the_ds_ctl2_and_clause_arms_are_fenced_and_differ_only_in_the_prompt_ov
     so line-level equality is asserted rather than trusted.
     """
     live = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml",
         allow_unpinned=True,
     )
     for path, workdir, overlay in (
@@ -1535,7 +1535,7 @@ def test_the_ds_ctl2_and_cap_arms_are_fenced_and_differ_only_in_the_bai_max_outp
     and line-level equality on everything else.
     """
     live = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml",
         allow_unpinned=True,
     )
     expected_max_output = {"data/build/exp_ds_ctl2": 16384, "data/build/exp_ds_cap": 5000}
@@ -1585,7 +1585,7 @@ def test_the_hy3_probe_config_is_fenced_and_carries_the_new_model():
     from tuned.data.generate import _provider_usd_cap
 
     live = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml",
         allow_unpinned=True,
     )
     cfg = load_build_config(HY3_CONFIG, allow_unpinned=True)
@@ -1704,7 +1704,7 @@ def test_the_irac_arms_are_fenced_and_differ_only_in_the_overlay_and_judge_seat(
     introduce silently.
     """
     live = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml",
         allow_unpinned=True,
     )
     for path, workdir, overlay in (
@@ -1822,7 +1822,7 @@ def test_the_f2only_confirm_arms_are_fenced_and_differ_only_in_the_prompt_overla
     any treatment.
     """
     live = load_build_config(
-        Path(__file__).parent.parent / "configs" / "data_law_v1.yaml",
+        Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml",
         allow_unpinned=True,
     )
     for path, workdir, overlay in (

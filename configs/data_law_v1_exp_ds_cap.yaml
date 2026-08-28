@@ -27,7 +27,7 @@
 # Generate only - judging is out of scope for this measurement.
 #
 build:
-  train_config: configs/law_v1_8b_ddp.yaml
+  train_config: training/configs/law_v1_8b_ddp.yaml
   workdir: data/build/exp_ds_cap
   target_total: 18000
   mvp_total: 10300

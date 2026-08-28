@@ -22,7 +22,7 @@ an idempotent INSERT OR REPLACE (store.upsert_seeds), never a growing table.
 datasets/pyarrow imports are lazy (inside the streaming helpers, never at
 module import time), matching replay.py/smoke.py's discipline.
 
-Build:  python -m tuned.data.seeds --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.seeds --config data/configs/data_law_v1.yaml
         [--limit-per-source N]
 """
 
@@ -299,7 +299,7 @@ if __name__ == "__main__":
     from tuned.data.store import Store
 
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/data_law_v1.yaml")
+    p.add_argument("--config", default="data/configs/data_law_v1.yaml")
     p.add_argument("--limit-per-source", type=int, default=None)
     args = p.parse_args()
 

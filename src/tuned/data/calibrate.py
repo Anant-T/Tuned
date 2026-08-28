@@ -48,9 +48,9 @@ calibration for the judges that passed. A build with one working judge and a
 named swap is a build the operator can act on; an exception is a build with
 nothing.
 
-Run:  python -m tuned.data.calibrate --config configs/data_law_v1.yaml --export
-      python -m tuned.data.calibrate --config configs/data_law_v1.yaml --ingest
-      python -m tuned.data.calibrate --config configs/data_law_v1.yaml --fit
+Run:  python -m tuned.data.calibrate --config data/configs/data_law_v1.yaml --export
+      python -m tuned.data.calibrate --config data/configs/data_law_v1.yaml --ingest
+      python -m tuned.data.calibrate --config data/configs/data_law_v1.yaml --fit
 """
 
 import hashlib
@@ -1033,7 +1033,7 @@ def main(argv=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--export", action="store_true", help=f"write {GOLD_TODO_NAME}")
     parser.add_argument("--ingest", action="store_true", help=f"read {GOLD_TODO_NAME} back")
     parser.add_argument("--fit", action="store_true", help="fit thresholds and report")

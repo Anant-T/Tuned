@@ -51,7 +51,7 @@ the citation gate is SKIPPED (detail carries novel_skipped) and verify.py
 must re-run it with the real index before any row is promoted. A gate row
 carrying novel_skipped means "unverified", never "passed".
 
-Run:  python -m tuned.data.generate --config configs/data_law_v1.yaml
+Run:  python -m tuned.data.generate --config data/configs/data_law_v1.yaml
       --stream synthesis --n-workers 4 [--forever] [--max-batches N]
 """
 
@@ -2273,7 +2273,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--stream", action="append", default=None, help="repeatable")
     parser.add_argument("--n-workers", type=int, default=4)
     parser.add_argument("--forever", action="store_true")

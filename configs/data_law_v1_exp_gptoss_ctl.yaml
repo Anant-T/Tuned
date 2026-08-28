@@ -37,7 +37,7 @@
 # from the referenced training config at load time.
 
 build:
-  train_config: configs/law_v1_8b_ddp.yaml
+  train_config: training/configs/law_v1_8b_ddp.yaml
   workdir: data/build/exp_gptoss_ctl
   # PROMPT OVERLAY: the CONTROL arm sets build.prompt_overlay on the line
   # below to data/build/exp_gptoss_ctl/prompts_preedit, the 14 generator

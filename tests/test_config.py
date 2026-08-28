@@ -4,7 +4,7 @@ import pytest
 
 from tuned.train.config import load_config
 
-CONFIG = Path(__file__).parent.parent / "configs" / "law_v1_8b_ddp.yaml"
+CONFIG = Path(__file__).parent.parent / "training" / "configs" / "law_v1_8b_ddp.yaml"
 
 MODULE_LIST = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 

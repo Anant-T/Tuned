@@ -65,7 +65,7 @@ WHAT EACH GATE IS FOR
    false-positive direction costs real rows, and the number should be read
    once before it is armed.
 
-Build:  python -m tuned.data.stats --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.stats --config data/configs/data_law_v1.yaml
         [--profile v1.0-MVP] [--in-train PATH] [--in-eval PATH]
 """
 
@@ -583,7 +583,7 @@ def main(argv: Sequence[str] | None = None, *, tokenizer=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--profile", default=None,
                         help="mix profile to grade against (default assembly.default_profile)")
     parser.add_argument("--in-train", default=None,

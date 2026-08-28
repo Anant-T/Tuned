@@ -6,7 +6,7 @@ is dictated by three facts about free-tier APIs:
 1. **Adding a provider must be pure YAML.**  There is exactly ONE client
    class; per-provider deviation from the OpenAI chat-completions shape
    lives in a named ``Quirk`` (request hook / response hook / Retry-After
-   parser) that ``configs/data_law_v1.yaml`` selects by name.  If a new
+   parser) that ``data/configs/data_law_v1.yaml`` selects by name.  If a new
    provider speaks plain OpenAI, adding it is a config edit and nothing
    more.
 
@@ -2171,7 +2171,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.config import load_build_config
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--check", action="store_true", help="one live call per configured model")
     parser.add_argument("--ref", default=None, help="check only this provider/model ref")
     args = parser.parse_args(argv)

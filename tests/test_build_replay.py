@@ -34,7 +34,7 @@ REPLAY_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "replay.p
 # --------------------------------------------------------------------------
 
 def _real_think_tags():
-    cfg = load_build_config("configs/data_law_v1.yaml", allow_unpinned=True)
+    cfg = load_build_config("data/configs/data_law_v1.yaml", allow_unpinned=True)
     return cfg.think_open, cfg.think_close
 
 

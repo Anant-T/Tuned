@@ -699,7 +699,7 @@ def test_the_real_template_renders_what_the_fake_pretends_to():
     transformers = pytest.importorskip("transformers")
     from tuned.data.config import load_build_config
 
-    cfg = load_build_config("configs/data_law_v1.yaml")
+    cfg = load_build_config("data/configs/data_law_v1.yaml")
     tok = transformers.AutoTokenizer.from_pretrained(cfg.model_repo, revision=cfg.model_revision)
     messages = reasoning_row(1)["messages"]
     text = rendered(tok, messages)

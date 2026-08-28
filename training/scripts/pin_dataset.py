@@ -36,7 +36,7 @@ def write_pin(config_path: Path, sha: str) -> None:
 
 
 if __name__ == "__main__":
-    cfg_path = Path(sys.argv[1] if len(sys.argv) > 1 else "configs/law_v1_8b_ddp.yaml")
+    cfg_path = Path(sys.argv[1] if len(sys.argv) > 1 else "training/configs/law_v1_8b_ddp.yaml")
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     repo = (raw.get("hub") or {}).get("dataset_repo")
     if not repo:

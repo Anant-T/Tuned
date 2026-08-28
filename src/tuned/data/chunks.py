@@ -69,7 +69,7 @@ before the new ones are written - replaced, never duplicated, and never left
 as orphaned rows nothing points at any more once a document's chunk
 boundaries shift.
 
-Build:  python -m tuned.data.chunks --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.chunks --config data/configs/data_law_v1.yaml
         [--limit N] [--force] [--roles-backend opennyai-subprocess]
 """
 
@@ -708,7 +708,7 @@ def main(argv: Sequence[str] | None = None, *, tokenizer=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument("--limit", type=int, default=None, help="stop after N documents chunked")
     parser.add_argument("--force", action="store_true", help="re-chunk everything, ignoring resume")
     parser.add_argument(

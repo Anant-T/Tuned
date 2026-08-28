@@ -140,7 +140,7 @@ would drop a cell some task already points at, and a reserve that would grow to
 take in a cell a teacher has already been asked about. Both mean the draw moved
 under work already spent.
 
-Build:  python -m tuned.data.transition --config configs/data_law_v1.yaml
+Build:  python -m tuned.data.transition --config data/configs/data_law_v1.yaml
         [--dry-run]
 """
 
@@ -1654,7 +1654,7 @@ def main(argv=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/data_law_v1.yaml")
+    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
     parser.add_argument(
         "--dry-run", action="store_true", help="measure the grid, write nothing"
     )

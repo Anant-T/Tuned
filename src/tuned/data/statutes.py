@@ -54,7 +54,7 @@ CODE_KIND = {
 }
 KINDS = frozenset(CODE_KIND.values())
 
-# Single source of truth. configs/data_law_v1.yaml build.appointed_day must
+# Single source of truth. data/configs/data_law_v1.yaml build.appointed_day must
 # equal this; the gate layer asserts it at load.
 APPOINTED_DAY = date(2024, 7, 1)
 

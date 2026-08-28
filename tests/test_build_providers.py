@@ -81,7 +81,7 @@ from tuned.data.providers import (
 )
 from tuned.data import providers  # noqa: E402 - module access for private hook internals below
 
-DATA_CONFIG = Path(__file__).parent.parent / "configs" / "data_law_v1.yaml"
+DATA_CONFIG = Path(__file__).parent.parent / "data" / "configs" / "data_law_v1.yaml"
 
 # SLOTS A AND B since 2026-08-19, when mistral was removed from the build
 # after human calibration disqualified it (holdout precision 0.237 on n=40,

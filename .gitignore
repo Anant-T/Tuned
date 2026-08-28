@@ -17,15 +17,20 @@ venv/
 *.onnx
 
 # --- Never commit datasets or run artifacts ---
-/data/
+# /data/* ignores the corpus, stores and pulled artifacts while the two
+# exceptions keep the pipeline's config and scripts tracked - a blanket
+# /data/ would stop git descending at all and silently untrack them.
+/data/*
+!/data/configs/
+!/data/scripts/
 /checkpoints/
 /outputs/
 /runs/
 /wandb/
-/pulled/
 
 # --- Secrets ---
 .env
+.env.*
 
 # --- Agent scratch (worktrees, SDD ledgers) ---
 .claude/

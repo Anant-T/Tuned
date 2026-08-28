@@ -3,7 +3,7 @@ never locally. Always 2x T4 data-parallel under torchrun - unsloth auto-assigns
 one rank per GPU, and each rank holds the full model.
 
 All launches are prefixed CUDA_VISIBLE_DEVICES=0,1 and go through
-`torchrun --nproc_per_node=2 -m tuned.train.sft --config configs/law_v1_8b_ddp.yaml --mode smoke`:
+`torchrun --nproc_per_node=2 -m tuned.train.sft --config training/configs/law_v1_8b_ddp.yaml --mode smoke`:
 
 Probe:    ... --max-steps 2 --save-steps 1 --dataset data/probe_long.jsonl --max-seq-length 8192
 Smoke:    ... (no extra args)
@@ -135,7 +135,7 @@ def check_vram_reserved(reserved_gib: list[float], limit_gib: float = 13.5) -> N
             f"peak reserved VRAM {worst:.2f} GiB exceeds the {limit_gib} GiB "
             "abort line - too close to the 14.56 GiB cap to trust across a "
             "multi-session run (fragmentation only grows). OOM ladder in "
-            "configs/law_v1_8b_ddp.yaml: standard-quant repo (-1.31 GiB) -> "
+            "training/configs/law_v1_8b_ddp.yaml: standard-quant repo (-1.31 GiB) -> "
             "seq 6144 (UNSLOTH_CE_LOSS_N_CHUNKS is already at "
             "32, not a lever left to spend)."
         )
@@ -324,7 +324,7 @@ def print_versions() -> None:
 def main(argv: list[str] | None = None) -> None:
     _proc_t0 = time.monotonic()  # --time-budget-s anchor: process start
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="configs/law_v1_8b_ddp.yaml")
+    p.add_argument("--config", default="training/configs/law_v1_8b_ddp.yaml")
     p.add_argument("--mode", choices=["smoke", "main"], default="smoke")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--allow-schedule-change", action="store_true",

@@ -54,7 +54,7 @@
 # result and the pre-registered lines this arm is graded against.
 #
 build:
-  train_config: configs/law_v1_8b_ddp.yaml
+  train_config: training/configs/law_v1_8b_ddp.yaml
   workdir: data/build/exp_irac_fix
   prompt_overlay: data/build/exp_irac_fix/prompts_stop_timing
   target_total: 18000
