@@ -19,10 +19,16 @@ import dataclasses
 import json
 import math
 import os
+import subprocess
 import time
 from pathlib import Path
 
 from tuned.train.config import Config, HubCfg, RunCfg, load_config
+
+# The filename push.py uploads to the private HF dataset repo (it is
+# assemble.TRAIN_FILENAME). Named here rather than imported: the data lane
+# must never be importable from the GPU process.
+MAIN_DATASET_FILENAME = "law_v1_train.jsonl"
 
 
 class _NonFiniteWindow:
@@ -73,6 +79,111 @@ def resolve_model_source(
             )
         return str(p), None
     return repo, revision
+
+
+def sha256_file(path: str | Path, _blocks: int = 1 << 20) -> str:
+    """Digest of the corpus that trained a checkpoint.
+
+    Deliberately stdlib and deliberately local: `tuned.data.acquire` has the
+    same helper, but importing it here would drag the whole data lane (httpx,
+    the store, the provider fleet) into the GPU process for one hashlib call.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(_blocks), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def resolve_main_dataset(
+    run: RunCfg, hub: HubCfg, mode: str, *, download=None
+) -> tuple[str, str]:
+    """Resolve the training corpus to a local path and digest it.
+
+    Mirrors resolve_model_source: the model is pinned by revision, and after
+    this the corpus is pinned by sha256. Returns (path, digest).
+
+    THE HUB IS THE ONLY ROUTE for main. `.gitignore` carries `/data/*` with
+    exactly two exceptions (configs/, scripts/), so the assembled corpus can
+    never be git-tracked and never reaches the Kaggle clone - while push.py
+    uploads it to the private HF DATASET repo as `law_v1_train.jsonl`. The
+    config's `data/law_v1.jsonl` was therefore a path nothing produced and
+    nothing fetched, and MAIN aborted even with a finished, pushed corpus.
+
+    THE DIGEST IS NOT DECORATION. A main run is one epoch spread over ~3
+    sessions; correct resumption needs `skip_first_batches` to replay the same
+    LengthGroupedSampler permutation, which is a function of the dataset FILE
+    (row order, row count, per-row token lengths). Rebuild the corpus between
+    two sessions - which the data pipeline is designed to keep doing - and
+    some rows train twice while others never train, with loss and grad_norm
+    both perfectly green. check_resume_schedule guards the LR half of exactly
+    this hazard; this guards the data half.
+    """
+    local = Path(run.dataset)
+    if mode != "main" or local.is_file():
+        return str(local), sha256_file(local) if local.is_file() else ""
+
+    if not hub.dataset_repo:
+        raise SystemExit(
+            f"train.main.dataset={run.dataset} does not exist and hub.dataset_repo "
+            "is null - the assembled corpus lives in a private HF dataset repo "
+            "(data/ is gitignored, so it is never in the clone). Set "
+            "hub.dataset_repo and pin it with training/scripts/pin_dataset.py."
+        )
+    if download is None:  # pragma: no cover - exercised by the fake in tests
+        from huggingface_hub import hf_hub_download as download
+
+    path = download(
+        repo_id=hub.dataset_repo,
+        filename=MAIN_DATASET_FILENAME,
+        revision=hub.dataset_revision,
+        repo_type="dataset",
+    )
+    return str(path), sha256_file(path)
+
+
+def check_dataset_pin(digest: str, pinned: str | None, mode: str) -> None:
+    """Refuse a corpus whose bytes moved under a pinned run (see above)."""
+    if mode != "main":
+        return
+    if not pinned:
+        raise SystemExit(
+            "hub.dataset_sha256 is null - a main run must pin the corpus it "
+            "trains on, because resume replays a sampler permutation derived "
+            f"from the file itself. This run's corpus digests to {digest}; "
+            "record it with training/scripts/pin_dataset.py and commit."
+        )
+    if digest != pinned:
+        raise SystemExit(
+            f"dataset digest {digest} does not match the pinned "
+            f"hub.dataset_sha256 {pinned} - the corpus was rebuilt. Resuming "
+            "across a rebuilt corpus retrains some rows and skips others "
+            "silently. Restore the pinned corpus, or re-pin AND restart the "
+            "run from step 0 (a fresh checkpoint repo)."
+        )
+
+
+def print_git_commit() -> None:
+    """Record which code trained the adapter.
+
+    The lane refuses an unpinned model revision and ==-pins every training
+    dep, then clones whatever is on the default branch. Across the 3+ sessions
+    of a main epoch that means session 3 can run different code against a
+    checkpoint session 1 produced, with nothing in train.log or the checkpoint
+    repo recording it. Must never raise: the package can run from a wheel.
+    """
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[3],
+            capture_output=True, text=True, timeout=10,
+        )
+        sha = probe.stdout.strip() if probe.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        sha = ""
+    print(f"git_commit={sha or 'unknown'}")
 
 
 def check_resume_schedule(
@@ -292,8 +403,6 @@ def check_ddp_visibility(world_size: int, visible_gpus: int) -> None:
 
 def read_gpu_capability() -> tuple | None:
     """Compute capability via nvidia-smi, before any CUDA library loads. None = undetermined."""
-    import subprocess
-
     try:
         probe = subprocess.run(
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
@@ -370,6 +479,7 @@ def main(argv: list[str] | None = None) -> None:
     output_dir = f"outputs/{args.mode}"
 
     print_versions()
+    print_git_commit()
 
     cap = read_gpu_capability()
     if cap is not None:
@@ -447,7 +557,16 @@ def main(argv: list[str] | None = None) -> None:
     # benefit (the sampler shards data across ranks at iteration time anyway).
     _dist = PartialState()
     with _dist.local_main_process_first():
-        ds = load_dataset("json", data_files=run.dataset, split="train")
+        # Inside the barrier on purpose: rank 0 does the hub fetch, rank 1
+        # takes the cache hit - the same serialization the dataset prep below
+        # already relies on, so this needs no new synchronization.
+        dataset_path, dataset_digest = resolve_main_dataset(run, cfg.hub, args.mode)
+        # Printed unconditionally, so every session log - and the 5-minute
+        # progress/train.log push - records which corpus bytes trained the
+        # checkpoint, whether or not a pin is set.
+        print(f"dataset_sha256={dataset_digest}")
+        check_dataset_pin(dataset_digest, cfg.hub.dataset_sha256, args.mode)
+        ds = load_dataset("json", data_files=dataset_path, split="train")
         ds = ds.map(
             lambda ex: {
                 "text": tokenizer.apply_chat_template(

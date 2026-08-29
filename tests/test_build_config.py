@@ -823,6 +823,44 @@ def test_rewrite_dataset_revision_inserts_when_missing():
     assert new == "hub:\n  dataset_revision: newsha\n  checkpoint_repo: x\n"
 
 
+def test_the_pin_rewrite_is_one_function_for_both_pins():
+    # dataset_revision says WHICH commit to fetch; dataset_sha256 says which
+    # BYTES that fetch must produce (sft.check_dataset_pin refuses a mismatch,
+    # because resume replays a sampler permutation derived from the file). Two
+    # copies of this regex would be two things to keep in step.
+    from pin_dataset import rewrite_pin
+
+    text = "hub:\n  checkpoint_repo: x\n  dataset_revision: oldsha\n"
+    new = rewrite_pin(rewrite_pin(text, "dataset_revision", "newsha"),
+                      "dataset_sha256", "deadbeef")
+    assert "dataset_revision: newsha" in new
+    assert "dataset_sha256: deadbeef" in new
+    assert "oldsha" not in new
+
+
+def test_the_corpus_digest_comes_from_the_shipped_manifest(tmp_path):
+    # push.py records the sha256 it uploaded in build_manifest.json, so the pin
+    # describes what actually shipped rather than a local rebuild that may
+    # differ - which is the whole failure this pin exists to catch.
+    import json
+
+    from pin_dataset import TRAIN_FILENAME, resolve_dataset_sha256
+
+    manifest = tmp_path / "build_manifest.json"
+    manifest.write_text(json.dumps({"outputs": [
+        {"path": "law_v1_eval.jsonl", "sha256": "eval-digest"},
+        {"path": TRAIN_FILENAME, "sha256": "train-digest"},
+    ]}), encoding="utf-8")
+    got = resolve_dataset_sha256("u/d", "rev", download=lambda **kw: str(manifest))
+    assert got == "train-digest"
+
+    # a repo with no manifest still pins its revision rather than failing
+    def _missing(**kw):
+        raise FileNotFoundError("no manifest")
+
+    assert resolve_dataset_sha256("u/d", "rev", download=_missing) is None
+
+
 def test_eval_cohort_strata_defaults_to_none_on_the_live_config():
     cfg = load_build_config("data/configs/data_law_v1.yaml", allow_unpinned=True)
     assert cfg.build.eval_cohort_strata is None

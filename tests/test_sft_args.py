@@ -1,3 +1,5 @@
+import dataclasses
+import hashlib
 from pathlib import Path
 
 from tuned.train.config import load_config
@@ -202,6 +204,114 @@ def test_resume_refuses_a_silently_rebuilt_lr_schedule(tmp_path):
     with pytest.raises(SystemExit, match="allow-schedule-change"):
         check_resume_schedule(ckpt, 64)
     check_resume_schedule(ckpt, 64, allow_schedule_change=True)  # the RESUME gate
+
+
+def _run_cfg(dataset: str):
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    return dataclasses.replace(cfg.train.main, dataset=dataset)
+
+
+def test_a_local_corpus_wins_and_never_touches_the_network(tmp_path):
+    from tuned.train.config import HubCfg
+    from tuned.train.sft import resolve_main_dataset
+
+    corpus = tmp_path / "law_v1.jsonl"
+    corpus.write_text('{"messages": []}\n', encoding="utf-8")
+
+    def _never(**kw):  # the fetch must not happen when the file is present
+        raise AssertionError("downloaded despite a local corpus")
+
+    path, digest = resolve_main_dataset(
+        _run_cfg(str(corpus)), HubCfg(checkpoint_repo=None, dataset_repo="u/d"),
+        "main", download=_never,
+    )
+    assert path == str(corpus)
+    assert len(digest) == 64
+
+
+def test_main_fetches_the_pinned_corpus_from_the_dataset_repo(tmp_path):
+    from tuned.train.config import HubCfg
+    from tuned.train.sft import MAIN_DATASET_FILENAME, resolve_main_dataset
+
+    # data/ is gitignored (only configs/ and scripts/ are excepted), so the
+    # assembled corpus can NEVER be in the Kaggle clone - the hub is the only
+    # route, and MAIN aborted here even with a finished, pushed corpus.
+    fetched = tmp_path / "cached" / MAIN_DATASET_FILENAME
+    fetched.parent.mkdir()
+    fetched.write_text('{"messages": [1]}\n', encoding="utf-8")
+    calls = []
+
+    def _fake(**kw):
+        calls.append(kw)
+        return str(fetched)
+
+    hub = HubCfg(
+        checkpoint_repo=None, dataset_repo="tantan01/tuned-law-v1-data",
+        dataset_revision="abc123",
+    )
+    path, digest = resolve_main_dataset(
+        _run_cfg(str(tmp_path / "absent.jsonl")), hub, "main", download=_fake
+    )
+    assert path == str(fetched)
+    assert digest == hashlib.sha256(fetched.read_bytes()).hexdigest()
+    assert calls == [{
+        "repo_id": "tantan01/tuned-law-v1-data",
+        "filename": MAIN_DATASET_FILENAME,
+        "revision": "abc123",
+        "repo_type": "dataset",
+    }]
+
+
+def test_a_missing_corpus_with_no_dataset_repo_is_a_named_refusal(tmp_path):
+    from tuned.train.config import HubCfg
+    from tuned.train.sft import resolve_main_dataset
+
+    with pytest.raises(SystemExit, match="hub.dataset_repo is null"):
+        resolve_main_dataset(
+            _run_cfg(str(tmp_path / "absent.jsonl")),
+            HubCfg(checkpoint_repo=None), "main", download=lambda **kw: "x",
+        )
+
+
+def test_smoke_never_reaches_for_the_hub(tmp_path):
+    from tuned.train.config import HubCfg
+    from tuned.train.sft import resolve_main_dataset
+
+    # The smoke/probe datasets are built locally by tuned.data.smoke; only the
+    # main corpus is a hub artifact.
+    path, digest = resolve_main_dataset(
+        _run_cfg(str(tmp_path / "smoke_v1.jsonl")),
+        HubCfg(checkpoint_repo=None), "smoke",
+        download=lambda **kw: pytest.fail("smoke must not fetch"),
+    )
+    assert path.endswith("smoke_v1.jsonl") and digest == ""
+
+
+def test_main_refuses_a_corpus_whose_digest_moved():
+    from tuned.train.sft import check_dataset_pin
+
+    # A main epoch spans ~3 sessions and resume replays a LengthGroupedSampler
+    # permutation derived from the FILE. A corpus rebuilt between sessions
+    # retrains some rows and skips others with loss and grad_norm both green -
+    # check_resume_schedule guards the LR half of this, nothing guarded the data.
+    check_dataset_pin("abc", "abc", "main")          # matching pin: silent
+    check_dataset_pin("abc", None, "smoke")          # gates are unpinned
+    with pytest.raises(SystemExit, match="was rebuilt"):
+        check_dataset_pin("abc", "def", "main")
+    with pytest.raises(SystemExit, match="hub.dataset_sha256 is null"):
+        check_dataset_pin("abc", None, "main")
+
+
+def test_the_corpus_digest_is_printed_and_the_commit_recorded():
+    src = SFT.read_text(encoding="utf-8")
+    # Both land in train.log and therefore in the 5-min progress/train.log push,
+    # so the shipped adapter carries its own provenance.
+    assert 'print(f"dataset_sha256={dataset_digest}")' in src
+    assert 'print(f"git_commit=' in src
+    # the commit banner must precede the GPU import, like every other preflight
+    commit = src.find("print_git_commit()")
+    unsloth = src.find("from unsloth import FastModel")
+    assert -1 not in (commit, unsloth) and commit < unsloth
 
 
 def test_checkpoint_download_runs_on_one_rank_only():

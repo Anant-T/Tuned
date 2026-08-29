@@ -143,9 +143,13 @@ def test_notebook_is_valid_and_complete():
     assert "os.killpg" in joined
     assert "_rank_pids(" in joined
     assert "proc.kill()" not in joined
-    # spawning MAIN without the real dataset would die 55s into the child;
-    # fail in milliseconds instead (same belt-and-suspenders as PROBE's)
-    assert '["train"]["main"]["dataset"]' in joined
+    # MAIN's corpus is NOT a local file the notebook can check for: data/ is
+    # gitignored, so the assembled corpus never reaches this clone and the old
+    # `Path(main_dataset).exists()` belt refused every MAIN run. sft.py's
+    # resolve_main_dataset fetches it from the private HF dataset repo at the
+    # pinned revision and refuses on a sha256 mismatch, which is both earlier
+    # and a better message than an assert here could give.
+    assert '["train"]["main"]["dataset"]' not in joined
     # the 13.5 abort line applies to RESERVED (the allocator high-water that
     # actually OOMs) - the PROBE bullet used to point readers at the smaller
     # allocated number, and the two mentions disagreed with each other
