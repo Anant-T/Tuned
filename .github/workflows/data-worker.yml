@@ -24,6 +24,10 @@ jobs:
   worker:
     if: github.repository == 'Anant-T/Tuned'
     runs-on: ubuntu-latest
+    # 350 = the argparse --minutes default (315) plus headroom for the
+    # baton pull, the final push and job setup. The two numbers constrain
+    # each other, so they are commented together - and --minutes is NOT
+    # restated on the run line below: one default, in one place.
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
@@ -43,4 +47,4 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: >
           python data/scripts/actions_worker.py --phase worker
-          --hf-repo tantan01/tuned-law-state --minutes 315
+          --hf-repo tantan01/tuned-law-state

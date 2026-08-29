@@ -175,6 +175,7 @@ class Bundle:
 
         self.repo_id = repo_id
         self.api = HfApi()
+        self.head: str | None = None  # the revision this holder pulled
 
     def ensure(self) -> None:
         self.api.create_repo(self.repo_id, repo_type="dataset", private=True, exist_ok=True)
@@ -182,15 +183,40 @@ class Bundle:
     def pull(self, dest: Path) -> Path:
         from huggingface_hub import snapshot_download
 
+        # Record the head we pulled and download THAT revision, so the tree we
+        # restore and the parent we later push against are the same commit by
+        # construction rather than by timing.
+        self.head = self.api.dataset_info(self.repo_id).sha
         return Path(
-            snapshot_download(self.repo_id, repo_type="dataset", local_dir=dest)
+            snapshot_download(
+                self.repo_id, repo_type="dataset",
+                revision=self.head, local_dir=dest,
+            )
         )
 
     def push(self, staging: Path, message: str) -> None:
-        self.api.upload_folder(
+        """Push the staged tree, refusing to overwrite a baton someone moved.
+
+        The one-generator invariant rests entirely on the Actions concurrency
+        group; nothing in the repo itself could detect a second holder, and
+        upload_folder is unconditional last-writer-wins. A stale local
+        seed-push, a dispatch from a branch whose concurrency block was edited,
+        or a local run against data/build would silently REWIND the build -
+        detectable only by noticing the task counts went down.
+
+        parent_commit turns that into a 412 from the Hub. No new state and no
+        generation counter: the Hub already knows what the head was.
+        """
+        info = self.api.upload_folder(
             repo_id=self.repo_id, repo_type="dataset",
             folder_path=str(staging), commit_message=message,
+            parent_commit=getattr(self, "head", None),
         )
+        # Track our own commit so successive pushes in one job chain correctly
+        # (the second push's parent is the first push's commit, not the pull).
+        oid = getattr(info, "oid", None)
+        if oid:
+            self.head = oid
 
 
 def _pump(proc: subprocess.Popen, name: str, log_path: Path) -> threading.Thread:
@@ -257,6 +283,12 @@ def _claimable(counts: dict[str, int]) -> int:
     return sum(counts.get(state, 0) for state in CLAIMABLE_STATES)
 
 
+def _is_baton_conflict(exc: BaseException) -> bool:
+    """A 412 from the Hub means our parent_commit is no longer the head."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status == 412 or "412" in f"{exc}" and "parent" in f"{exc}".lower()
+
+
 PUSH_BACKOFF_S = (30, 90, 240)
 
 
@@ -295,6 +327,17 @@ def _push(
             print(f"bundle pushed: {message}")
             return True
         except Exception as exc:  # noqa: BLE001
+            if _is_baton_conflict(exc):
+                # NOT retryable and NOT best-effort: another holder pushed
+                # since we pulled, so our tree is built on a state that is no
+                # longer the head. Retrying would either fail identically or,
+                # worse, succeed against a moved parent and rewind their work.
+                print(
+                    "BATON STOLEN - another holder pushed since we pulled; "
+                    "refusing to overwrite. Check for a second worker run or a "
+                    "local run against data/build."
+                )
+                raise
             last = f"{type(exc).__name__}: {exc}"
             if attempt < attempts:
                 wait = PUSH_BACKOFF_S[min(attempt - 1, len(PUSH_BACKOFF_S) - 1)]
@@ -547,6 +590,10 @@ def main_parser() -> argparse.ArgumentParser:
     from tuned.data.judge import DEFAULT_AUDIT_SAMPLE
 
     parser.add_argument("--audit-sample", type=float, default=DEFAULT_AUDIT_SAMPLE)
+    parser.add_argument(
+        "--seed-push-clobbers-remote", action="store_true",
+        help="allow --phase seed-push to overwrite a remote that already holds a baton",
+    )
     return parser
 
 
@@ -562,6 +609,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.phase == "seed-push":
         bundle.ensure()
+        # The handoff is ONE-TIME. Re-running it once the remote owns the
+        # baton overwrites the remote state with whatever this machine happens
+        # to hold - the README has warned about it in prose since the handoff,
+        # while the code did nothing. Make the precondition explicit instead.
+        if not args.seed_push_clobbers_remote and bundle.api.file_exists(
+            args.hf_repo, str(DB_RELPATH.as_posix()), repo_type="dataset"
+        ):
+            print(
+                f"REFUSING: {args.hf_repo} already holds a state DB - the remote "
+                "owns the baton. Re-running seed-push would clobber it with this "
+                "machine's stale copy; single files go up via HfApi.upload_file. "
+                "Pass --seed-push-clobbers-remote if that is really what you want."
+            )
+            return 3
         bundle.push(stage_bundle(root, root.parent / "bundle_out"), "seed: local handoff")
         print(f"seeded {args.hf_repo} from {root}")
         return 0

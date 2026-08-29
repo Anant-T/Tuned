@@ -8,6 +8,8 @@ round-trip the baton depends on.
 
 import sqlite3
 import sys
+
+import pytest
 from pathlib import Path
 
 SCRIPTS = Path(__file__).parent.parent / "data" / "scripts"
@@ -396,3 +398,155 @@ def test_logs_are_scoped_per_run_so_the_baton_stops_overwriting_them(monkeypatch
     assert actions_worker._run_scope() == "1234567"
     monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
     assert actions_worker._run_scope() == "local"
+
+
+# --------------------------------------------------------------------------
+# The baton fence. The one-generator invariant rested entirely on the Actions
+# concurrency group: upload_folder is unconditional last-writer-wins, and a
+# second holder rewound the build silently - visible only as task counts
+# going DOWN.
+# --------------------------------------------------------------------------
+
+
+class _Response:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+
+class _Conflict(Exception):
+    def __init__(self):
+        super().__init__("412 Client Error: Precondition Failed")
+        self.response = _Response(412)
+
+
+class _RecordingApi:
+    def __init__(self, head="head-sha", conflict=False, exists=False):
+        self.head = head
+        self.conflict = conflict
+        self.exists = exists
+        self.uploads = []
+
+    def dataset_info(self, repo_id):
+        return type("Info", (), {"sha": self.head})()
+
+    def create_repo(self, *a, **k):
+        return None
+
+    def file_exists(self, repo_id, filename, repo_type=None):
+        return self.exists
+
+    def upload_folder(self, **kw):
+        self.uploads.append(kw)
+        if self.conflict:
+            raise _Conflict()
+        return type("Commit", (), {"oid": "new-sha"})()
+
+
+_REAL_BUNDLE = actions_worker.Bundle
+
+
+def _bundle_with(api):
+    bundle = _REAL_BUNDLE.__new__(_REAL_BUNDLE)
+    bundle.repo_id = "u/r"
+    bundle.api = api
+    bundle.head = None
+    return bundle
+
+
+def test_the_push_declares_the_revision_it_pulled_as_its_parent(tmp_path, monkeypatch):
+    api = _RecordingApi(head="pulled-sha")
+    bundle = _bundle_with(api)
+    monkeypatch.setattr(
+        actions_worker, "snapshot_download", lambda *a, **k: str(tmp_path), raising=False
+    )
+    import huggingface_hub
+
+    seen = {}
+
+    def _fake_snapshot(repo_id, **kw):
+        seen.update(kw)
+        return str(tmp_path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot)
+    bundle.pull(tmp_path)
+    # the tree we restore IS the revision we will push against
+    assert seen["revision"] == "pulled-sha"
+
+    bundle.push(tmp_path, "checkpoint")
+    assert api.uploads[0]["parent_commit"] == "pulled-sha"
+    # successive pushes in one job chain onto our own commit, not the pull
+    bundle.push(tmp_path, "second")
+    assert api.uploads[1]["parent_commit"] == "new-sha"
+
+
+def test_a_stolen_baton_fails_the_job_instead_of_being_retried(tmp_path, capsys, monkeypatch):
+    """A 412 says our parent is no longer the head. Retrying it would either
+    fail identically or - worse - succeed against a moved parent and rewind
+    the other holder's work, so it must not be swallowed by the best-effort
+    push path."""
+    monkeypatch.setattr(actions_worker, "stage_bundle", lambda r, s: s)
+    bundle = _bundle_with(_RecordingApi(conflict=True))
+    bundle.head = "stale"
+    with pytest.raises(Exception, match="412"):
+        actions_worker._push(
+            bundle, tmp_path, tmp_path, "checkpoint", attempts=3,
+            sleep=lambda s: None,
+        )
+    assert "BATON STOLEN" in capsys.readouterr().out
+
+
+def test_a_transient_failure_is_still_retried(tmp_path, monkeypatch):
+    # the fence must not turn ordinary 5xx flakiness into a hard failure
+    class _Flaky(_RecordingApi):
+        def __init__(self):
+            super().__init__()
+            self.left = 2
+
+        def upload_folder(self, **kw):
+            if self.left:
+                self.left -= 1
+                raise RuntimeError("HF 503")
+            return super().upload_folder(**kw)
+
+    monkeypatch.setattr(actions_worker, "stage_bundle", lambda r, s: s)
+    bundle = _bundle_with(_Flaky())
+    assert actions_worker._push(
+        bundle, tmp_path, tmp_path, "checkpoint", attempts=3, sleep=lambda s: None
+    ) is True
+
+
+def test_seed_push_refuses_to_clobber_a_remote_that_owns_the_baton(tmp_path, capsys, monkeypatch):
+    """The handoff is one-time, and re-running it overwrites the remote with
+    this machine's stale copy. README warned about it in prose while the code
+    did nothing."""
+    api = _RecordingApi(exists=True)
+
+    monkeypatch.setattr(actions_worker, "Bundle", lambda repo: _bundle_with(api))
+    monkeypatch.setattr(
+        actions_worker, "stage_bundle", lambda r, s: s
+    )
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text("x: 1", encoding="utf-8")
+
+    class _Cfg:
+        class build:
+            workdir = str(tmp_path / "build")
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "_", type("m", (), {})()
+    )
+    import tuned.data.config as data_config
+    import tuned.data.paths as data_paths
+
+    monkeypatch.setattr(data_config, "load_build_config", lambda p: _Cfg())
+    monkeypatch.setattr(
+        data_paths, "build_paths",
+        lambda w: type("P", (), {"ensure": lambda self: type("R", (), {"root": tmp_path})()})(),
+    )
+
+    rc = actions_worker.main(
+        ["--phase", "seed-push", "--hf-repo", "u/r", "--config", str(cfg_path)]
+    )
+    assert rc == 3
+    assert "REFUSING" in capsys.readouterr().out
+    assert api.uploads == []  # nothing was overwritten

@@ -123,8 +123,12 @@ def test_notebook_is_valid_and_complete():
     # worst case ~30 min of compute) and must NEVER carry
     # --allow-schedule-change: a schedule change on a production resume is
     # the +134% LR jump the guard exists to prevent.
-    assert '"MAIN": ["--time-budget-s", "37800"]' in joined
-    assert '"MAIN_RESUME": ["--resume", "--time-budget-s", "37800"]' in joined
+    # ONE production entry: MAIN_RESUME carried nothing the checkpoint repo did
+    # not already hold, and forgetting to flip MODE on session 2 restarted at
+    # step 0 - whose first save overwrites last-checkpoint/ at the fixed
+    # path_in_repo, silently discarding a session of a multi-session epoch.
+    assert '"MAIN": ["--resume-if-available", "--time-budget-s", "37800"]' in joined
+    assert "MAIN_RESUME" not in joined
     for line in joined.splitlines():
         if '"MAIN' in line:
             assert "--allow-schedule-change" not in line, line

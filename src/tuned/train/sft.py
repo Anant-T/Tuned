@@ -8,10 +8,15 @@ All launches are prefixed CUDA_VISIBLE_DEVICES=0,1 and go through
 Probe:    ... --max-steps 2 --save-steps 1 --dataset data/probe_long.jsonl --max-seq-length 8192
 Smoke:    ... (no extra args)
 Resume:   ... --resume --max-steps 64 --allow-schedule-change
-Main:     ... --mode main --time-budget-s 37800 (later sessions add --resume;
-          NEVER --allow-schedule-change - that jump is the +134% LR bug)
+Main:     ... --mode main --resume-if-available --time-budget-s 37800
+          (every session, unchanged; NEVER --allow-schedule-change - that
+          jump is the +134% LR bug)
 
-The resume flag is gate-only: changing max_steps rebuilds the LR schedule.
+--resume demands a checkpoint and is the gate's flag. --resume-if-available
+resumes only a checkpoint whose max_steps matches and which has steps left,
+so one production entry serves every session of a multi-session epoch: the
+alternative was an operator flipping a MODE by hand, where forgetting once
+restarts at step 0 and the next save overwrites last-checkpoint/.
 """
 
 import argparse
@@ -209,6 +214,34 @@ def check_resume_schedule(
         "would jump at the resume step. --allow-schedule-change accepts that; "
         "it is meant for the RESUME gate, never for the main run."
     )
+
+
+def resume_decision(checkpoint_dir: str | Path, max_steps: int) -> bool:
+    """Whether a checkpoint at this path should be resumed from.
+
+    Exists so a multi-session main run needs no per-session notebook edit. The
+    hazard that makes it worth code rather than an operator habit: MODE and
+    MAIN_RESUME were two entries carrying the same information the checkpoint
+    repo already holds, and forgetting to flip it started training at step 0 -
+    whose first save, ten steps later, OVERWRITES last-checkpoint/ at the
+    fixed path_in_repo. A whole session of a multi-session epoch is discarded
+    silently, recoverable only by digging an older revision out of the Hub.
+
+    Comparing max_steps is what makes it safe to point at the shared
+    checkpoint repo: PROBE and SMOKE push there too, so "a checkpoint exists"
+    alone would try to resume a 60-step smoke run into a main run.
+    """
+    state = Path(checkpoint_dir) / "trainer_state.json"
+    if not state.is_file():
+        return False
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    if saved.get("max_steps") != max_steps:
+        # Defer to the schedule guard, which explains the LR-rebuild hazard
+        # and offers the escape hatch. Never silently start fresh here: that
+        # is the step-0 overwrite this function exists to prevent.
+        check_resume_schedule(checkpoint_dir, max_steps)
+        return False
+    return int(saved.get("global_step") or 0) < max_steps
 
 
 def check_main_max_steps(mode: str, max_steps: int) -> None:
@@ -436,6 +469,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--config", default="training/configs/law_v1_8b_ddp.yaml")
     p.add_argument("--mode", choices=["smoke", "main"], default="smoke")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--resume-if-available", action="store_true",
+                   help="resume when the checkpoint repo already holds a compatible "
+                        "checkpoint, else start fresh (the production main entry)")
     p.add_argument("--allow-schedule-change", action="store_true",
                    help="permit a resume whose max_steps differs from the checkpoint's (RESUME gate only)")
     p.add_argument("--no-hub", action="store_true")
@@ -730,25 +766,42 @@ def main(argv: list[str] | None = None) -> None:
         trainer.add_callback(_TimeBudget(args.time_budget_s, start=_proc_t0))
 
     resume = False
-    if args.resume:
+    if args.resume or args.resume_if_available:
         from huggingface_hub import snapshot_download
 
         # One rank downloads: both share this local_dir, so a second pull is
         # duplicate ~0.5-0.7 GB of bandwidth and two writers on one tree. The
         # barrier holds rank 1 until the checkpoint is fully written.
         if trainer.accelerator.is_main_process:
-            snapshot_download(
-                cfg.hub.checkpoint_repo,
-                allow_patterns=["last-checkpoint/*"],
-                local_dir=output_dir,
-            )
+            try:
+                snapshot_download(
+                    cfg.hub.checkpoint_repo,
+                    allow_patterns=["last-checkpoint/*"],
+                    local_dir=output_dir,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A first main session has nothing to download. --resume still
+                # demands one; --resume-if-available treats it as "start fresh".
+                if args.resume:
+                    raise SystemExit(
+                        f"could not fetch last-checkpoint from "
+                        f"{cfg.hub.checkpoint_repo}: {exc}"
+                    ) from exc
+                print(f"no checkpoint to resume ({type(exc).__name__}) - starting fresh")
         trainer.accelerator.wait_for_everyone()
-        resume = f"{output_dir}/last-checkpoint"
-        if not Path(resume).is_dir():
-            raise SystemExit(f"no last-checkpoint found in {cfg.hub.checkpoint_repo}")
-        check_resume_schedule(
-            resume, run.max_steps, allow_schedule_change=args.allow_schedule_change
-        )
+        candidate = f"{output_dir}/last-checkpoint"
+        if args.resume:
+            resume = candidate
+            if not Path(resume).is_dir():
+                raise SystemExit(f"no last-checkpoint found in {cfg.hub.checkpoint_repo}")
+            check_resume_schedule(
+                resume, run.max_steps, allow_schedule_change=args.allow_schedule_change
+            )
+        elif resume_decision(candidate, run.max_steps):
+            resume = candidate
+            print(f"resuming from {resume}")
+        else:
+            print("no compatible checkpoint - starting fresh")
 
     stats = trainer.train(resume_from_checkpoint=resume)
     print(f"train_loss={stats.training_loss:.4f}")

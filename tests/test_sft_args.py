@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import json
 from pathlib import Path
 
 from tuned.train.config import load_config
@@ -603,3 +604,57 @@ def test_remediation_ladders_end_at_the_6144_rung():
     src = inspect.getsource(sft.main)
     assert "standard-quant repo -> seq 6144" in src
     assert "seq 8192" not in src
+
+
+def _state(tmp_path, **body):
+    ckpt = tmp_path / "last-checkpoint"
+    ckpt.mkdir(exist_ok=True)
+    (ckpt / "trainer_state.json").write_text(json.dumps(body), encoding="utf-8")
+    return ckpt
+
+
+def test_resume_decision_starts_fresh_when_there_is_no_checkpoint(tmp_path):
+    from tuned.train.sft import resume_decision
+
+    # A first main session has nothing to resume; --resume-if-available must
+    # not turn that into a refusal.
+    assert resume_decision(tmp_path / "last-checkpoint", 1500) is False
+
+
+def test_resume_decision_resumes_a_matching_unfinished_run(tmp_path):
+    from tuned.train.sft import resume_decision
+
+    assert resume_decision(_state(tmp_path, max_steps=1500, global_step=470), 1500) is True
+
+
+def test_resume_decision_declines_a_finished_run(tmp_path):
+    from tuned.train.sft import resume_decision
+
+    # Resuming AT max_steps loads the checkpoint and exits without stepping -
+    # the no-op false green the RESUME gate exists to avoid.
+    assert resume_decision(_state(tmp_path, max_steps=1500, global_step=1500), 1500) is False
+
+
+def test_resume_decision_refuses_a_foreign_schedule_rather_than_restarting(tmp_path):
+    """The reason the predicate compares max_steps at all.
+
+    PROBE and SMOKE push to the SAME checkpoint repo as main, so "a checkpoint
+    exists" alone would try to resume a 60-step smoke run into a 1500-step main
+    run. Silently starting fresh instead would be worse still: the first save
+    ten steps later overwrites last-checkpoint/ at the fixed path_in_repo.
+    Defer to the schedule guard, which explains the LR-rebuild hazard.
+    """
+    from tuned.train.sft import resume_decision
+
+    with pytest.raises(SystemExit, match="allow-schedule-change"):
+        resume_decision(_state(tmp_path, max_steps=60, global_step=60), 1500)
+
+
+def test_the_production_entry_never_opts_into_a_schedule_change():
+    # --allow-schedule-change on a production resume IS the +134% LR jump the
+    # guard exists to prevent; it belongs to the RESUME gate alone.
+    src = SFT.read_text(encoding="utf-8")
+    assert "--resume-if-available" in src
+    # the auto path must go through resume_decision, never straight to resume
+    auto = src.find("elif resume_decision(")
+    assert auto != -1
