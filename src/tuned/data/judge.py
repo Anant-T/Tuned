@@ -113,6 +113,7 @@ Run:  python -m tuned.data.judge --config data/configs/data_law_v1.yaml
 
 import asyncio
 import json
+import math
 import os
 import re
 import sys
@@ -179,6 +180,12 @@ UNROUTABLE_STATE = "judge_unroutable"
 # buys the full dual treatment; the rest exit here, gate-clean but unjudged,
 # and the sample's accept rate is the quality evidence for the whole batch.
 AUDIT_ACCEPT_DISPOSITION = "audit:gate-accept"
+# Same accept, different WARRANT, so the readout can tell them apart: this one
+# is a row the hash SELECTED for judging that the judge fleet could not serve
+# (every eligible ref over quota, attempts exhausted). It ships on its gates,
+# exactly like an unsampled row - what it must not do is end in judge_error,
+# which would make a row's survival depend on whether the hash picked it.
+AUDIT_UNJUDGED_DISPOSITION = "audit:gate-accept:unjudged"
 DEFAULT_AUDIT_SAMPLE = 0.05
 
 # Defined in generate.py and re-exported here: the startup preflight sizes
@@ -609,7 +616,13 @@ def _score(value) -> int:
     Accepts 4, "4", 4.0 and "4/5" because free-tier judges emit all four.
     Anything outside the range is a parse failure, not a clamp: a judge that
     returns 0 or 7 did not follow the rubric, and pretending it said 1 or 5
-    would feed calibration a score nobody gave.
+    would feed calibration a score nobody gave. A FRACTION is the same defect
+    in the middle of the range and is refused for the same reason: the rubric
+    asks for "an integer from 1 to 5" (judge_pointwise_v1), so 3.5 is a judge
+    declining to commit - and rounding it to 4 crosses PASS_MIN and mints a
+    pass on the very axis that decides the verdict (JudgeScores.verdict is
+    min_axis >= PASS_MIN). One retry per slot is already budgeted, so the cost
+    of refusing is at most one re-ask of a judge that is off-rubric anyway.
     """
     if isinstance(value, bool):
         raise JudgeParseError(f"axis value is a bool: {value!r}")
@@ -619,7 +632,13 @@ def _score(value) -> int:
         number = float(value)
     except (TypeError, ValueError):
         raise JudgeParseError(f"axis value is not a number: {value!r}") from None
-    score = int(round(number))
+    if not math.isfinite(number):
+        # inf/nan reach int() as OverflowError/ValueError, which would escape
+        # the slot's JudgeParseError handling as a crash rather than a re-ask.
+        raise JudgeParseError(f"axis value is not finite: {value!r}")
+    if number != int(number):
+        raise JudgeParseError(f"axis value is not an integer: {value!r}")
+    score = int(number)
     if not (SCORE_RANGE[0] <= score <= SCORE_RANGE[1]):
         raise JudgeParseError(f"axis value out of range 1-5: {value!r}")
     return score
@@ -997,6 +1016,43 @@ def _set_state(store, task_id: str, state: str, disposition: str | None, *, work
     return moved
 
 
+def _audit_accept(
+    store,
+    task_id,
+    gen,
+    *,
+    worker_id,
+    stats: "JudgeStats",
+    sample: float,
+    disposition: str,
+    outcome: str,
+    reason: str | None = None,
+) -> str:
+    """Accept a gate-clean row without a judge verdict, and say which kind.
+
+    Two callers, one write, because they must agree: the sampler (this row was
+    not selected) and the attempt cap (this row WAS selected but no judge could
+    be reached). Before, only the first existed, so a sampled row whose every
+    judge ref was over quota burned MAX_JUDGE_ATTEMPTS claims and parked in
+    judge_error - lost from the corpus entirely, when the identical row would
+    have shipped had the hash not picked it. That also biased the sample: the
+    surviving verdicts were whichever rows the fleet had quota for, i.e. the
+    first ~30 rows of a UTC day, not the uniform hash sample audit_sampled's
+    docstring promises.
+    """
+    if not _set_state(store, task_id, ACCEPTED_STATE, disposition, worker_id=worker_id):
+        stats.lost_leases += 1
+        return LOST_LEASE
+    payload = {"task_id": task_id, "gen_id": int(gen["gen_id"]), "sample": sample}
+    if reason:
+        payload["reason"] = reason
+    store.log_event("audit_gate_accept", payload)
+    stats.decided += 1
+    stats.accepted += 1
+    stats.outcomes[outcome] = stats.outcomes.get(outcome, 0) + 1
+    return ACCEPTED_STATE
+
+
 def _park(
     store,
     task,
@@ -1164,19 +1220,11 @@ async def judge_task(
     # rendering or routing. The counters follow the WRITE, same as every
     # decision below.
     if cfg.routing.judge_mode == "audit" and not audit_sampled(task_id, audit_sample):
-        if not _set_state(
-            store, task_id, ACCEPTED_STATE, AUDIT_ACCEPT_DISPOSITION, worker_id=worker_id
-        ):
-            stats.lost_leases += 1
-            return LOST_LEASE
-        store.log_event(
-            "audit_gate_accept",
-            {"task_id": task_id, "gen_id": int(gen["gen_id"]), "sample": audit_sample},
+        return _audit_accept(
+            store, task_id, gen, worker_id=worker_id, stats=stats,
+            sample=audit_sample, disposition=AUDIT_ACCEPT_DISPOSITION,
+            outcome="audit-accept",
         )
-        stats.decided += 1
-        stats.accepted += 1
-        stats.outcomes["audit-accept"] = stats.outcomes.get("audit-accept", 0) + 1
-        return ACCEPTED_STATE
 
     try:
         # The judge sees the materials the generator saw - same builder, same
@@ -1288,6 +1336,21 @@ async def judge_task(
             # cheaper to pay than a second classification of "the provider is
             # down" that could disagree with the generator's.
             if int(task.get("attempts") or 0) >= MAX_JUDGE_ATTEMPTS:
+                # In AUDIT mode a sampled row that the fleet could not serve
+                # ships on its gates rather than dying here: an unsampled twin
+                # would already have been accepted with zero calls, so parking
+                # this one makes survival depend on the hash. Kept at the CAP,
+                # never on the first transient failure - bailing out early
+                # would collapse the sample to zero during any 60 s cooling
+                # window and there would be no quality evidence at all.
+                if cfg.routing.judge_mode == "audit":
+                    return _audit_accept(
+                        store, task_id, gen, worker_id=worker_id, stats=stats,
+                        sample=audit_sample,
+                        disposition=AUDIT_UNJUDGED_DISPOSITION,
+                        outcome="audit-accept-unjudged",
+                        reason=f"judge-slot-{slot}:{outcome.error}"[:200],
+                    )
                 return _park(
                     store, task, ERROR_STATE, f"judge-slot-{slot}:{outcome.error}"[:200],
                     worker_id=worker_id, stats=stats, counter="judge_errors",
@@ -1365,6 +1428,17 @@ async def judge_task(
                 if tiebreak.payload_error or int(task.get("attempts") or 0) >= (
                     MAX_JUDGE_ATTEMPTS
                 ):
+                    # Same rule as the slot arm, with one exception kept: a
+                    # payload_error is a defect in the request WE built, not a
+                    # fleet that is busy, so it stays an error to be looked at.
+                    if cfg.routing.judge_mode == "audit" and not tiebreak.payload_error:
+                        return _audit_accept(
+                            store, task_id, gen, worker_id=worker_id, stats=stats,
+                            sample=audit_sample,
+                            disposition=AUDIT_UNJUDGED_DISPOSITION,
+                            outcome="audit-accept-unjudged",
+                            reason=f"tiebreak:{tiebreak.error}"[:200],
+                        )
                     return _park(
                         store, task, ERROR_STATE, f"tiebreak:{tiebreak.error}"[:200],
                         worker_id=worker_id, stats=stats, counter="judge_errors",

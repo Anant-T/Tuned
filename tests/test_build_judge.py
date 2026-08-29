@@ -41,6 +41,7 @@ from tuned.data.judge import (
     JudgeStats,
     SlotOutcome,
     _outcome_from_row,
+    _score,
     decide,
     failing_rationale,
     generation_family,
@@ -201,6 +202,29 @@ def test_parser_coerces_string_and_float_scores():
     assert (parsed.grounding, parsed.validity, parsed.coverage) == (4, 4, 3)
 
 
+def test_a_fractional_axis_is_a_parse_failure_not_a_rounded_pass():
+    """3.5 -> 4 would mint a PASS the judge never gave.
+
+    The rubric asks for "an integer from 1 to 5", and JudgeScores.verdict is
+    min_axis >= PASS_MIN (4) - so rounding a judge that declined to commit
+    lands exactly on the axis value that decides accept/reject, and in audit
+    mode that verdict is the entire quality warrant for the sampled batch.
+    The parser already refuses 0 and 7 on precisely this reasoning; a
+    fraction is the same defect in the middle of the range. Banker's rounding
+    made the decision-flipping window [3.5, 4.0).
+    """
+    for bad in ("3.5", "3.6", "4.5", "2.5"):
+        with pytest.raises(JudgeParseError, match="not an integer"):
+            _score(bad)
+    # non-finite reaches int() as OverflowError/ValueError, which would escape
+    # the slot's parse-failure handling as a crash instead of a re-ask
+    for bad in ("inf", "nan", "-inf"):
+        with pytest.raises(JudgeParseError, match="not finite"):
+            _score(bad)
+    # every form the docstring promises still parses
+    assert [_score(v) for v in (4, "4", 4.0, "4/5", " 5 ")] == [4, 4, 4, 4, 5]
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -210,6 +234,7 @@ def test_parser_coerces_string_and_float_scores():
         '{"grounding": 9, "validity": 4, "coverage": 4}',
         '{"grounding": true, "validity": 4, "coverage": 4}',
         '{"grounding": "good", "validity": 4, "coverage": 4}',
+        '{"grounding": 3.5, "validity": 4, "coverage": 4}',
         "",
     ],
 )
@@ -2346,3 +2371,68 @@ def test_audit_sample_cli_flag_refuses_a_fraction_outside_the_unit_interval():
         judge_main(["--audit-sample", "1.5"])
     with pytest.raises(SystemExit):
         judge_main(["--audit-sample", "-0.1"])
+
+
+def test_a_sampled_row_the_fleet_cannot_serve_ships_instead_of_dying(tmp_path, cfg, paths):
+    """The sample must not decide whether a row SURVIVES, only whether it is
+    judged.
+
+    An unsampled row is accepted on its gates with zero calls. Its sampled
+    twin used to burn all 8 claims against an over-quota fleet and park in
+    judge_error - lost from the corpus for no reason but the hash. That also
+    biased the evidence: the verdicts that survived were whichever rows the
+    fleet still had quota for (the first ~30 rows of a UTC day), not the
+    uniform hash sample audit_sampled promises.
+    """
+    over_quota = ProviderError(
+        "role 'judge': all 2 eligible model(s) failed; last: 429",
+        status=429, provider="groq", model="qwen/qwen3.6-27b", retryable=True,
+    )
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(cfg, {"judge": [over_quota]})
+        store.conn.execute("UPDATE task SET attempts = ?", (MAX_JUDGE_ATTEMPTS - 1,))
+        totals = run_judge(store, _audit(cfg), router, paths, audit_sample=1.0)
+
+        task = only_task(store)
+        assert task["state"] == "accepted"
+        assert task["disposition"] == "audit:gate-accept:unjudged"
+        # counted apart from the sampled accepts, so the readout can report
+        # how much of the batch shipped without a verdict
+        assert totals["outcomes"] == {"audit-accept-unjudged": 1}
+        assert totals["judge_errors"] == 0
+        event = json.loads(store.events("audit_gate_accept")[-1]["detail_json"])
+        assert "judge-slot-a" in event["reason"]
+
+
+def test_dual_mode_still_parks_a_row_no_judge_could_serve(tmp_path, cfg, paths):
+    """The audit-accept fallback is scoped to audit mode. Under dual there is
+    no 'ships unjudged' contract to honour - every row is meant to carry a
+    verdict - so an unreachable fleet must still surface as judge_error."""
+    over_quota = ProviderError(
+        "role 'judge': all 2 eligible model(s) failed; last: 429",
+        status=429, provider="groq", model="qwen/qwen3.6-27b", retryable=True,
+    )
+    with judged_store(tmp_path, paths, cfg) as store:
+        router = FakeRouter(cfg, {"judge": [over_quota]})
+        store.conn.execute("UPDATE task SET attempts = ?", (MAX_JUDGE_ATTEMPTS - 1,))
+        totals = run_judge(store, cfg, router, paths)
+
+        task = only_task(store)
+        assert task["state"] == "judge_error"
+        assert totals["judge_errors"] == 1
+        assert reopen_tasks(store, ["judge_error"]) == {"judge_error": 1}
+
+
+def test_the_two_audit_accepts_are_told_apart_in_the_store(tmp_path, cfg, paths):
+    """Both ship on gates, but only one of them was ever OFFERED to a judge.
+
+    audit_readout groups by disposition, so a single shared string would make
+    'we chose not to judge this' and 'we could not judge this' indistinguishable
+    - and the second is the one that means the judge fleet is underwater.
+    """
+    assert judge_mod.AUDIT_ACCEPT_DISPOSITION != judge_mod.AUDIT_UNJUDGED_DISPOSITION
+    # the unjudged variant must remain recognisable as an audit accept, since
+    # the readout's 'shipped on gates' denominator keys on the prefix
+    assert judge_mod.AUDIT_UNJUDGED_DISPOSITION.startswith(
+        judge_mod.AUDIT_ACCEPT_DISPOSITION
+    )
