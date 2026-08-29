@@ -1031,7 +1031,7 @@ def test_a_verify_pass_does_not_call_re_reading_the_corpus_an_adoption(tmp_path,
 
 def test_rebase_recovers_an_eval_set_from_a_deleted_worktree(tmp_path):
     """The real 2026-08-29 failure: every hf eval set was indexed inside
-    .claude/worktrees/law-v1-data-pipeline, the restructure deleted it, and
+    a linked worktree, the restructure deleted it, and
     decontaminate refused to run because it could not read a set it is
     measured against. The files never moved relative to `corpus`."""
     from tuned.data.acquire import rebase_under_corpus
@@ -1043,8 +1043,8 @@ def test_rebase_recovers_an_eval_set_from_a_deleted_worktree(tmp_path):
     landed.write_bytes(b"parquet")
 
     recorded = (
-        r"C:\Users\Anant\Desktop\projects\tuned\.claude\worktrees"
-        r"\law-v1-data-pipeline\data\build\corpus\hf\aibe\data"
+        r"C:\old-checkout\worktrees\law-v1-data-pipeline"
+        r"\data\build\corpus\hf\aibe\data"
         r"\train-00000-of-00001.parquet"
     )
     assert rebase_under_corpus(recorded, key, corpus) == landed

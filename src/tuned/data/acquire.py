@@ -326,7 +326,7 @@ def rebase_under_corpus(recorded: str | Path, object_key: str, corpus_dir: str |
     only meaningful on the machine and in the checkout that wrote it. Both
     assumptions have already broken: the 2026-08-28 single-project
     restructure deleted the worktree every hf eval set was acquired under, so
-    every recorded path pointed into `.claude/worktrees/law-v1-data-pipeline/`
+    every recorded path named a checkout that no longer existed
     and decontaminate refused to run at all - correctly, because a pass that
     cannot read an eval set must not report clean. The same break happens on
     any CI runner, where the checkout root is different again.

@@ -12,7 +12,7 @@
 
 - **Operator directives (2026-08-28):** NO OpenRouter, NO paid refs — the fleet is bai/deepseek-v4-flash (generator), groq/qwen3.6-27b, cerebras/gemma-4-31b, groq/openai/gpt-oss-20b (judges/tiebreak). mistral-large keeps its tiebreak seat (free tier, already routed).
 - **Full generation is GATED on the user approving the 2–5 sample outputs.** Do not start a full wave.
-- NO Claude/Anthropic attribution anywhere: no co-author trailers, no "Generated with", no watermarks (global CLAUDE.md hard rule).
+- NO attribution or watermarks anywhere: no co-author trailers, no "Generated with" footers (global hard rule).
 - Never print `.env` contents. Keys load via `providers.load_dotenv_keys` from the repo-root `.env`.
 - `data/build/state/law_v1.sqlite3` is written ONLY by pipeline commands (`tuned.data.generate/judge/tasks`); ad-hoc inspection opens `mode=ro`.
 - Inside the pipeline tree always invoke `./.venv/Scripts/python.exe` with `PYTHONIOENCODING=utf-8`.
@@ -24,7 +24,7 @@
 
 ### Task A1: Live validation batch — generation
 
-**Files:** none modified (pipeline run). Working dir: `.claude/worktrees/law-v1-data-pipeline`.
+**Files:** none modified (pipeline run). Working dir: the `law-v1-data-pipeline` linked worktree (since deleted by this restructure).
 
 - [ ] **Step 1:** Confirm keys + preflight: `PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe -m tuned.data.generate --config configs/data_law_v1.yaml --stream synthesis --n-workers 5 --max-batches 1` — the CLI prints `loaded N key(s) from .env` and a preflight; ONE batch claims ≤5 of the 127 pending synthesis tasks.
 - [ ] **Step 2:** Read the batch line (`batch 1: claimed=… gen-ok=… clean=…`). Expected: claimed ~5, gen-ok ≥4 (bai rpm 8; ~33s/call), some clean at the recalibrated gates. If claimed=0, the pending pool is stale-guarded — run `./.venv/Scripts/python.exe -m tuned.data.tasks --reopen stale_prompt` and retry Step 1 once.
