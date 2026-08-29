@@ -16,14 +16,7 @@ SFT = ROOT / "src" / "tuned" / "train" / "sft.py"
 
 
 def test_training_deps_that_gate_the_load_path_are_pinned():
-    train = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"][
-        "optional-dependencies"
-    ]["train"]
-    pins = dict(
-        re.fullmatch(r"([A-Za-z0-9_-]+)==(.+)", spec).groups()
-        for spec in train
-        if "==" in spec
-    )
+    pins = _pins("train")
     # peft: the unsloth#5677 mitigation depends on peft's re.fullmatch semantics
     # in _check_target_module_exists (verified in 0.20.0).
     assert "peft" in pins, "peft must be ==-pinned in [train]"
@@ -31,6 +24,40 @@ def test_training_deps_that_gate_the_load_path_are_pinned():
     # ALLOW_PREQUANTIZED_MODELS to False, which silently strips the
     # -unsloth-bnb-4bit suffix AND drops the pinned model revision.
     assert "bitsandbytes" in pins, "bitsandbytes must be ==-pinned in [train]"
+
+
+def _pins(extra: str) -> dict[str, str]:
+    specs = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ][extra]
+    return dict(
+        re.fullmatch(r"([A-Za-z0-9_-]+)==(.+)", spec).groups()
+        for spec in specs
+        if "==" in spec
+    )
+
+
+def test_the_build_extra_pins_the_tokenizer_the_trainer_uses():
+    # assemble.py measures every row's token_length against max_seq_length with
+    # a tokenizer it loads itself, and stats.py re-measures the same rows; the
+    # trainer then trains on what survived. A transformers version skew between
+    # the two extras means the builder's ruler is not the trainer's ruler, so
+    # the corpus is filtered against a length nobody trains at.
+    #
+    # This test also guards the blocker it was written for: transformers was
+    # ABSENT from [build] entirely, so `tuned.data.assemble` raised
+    # ModuleNotFoundError on the CI ship path and no dataset was ever produced.
+    build, train = _pins("build"), _pins("train")
+    assert "transformers" in build, (
+        "transformers must be pinned in [build] - assemble.py:load_tokenizer "
+        "imports it, and without it the data-assemble chain dies at step 5 of 6"
+    )
+    assert "transformers" in train
+    assert build["transformers"] == train["transformers"], (
+        "the [build] tokenizer pin must equal the [train] pin - a different "
+        f"version measures a different token_length ({build['transformers']} "
+        f"vs {train['transformers']})"
+    )
 
 
 def test_sft_guards_prequantized_load_before_model_download():

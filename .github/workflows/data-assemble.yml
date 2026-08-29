@@ -24,6 +24,11 @@ jobs:
           python-version: "3.12"
       - name: Install
         run: pip install -e ".[build]"
+      # The chain's tokenizer users (assemble, stats) import transformers
+      # lazily, so a missing dep surfaced ~90 min in, at step 5 of 6, after
+      # verify/decontaminate/dedupe/split had already run. Fail in 2 s instead.
+      - name: Check the chain's imports resolve
+        run: python -c "import transformers, tuned.data.assemble, tuned.data.stats"
       - name: Assemble and push
         env:
           BAI_API_KEY: ${{ secrets.BAI_API_KEY }}

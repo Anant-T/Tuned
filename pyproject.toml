@@ -31,6 +31,19 @@ build = [
     "semhash",
     "pymupdf4llm",
     "huggingface_hub",
+    # PINNED TO THE SAME VERSION AS [train], and the pin is correctness rather
+    # than hygiene. assemble.py and stats.py load the tokenizer to measure
+    # token_length against max_seq_length; a tokenizer built by a different
+    # transformers version measures a different length than the trainer will,
+    # so the builder would drop (or keep) rows the trainer disagrees about.
+    # test_pins.py asserts the two extras carry the same pin.
+    #
+    # Its ABSENCE was a hard blocker: the data-assemble chain ran
+    # verify -> shape -> decontaminate -> dedupe -> split and then died with
+    # ModuleNotFoundError inside `tuned.data.assemble` (load_tokenizer, which
+    # imports transformers lazily), so push.py never ran and CI had never
+    # produced a dataset. transformers pulls no torch, so this costs ~15 MB.
+    "transformers==5.5.0",
 ]
 train = [
     # Pinned: the resolver silently bumped unsloth 2026.8.3 -> 2026.8.4 between
