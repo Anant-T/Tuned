@@ -20,6 +20,11 @@ import sys
 from pathlib import Path
 
 AUDIT_DISPOSITION = "audit:gate-accept"
+# Rows the hash SELECTED for judging that no judge could be reached for. They
+# ship on their gates like an unsampled row, but the count is a fleet-health
+# signal rather than a sampling choice: a rising number means the judge fleet
+# is underwater and the sample is thinning.
+AUDIT_UNJUDGED_DISPOSITION = "audit:gate-accept:unjudged"
 
 
 def summarize(conn: sqlite3.Connection) -> dict:
@@ -28,6 +33,9 @@ def summarize(conn: sqlite3.Connection) -> dict:
     )
     audit_accepts = conn.execute(
         "SELECT COUNT(*) FROM task WHERE disposition = ?", (AUDIT_DISPOSITION,)
+    ).fetchone()[0]
+    audit_unjudged = conn.execute(
+        "SELECT COUNT(*) FROM task WHERE disposition = ?", (AUDIT_UNJUDGED_DISPOSITION,)
     ).fetchone()[0]
     # The sampled rows are the ones the judges actually decided: their
     # dispositions carry judge:accept / judge:reject*. Rows decided before
@@ -43,11 +51,34 @@ def summarize(conn: sqlite3.Connection) -> dict:
     return {
         "states": states,
         "audit_accepts": audit_accepts,
+        "audit_unjudged": audit_unjudged,
         "sampled_decided": decided,
         "sampled_accepted": accepted,
         "sample_accept_rate": (accepted / decided) if decided else None,
         "sampled_dispositions": sampled,
     }
+
+
+def format_summary(s: dict) -> list[str]:
+    """The readout as lines. Shared with the Actions run report so the ship
+    gate the operator reads and the summary CI prints are one formatter."""
+    lines = [
+        "task states: " + ", ".join(f"{k}={v}" for k, v in s["states"].items()),
+        f"audit-accepted (gates only, not sampled): {s['audit_accepts']}",
+    ]
+    if s["audit_unjudged"]:
+        lines.append(
+            f"audit-accepted (sampled but NO judge reachable): {s['audit_unjudged']}"
+            "  <- judge fleet is thinning the sample"
+        )
+    rate = s["sample_accept_rate"]
+    lines.append(
+        f"dual-judged sample: {s['sampled_decided']} decided, "
+        f"{s['sampled_accepted']} accepted"
+        + (f" -> accept rate {100 * rate:.1f}%" if rate is not None
+           else " (nothing sampled yet)")
+    )
+    return lines
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,17 +89,8 @@ def main(argv: list[str] | None = None) -> int:
         s = summarize(conn)
     finally:
         conn.close()
-    print("task states: " + ", ".join(f"{k}={v}" for k, v in s["states"].items()))
-    print(f"audit-accepted (gates only, unjudged): {s['audit_accepts']}")
-    print(
-        f"dual-judged sample: {s['sampled_decided']} decided, "
-        f"{s['sampled_accepted']} accepted"
-        + (
-            f" -> accept rate {100 * s['sample_accept_rate']:.1f}%"
-            if s["sample_accept_rate"] is not None
-            else " (nothing sampled yet)"
-        )
-    )
+    for line in format_summary(s):
+        print(line)
     for disposition, n in sorted(s["sampled_dispositions"].items()):
         print(f"  {disposition}: {n}")
     return 0

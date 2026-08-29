@@ -27,6 +27,7 @@ key value - CI logs on a public repo are public.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -227,14 +228,159 @@ def _stop(procs: Sequence[subprocess.Popen]) -> None:
                 p.wait()
 
 
-def _push_quietly(bundle: Bundle, root: Path, staging: Path, message: str) -> None:
-    """Periodic pushes are best-effort: a transient HF failure must not kill
-    the fleet mid-run - the next interval (or the final push) retries."""
+# States a future claim can still pick up. Anything else is terminal for this
+# wave, so a queue holding only those has no work left for either child.
+CLAIMABLE_STATES = ("pending", "generating", "judging", "judging_active")
+
+
+def _run_scope() -> str:
+    """One log directory per Actions run.
+
+    logs/ is staged into the baton but never restored, so every run started
+    with an empty logs/gen.log and its push REPLACED the previous run's copy
+    at the repo tip - the per-job logs README points the operator at only ever
+    described the last ~5.25 h."""
+    return os.environ.get("GITHUB_RUN_ID", "local")
+
+
+def _task_counts(state_db: Path) -> dict[str, int] | None:
+    if not state_db.is_file():
+        return None
     try:
-        bundle.push(stage_bundle(root, staging), message)
-        print(f"bundle pushed: {message}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"bundle push failed ({type(exc).__name__}: {exc}) - continuing")
+        with sqlite3.connect(f"file:{state_db.as_posix()}?mode=ro", uri=True) as conn:
+            return dict(conn.execute("SELECT state, COUNT(*) FROM task GROUP BY state"))
+    except sqlite3.Error:
+        return None
+
+
+def _claimable(counts: dict[str, int]) -> int:
+    return sum(counts.get(state, 0) for state in CLAIMABLE_STATES)
+
+
+PUSH_BACKOFF_S = (30, 90, 240)
+
+
+def _push(
+    bundle: Bundle,
+    root: Path,
+    staging: Path,
+    message: str,
+    *,
+    attempts: int = 1,
+    sleep=None,
+) -> bool:
+    """Push the baton, optionally retrying. Returns whether it landed.
+
+    Periodic pushes stay best-effort at attempts=1: a transient HF failure
+    must not kill the fleet mid-run, because the next interval retries.
+
+    The FINAL push is the one that cannot be best-effort, and it used to be
+    the only push with no retry at all - the docstring above delegated
+    recovery to "the final push" while that push was a single unguarded
+    upload_folder. A transient 5xx there discarded everything generated since
+    the last checkpoint AND failed the job with a traceback.
+
+    stage_bundle runs ONCE, outside the retry loop: it VACUUMs a ~565 MB
+    database and copies the raw tree, so re-staging per attempt would triple
+    that work to re-send bytes that have not changed.
+    """
+    # Resolved at CALL time, not bound as a default: a default would capture
+    # time.sleep at import and make the backoff unpatchable, which is a real
+    # 2-minute stall in any test that exercises the retry path.
+    sleep = sleep or time.sleep
+    staged = stage_bundle(root, staging)
+    for attempt in range(1, attempts + 1):
+        try:
+            bundle.push(staged, message)
+            print(f"bundle pushed: {message}")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            last = f"{type(exc).__name__}: {exc}"
+            if attempt < attempts:
+                wait = PUSH_BACKOFF_S[min(attempt - 1, len(PUSH_BACKOFF_S) - 1)]
+                print(f"bundle push failed ({last}) - retrying in {wait}s")
+                sleep(wait)
+    print(f"bundle push failed ({last}) - continuing")
+    return False
+
+
+def _tail(path: Path, lines: int = 20) -> list[str]:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+    except OSError:
+        return []
+
+
+def _audit_summary(state_db: Path) -> list[str]:
+    """The dual-judged sample's accept rate, computed where the operator will
+    see it. audit_readout.py has been the documented ship gate since
+    2026-08-29 while being invoked by no workflow at all, so the one number
+    standing behind every audit-accepted row was machine-computed and
+    machine-ignored."""
+    if not state_db.is_file():
+        return []
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import audit_readout
+
+        with sqlite3.connect(f"file:{state_db.as_posix()}?mode=ro", uri=True) as conn:
+            return audit_readout.format_summary(audit_readout.summarize(conn))
+    except Exception as exc:  # noqa: BLE001 - a readout must never fail a run
+        return [f"audit readout unavailable ({type(exc).__name__}: {exc})"]
+
+
+def _finish(
+    root: Path,
+    procs: Sequence[subprocess.Popen],
+    names: Sequence[str],
+    *,
+    gen_died_early: bool,
+    final_push_ok: bool,
+) -> int:
+    """Say what happened, everywhere the operator might look, and exit
+    accordingly.
+
+    run_worker used to `return 0` unconditionally, so NO build failure could
+    fail the job or send a notification: a generator that SystemExit(2)'d at
+    t~5s on a missing key left the judge polling an empty queue for 5.25 h and
+    the run went green. That unconditional zero is also why the Actions
+    failure mail - the only notification channel this build has - could never
+    fire.
+    """
+    report: list[str] = []
+    for name, proc in zip(names, procs):
+        report.append(f"[{name}] exited rc={proc.returncode}")
+
+    counts = _task_counts(root / DB_RELPATH)
+    if counts is not None:
+        report.append("task states: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+        if not _claimable(counts):
+            report.append(
+                "QUEUE EMPTY - nothing left to claim; re-plan with "
+                "`python -m tuned.data.tasks --config <cfg> --n <rows>`"
+            )
+    report += _audit_summary(root / DB_RELPATH)
+
+    gen_log = _tail(root / "logs" / _run_scope() / "gen.log")
+    if gen_log:
+        report.append("--- last lines of gen.log ---")
+        report += gen_log
+
+    if gen_died_early:
+        report.append("GENERATOR DIED EARLY - this run generated nothing after that point")
+    if not final_push_ok:
+        report.append("FINAL PUSH FAILED - work since the last checkpoint is unrecovered")
+
+    text = "\n".join(report)
+    print(text)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with open(summary, "a", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        except OSError as exc:
+            print(f"step summary unavailable ({exc})")
+    return 1 if (gen_died_early or not final_push_ok) else 0
 
 
 def run_worker(args, root: Path, bundle: Bundle) -> int:
@@ -256,25 +402,54 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
             text=True, encoding="utf-8", errors="replace",
         )
         procs.append(proc)
-        pumps.append(_pump(proc, name, root / "logs" / f"{name}.log"))
+        pumps.append(_pump(proc, name, root / "logs" / _run_scope() / f"{name}.log"))
         print(f"[{name}] started pid={proc.pid}")
 
+    names = ("gen", "judge")
+    seen_dead: set[str] = set()
+    gen_died_early = False
+    push_failures = 0
     try:
-        while time.monotonic() < deadline and any(p.poll() is None for p in procs):
+        # Deliberately NOT `any(alive)`: that kept the supervisor sleeping for
+        # the rest of the 5.25 h whenever the GENERATOR died and the judge
+        # kept polling an empty queue. Nor `all(alive)` - a judge death (both
+        # live judges share one GROQ_API_KEY, so groq going down takes them
+        # together) must not stop the one process on the critical path.
+        while time.monotonic() < deadline:
+            for name, proc in zip(names, procs):
+                if proc.poll() is not None and name not in seen_dead:
+                    seen_dead.add(name)
+                    print(f"[{name}] EXITED EARLY rc={proc.returncode}")
+                    if name == "gen":
+                        gen_died_early = True
+            if gen_died_early or len(seen_dead) == len(procs):
+                break
             time.sleep(15)
             if time.monotonic() >= next_push:
-                _push_quietly(bundle, root, staging, "periodic checkpoint")
+                if _push(bundle, root, staging, "periodic checkpoint"):
+                    push_failures = 0
+                else:
+                    push_failures += 1
+                    if push_failures >= 3:
+                        print(
+                            f"CHECKPOINTS FAILING ({push_failures} in a row) - "
+                            "the baton is not being saved"
+                        )
                 next_push = time.monotonic() + args.push_every
     finally:
         _stop(procs)
         for t in pumps:
             t.join(timeout=30)
 
-    for name, proc in zip(("gen", "judge"), procs):
-        print(f"[{name}] exited rc={proc.returncode}")
-    bundle.push(stage_bundle(root, staging), "end-of-job checkpoint")
-    print("final bundle push done")
-    return 0
+    # attempts=3: the periodic path delegates recovery to this push, so this
+    # is the one that must not fail on a transient 5xx.
+    final_push_ok = _push(
+        bundle, root, staging, "end-of-job checkpoint", attempts=3
+    )
+    return _finish(
+        root, procs, names,
+        gen_died_early=gen_died_early, final_push_ok=final_push_ok,
+    )
 
 
 def run_assemble(args, root: Path, bundle: Bundle) -> int:
@@ -342,11 +517,13 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
             folder_path=str(out_dir), path_in_repo="out",
             commit_message="assembly artifacts",
         )
-    _push_quietly(bundle, root, root.parent / "bundle_out", "post-assembly checkpoint")
+    _push(bundle, root, root.parent / "bundle_out", "post-assembly checkpoint")
     return rc
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main_parser() -> argparse.ArgumentParser:
+    """The CLI surface, separated so tests can read the DEFAULTS the
+    unattended run actually uses rather than re-asserting literals."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--phase", required=True, choices=("worker", "assemble", "seed-push"))
     parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
@@ -361,8 +538,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     # in-flight); what it actually buys is amortising the gather's tail
     # stall over more work.
     parser.add_argument("--n-workers", type=int, default=12)
-    parser.add_argument("--audit-sample", type=float, default=0.05)
-    args = parser.parse_args(argv)
+    # Imported, not restated, for the same reason as SHAPED_PREFIX above: this
+    # fraction IS the quality warrant for every audit-accepted row, and while
+    # it was a bare literal here, changing DEFAULT_AUDIT_SAMPLE in judge.py had
+    # no effect whatsoever on the unattended run - the only run that matters.
+    # Function-local because judge -> generate -> providers pulls httpx into
+    # the supervisor at import time, which the shape import does not.
+    from tuned.data.judge import DEFAULT_AUDIT_SAMPLE
+
+    parser.add_argument("--audit-sample", type=float, default=DEFAULT_AUDIT_SAMPLE)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = main_parser().parse_args(argv)
 
     from tuned.data.config import load_build_config
     from tuned.data.paths import build_paths
