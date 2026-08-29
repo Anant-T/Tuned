@@ -36,6 +36,13 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+# Imported rather than restated: the shaped filenames are a contract between
+# this chain's shape step and its decontaminate step, and a second copy of
+# the prefix would let them disagree silently - decontaminate would fall
+# back to globbing the unshaped pools and the gates would go red for a
+# reason nothing in this file mentions.
+from tuned.data.shape import SHAPED_PREFIX
+
 STREAMS = ("synthesis", "transition", "curated_c2")
 DB_RELPATH = Path("state") / "law_v1.sqlite3"
 GRACE_S = 90  # SIGTERM -> this long -> SIGKILL, wide enough for a final fsync
@@ -59,19 +66,42 @@ def child_argvs(config: str, *, n_workers: int, audit_sample: float) -> list[lis
     ]
 
 
-def assemble_argvs(config: str, citation_index: Path | None = None) -> list[list[str]]:
+def assemble_argvs(
+    config: str,
+    citation_index: Path | None = None,
+    streams: list[str] | None = None,
+    out_dir: Path | None = None,
+    profile: str = "v1.0-MVP",
+) -> list[list[str]]:
     """The assembly chain, in order. stats is last and gates push.py.
 
     citation_index arms verify's existence half - without it every row ships
     citation-UNVERIFIED (verify warns loudly). The bundle carries the index
     when the operator has built it (tuned.data.citations --build).
+
+    `streams` (the stream file STEMS, e.g. ["replay", "curated_c1"]) inserts
+    the shape stage and points decontaminate at its output instead of the
+    pools. Without it the pools ship whole, which is the documented escape
+    and also what every pre-2026-08-29 run did - and what put three gates
+    red, because the pools are sized for the FINISHED corpus and feeding
+    them to a half-generated one guarantees a replay-dominated mix. The
+    shaped names are a pure function of the stem, so they can be named here
+    before shape has run.
     """
     verify_step = ["verify"] + (
         ["--index", str(citation_index)] if citation_index else []
     )
+    if streams:
+        base = out_dir or Path("data/build/out")
+        shaped = []
+        for stem in streams:
+            shaped += ["--in", str(base / f"{SHAPED_PREFIX}{stem}.jsonl")]
+        head = [["shape", "--profile", profile], ["decontaminate", *shaped]]
+    else:
+        head = [["decontaminate"]]
     chain = [
-        verify_step, ["decontaminate"], ["dedupe"], ["split"], ["assemble"],
-        ["stats", "--profile", "v1.0-MVP"],
+        verify_step, *head, ["dedupe"], ["split"], ["assemble"],
+        ["stats", "--profile", profile],
     ]
     return [
         [sys.executable, "-u", "-m", f"tuned.data.{step[0]}", "--config", config, *step[1:]]
@@ -283,8 +313,14 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
     if not index.is_file():
         index = None
         print("no citation index in the bundle - verify's existence half stays UNVERIFIED")
+    # The stems the shape stage will write, read off the bundle's own stream
+    # files so a stream added later is shaped without editing this script.
+    streams = sorted(p.stem for p in (root / "streams").glob("*.jsonl"))
+    if not streams:
+        print("no stream files in the bundle - the pools ship unshaped")
     rc = 0
-    for argv in assemble_argvs(args.config, citation_index=index):
+    for argv in assemble_argvs(args.config, citation_index=index,
+                               streams=streams, out_dir=root / "out"):
         step = argv[3].rsplit(".", 1)[-1]
         print(f"== {step} ==")
         rc = subprocess.run(argv).returncode

@@ -50,6 +50,32 @@ def test_the_assembly_chain_runs_in_order_and_stats_gates_last():
     assert armed[0][-2:] == ["--index", str(Path("x/citation_index.txt"))]
 
 
+def test_naming_the_streams_inserts_shape_and_feeds_decontaminate_its_output():
+    """The pools are sized for the FINISHED corpus; feeding them whole to a
+    half-generated one is what put mix/trace/empty_think red on 2026-08-29.
+    Shape runs first and decontaminate must read ITS files, not the pools."""
+    out = Path("w/out")
+    argvs = actions_worker.assemble_argvs(
+        "cfg.yaml", streams=["curated_c1", "replay"], out_dir=out
+    )
+    modules = [a[3] for a in argvs]
+    assert modules == [
+        "tuned.data.verify", "tuned.data.shape", "tuned.data.decontaminate",
+        "tuned.data.dedupe", "tuned.data.split", "tuned.data.assemble",
+        "tuned.data.stats",
+    ]
+    assert argvs[1][-2:] == ["--profile", "v1.0-MVP"]
+    decon = argvs[2]
+    assert decon[-4:] == [
+        "--in", str(out / "shaped_curated_c1.jsonl"),
+        "--in", str(out / "shaped_replay.jsonl"),
+    ]
+    # Both stages must be told the SAME profile, or shape sizes the corpus
+    # against one mix and stats gates it against another.
+    assert argvs[1][argvs[1].index("--profile") + 1] == \
+        argvs[-1][argvs[-1].index("--profile") + 1]
+
+
 def _tiny_db(path: Path, marker: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)

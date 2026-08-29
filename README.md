@@ -104,6 +104,18 @@ Operator surface:
 - **Ship a dataset cut**: Actions -> `data-assemble` -> Run workflow. It
   reconciles, verifies, assembles, and pushes to the HF dataset repo only if
   `stats` is green; the `out/` artifacts upload to the baton either way.
+- **Corpus size follows generation**: the chain's first content stage is
+  `tuned.data.shape`, which trims the pre-built pools (4,320 replay, 1,700
+  curated C1 — both sized for the FINISHED corpus) down to the profile the
+  generated rows can support. `grounded_synthesis` can only come from the
+  teacher, so it sets the size: one generated row buys ~2.05 corpus rows.
+  Shipping the pools whole is what put `mix`, `trace` and `empty_think` red
+  before this existed, and no amount of waiting fixed it — at the exact
+  target mix the pools' own composition lands no-think at 34%, against a
+  gate window of 18–20%. `--replay-nothink-share` moves the no-think budget
+  between replay's chat slices and curated's raw legal rows; the default
+  keeps the pools' composition, and lowering it buys corpus by changing
+  what no-think is trained on, which is a design decision, not a knob.
 - **Ship gate**: `python data/scripts/audit_readout.py <store>` prints the
   dual-judged sample's accept rate — the quality evidence for the whole
   audit-accepted batch. Read it before publishing.
