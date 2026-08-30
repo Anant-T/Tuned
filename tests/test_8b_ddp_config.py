@@ -57,15 +57,29 @@ def test_main_run_shape():
     # (8->32 KV-head expansion), materializes a 64 MiB mask, and pays 8192^2
     # attention on ~2,500-token segments. ga=6 buys packing's only real
     # benefit (a 3x gradient batch, ~30k real tokens/optimizer step) at zero
-    # VRAM or kernel change. save_steps counts OPTIMIZER steps, which get ~3x
-    # longer (~224 s) - so it must shrink, not grow: 10 x ~224 s ~= 37 min,
-    # the same cadence band the lane qualified at (25 x 74.7 s ~= 31 min).
-    # 50 would have meant ~3.1 h between checkpoints.
+    # VRAM or kernel change. save_steps counts OPTIMIZER steps, which at ga=6
+    # hold 3x the micro-batches a ga=2 step did, so it must shrink, not grow.
     run = load_config(CONFIGS / "law_v1_8b_ddp.yaml").train.main
     assert run.max_seq_length == 8192
     assert run.per_device_train_batch_size == 1
     assert run.gradient_accumulation_steps == 6
-    assert run.save_steps == 10
+
+    # A BAND, because the number it used to pin is not measured yet. The
+    # cadence argument for 10 rests on ~224 s/optimizer step, which is 3 x the
+    # 74.7 s timed on smoke_v1 - rows built from a fixed template, every one
+    # of them filling the 8192 bucket. The law corpus is drop-never-truncate
+    # (p50 2288 / p90 5757 on the current build), attention is quadratic in
+    # that length, and at bs=1 the collator pads only to the row itself. So
+    # 37 min is an upper bound on the cadence, the real value comes off
+    # session 1's log, and freezing 10 here would make setting it a two-file
+    # edit for no gain.
+    #
+    # What the band defends is the SHAPE, which does not depend on the step
+    # time: small enough that a session killed at the watchdog loses minutes
+    # of steps rather than hours, large enough that the adapter push is not
+    # most of what the session does. 25 is what the lane qualified at under
+    # smoke; 50 was rejected outright.
+    assert 5 <= run.save_steps <= 25
     assert run.dataset == "data/law_v1.jsonl"
     # 0 = deliberately underived: max_steps must be set from the POST-FILTER
     # row count (train_on_responses_only drops fully-masked rows with only a

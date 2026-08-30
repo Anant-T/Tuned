@@ -138,10 +138,26 @@ train:
   # itself), so the unpacked lane wastes zero tokens on padding; packing's
   # only real benefit is the 3x gradient batch, and ga=6 buys exactly that
   # (~30k real tokens/optimizer step) at zero VRAM or kernel change.
-  # save_steps counts OPTIMIZER steps, which get ~3x longer (~224 s at the
-  # measured 74.7 s/step for ga=2) - so it shrinks 25 -> 10, it does not
-  # grow: 10 x ~224 s ~= 37 min, the cadence band the lane qualified at
-  # (25 x 74.7 s ~= 31 min). 50 would have been ~3.1 h between checkpoints.
+  # save_steps counts OPTIMIZER steps, which at ga=6 hold 3x the micro-batches
+  # a ga=2 step did - so it shrinks 25 -> 10, it does not grow. 50 would have
+  # been hours between checkpoints on any reading.
+  #
+  # 224 s/optimizer step IS NOT A MEASUREMENT, and the ~37 min cadence read
+  # off it is an UPPER BOUND rather than a prediction. It is 3 x 74.7 s, and
+  # 74.7 s was measured on smoke_v1 - built from a fixed template, so every
+  # row fills the 8192 bucket. The law corpus is drop-never-truncate: the
+  # current build's stats.md reads p50 2288 / p90 5757 against that same
+  # 8192, and at bs=1 the collator pads to the longest row in the batch,
+  # which is the row itself. Attention is quadratic in that length and the
+  # MLP linear, so a median step does substantially less work than the one
+  # 74.7 s was timed on, and group_by_length keeps similar lengths together
+  # rather than pairing a short row with a long one.
+  #
+  # So the real cadence is shorter than 37 min by an unknown factor, and
+  # nothing in this repo can say by how much. Read s/step off session 1's
+  # log and set this then - it is the same "measure first" entry as
+  # max_grad_norm. The test asserts a BAND, not this number, so that setting
+  # it is an edit here and not an edit here plus an edit there.
   # max_steps: 0 is a SENTINEL - sft.py refuses to train main on it. Derive
   # it FROM THE BUILD, not from a GPU session: read counts.train.kept out of
   # the assemble.json push.py ships beside the corpus, set

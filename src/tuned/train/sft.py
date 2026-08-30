@@ -432,12 +432,15 @@ def ceiling_check_due(step: int, early: int, every: int) -> bool:
     risk of missing one, only of reporting it late. every=1 exists so the
     abort fires AT the breaching step: the `at step {N}` in the error message
     then names the step that actually caused the breach, not whichever later
-    step happened to be sampled. At ga=6 (~224 s/optimizer step), 24 late
-    steps is ~90 minutes of Kaggle quota spent training on a profile already
-    known to be OOM-bound. It costs nothing to check every step either way -
-    a stats-counter read, no CUDA sync, against a ~74 s step. `every` still
-    exists and still samples (rather than checking every step) when set above
-    1."""
+    step happened to be sampled. At ga=6, 24 late steps is on the order of an
+    hour of Kaggle quota spent training on a profile already known to be
+    OOM-bound - the exact figure depends on a step time this lane has not
+    measured on the law corpus (see the save_steps comment in
+    law_v1_8b_ddp.yaml; the often-quoted 224 s is an upper bound derived from
+    smoke_v1's full-bucket rows, not from real data). It costs nothing to
+    check every step either way - a stats-counter read, no CUDA sync, against
+    a step measured in tens of seconds. `every` still exists and still samples
+    (rather than checking every step) when set above 1."""
     return step <= early or step % every == 0
 
 
