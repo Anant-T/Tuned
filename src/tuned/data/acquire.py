@@ -64,6 +64,7 @@ from tuned.data.seeds import (
     PREDEX_SOURCE_ID,
     TATHYANYAYA_SOURCE_ID,
 )
+from tuned.data.paths import DEFAULT_CONFIG
 
 # --------------------------------------------------------------------------
 # The bucket, and the slice of it v1 wants.
@@ -769,7 +770,7 @@ def main(argv: Sequence[str] | None = None, *, fetcher=None, snapshot_fn=None) -
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument(
         "--kind",
         default="all",

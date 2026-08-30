@@ -148,6 +148,7 @@ from pathlib import Path
 
 from tuned.data.acquire import SC_SOURCE_ID, local_path_for
 from tuned.data.select import SELECTION_FILENAME
+from tuned.data.paths import DEFAULT_CONFIG
 
 # Bump when a cleanup or boundary rule changes: rows written under an older
 # version are re-extracted, rows at this version are left alone.
@@ -2455,7 +2456,7 @@ def main(argv: Sequence[str] | None = None, *, reader=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--selection", default=None, help=f"default corpus/{SELECTION_FILENAME}")
     parser.add_argument("--out", default=None, help=f"default corpus/{EXTRACTION_FILENAME}")
     parser.add_argument(

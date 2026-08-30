@@ -82,6 +82,7 @@ from tuned.data.providers import (
     unkeyed_roles,
 )
 from tuned.data.store import utcday, utcnow
+from tuned.data.paths import DEFAULT_CONFIG
 
 # Task states this module owns. 'judging' is the hand-off to judge.py.
 JUDGING_STATE = "judging"
@@ -2210,7 +2211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--stream", action="append", default=None, help="repeatable")
     parser.add_argument("--n-workers", type=int, default=4)
     parser.add_argument("--forever", action="store_true")

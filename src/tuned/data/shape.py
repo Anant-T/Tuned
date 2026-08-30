@@ -53,6 +53,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from tuned.data.paths import DEFAULT_CONFIG
 
 MANIFEST_FILENAME = "shape.json"
 SHAPED_PREFIX = "shaped_"
@@ -531,7 +532,7 @@ def main(argv=None) -> int:
     from tuned.data.store import Store
 
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    p.add_argument("--config", default=DEFAULT_CONFIG)
     p.add_argument("--profile", default="v1.0-MVP")
     p.add_argument("--in", dest="inputs", action="append", default=None,
                    help="stream JSONL to shape (repeatable; default every *.jsonl "

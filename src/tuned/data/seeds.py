@@ -30,6 +30,7 @@ import hashlib
 import re
 
 from tuned.data.replay import has_markup
+from tuned.data.paths import DEFAULT_CONFIG
 
 # --------------------------------------------------------------------------
 # Source identity - the same string is embedded in every seed row this
@@ -299,7 +300,7 @@ if __name__ == "__main__":
     from tuned.data.store import Store
 
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    p.add_argument("--config", default=DEFAULT_CONFIG)
     p.add_argument("--limit-per-source", type=int, default=None)
     args = p.parse_args()
 

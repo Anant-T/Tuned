@@ -153,6 +153,7 @@ from tuned.data.providers import (
     undersized_families,
 )
 from tuned.data.store import utcday, utcnow
+from tuned.data.paths import DEFAULT_CONFIG
 
 # Queue states. state_from -> state_to must differ (store.claim_tasks
 # enforces it): a shared name would disable lease fencing.
@@ -1704,7 +1705,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--stream", action="append", default=None, help="repeatable")
     parser.add_argument("--n-workers", type=int, default=4)
     parser.add_argument("--forever", action="store_true")

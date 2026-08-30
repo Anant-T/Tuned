@@ -460,6 +460,13 @@ _SOURCES = {"kanoongpt": _stream_kanoongpt}
 
 if __name__ == "__main__":
     import argparse
+
+    # Local, not module-level: test_no_module_level_dataset_import holds this
+    # module's top-level imports to an stdlib allowlist so that importing it
+    # can never touch the network. paths is stdlib-only today, but admitting
+    # `tuned` to that allowlist would let a later edit pull in a module that
+    # is not.
+    from tuned.data.paths import DEFAULT_CONFIG
     import sys
 
     from tuned.data.config import load_build_config
@@ -467,7 +474,7 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="Build the citation-existence index.")
     p.add_argument("--build", action="store_true", help="build the index (the only mode)")
-    p.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    p.add_argument("--config", default=DEFAULT_CONFIG)
     p.add_argument("--source", default="kanoongpt", choices=sorted(_SOURCES))
     p.add_argument("--out", default=None)
     args = p.parse_args()

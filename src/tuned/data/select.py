@@ -78,6 +78,7 @@ from pathlib import Path
 
 from tuned.data.acquire import DEV_YEARS, HF_SOURCES, SC_BUCKET, SC_SOURCE_ID, parse_year
 from tuned.data.seeds import classify_case_type
+from tuned.data.paths import DEFAULT_CONFIG
 
 SELECTION_FILENAME = "selection.jsonl"
 
@@ -727,7 +728,7 @@ def main(argv: Sequence[str] | None = None, *, rows=None, landmarks=_UNSET) -> i
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--years", default=None, help=f"default {DEV_YEARS[0]}-{DEV_YEARS[-1]}")
     parser.add_argument(
         "--limit",

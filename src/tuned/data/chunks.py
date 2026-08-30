@@ -87,6 +87,7 @@ from tuned.data.extract import STATUS_OK as DOC_STATUS_OK
 from tuned.data.roles_infer import ROLES_VERSION
 from tuned.data.seeds import INJUDGEMENTS_SOURCE_ID, classify_case_type, seed_id_for
 from tuned.data.segment import SEGMENT_VERSION, TIER_ROLES, Segment, segment_document
+from tuned.data.paths import DEFAULT_CONFIG
 
 # Bump when the packing rule itself changes what a chunk's boundaries are -
 # independent of SEGMENT_VERSION, which governs the segments a chunk is
@@ -709,7 +710,7 @@ def main(argv: Sequence[str] | None = None, *, tokenizer=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--limit", type=int, default=None, help="stop after N documents chunked")
     parser.add_argument("--force", action="store_true", help="re-chunk everything, ignoring resume")
     parser.add_argument(

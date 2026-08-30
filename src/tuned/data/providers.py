@@ -43,6 +43,7 @@ from pathlib import Path
 import httpx
 
 from tuned.data.config import BuildConfig, ModelCfg, ModelRef, ProviderCfg
+from tuned.data.paths import DEFAULT_CONFIG
 
 _CHAT_PATH = "chat/completions"
 _BACKOFF_BASE_S = 1.0
@@ -2122,7 +2123,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.config import load_build_config
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--check", action="store_true", help="one live call per configured model")
     parser.add_argument("--ref", default=None, help="check only this provider/model ref")
     args = parser.parse_args(argv)

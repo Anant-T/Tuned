@@ -1029,7 +1029,7 @@ routing:
   # audit since 2026-08-29: one groq key caps the dual fleet at ~35-40
   # decided rows/UTC-day (qwen + gpt-oss each tpd 200k vs ~5.5k-token judge
   # calls), which cannot keep pace with generation. In audit mode only a
-  # hash-sampled fraction of rows (judge --audit-sample, default 0.05) buys
+  # hash-sampled fraction of rows (judge --audit-sample) buys
   # the dual treatment; the rest are accepted on gates with disposition
   # "audit:gate-accept", and the sample's accept rate is the batch's quality
   # evidence. Flip back to dual when judge capacity returns.

@@ -118,6 +118,7 @@ from tuned.data.split import (
 )
 from tuned.data.split import EVAL_FILENAME as SPLIT_EVAL_FILENAME
 from tuned.data.split import TRAIN_FILENAME as SPLIT_TRAIN_FILENAME
+from tuned.data.paths import DEFAULT_CONFIG
 
 TRAIN_FILENAME = "law_v1_train.jsonl"
 EVAL_FILENAME = "law_v1_eval.jsonl"
@@ -372,7 +373,7 @@ def main(argv: Sequence[str] | None = None, *, tokenizer=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--in-train", default=None, help=f"default out/{SPLIT_TRAIN_FILENAME}")
     parser.add_argument("--in-eval", default=None, help=f"default out/{SPLIT_EVAL_FILENAME}")
     parser.add_argument("--out-train", default=None, help=f"default out/{TRAIN_FILENAME}")

@@ -42,7 +42,9 @@ from typing import Sequence
 # this chain's shape step and its decontaminate step, and a second copy of
 # the prefix would let them disagree silently - decontaminate would fall
 # back to globbing the unshaped pools and the gates would go red for a
-# reason nothing in this file mentions.
+# reason nothing in this file mentions. The config path is here for the same
+# reason: it moved once already in the 2026-08-28 restructure.
+from tuned.data.paths import DEFAULT_CONFIG
 from tuned.data.shape import SHAPED_PREFIX
 
 STREAMS = ("synthesis", "transition", "curated_c2")
@@ -691,7 +693,7 @@ def main_parser() -> argparse.ArgumentParser:
     unattended run actually uses rather than re-asserting literals."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--phase", required=True, choices=("worker", "assemble", "seed-push"))
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--hf-repo", required=True, help="private HF dataset repo for the bundle")
     parser.add_argument("--minutes", type=float, default=315)
     parser.add_argument("--push-every", type=float, default=900)

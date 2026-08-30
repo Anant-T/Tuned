@@ -162,6 +162,7 @@ from tuned.data.statutes import (
     SectionRef,
     governing_family,
 )
+from tuned.data.paths import DEFAULT_CONFIG
 
 # The stream and task type these seeds are planned under - gates.
 # TRANSITION_STREAM and tasks.TRANSITION_MIX's only key. Stated as literals
@@ -1654,7 +1655,7 @@ def main(argv=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument(
         "--dry-run", action="store_true", help="measure the grid, write nothing"
     )

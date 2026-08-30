@@ -61,6 +61,7 @@ from dataclasses import dataclass, field
 
 from tuned.data.config import CALIBRATION_RULES, JUDGE_SCORE_RANGE
 from tuned.data.store import utcnow
+from tuned.data.paths import DEFAULT_CONFIG
 
 # Re-exported so calibrate.py and config.py cannot drift apart on the
 # vocabulary: config validates `calibration.rules` against this tuple and this
@@ -1033,7 +1034,7 @@ def main(argv=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--export", action="store_true", help=f"write {GOLD_TODO_NAME}")
     parser.add_argument("--ingest", action="store_true", help=f"read {GOLD_TODO_NAME} back")
     parser.add_argument("--fit", action="store_true", help="fit thresholds and report")

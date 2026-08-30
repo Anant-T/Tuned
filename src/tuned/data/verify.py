@@ -71,6 +71,7 @@ from tuned.data.generate import (
 )
 from tuned.data.jsonl import read_at
 from tuned.data.store import DEFAULT_LEASE_S, _TS_FMT
+from tuned.data.paths import DEFAULT_CONFIG
 
 REJECTED_STATE = "rejected"
 
@@ -499,7 +500,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--index", default=None, help="path to the citation index")
     parser.add_argument("--state", default=None, help="only re-gate tasks in this state")
     parser.add_argument(

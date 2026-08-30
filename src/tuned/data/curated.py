@@ -43,6 +43,7 @@ from tuned.data.replay import (
     is_refusal,
     sha256_hex,
 )
+from tuned.data.paths import DEFAULT_CONFIG
 
 SLICE_ORDER = ("predex_prediction", "aalap_safe", "pi169_audited")
 DEFAULT_COUNTS = (800, 600, 300)
@@ -361,7 +362,7 @@ if __name__ == "__main__":
     from tuned.data.config import load_build_config
 
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    p.add_argument("--config", default=DEFAULT_CONFIG)
     p.add_argument("--out", default=None)
     p.add_argument("--counts", default=None, help="predex,aalap,pi169")
     args = p.parse_args()

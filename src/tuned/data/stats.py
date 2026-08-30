@@ -86,6 +86,7 @@ from tuned.data.curated import _NEW_CODE_RE as NEW_CODE_RE
 from tuned.data.decontaminate import item_key, row_answer, row_messages, row_prompt, row_prov
 from tuned.data.replay import empty_think
 from tuned.data.split import custody_of, custody_refusal
+from tuned.data.paths import DEFAULT_CONFIG
 
 REPORT_FILENAME = "stats.json"
 SUMMARY_FILENAME = "stats.md"
@@ -645,7 +646,7 @@ def main(argv: Sequence[str] | None = None, *, tokenizer=None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--profile", default=None,
                         help="mix profile to grade against (default assembly.default_profile)")
     parser.add_argument("--in-train", default=None,

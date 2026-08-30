@@ -60,6 +60,7 @@ import hashlib
 from collections.abc import Mapping, Sequence
 
 from tuned.data import prompt_registry
+from tuned.data.paths import DEFAULT_CONFIG
 
 # Max tasks any one seed may back, across every task type and wave.
 PER_SEED_CAP = 4
@@ -757,7 +758,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     # No default, so that "was it passed?" is answerable: --stream is honoured
     # by the PLANNER and ignored by the re-open, and a --reopen-only command
     # that names one is asking for a filter it will not get.

@@ -53,6 +53,7 @@ import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from tuned.data.paths import DEFAULT_CONFIG
 
 # Easiest first. The order is load-bearing: bands are cut at the CUMULATIVE
 # shares of this sequence, so reversing it would put the hard label on the
@@ -482,7 +483,7 @@ def main(argv=None) -> int:  # pragma: no cover - the live probe path
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument(
         "--probe",
         action="store_true",

@@ -105,6 +105,7 @@ from tuned.data.split import MANIFEST_FILENAME as SPLIT_MANIFEST_FILENAME
 from tuned.data.split import read_manifest
 from tuned.data.stats import GREEN
 from tuned.data.stats import REPORT_FILENAME as STATS_REPORT_FILENAME
+from tuned.data.paths import DEFAULT_CONFIG
 
 README_FILENAME = "README.md"
 MANIFEST_FILENAME = "build_manifest.json"
@@ -822,7 +823,7 @@ def main(argv: Sequence[str] | None = None, *, hub_client=None) -> int:
     from tuned.data.paths import build_paths
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--report", default=None, help=f"default out/{STATS_REPORT_FILENAME}")
     parser.add_argument("--out", default=None, help="where the card+manifest render (default out/)")
     parser.add_argument("--dry-run", action="store_true",

@@ -142,6 +142,14 @@ class BuildPaths:
         return self
 
 
+# The data-build config every CLI in this package defaults to. Imported
+# rather than restated: the path moved once already in the 2026-08-28
+# restructure, and 25 copies is 25 chances to move it to a different place.
+# probe.py and smoke.py are deliberately NOT on this - they default to the
+# TRAINING config, which is a different file with a different owner.
+DEFAULT_CONFIG = "data/configs/data_law_v1.yaml"
+
+
 def build_paths(workdir: str | Path) -> BuildPaths:
     path = Path(workdir)
     if path.is_absolute():

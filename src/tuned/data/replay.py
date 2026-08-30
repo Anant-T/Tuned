@@ -28,6 +28,7 @@ Build:  python -m tuned.data.replay --config data/configs/data_law_v1.yaml
 import hashlib
 import re
 from pathlib import Path
+from tuned.data.paths import DEFAULT_CONFIG
 
 SLICE_ORDER = ("ot_reasoning", "nemotron_reasoning", "smoltalk_nothink", "legal_qa_empty", "wildchat_prof")
 DEFAULT_COUNTS = (2520, 600, 600, 300, 300)
@@ -464,7 +465,7 @@ if __name__ == "__main__":
     from tuned.data.config import load_build_config
 
     p = argparse.ArgumentParser()
-    p.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    p.add_argument("--config", default=DEFAULT_CONFIG)
     p.add_argument("--out", default=None)
     p.add_argument("--counts", default=None, help="ot,nemotron,smoltalk,legal,wildchat")
     args = p.parse_args()

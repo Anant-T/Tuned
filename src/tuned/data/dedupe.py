@@ -145,6 +145,7 @@ from tuned.data.decontaminate import (
     tokens,
     write_manifest,
 )
+from tuned.data.paths import DEFAULT_CONFIG
 
 OUT_FILENAME = "deduped.jsonl"
 DROPS_FILENAME = "dedupe_drops.jsonl"
@@ -883,7 +884,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from tuned.data.store import Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--in", dest="inputs", action="append", default=None,
                         help=f"default out/{DECON_OUT_FILENAME} (decontaminate.py's output - "
                              f"running this on un-decontaminated rows loses clean twins)")

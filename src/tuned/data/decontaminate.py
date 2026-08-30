@@ -280,6 +280,7 @@ from pathlib import Path
 from tuned.data.acquire import HF_SOURCES, rebase_under_corpus
 from tuned.data.citations import extract_citations
 from tuned.data.select import landmark_key
+from tuned.data.paths import DEFAULT_CONFIG
 
 OUT_FILENAME = "decontaminated.jsonl"
 DROPS_FILENAME = "decontamination_drops.jsonl"
@@ -3194,7 +3195,7 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
     from tuned.data.store import TASK_STATES, Store
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="data/configs/data_law_v1.yaml")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--in", dest="inputs", action="append", default=None,
                         help="stream JSONL to screen (repeatable; default every *.jsonl "
                              "in the streams dir)")
