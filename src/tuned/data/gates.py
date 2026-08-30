@@ -494,7 +494,7 @@ SHINGLE_STEP = 10
 # fails an existence test. Retries re-rolled a ~50/50 property (P(pass|fail)
 # 43%, P(pass|pass) 63%), burning calls without selecting. At 500 the residual
 # 4% is genuine multi-sentence copying. Full evidence:
-# docs/reports/2026-08-28-verbatim-overlap-drafting-drift.md and the
+# prev_rep.md 2.5 (verbatim-overlap-drafting-drift) and the
 # recalibration report beside it.
 #
 # The SECOND CONSUMER above is DECOUPLED by this raise rather than dragged

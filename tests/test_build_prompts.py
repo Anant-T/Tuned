@@ -65,16 +65,16 @@ from tuned.data.gates import (
 # and the 450-700 band was given an explicit upper stop - and re-pinned the
 # shas below to match. It is proven harmful to gpt-oss (paired A/B, 4
 # pre-registered fails,
-# docs/reports/2026-08-27-gptoss-floor-under-the-prompt-ceiling.md) and
+# prev_rep.md 2.4, gptoss-floor-under-the-prompt-ceiling) and
 # at-best-wash for deepseek (clean rerun,
-# docs/reports/2026-08-28-deepseek-prompt-era-rerun.md: +4.97pp for pre-edit,
+# prev_rep.md 2.4, deepseek-prompt-era-rerun: +4.97pp for pre-edit,
 # full-gate clean 16.5% vs 8.5%, 17% cheaper per passing row) - helping
 # nobody on any measurement, so the operator reverted it. All fourteen
 # gen_* templates are back to their pre-2026-08-27 bytes, so the shas below
 # are the 2026-08-18 pins restored, not a new pin.
 #
 # RE-PINNED 2026-08-28 (anti-rehearsal clause shipped). The three-arm
-# clause/cap A/B (docs/reports/2026-08-28-deepseek-clause-and-cap-ab.md)
+# clause/cap A/B (prev_rep.md 2.4, deepseek-clause-and-cap-ab)
 # measured the clause's own irac_placement target FAIL (-4.46pp vs a >=15pp
 # bar) but a strong showing on everything else - length_band +16.05pp
 # (42.20% -> 58.25%), think p50 -18.7%, full-gate clean 11.0% -> 14.6%, no
@@ -87,7 +87,7 @@ from tuned.data.gates import (
 # unchanged from the 2026-08-18/2026-08-18-restored pins.
 #
 # RE-PINNED AGAIN 2026-08-28, gen_summarization_v1/v2 ONLY (F2 shipped). The
-# root-cause A/B (docs/reports/2026-08-28-irac-stop-timing-fix.md) found
+# root-cause A/B (prev_rep.md 2.4, irac-stop-timing-fix) found
 # summarization's irac_placement failures were a template/gate drift: both
 # templates still mandated a four-headed ANSWER that
 # gates.IRAC_ANSWER_TASK_TYPES (src/tuned/data/gates.py:116) had already
@@ -183,8 +183,8 @@ IRAC_PLACEMENT_CLAUSE = "never inside your reasoning"
 IRAC_LINE_START_CLAUSE = "never opens a line with one of those four words"
 
 # gen_summarization_v1/v2's OWN wording for the same reasoning-side
-# prohibition, since 2026-08-28 (F2, docs/reports/2026-08-28-irac-stop-timing-
-# fix.md). Summarization is not in gates.IRAC_ANSWER_TASK_TYPES, so F2 dropped
+# prohibition, since 2026-08-28 (F2, prev_rep.md 2.4, irac-stop-timing-fix).
+# Summarization is not in gates.IRAC_ANSWER_TASK_TYPES, so F2 dropped
 # the four-headings ANSWER mandate entirely and rewords IRAC_PLACEMENT_CLAUSE /
 # IRAC_LINE_START_CLAUSE together into one sentence naming the four words
 # directly rather than "those four words" - verbatim-identical between the two
@@ -214,9 +214,9 @@ ANSWER_LENGTH_CLAUSE = "250 to 450 words"
 # CEILING ADDED 2026-08-27, REVERTED 2026-08-28. The 2026-08-27 edit deleted
 # the licence clause from all fourteen templates and trimmed this constant to
 # "450 to 700 words of deliberation" to match. It is proven harmful to
-# gpt-oss (docs/reports/2026-08-27-gptoss-floor-under-the-prompt-ceiling.md,
+# gpt-oss (prev_rep.md 2.4, gptoss-floor-under-the-prompt-ceiling,
 # 4 pre-registered fails) and at-best-wash for deepseek
-# (docs/reports/2026-08-28-deepseek-prompt-era-rerun.md: +4.97pp for the
+# (prev_rep.md 2.4, deepseek-prompt-era-rerun: +4.97pp for the
 # pre-edit prompts, clean full-gate 16.5% vs 8.5%, 17% cheaper per passing
 # row) - so the operator reverted it. The licence clause is back in every
 # template and this constant is back to its full 2026-08-18 form.
@@ -526,7 +526,7 @@ def test_generator_states_the_irac_answer_contract(prompt_id):
     the four headings in the answer at all - gates.IRAC_ANSWER_TASK_TYPES
     (src/tuned/data/gates.py:116) never required it for summarization, and
     the old templates mandating it anyway was the template/gate drift
-    docs/reports/2026-08-28-irac-stop-timing-fix.md traces the irac_placement
+    prev_rep.md 2.4 (irac-stop-timing-fix) traces the irac_placement
     failures to. What both templates keep is the REASONING-side prohibition -
     the four words may still not open a line inside the trace - just worded
     for the new prose answer instead of the old headed one. The bare-word

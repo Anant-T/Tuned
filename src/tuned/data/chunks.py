@@ -29,7 +29,8 @@ SHORT. An earlier version of this docstring said they "are already short
 excerpts", which is false: measured 2026-08-26 over all 60,603 seeds, 92.8%
 of PredEx and 69.9% of TathyaNyaya rows exceed MAX_CHUNK_TOKENS, with p99s of
 10,389 and 11,734 tokens and maxima of 50,369 and 30,098
-(docs/reports/2026-08-26-row-length-under-deepseek-traces.md). Chunking them
+(git 3406377^:docs/reports/2026-08-26-row-length-under-deepseek-traces.md -
+that one report has no prev_rep section). Chunking them
 would look like an obvious win and is a trap.
 
 The real reason is that each of those seeds CARRIES ITS OWN ANSWER.

@@ -3471,7 +3471,7 @@ def test_the_judge_pool_is_the_one_calibration_left_behind(cfg):
     # an empty one - HTTP 200, finish_reason=length, the whole 1,024-token
     # reply budget spent on reasoning - which is a live failure mode of this
     # provider and not a rounding error. See
-    # docs/reports/2026-08-27-deepseek-as-judge-slot-b.md.
+    # prev_rep.md 2.3 (deepseek-as-judge-slot-b).
     # It holds a judge seat rather than a tiebreak-only one because the
     # alternative that day was not a proven judge: gemma answers HTTP 402 and
     # the next ref in the list is paid. That trade is the config's, not this

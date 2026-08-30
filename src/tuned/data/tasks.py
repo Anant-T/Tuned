@@ -70,7 +70,8 @@ PER_SEED_CAP = 4
 # assemble.py already drops a row whose rendered length exceeds
 # max_seq_length - but at the FAR END of the pipeline, after the teacher has
 # been paid for the generation. Measured 2026-08-26 over 1,368 real
-# generations (docs/reports/2026-08-26-row-length-under-deepseek-traces.md):
+# generations (git 3406377^:docs/reports/2026-08-26-row-length-under-
+# deepseek-traces.md - that one report has no prev_rep section):
 # 16 rows were dropped that way, averaging a 7,597-token seed against a
 # 492-token trace, and all 16 came from PredEx and TathyaNyaya - the two
 # sources chunks.py does not chunk. The drop is therefore silent at the point

@@ -1590,7 +1590,7 @@ def test_verbatim_overlap_naming_the_case_and_the_statute_is_not_transcription()
     traces' copied coverage was p50 2.1% of the trace (max 19%), i.e. quotes,
     not the transcription this gate exists to catch. Evidence beside
     DEFAULT_MAX_RUN in gates.py and in
-    docs/reports/2026-08-28-verbatim-overlap-drafting-drift.md.
+    prev_rep.md 2.5 (verbatim-overlap-drafting-drift).
     """
     think = f"Working through it: {SOURCE_RUN_35} and so the link holds."
     result = check_verbatim_overlap(think, _ctx())
