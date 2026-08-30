@@ -776,7 +776,7 @@ def test_the_generation_budget_does_not_move_when_the_band_moves(tmp_path):
     subject here, not the number).
     """
     raw = DATA_CONFIG.read_text(encoding="utf-8")
-    moved = raw.replace("think_min: 500, think_max: 4000", "think_min: 500, think_max: 1500")
+    moved = raw.replace("think_min: 500, think_max: 4500", "think_min: 500, think_max: 1500")
     assert moved != raw, "the length_band line moved; update this fixture"
     path = tmp_path / "band_moved.yaml"
     path.write_text(moved, encoding="utf-8")
@@ -2086,10 +2086,43 @@ def test_the_gate_estimate_is_not_moved_by_the_routing_estimate(tmp_path, cfg):
     with make_store(tmp_path) as store:
         task = only_task(store)
         bundle = build_prompt(cfg, task, store.get_seed(task["seed_id"]))
-        assert bundle.prompt_est_tokens == sum(
-            len(m.get("content") or "") for m in bundle.messages
-        ) // 4
         assert bundle.context_est_tokens > bundle.prompt_est_tokens
+
+
+def test_the_gate_estimate_is_the_row_that_ships_not_the_teacher_prompt(tmp_path, cfg):
+    """length_band.total_max IS the training bucket, so it must be measured
+    over the sequence the trainer will see.
+
+    assemble.py drops an over-length row outright (DROP_TOO_LONG,
+    drop-never-truncate) and max_seq_length is 8192, so total_max is a
+    packing-admissibility test and nothing else. The row it admits is the one
+    decontaminate.py builds - `seed["text"]` as the user turn and nothing more,
+    which that module states in capitals: THE PROMPT IS THE GROUNDING, NOT THE
+    RENDERED TEMPLATE.
+
+    Counting the rendered message set instead charged the persona and the
+    craft instructions - a fixed ~806 est tokens, 695 to 918 across the
+    fourteen generator templates - against a budget those bytes never occupy,
+    and rejected rows that would have fitted.
+    """
+    with make_store(tmp_path) as store:
+        task = only_task(store)
+        seed = store.get_seed(task["seed_id"])
+        bundle = build_prompt(cfg, task, seed)
+
+        assert bundle.prompt_est_tokens == len(seed["text"]) // 4
+
+        # ...and that is strictly less than the rendered prompt, because the
+        # instruction text is real and is excluded. Pinned as an inequality
+        # rather than a number so a template edit cannot silently pass.
+        rendered = sum(len(m.get("content") or "") for m in bundle.messages) // 4
+        assert bundle.prompt_est_tokens < rendered
+
+        # The excluded text is the teacher's alone: it never reaches a row.
+        user_turn = {"role": "user", "content": seed["text"]}
+        assert user_turn["content"] not in "".join(
+            m["content"] for m in bundle.messages if m["role"] == "system"
+        )
 
 
 # --------------------------------------------------------------------------

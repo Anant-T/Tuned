@@ -263,10 +263,13 @@ ANSWER_TOKEN_ALLOWANCE = 1000
 #     reply_over_budget 347 times across the 11 experiment arms (~a third of
 #     calls), each one a wasted `regenerate` on a reply the call had actually
 #     permitted. Even a fully band-legal reply could trip it.
-#   * The worst-case gate-legal reply still fits with room: at think_max 4000
-#     (raised the same day, see the yaml) it is 20,000 chars = ~5,089 real
-#     tokens at the measured deepseek MINIMUM 3.93 chars/token (n=1,086,
-#     tighter than the 4.24 gpt-oss pilot minimum the old test converted at).
+#   * The worst-case gate-legal reply still fits with room: at think_max 4500
+#     (4000 when this was written; re-fitted 2026-08-31 after the length gate
+#     stopped charging the un-shipped instruction text - see the yaml) it is
+#     22,000 chars = ~5,598 real tokens at the measured deepseek MINIMUM 3.93
+#     chars/token (n=1,086, tighter than the 4.24 gpt-oss pilot minimum the
+#     old test converted at). Still ~3x under this constant, which is why the
+#     re-fit did not have to move it.
 #
 # If a gpt-oss generator ever returns, _cerebras_request_hook clamps this to
 # the model's own 4,096 ceiling on the wire, exactly as before - the constant
@@ -1190,7 +1193,17 @@ def build_prompt(cfg, task: Mapping, seed: Mapping, *, reviewer_note: str | None
         slots=slots,
         # chars/4 for the gates (see PromptBundle), and the conservative,
         # script-aware count for the router.
-        prompt_est_tokens=sum(len(m.get("content") or "") for m in messages) // 4,
+        #
+        # The gate estimate counts the SEED TEXT, not the rendered messages,
+        # because length_band.total_max is the 8192 training bucket and the
+        # user turn of a built row is seed["text"] alone (decontaminate.py:
+        # "THE PROMPT IS THE GROUNDING, NOT THE RENDERED TEMPLATE"). The
+        # persona and the craft instructions are the teacher's; they never
+        # reach a row, and charging them spent a fixed ~806 est tokens of the
+        # bucket - 695 to 918 across the fourteen generator templates - on
+        # bytes the trainer never sees. The router's estimate still counts the
+        # whole message set, which is the thing actually sent on the wire.
+        prompt_est_tokens=len(seed.get("text") or "") // 4,
         context_est_tokens=context_estimate(messages),
     )
 
