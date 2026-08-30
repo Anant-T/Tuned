@@ -23,7 +23,13 @@ from pipeline_fakes import (
     temp_config,
 )
 
-from tuned.data.generate import build_prompt, judge_messages, judge_needed_tokens, run_workers
+from tuned.data.generate import (
+    build_prompt,
+    judge_messages,
+    judge_needed_tokens,
+    reviewer_note_from_judgement,
+    run_workers,
+)
 from tuned.data.jsonl import read_at
 from tuned.data.providers import ProviderError
 from tuned.data import judge as judge_mod
@@ -103,6 +109,23 @@ def judged_store(tmp_path, paths, cfg, n=1, generator_script=None):
     )
     assert store.task_counts() == {"judging": n}
     return store
+
+
+def run_generate(store, cfg, router_script, paths, **kwargs):
+    """One generator pass over whatever is `pending`.
+
+    The judge no longer generates - it hands a regeneration back to `pending`
+    and the single generator process picks it up - so any test that used to
+    see a regeneration inside one run_judge call now needs this between two
+    of them. Pinned the same way judged_store pins it.
+    """
+    gen_cfg = cfg_with_gpt_oss_as_sole_generator(cfg)
+    kwargs.setdefault("streams", ["synthesis"])
+    kwargs.setdefault("n_workers", 1)
+    kwargs.setdefault("max_batches", 1)
+    router = FakeRouter(gen_cfg, router_script)
+    asyncio.run(run_workers(store, gen_cfg, router, paths=paths, **kwargs))
+    return router
 
 
 def run_judge(store, cfg, router, paths, **kwargs):
@@ -634,13 +657,25 @@ def test_a_borderline_pair_buys_exactly_one_regeneration(tmp_path, cfg, paths):
             },
         )
         totals = run_judge(store, cfg, router, paths)
-        # One regeneration, then the second borderline reading is terminal.
+        # The judge buys the regeneration but does not make it: the task goes
+        # back to pending and THIS process makes no generator call.
         assert totals["regenerated"] == 1
-        assert len(router.calls_for("generator")) == 1
-        assert only_task(store)["state"] == "rejected"
-        note_call = router.calls_for("generator")[0]
-        assert "a material issue is left unresolved" in note_call["messages"][-1]["content"]
+        assert router.calls_for("generator") == []
+        assert only_task(store)["state"] == "pending"
+        assert only_task(store)["disposition"] == "judge:regenerate"
         assert store.events("judge_regeneration")
+        # The note is re-derivable from what was persisted, which is what
+        # makes handing the task back safe.
+        assert "a material issue is left unresolved" in reviewer_note_from_judgement(
+            store, only_task(store)
+        )
+
+        gen_router = run_generate(store, cfg, {"generator": [chat_response()]}, paths)
+        note_call = gen_router.calls_for("generator")[0]
+        assert "a material issue is left unresolved" in note_call["messages"][-1]["content"]
+        # ...and the second borderline reading is terminal.
+        run_judge(store, cfg, router, paths)
+        assert only_task(store)["state"] == "rejected"
         # Two generations, the second flagged as the rationale-fed one.
         params = [
             json.loads(row[0])
@@ -653,23 +688,26 @@ def test_a_borderline_pair_buys_exactly_one_regeneration(tmp_path, cfg, paths):
 
 def test_a_regeneration_that_satisfies_the_judges_is_accepted(tmp_path, cfg, paths):
     with judged_store(tmp_path, paths, cfg) as store:
-        router = FakeRouter(
-            cfg,
-            {
-                "judge": [
-                    judge_reply(3, 5, 5, "thin"),
-                    judge_reply(3, 5, 5, "thin"),
-                    judge_reply(5, 5, 5),
-                ],
-                "generator": [chat_response()],
-            },
+        # A ROUTER PER ROUND, now that the two rounds are two processes: the
+        # judge pass and the re-judge pass no longer share one script
+        # position, and a cycled leftover reply would silently buy a tiebreak.
+        borderline = FakeRouter(
+            cfg, {"judge": [judge_reply(3, 5, 5, "thin"), judge_reply(3, 5, 5, "thin")]}
         )
-        totals = run_judge(store, cfg, router, paths)
+        totals = run_judge(store, cfg, borderline, paths)
         assert totals["regenerated"] == 1
+        assert only_task(store)["state"] == "pending"
+        run_generate(store, cfg, {"generator": [chat_response()]}, paths)
+        clean = FakeRouter(cfg, {"judge": [judge_reply(5, 5, 5), judge_reply(5, 5, 5)]})
+        run_judge(store, cfg, clean, paths)
         assert only_task(store)["state"] == "accepted"
         # The new generation was judged, not the old one.
         gen = store.latest_generation(only_task(store)["task_id"])
-        assert gen["attempt"] == 2
+        # ATTEMPT 3, NOT 2, and the extra one is the point: the regeneration
+        # now goes through a real claim instead of being made inside the
+        # judge, so it is counted against MAX_ATTEMPTS like every other paid
+        # call. It used to be a fourth generation under a cap of three.
+        assert gen["attempt"] == 3
         assert len(store.judgements_for(gen["gen_id"])) == 2
 
 
@@ -677,14 +715,14 @@ def test_a_regeneration_that_fails_the_gates_takes_the_gate_disposition(tmp_path
     from pipeline_fakes import FABRICATED_ANSWER, CLEAN_THINK
 
     with judged_store(tmp_path, paths, cfg) as store:
-        router = FakeRouter(
-            cfg,
-            {
-                "judge": [judge_reply(3, 3, 3, "thin")],
-                "generator": [chat_response(FABRICATED_ANSWER, CLEAN_THINK)],
-            },
-        )
+        router = FakeRouter(cfg, {"judge": [judge_reply(3, 3, 3, "thin")]})
         run_judge(store, cfg, router, paths)
+        assert only_task(store)["state"] == "pending"
+        # The gate disposition is now the GENERATOR's to apply, on the pass
+        # that makes the regeneration - the judge never sees this answer.
+        run_generate(
+            store, cfg, {"generator": [chat_response(FABRICATED_ANSWER, CLEAN_THINK)]}, paths
+        )
         task = only_task(store)
         assert task["state"] == "rejected"
         assert task["disposition"].startswith("reject:")

@@ -125,12 +125,11 @@ from tuned.data.calibrate import Candidate, decides_pass
 from tuned.data.config import CALIBRATION_RULES, ModelRef
 from tuned.data.generate import (
     JUDGE_PROMPT_ID,
+    PENDING_STATE,
     ROW_SHAPED_SKIPS,
     TIEBREAK_PROMPT_ID,
     SlotError,
-    apply_gate_disposition,
     build_prompt,
-    generate_once,
     judge_messages,
     judge_needed_tokens,
     make_router,
@@ -233,10 +232,6 @@ JUDGE_MAX_TOKENS = DEFAULT_JUDGE_REPLY_TOKENS
 
 # Provisional bands live in judge_policy so the matched evaluator cannot drift.
 SCORE_RANGE = (1, 5)
-
-# Used only when the harshest judge returned no rationale at all - the
-# teacher still has to be told what to fix, and silence is not a note.
-DEFAULT_REVIEWER_NOTE = "the reasoning did not carry the conclusion it announced"
 
 # Streams whose rows are teacher-generated and therefore judgeable. replay
 # (empty-think) rows never enter the task table at all; this is a tripwire.
@@ -1175,7 +1170,6 @@ async def judge_task(
     day: str | None = None,
     stats: JudgeStats | None = None,
     audit_sample: float = DEFAULT_AUDIT_SAMPLE,
-    _regenerating: bool = False,
 ) -> str:
     """Judge one generation and move the task to its outcome state.
 
@@ -1399,7 +1393,7 @@ async def judge_task(
 
     slot_decisions = [_apply_slot(o) for o in outcomes]
     verdicts = [d.verdict for d in slot_decisions]
-    already = _regenerating or has_regenerated(store, task_id)
+    already = has_regenerated(store, task_id)
     action = decide(verdicts, already_regenerated=already)
     tiebreak_unroutable = False
 
@@ -1563,22 +1557,22 @@ async def judge_task(
         "judge_regeneration",
         {"task_id": task_id, "gen_id": int(gen["gen_id"]), "note": note[:500]},
     )
-    result = await generate_once(
-        store, cfg, router, task,
-        paths=paths, reviewer_note=note or DEFAULT_REVIEWER_NOTE, day=day,
-    )
-    stats.prompt_tokens += result.prompt_tokens
-    stats.completion_tokens += result.completion_tokens
-    if not result.ok or result.disposition is not None:
-        # The regeneration failed or was gated out; the gate disposition is
-        # the answer (rejected, or back to pending for another attempt).
-        return apply_gate_disposition(store, task, result, worker_id=worker_id)
-    # Clean regeneration: judge it once more, with the cap now spent.
-    return await judge_task(
-        store, cfg, router, task,
-        paths=paths, worker_id=worker_id, day=day, stats=stats,
-        audit_sample=audit_sample, _regenerating=True,
-    )
+    # THE JUDGE DOES NOT GENERATE. It hands the task back to `pending` and the
+    # one generator process picks it up, which is the same rule
+    # actions_worker enforces for its two children: a second generator is a
+    # second rpm bucket against one ACCOUNT-level limit, and neither bucket
+    # can see the other, so the pair can jointly admit more than the account
+    # allows and a 429 costs a slot too. Low-volume today only because audit
+    # mode sends 5% of rows to a judge; flipping judge_mode back to `dual`
+    # makes this the normal path.
+    #
+    # The note survives in the judgement rows, not in memory:
+    # generate.reviewer_note_from_judgement re-derives it by the same
+    # harshest-slot rule when the generator picks the task up. The once-only
+    # cap is unaffected - has_regenerated reads `reviewer_note_applied` off
+    # the persisted generation params, so a restart cannot spend it twice.
+    _set_state(store, task_id, PENDING_STATE, "judge:regenerate", worker_id=worker_id)
+    return PENDING_STATE
 
 
 # --------------------------------------------------------------------------

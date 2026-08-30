@@ -1418,6 +1418,41 @@ def repair_note_from_prior(store, task: Mapping) -> str | None:
     return format_repair_instruction(failed, task.get("task_type"))
 
 
+# Used only when the harshest judge returned no rationale at all - the
+# teacher still has to be told what to fix, and silence is not a note. It
+# lived in judge.py while the judge made the regeneration call itself.
+DEFAULT_REVIEWER_NOTE = "the reasoning did not carry the conclusion it announced"
+
+
+def reviewer_note_from_judgement(store, task: Mapping) -> str | None:
+    """The harshest judge's rationale for this task's latest generation.
+
+    The judge process used to hand this note straight to a generation call it
+    made itself. It no longer generates - it sets the task back to `pending`
+    and the one generator process picks it up - so the note has to be
+    RE-DERIVABLE from what was persisted rather than passed in memory.
+
+    Harshest, not first, and identical to judge.failing_rationale's rule: the
+    rubric asks every judge to name the decisive reason for its LOWEST score,
+    so the lowest-scoring judge's sentence is the one that says what is
+    actually wrong. Ties keep the first slot, which is judge_slot order.
+    """
+    latest = store.latest_generation(task["task_id"])
+    if latest is None:
+        return None
+    scored = [
+        row
+        for row in store.judgements_for(latest["gen_id"])
+        if all(row.get(axis) is not None for axis in ("grounding", "validity", "coverage"))
+    ]
+    if not scored:
+        return None
+    worst = min(scored, key=lambda r: min(r["grounding"], r["validity"], r["coverage"]))
+    # A judged-and-failed row always gets a note, exactly as it did when the
+    # judge passed `note or DEFAULT_REVIEWER_NOTE` into its own call.
+    return (worst.get("rationale") or "").strip() or DEFAULT_REVIEWER_NOTE
+
+
 def reply_budget_chars(cfg) -> int:
     """The most characters one generation call can physically return.
 
@@ -1520,9 +1555,14 @@ def next_attempt(store, task: Mapping) -> int:
     task.attempts counts CLAIMS and the generation table is
     UNIQUE(task_id, attempt), so the two have to be reconciled: a claim that
     produced no generation (provider down) leaves attempts ahead of the
-    generations, and a judge-driven regeneration produces a generation
-    without a fresh claim. Taking the max of the two keeps the number both
-    unique and monotonic under either skew.
+    generations. Taking the max of the two keeps the number both unique and
+    monotonic under either skew.
+
+    A judge-driven regeneration USED TO produce a generation without a fresh
+    claim, which is how a task could reach a fourth generation under a cap of
+    three. The judge no longer generates - it hands the task back to
+    `pending` - so that regeneration is an ordinary claim now and is counted
+    like one.
     """
     latest = store.latest_generation(task["task_id"])
     latest_attempt = int(latest["attempt"]) if latest else 0
@@ -1649,6 +1689,11 @@ async def generate_once(
     # A judge-driven regeneration already carries an explicit note. A
     # worker retry for a repairable gate failure must not re-send the
     # unchanged request: attach a note derived from the failed gates.
+    if reviewer_note is None:
+        # The judge's own rationale first: it is a reviewer's reading of THIS
+        # answer, and the gate-derived note below is a fallback that only
+        # knows which gates failed.
+        reviewer_note = reviewer_note_from_judgement(store, task)
     if reviewer_note is None:
         reviewer_note = repair_note_from_prior(store, task)
     try:
