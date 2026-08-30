@@ -311,6 +311,10 @@ MANIFEST_FILENAME = "decontamination.json"
 # 5: the exact index MEASURES ITSELF - grams and an estimated footprint, per
 #    eval set and in total - and `--max-index-grams` turns a memory-kill during
 #    construction into a named refusal that says which set crossed the line.
+#    Every drop record also carries `source` beside `form`: `form` prefers a
+#    row's task_type, so a generated row's drop filed under `irac_analysis`
+#    could not be attributed to the stream shape.py sizes by, which made the
+#    retention of the generated streams unmeasurable from this file.
 #    No rule changed; the manifest gained the numbers that decide whether the
 #    index has to be sharded.
 DECON_VERSION = 5
@@ -1646,6 +1650,14 @@ def decontaminate_items(
                 "origin": item.origin,
                 "reason": reason,
                 "form": item.form,
+                # BESIDE `form`, not instead of it. `form` is the question
+                # form (row_form prefers task_type), which is what dedupe's
+                # prompt rule groups by; `source` is what shape.py's retention
+                # table is keyed on, and for a generated row the two differ -
+                # `irac_analysis` vs `synthesis`. One of them has to be here
+                # or the retention of the generated streams cannot be measured
+                # from the artifacts at all.
+                "source": row_prov(item.row).get("source") or "",
                 "hits": [
                     {"level": h.level, "eval_set": h.eval_set, "item_id": h.item_id, **h.detail}
                     for h in found

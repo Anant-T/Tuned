@@ -430,6 +430,10 @@ def _drop(candidate: Candidate, reason: str, twin: str | None, detail: dict) -> 
         "reason": reason,
         "duplicate_of": twin,
         "case_id": candidate.case_id,
+        # Here rather than in `detail` so EVERY reason carries it - the exact
+        # rule passes no form at all. See decontaminate's drop record for why
+        # `form` cannot stand in for it.
+        "source": (candidate.item.row.get("_prov") or {}).get("source") or "",
         **detail,
     }
 

@@ -2184,6 +2184,12 @@ def test_the_cli_writes_the_rows_the_drops_and_the_manifest(tmp_path, capsys):
     # The row written out is the row read in, untouched.
     assert kept[0] == row(prose(106, 200))
     assert drops[0]["reason"] == f"{LEVEL_TEXT}:bbl"
+    # `source` beside `form`, so shape.py's retention can attribute the drop
+    # to the source that shipped it. `form` prefers task_type, which files a
+    # generated row's drop under `irac_analysis` while the row ships as
+    # `synthesis` - and shape.retention_report refuses a drops file without
+    # this field rather than falling back to it.
+    assert drops[0]["source"] == "test"
     assert manifest["counts"] == {"total": 2, "kept": 1, "dropped": 1, "empty_text": 0}
     assert manifest["thresholds"]["containment"] == CONTAINMENT
     assert manifest["thresholds"]["ngram"] == NGRAM

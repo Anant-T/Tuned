@@ -273,7 +273,7 @@ def test_generated_counts_discount_the_rows_the_chain_will_drop(tmp_path):
     and lands every share of the mix wrong at once. That is exactly what the
     first shaped rehearsal did - grounded_synthesis 27.7% against a 30.1%
     target, with all four stream pools individually on target."""
-    from tuned.data.shape import MEASURED_RETENTION, generated_counts
+    from tuned.data.shape import DEFAULT_RETENTION, MEASURED_RETENTION, generated_counts
 
     cfg = load_build_config(temp_config(tmp_path), allow_unpinned=True)
     paths = paths_for(tmp_path)
@@ -287,7 +287,10 @@ def test_generated_counts_discount_the_rows_the_chain_will_drop(tmp_path):
     assert accepted == {SYNTHESIS_BUCKET: 100, CURATED_BUCKET: 100}
     assert raw == {SYNTHESIS_BUCKET: 100, CURATED_BUCKET: 100}
     assert effective[SYNTHESIS_BUCKET] == round(100 * MEASURED_RETENTION["synthesis"])
-    assert effective[CURATED_BUCKET] == round(100 * MEASURED_RETENTION["curated_c2"])
+    # curated_c2 has never put a row through the chain, so it carries no
+    # measured entry and takes the default rather than an invented figure.
+    assert "curated_c2" not in MEASURED_RETENTION
+    assert effective[CURATED_BUCKET] == round(100 * DEFAULT_RETENTION)
     assert effective[SYNTHESIS_BUCKET] < accepted[SYNTHESIS_BUCKET]
 
 
@@ -345,3 +348,121 @@ def test_the_cli_refuses_when_nothing_has_been_generated(tmp_path, capsys):
     assert shape_main(["--config", config, "--profile", "v1.0-MVP"]) == 2
     assert "REFUSED" in capsys.readouterr().out
     assert not (paths.out_dir / MANIFEST_FILENAME).exists()
+
+
+# --------------------------------------------------------------------------
+# --measure: the instrument MEASURED_RETENTION is made of.
+#
+# The table used to be a set of round numbers with a comment promising a
+# --measure that did not exist. PredEx sat at 0.900 against a real 0.846 and
+# WildChat at 0.955 against 0.910, and this table sizes the WHOLE corpus - a
+# wrong entry lands every share of the mix wrong at once.
+# --------------------------------------------------------------------------
+
+def _prov_row(source, i=0):
+    return {"messages": [{"role": "user", "content": f"q{i}"}], "_prov": {"source": source}}
+
+
+def _chain(out_dir, *, kept, drops, shipped):
+    from tuned.data.assemble import EVAL_FILENAME, TRAIN_FILENAME
+    from tuned.data.decontaminate import DROPS_FILENAME, OUT_FILENAME
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(out_dir / OUT_FILENAME, [_prov_row(s, i) for i, s in enumerate(kept)])
+    write_jsonl(out_dir / DROPS_FILENAME, [{"source": s, "reason": "x"} for s in drops])
+    write_jsonl(out_dir / TRAIN_FILENAME, [_prov_row(s, i) for i, s in enumerate(shipped)])
+    write_jsonl(out_dir / EVAL_FILENAME, [])
+
+
+def test_retention_is_shipped_over_what_entered_not_over_what_survived(tmp_path):
+    """kept + dropped IS what entered - the identity decontamination.json
+    states in its own counts - so no stage between decontaminate and assemble
+    has to be enumerated here, and one added later cannot be forgotten."""
+    from tuned.data.shape import retention_report
+
+    _chain(
+        tmp_path / "out",
+        kept=["predex"] * 77 + ["wildchat"] * 60,
+        drops=["predex"] * 23,
+        # 7 of the surviving predex rows and 6 wildchat rows are lost further
+        # down the chain (dedupe, the per-case cap, the over-length drop).
+        shipped=["predex"] * 70 + ["wildchat"] * 54,
+    )
+    report = retention_report(tmp_path / "out")
+    assert report["predex"] == {
+        "entered": 100, "shipped": 70, "retention": 0.7, "reportable": True,
+    }
+    assert report["wildchat"]["retention"] == 0.9
+
+
+def test_a_figure_is_withheld_below_the_floor_and_the_counts_are_not(tmp_path, capsys):
+    """A retention fitted on fifteen rows is not a measurement. It is also not
+    a zero, which is why the counts are still printed beside the withheld
+    ratio - the generated streams sit here today."""
+    from tuned.data.shape import RETENTION_MIN_N, print_retention, retention_report
+
+    _chain(tmp_path / "out", kept=["synthesis"] * 15, drops=[], shipped=["synthesis"] * 12)
+    report = retention_report(tmp_path / "out")
+    assert report["synthesis"]["reportable"] is False
+    assert report["synthesis"]["entered"] == 15
+    # ...and the ratio is still computed, so a caller that knows what it is
+    # doing can read it; it is the PRINTED table that withholds it.
+    assert report["synthesis"]["retention"] == 0.8
+    print_retention(report)
+    out = capsys.readouterr().out
+    assert f"n<{RETENTION_MIN_N}" in out and "0.800" not in out
+    assert "15" in out and "12" in out
+
+
+def test_a_half_run_chain_refuses_rather_than_reporting_its_missing_stages(tmp_path):
+    """Losses and stages-that-have-not-run are the same arithmetic and
+    completely different facts."""
+    from tuned.data.shape import retention_report
+
+    _chain(tmp_path / "out", kept=["a"] * 60, drops=[], shipped=["a"] * 60)
+    (tmp_path / "out" / "law_v1_train.jsonl").unlink()
+    with pytest.raises(ShapeError, match="COMPLETED chain"):
+        retention_report(tmp_path / "out")
+
+
+def test_a_drops_file_without_source_refuses_instead_of_reading_form(tmp_path):
+    """`form` prefers a row's task_type, so a generated row's drop files under
+    `irac_analysis` while the row ships as `synthesis`. Falling back to it
+    would be exact for every file-based source and silently wrong for exactly
+    the streams the retention correction exists for."""
+    from tuned.data.decontaminate import DROPS_FILENAME
+    from tuned.data.shape import retention_report
+
+    _chain(tmp_path / "out", kept=["a"] * 60, drops=[], shipped=["a"] * 60)
+    write_jsonl(tmp_path / "out" / DROPS_FILENAME, [{"form": "irac_analysis", "reason": "x"}])
+    with pytest.raises(ShapeError, match="predates the drop record"):
+        retention_report(tmp_path / "out")
+
+
+def test_measure_shapes_nothing_and_writes_nothing(tmp_path, capsys):
+    config = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    _chain(paths.out_dir, kept=["predex"] * 60, drops=["predex"] * 40, shipped=["predex"] * 55)
+
+    assert shape_main(["--config", config, "--measure"]) == 0
+    assert "0.550" in capsys.readouterr().out
+    assert not (paths.out_dir / MANIFEST_FILENAME).exists()
+    assert not list(paths.out_dir.glob("shaped_*.jsonl"))
+
+
+def test_the_table_holds_no_number_that_was_never_measured():
+    """transition and curated_c2 have never put a row through the chain. A
+    value here would be invented, and DEFAULT_RETENTION is the honest answer
+    until they have - this is the fence against someone filling them in."""
+    from tuned.data.shape import MEASURED_RETENTION
+
+    assert "transition" not in MEASURED_RETENTION
+    assert "curated_c2" not in MEASURED_RETENTION
+    # The reading that made the point: the old table said 0.900.
+    assert MEASURED_RETENTION["L-NLProc/PredEx_Instruction-Tuning_Pred-Exp"] == 0.846
+    assert MEASURED_RETENTION["allenai/WildChat-4.8M"] == 0.910
+    # synthesis is KEPT below the floor on purpose: deleting it falls back to
+    # DEFAULT_RETENTION, which is a higher retention on no evidence at all.
+    from tuned.data.shape import DEFAULT_RETENTION
+
+    assert MEASURED_RETENTION["synthesis"] < DEFAULT_RETENTION

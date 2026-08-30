@@ -39,6 +39,10 @@ Run:  python -m tuned.data.shape --config data/configs/data_law_v1.yaml
       [--profile v1.0-MVP] [--replay-nothink-share 0.15]
       [--empty-target 0.19] [--no-retention-correction]
 
+Re-fit the retention table off the last completed chain (reads out/, writes
+nothing):
+      python -m tuned.data.shape --config ... --measure
+
 Then point decontaminate at the output instead of the pools:
       python -m tuned.data.decontaminate --config ... \
           --in out/shaped_replay.jsonl --in out/shaped_curated_c1.jsonl
@@ -58,32 +62,60 @@ SHAPED_PREFIX = "shaped_"
 DEFAULT_EMPTY_TARGET = 0.19
 
 # Rows requested here do not all survive: decontamination, dedupe and the
-# over-length drop in assemble each take a cut, and the cut is PER SOURCE
-# (PredEx loses 15%, WildChat 9%, OpenThoughts 0.4%). Measured on the
-# 2026-08-29 full-chain run - built stream counts vs assembled counts.
-# Re-measure with `python -m tuned.data.shape --measure` after any change
-# to the decontamination corpora or the dedupe thresholds; a stale table
-# shows up as a mix gate that misses by a point or two, never as silence.
+# over-length drop in assemble each take a cut, and the cut is PER SOURCE.
+#
+# EVERY FIGURE BELOW IS A READING, and each carries the n it was read from.
+# `--measure` computes them off the chain's own artifacts (see
+# retention_report). The values here were read on 2026-08-30 from the
+# 2026-08-29 full-chain run in the build out/ dir - a chain that predates the
+# drop record's `source` field, so its drops were attributed through `form`,
+# which is exact for every file-based source (row_form falls back to `source`
+# for a row with no task identity) and is why the generated streams are absent
+# from the readings. `--measure` refuses that artifact rather than repeating
+# the attribution, and will reproduce these seven numbers off the next
+# completed chain.
+#
+# The previous table was a set of round numbers that did not reproduce -
+# PredEx sat at 0.900 against a measured 0.846, WildChat at 0.955 against
+# 0.910 - while the prose beside it ("PredEx loses 15%") was right.
+# Re-measure after any change to the decontamination corpora or the dedupe
+# thresholds; a stale table shows up as a mix gate that misses by a point or
+# two, never as silence.
 MEASURED_RETENTION = {
-    "open-thoughts/OpenThoughts-114k": 0.995,
-    "HuggingFaceTB/smoltalk2:OpenHermes-2.5": 1.000,
-    "GSMS-B/Indian-Legal-QA-BNS-BNSS-BSA": 0.960,
-    "allenai/WildChat-4.8M": 0.955,
-    "L-NLProc/PredEx_Instruction-Tuning_Pred-Exp": 0.900,
-    "opennyaiorg/aalap_instruction_dataset": 0.930,
-    "169Pi/indian_law": 0.980,
-    # GENERATED rows lose the most, and forgetting them is not a rounding
-    # error: an accepted task is not an assembled row, and sizing the corpus
-    # off the accepted COUNT holds the numerator while the chain shrinks the
-    # denominator. The first shaped rehearsal (2026-08-29) shipped
-    # grounded_synthesis at 27.7% against a 30.1% target for exactly this
-    # reason, with every stream pool landing on its own target. Keyed by
-    # stream name because that is what generated rows carry as _prov.source.
+    "open-thoughts/OpenThoughts-114k": 0.996,          # n=3,120  2026-08-30
+    "L-NLProc/PredEx_Instruction-Tuning_Pred-Exp": 0.846,  # n=800  2026-08-30
+    "HuggingFaceTB/smoltalk2:OpenHermes-2.5": 1.000,   # n=600    2026-08-30
+    "opennyaiorg/aalap_instruction_dataset": 0.958,    # n=600    2026-08-30
+    "GSMS-B/Indian-Legal-QA-BNS-BNSS-BSA": 0.983,      # n=300    2026-08-30
+    "allenai/WildChat-4.8M": 0.910,                    # n=300    2026-08-30
+    "169Pi/indian_law": 0.957,                         # n=300    2026-08-30
+    # GENERATED rows are the ones this correction exists for, and they are the
+    # ones still UNMEASURED: an accepted task is not an assembled row, and
+    # sizing the corpus off the accepted COUNT holds the numerator while the
+    # chain shrinks the denominator - which is how the first shaped rehearsal
+    # shipped grounded_synthesis at 27.7% against a 30.1% target with every
+    # stream pool individually on target. Keyed by stream name because that is
+    # what a generated row carries as _prov.source.
+    #
+    # 0.857 IS A PLACEHOLDER, NOT A READING. The corpus held 15 generated rows
+    # when the table above was measured - far under RETENTION_MIN_N - so
+    # `--measure` reports the count and refuses to print a figure. It is kept
+    # rather than deleted because deleting it falls back to DEFAULT_RETENTION
+    # (0.95), which is a HIGHER retention on no evidence at all and would
+    # under-size the corpus in the one place the correction matters. Re-fit it
+    # from the first run that ships 50+ generated rows.
     "synthesis": 0.857,
-    "transition": 0.857,
-    "curated_c2": 0.806,
+    # `transition` and `curated_c2` are ABSENT deliberately. Neither has ever
+    # put a row through the chain, so any number here would be invented; the
+    # DEFAULT_RETENTION fallback is the honest answer until they have.
 }
 DEFAULT_RETENTION = 0.95
+
+# n below which a per-source figure is not reported. This table sizes the
+# WHOLE corpus, and a retention read off a handful of rows is one drop away
+# from a different number - so `--measure` prints the counts and withholds
+# the ratio rather than offering a figure that reads like a measurement.
+RETENTION_MIN_N = 50
 
 SYNTHESIS_BUCKET = "grounded_synthesis"
 CURATED_BUCKET = "curated"
@@ -359,6 +391,101 @@ def shape_streams(stream_rows: dict, plan_: ShapePlan, assembly) -> dict:
 
 
 # --------------------------------------------------------------------------
+# The measurement the table above is made of.
+# --------------------------------------------------------------------------
+
+def retention_report(out_dir) -> dict:
+    """Measured retention per `_prov.source`: shipped rows / rows that entered.
+
+    READ OFF THE CHAIN'S OWN ARTIFACTS, never off the stream files. The chain
+    may have been fed shaped files or a hand-picked subset, and generated rows
+    come from the store rather than from any file in streams/ - so the stream
+    pools are not what entered. `decontaminated.jsonl` plus
+    `decontamination_drops.jsonl` IS what entered (kept + dropped == total, an
+    identity decontamination.json states in its own counts), and
+    law_v1_train + law_v1_eval is what shipped. Everything in between - dedupe,
+    the per-case cap, split, the over-length drop in assemble - falls out of
+    the difference, so a stage added later cannot be forgotten here.
+
+    Returns {source: {"entered", "shipped", "retention", "reportable"}}.
+    `reportable` is n >= RETENTION_MIN_N; the caller prints the counts for the
+    rest WITHOUT a ratio, because a retention fitted on fifteen rows is not a
+    measurement and this table sizes the whole corpus.
+    """
+    from tuned.data.assemble import EVAL_FILENAME, TRAIN_FILENAME
+    from tuned.data.decontaminate import DROPS_FILENAME, OUT_FILENAME
+    from tuned.data.jsonl import read_jsonl
+
+    out_dir = Path(out_dir)
+    entered: dict[str, int] = {}
+    shipped: dict[str, int] = {}
+
+    def tally(into, path, source_of):
+        if not path.is_file():
+            raise ShapeError(
+                f"{path} is missing - retention is measured off a COMPLETED chain "
+                f"(decontaminate through assemble), and a partial one would report "
+                f"losses that are really stages that have not run yet"
+            )
+        for row in read_jsonl(path):
+            key = source_of(row)
+            into[key] = into.get(key, 0) + 1
+
+    tally(entered, out_dir / OUT_FILENAME, row_source)
+    # The drop record carries `source` beside `form` for exactly this: `form`
+    # prefers a row's task_type, so a generated row's drop files under
+    # `irac_analysis` while the row itself ships as `synthesis`.
+    #
+    # A drops file written before that field existed is REFUSED rather than
+    # read through `form`. The fallback would be exact for every file-based
+    # source and silently wrong for the generated streams - which are the ones
+    # this correction exists for, and the ones whose figure nobody would think
+    # to doubt. Reporting 1.000 for a source that lost 15% of its rows is how
+    # the previous table survived as long as it did.
+    def drop_source(record):
+        if "source" not in record:
+            raise ShapeError(
+                f"{out_dir / DROPS_FILENAME} predates the drop record's `source` "
+                f"field, so a drop cannot be attributed to the source that "
+                f"shipped it. Reading it through `form` instead would be exact "
+                f"for the file-based sources and silently wrong for the "
+                f"generated streams. Re-run the chain from decontaminate."
+            )
+        return record.get("source") or ""
+
+    tally(entered, out_dir / DROPS_FILENAME, drop_source)
+    tally(shipped, out_dir / TRAIN_FILENAME, row_source)
+    tally(shipped, out_dir / EVAL_FILENAME, row_source)
+
+    report = {}
+    for source in sorted(set(entered) | set(shipped)):
+        n = entered.get(source, 0)
+        kept = shipped.get(source, 0)
+        report[source] = {
+            "entered": n,
+            "shipped": kept,
+            "retention": round(kept / n, 3) if n else None,
+            "reportable": n >= RETENTION_MIN_N,
+        }
+    return report
+
+
+def print_retention(report: dict) -> None:
+    print(f"{'source':<52}{'entered':>9}{'shipped':>9}{'retention':>11}")
+    for source, row in sorted(report.items()):
+        figure = (
+            f"{row['retention']:.3f}" if row["reportable"]
+            else f"n<{RETENTION_MIN_N}"
+        )
+        print(f"{source or '<no source>':<52}{row['entered']:>9}"
+              f"{row['shipped']:>9}{figure:>11}")
+    print(
+        "  a withheld figure is not a zero: the source shipped too few rows for "
+        "a ratio to mean anything. MEASURED_RETENTION sizes the whole corpus."
+    )
+
+
+# --------------------------------------------------------------------------
 # CLI.
 # --------------------------------------------------------------------------
 
@@ -420,12 +547,26 @@ def main(argv=None) -> int:
     p.add_argument("--no-retention-correction", action="store_true",
                    help="request exactly the target counts, ignoring the measured "
                         "per-source losses in decontaminate/dedupe/assemble")
+    p.add_argument("--measure", action="store_true",
+                   help="print measured per-source retention off the last completed "
+                        "chain in out/ and exit; shapes nothing and writes nothing")
     args = p.parse_args(argv)
 
     cfg = load_build_config(args.config)
     paths = build_paths(cfg.build.workdir).ensure()
     out_dir = Path(args.out_dir) if args.out_dir else paths.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.measure:
+        # Early, and before anything is read or written: this is the
+        # instrument the MEASURED_RETENTION table is made of, and it must be
+        # runnable against a build whose streams have moved on since.
+        try:
+            print_retention(retention_report(out_dir))
+        except ShapeError as exc:
+            print(f"REFUSED: {exc}")
+            return 2
+        return 0
 
     targets = cfg.assembly.targets(args.profile)
     inputs = ([Path(x) for x in args.inputs] if args.inputs

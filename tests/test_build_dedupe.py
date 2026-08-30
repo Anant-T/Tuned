@@ -154,6 +154,9 @@ def test_an_exact_duplicate_drops_the_later_row_and_names_the_survivor():
     assert stats["by_reason"] == {REASON_EXACT: 1}
     assert drops[0]["origin"] == "fixture#2"
     assert drops[0]["duplicate_of"] == kept[0].key
+    # In the record itself, not in `detail`: the exact rule passes no form at
+    # all, and shape.py's retention has to attribute EVERY drop to a source.
+    assert "source" in drops[0]
 
 
 def test_the_prompt_threshold_decides_in_both_directions():
