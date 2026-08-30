@@ -12,8 +12,9 @@ Phases:
   seed-push  upload the local data/build state to the bundle repo (the
              one-time handoff, run on the operator's machine)
   worker     restore bundle -> reconcile -> run generate + judge until the
-             deadline, pushing the bundle every --push-every seconds ->
-             final push
+             deadline, pushing raw+streams every --push-every seconds and
+             the database every --db-every -> final push, always with the
+             database
   assemble   restore bundle -> reconcile -> wait for leases to expire ->
              verify -> decontaminate -> dedupe -> split -> assemble ->
              stats -> push.py only if stats is green; the out/ tree is
@@ -158,16 +159,31 @@ INDEX_RELPATH = Path("corpus") / "citation_index.txt"
 RESTORE_SUBS = ("state", "raw", "streams", "corpus")
 
 
-def stage_bundle(root: Path, staging: Path) -> Path:
+def stage_bundle(root: Path, staging: Path, *, db: bool = True) -> Path:
     """Copy everything the baton carries into a clean staging tree.
 
     The citation index rides along when it exists - ONE file, never the
     corpus dir (1.9 GB of source text the remote worker has no use for).
+
+    `db=False` stages everything EXCEPT the database snapshot. The DB is by
+    far the largest thing here and it is rewritten whole every time - a
+    VACUUMed ~565 MB file, uploaded as a new blob on each checkpoint, is
+    almost all of this repo's growth. Bundle.push passes no delete_patterns,
+    so a staging tree without one simply leaves the last DB pushed in place
+    on the remote, and the raw/stream appends still land at full cadence.
+
+    SKIPPING IT ENTIRELY IS NOT AN OPTION, and was refuted three times in the
+    audit before it stuck: reconcile_raw rebuilds generation and judgement
+    rows from the raw log, but it restores NEITHER task state NOR gate_result.
+    Without a DB, every row whose answer was already bought sits at `pending`
+    and the next claim pays for it again. So the DB goes at its own, slower
+    cadence, and the end-of-job push always sends one.
     """
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
-    snapshot_db(root / DB_RELPATH, staging / DB_RELPATH)
+    if db:
+        snapshot_db(root / DB_RELPATH, staging / DB_RELPATH)
     for sub in ("raw", "streams", "logs"):
         src = root / sub
         if src.is_dir():
@@ -352,6 +368,7 @@ def _push(
     *,
     attempts: int = 1,
     sleep=None,
+    db: bool = True,
 ) -> bool:
     """Push the baton, optionally retrying. Returns whether it landed.
 
@@ -367,12 +384,15 @@ def _push(
     stage_bundle runs ONCE, outside the retry loop: it VACUUMs a ~565 MB
     database and copies the raw tree, so re-staging per attempt would triple
     that work to re-send bytes that have not changed.
+
+    `db=False` sends everything but the database - see stage_bundle. It is
+    the caller's cadence decision, not a property of a push.
     """
     # Resolved at CALL time, not bound as a default: a default would capture
     # time.sleep at import and make the backoff unpatchable, which is a real
     # 2-minute stall in any test that exercises the retry path.
     sleep = sleep or time.sleep
-    staged = stage_bundle(root, staging)
+    staged = stage_bundle(root, staging, db=db)
     for attempt in range(1, attempts + 1):
         try:
             bundle.push(staged, message)
@@ -592,6 +612,7 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
     staging = root.parent / "bundle_out"
     deadline = time.monotonic() + args.minutes * 60
     next_push = time.monotonic() + args.push_every
+    next_db_push = time.monotonic() + args.db_every
     procs, pumps = [], []
     for name, argv in zip(("gen", "judge"), child_argvs(
         args.config, n_workers=args.n_workers, audit_sample=args.audit_sample
@@ -625,8 +646,25 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
                 break
             time.sleep(15)
             if time.monotonic() >= next_push:
-                if _push(bundle, root, staging, "periodic checkpoint"):
+                # TWO CADENCES, ONE LOOP. raw/ and streams/ are appends and
+                # cheap; the DB is a ~565 MB VACUUMed file rewritten whole,
+                # uploaded as a brand-new blob every time, and it is almost
+                # all of this repo's growth (~56 GB/day at 15-minute pushes,
+                # against ~29 with the database hourly).
+                #
+                # What a DB-less checkpoint costs is bounded and known: on a
+                # crash, reconcile_raw replays the generation and judgement
+                # rows from the raw log, but not task state and not
+                # gate_result, so up to --db-every of ALREADY-PAID answers
+                # return to `pending` and get bought again. An hour of that
+                # is the trade the storage buys, and the end-of-job push
+                # always sends a database.
+                with_db = time.monotonic() >= next_db_push
+                label = "periodic checkpoint" + ("" if with_db else " (raw+streams)")
+                if _push(bundle, root, staging, label, db=with_db):
                     push_failures = 0
+                    if with_db:
+                        next_db_push = time.monotonic() + args.db_every
                 else:
                     push_failures += 1
                     if push_failures >= 3:
@@ -816,6 +854,14 @@ def main_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hf-repo", required=True, help="private HF dataset repo for the bundle")
     parser.add_argument("--minutes", type=float, default=315)
     parser.add_argument("--push-every", type=float, default=900)
+    # The DB rides a slower lane than the appends beside it. It is a ~565 MB
+    # VACUUMed file rewritten whole and stored as a new blob per push, so at
+    # the raw cadence it is essentially all of the baton repo's growth
+    # (~56 GB/day, against ~29 hourly). The number IS the crash-loss bound:
+    # reconcile_raw replays generations and judgements from the raw log but
+    # neither task state nor gate_result, so a crash returns up to this much
+    # already-paid work to `pending` to be bought again.
+    parser.add_argument("--db-every", type=float, default=3600)
     # 12 per stream x 3 streams = 36 calls in one gather. Admission runs at
     # the generator bucket's rate (~7.5 s/call at rpm 8), so the last call is
     # admitted at ~270 s and runs at most ~120 s: ~390 s against a 900 s

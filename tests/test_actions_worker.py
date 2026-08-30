@@ -561,7 +561,7 @@ def _run_worker(tmp_path, monkeypatch, procs, bundle=None, **over):
     for key, value in over.items():
         setattr(args, key, value)
     monkeypatch.setattr(actions_worker.subprocess, "run", lambda *a, **k: None)
-    monkeypatch.setattr(actions_worker, "stage_bundle", lambda r, s: s)
+    monkeypatch.setattr(actions_worker, "stage_bundle", lambda r, s, db=True: s)
     monkeypatch.setattr(actions_worker, "_pump", lambda p, n, path: _FakePump())
     monkeypatch.setattr(actions_worker.time, "sleep", lambda s: None)
     it = iter(procs)
@@ -777,7 +777,7 @@ def test_a_stolen_baton_fails_the_job_instead_of_being_retried(tmp_path, capsys,
     fail identically or - worse - succeed against a moved parent and rewind
     the other holder's work, so it must not be swallowed by the best-effort
     push path."""
-    monkeypatch.setattr(actions_worker, "stage_bundle", lambda r, s: s)
+    monkeypatch.setattr(actions_worker, "stage_bundle", lambda r, s, db=True: s)
     bundle = _bundle_with(_RecordingApi(conflict=True))
     bundle.head = "stale"
     with pytest.raises(Exception, match="412"):
@@ -801,7 +801,7 @@ def test_a_transient_failure_is_still_retried(tmp_path, monkeypatch):
                 raise RuntimeError("HF 503")
             return super().upload_folder(**kw)
 
-    monkeypatch.setattr(actions_worker, "stage_bundle", lambda r, s: s)
+    monkeypatch.setattr(actions_worker, "stage_bundle", lambda r, s, db=True: s)
     bundle = _bundle_with(_Flaky())
     assert actions_worker._push(
         bundle, tmp_path, tmp_path, "checkpoint", attempts=3, sleep=lambda s: None
@@ -816,7 +816,7 @@ def test_seed_push_refuses_to_clobber_a_remote_that_owns_the_baton(tmp_path, cap
 
     monkeypatch.setattr(actions_worker, "Bundle", lambda repo: _bundle_with(api))
     monkeypatch.setattr(
-        actions_worker, "stage_bundle", lambda r, s: s
+        actions_worker, "stage_bundle", lambda r, s, db=True: s
     )
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text("x: 1", encoding="utf-8")
@@ -1023,3 +1023,64 @@ def test_the_out_upload_deletes_only_because_it_is_scoped_to_out():
     # the failure this test exists for
     whole = Path(actions_worker.__file__).read_text(encoding="utf-8")
     assert whole.count("delete_patterns=") == 1
+
+
+def test_a_db_less_stage_keeps_everything_else(tmp_path):
+    """The DB is a ~565 MB VACUUMed file rewritten whole and stored as a new
+    blob per push - essentially all of this repo's growth. The appends beside
+    it are cheap and must keep their own cadence."""
+    root = tmp_path / "build"
+    _tiny_db(root / actions_worker.DB_RELPATH, "baton").close()
+    (root / "streams").mkdir()
+    (root / "streams" / "replay.jsonl").write_text('{"row":1}\n', encoding="utf-8")
+    (root / "raw" / "gen").mkdir(parents=True)
+    (root / "raw" / "gen" / "gen.ndjson").write_text('{"kind":"generation"}\n', encoding="utf-8")
+
+    light = actions_worker.stage_bundle(root, tmp_path / "s1", db=False)
+    assert not (light / actions_worker.DB_RELPATH).exists()
+    assert (light / "streams" / "replay.jsonl").is_file()
+    assert (light / "raw" / "gen" / "gen.ndjson").is_file()
+
+    full = actions_worker.stage_bundle(root, tmp_path / "s2")
+    assert (full / actions_worker.DB_RELPATH).is_file()
+
+
+def test_a_db_less_push_does_not_remove_the_database_from_the_remote():
+    """The cheap variant only works because Bundle.push is a plain
+    upload_folder with no delete_patterns: a staging tree without a DB leaves
+    the last one pushed in place. If a delete ever appears on THAT call, a
+    raw-only checkpoint would wipe the store off the baton."""
+    import inspect
+
+    src = inspect.getsource(actions_worker.Bundle.push)
+    assert "delete_patterns" not in src, (
+        "Bundle.push must not delete: a db=False checkpoint would erase the store"
+    )
+
+
+def test_the_database_rides_a_slower_lane_and_the_final_push_always_carries_it():
+    import inspect
+
+    parsed = actions_worker.main_parser().parse_args(["--phase", "worker", "--hf-repo", "u/r"])
+    assert parsed.push_every == 900
+    assert parsed.db_every == 3600
+    assert parsed.db_every > parsed.push_every, "a DB cadence at or under the append cadence buys nothing"
+
+    src = inspect.getsource(actions_worker.run_worker)
+    # the periodic push decides; the end-of-job push never does
+    assert "db=with_db" in src
+    final = src[src.index('"end-of-job checkpoint"') - 200:]
+    assert "db=False" not in final.split("_finish")[0]
+
+
+def test_the_db_clock_only_advances_on_a_push_that_landed():
+    """Otherwise a failed hourly checkpoint would push the next attempt an
+    hour further out, and the crash-loss bound --db-every names would quietly
+    stop being true."""
+    import inspect
+
+    src = inspect.getsource(actions_worker.run_worker)
+    advance = src.index("next_db_push = time.monotonic() + args.db_every", src.index("with_db ="))
+    failure = src.index("push_failures += 1")
+    assert advance < failure, "the advance must sit in the success branch"
+    assert "if with_db:" in src[advance - 120:advance]
