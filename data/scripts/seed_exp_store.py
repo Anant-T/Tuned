@@ -5,8 +5,14 @@ The exp_* arms before this one were seeded by hand. This copies the
 a live store into the arm's own store, so an arm can be stood up in one
 command and the live database is never opened for write.
 
-    python scripts/seed_exp_store.py --config configs/data_law_v1_exp_deepseek.yaml \
+    python data/scripts/seed_exp_store.py \
+        --config data/configs/data_law_v1_exp_<arm>.yaml \
         --from data/build/state/law_v1.sqlite3 --per-source 200 --seed 3407
+
+An arm's config sets `build.workdir` to `data/build/exp_<arm>` and adds that
+directory name to `paths.ISOLATED_WORKDIR_SIBLINGS`; without the second step
+`is_live_control_workdir` treats the arm as the live control, which is the
+deny-by-default answer and the safe one.
 
 THE SAMPLE HAS NO LENGTH FILTER, on purpose. tasks._candidate_seeds refuses
 a seed longer than seed_token_budget(cfg); the only way to prove that live

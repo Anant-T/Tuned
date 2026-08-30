@@ -23,8 +23,7 @@ importable package both run on.
 | `data/scripts/` | Store seeding and calibration-set export. |
 | `data/build/` | Gitignored working area: corpus, the live SQLite store, pulled artifacts, archive. |
 | `tests/` | The full suite (data + train), runs locally on CPU. |
-| `prev_rep.md` | The archive: full lane history, retired configs, closed questions, campaign records. Check it before re-litigating anything. |
-| `docs/superpowers/` | Implementation plans. |
+| `prev_rep.md` | The archive: full lane history, retired configs, closed questions, campaign records. Check it before re-litigating anything. Retired plans are summarised in §3.6. |
 
 ## Local setup (Windows, no GPU)
 

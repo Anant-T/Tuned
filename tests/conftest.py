@@ -35,8 +35,9 @@ entry points are patched, and all four are load-bearing - `create_connection`
 and `getaddrinfo` are what the HTTP stack in `requests`/`urllib3` reaches for,
 and `socket.connect`/`connect_ex` are what a raw socket uses, so patching only
 some of them leaves a live path out. A test that genuinely wants the network
-marks itself `@pytest.mark.live` (nothing does today; the marker exists so that
-adding one is a visible decision).
+marks itself `@pytest.mark.live`, which is registered in pyproject. Two do:
+test_build_push.py and test_build_roles_infer.py, both of which skip unless
+an opt-in env var is set, so a default run still touches no network.
 
 WHERE THE GUARD STOPS, stated rather than implied: it patches THIS
 interpreter. A test that spawns a subprocess (`_cli_bytes` does, to compare
@@ -73,12 +74,6 @@ _REFUSED_SOCKET_HOOKS = (
 
 class OutboundNetworkAttempt(RuntimeError):
     """A test in a network-free module tried to open a connection."""
-
-
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers", "live: this test is allowed to use the network (nothing is, today)"
-    )
 
 
 @pytest.fixture(autouse=True)

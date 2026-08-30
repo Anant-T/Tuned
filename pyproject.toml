@@ -16,6 +16,13 @@ path = "src/tuned/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/tuned"]
 
+# The one marker the suite defines. Registered here rather than in a
+# conftest hook so `--strict-markers` remains available without a code
+# change, and so the network guard's escape hatch is declared where the
+# rest of the project's configuration lives.
+[tool.pytest.ini_options]
+markers = ["live: this test is allowed to use the network"]
+
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 # Dataset-curation deps. Deliberately UNPINNED and never installed on Kaggle:

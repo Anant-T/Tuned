@@ -480,7 +480,7 @@ The base `prompts/gen_drafting_v1.md:21` and `_v2.md:21` instead mandate "the se
 
 ### 3.6 Retired plans (`docs/superpowers/plans/`)
 
-One line each; `2026-08-28-single-project-restructure.md` survives.
+One line each; all retired.
 
 - `2026-08-04-l4-smoke-run.md` — walking skeleton: repo → Lightning Studio → unsloth QLoRA on Gemma 4 31B → Hub checkpoint → resume, ~1k-example smoke on an L4 (~$1.50). Never executed on GPU.
 - `2026-08-05-kaggle-smoke-migration.md` — move to Kaggle free tier with Ministral-3-14B and a Qwen3-14B escape-hatch config; model-specific strings moved from code into config so the fallback is a pure config swap.
@@ -491,6 +491,7 @@ One line each; `2026-08-28-single-project-restructure.md` survives.
 - `2026-08-27-generator-prompt-length-fix.md` — delete the run-long permission from all 14 generator prompts, prove it on a paired A/B against banked control data, re-baseline the 42 stale tests blocking the merge.
 - `2026-08-27-live-config-safety-and-gptoss-floor.md` — close the uncapped paid-judge path, restore gpt-oss as lead generator, raise `think_max` to the point of diminishing returns, then measure whether the committed ceiling harms the now-lead generator.
 - `2026-08-27-role-aware-bai-hook.md` — thread the call's role through the request-hook protocol so a judge does not inherit the generator's reply-budget raise, then wire deepseek into judge slot B and prove it with real calls.
+- `2026-08-28-single-project-restructure.md` — collapsed the worktree split into one project (`training/` + `data/` + shared `src/tuned`), validated the recalibrated deepseek fleet on a small live batch, purged the paid refs / harmony machinery / the 19 `exp_*` configs, and wrote this archive. Executed 2026-08-28; retired 2026-08-30, because a directory holding exactly one plan with 27 unchecked boxes reads as work to do.
 
 ---
 
