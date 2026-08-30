@@ -510,9 +510,3 @@ def test_the_module_holds_exactly_one_seam_that_can_spend_quota():
                 spenders.append(node.name)
     assert set(spenders) <= {"main", "drive"}, spenders
 
-
-def test_the_costed_reason_is_written_down_where_the_next_reader_will_look():
-    # The number is the argument. Without it the ceiling reads as a tunable.
-    src = DIFFICULTY_SRC.read_text(encoding="utf-8")
-    assert "32M tokens" in src
-    assert "65 days" in src

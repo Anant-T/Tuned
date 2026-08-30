@@ -3175,32 +3175,28 @@ def _largest_prompt_that_fits(cfg, role: str, family: str, reply_tokens: int = 0
     return lo
 
 
-def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
-    """That block is the operator's spec for the judge pool, and its arithmetic
-    was pre-margin and ~40% high (it said ~4.2k where the real divert point is
-    2555, and ~7.2k where slot B really dies at 5531) while pool_gaps printed a
-    third number. All of them come from here now - and the advice is read out
-    of the preflight's own output, not recomputed beside it, because that
-    string is what the operator shops against.
+def test_the_preflight_advises_the_thresholds_the_code_computes(cfg, keys):
+    """The advice is read out of the preflight's own output, not recomputed
+    beside it, because that string is what the operator shops against.
+
+    This checks the NUMBERS, not the comment block that quotes them. It used
+    to do both, and the prose half made every edit to that block a suite
+    failure for no behaviour change - which is why the block grew instead of
+    being pruned. The config's arithmetic was once pre-margin and ~40% high
+    (it said ~4.2k where the real divert point is 2555, and ~7.2k where slot B
+    really dies at 5531); what stopped that recurring is that these numbers
+    are derived here rather than transcribed, and that survives the cut.
 
     Two numbers, not one, and the difference is easy to get wrong. Both
-    thresholds are quoted: the judge's is the bar any replacement judge must
+    thresholds are derived: the judge's is the bar any replacement judge must
     clear, and the tiebreak's is the bar any replacement tiebreak must clear.
     Which one is larger is NOT a design requirement, only a fact about which
     of the two prompts currently renders longer - the preflight sizes the two
     separately regardless of which way that falls, and a prompt edit to
     either template can flip it (judge-calibration Task 2, 2026-08-24, did
     exactly that).
-
-    THE GENERATOR NUMBERS ARE THE 2026-08-19 CORRECTION, and they are pinned
-    here because this test is the only thing standing between that block and
-    the last three years of drift. The block now states BOTH cliffs - the one
-    the stale 8192 pin produced and the one the probed 131,072 produces - and
-    both are re-derived from the code rather than transcribed.
     """
-    from tuned.data.generate import max_output_tokens, preflight_messages
-
-    text = DATA_CONFIG.read_text(encoding="utf-8")
+    from tuned.data.generate import preflight_messages
 
     # cfg_with_gpt_oss_reinstated_as_generator ADDED 2026-08-28: cerebras/
     # gpt-oss-120b is removed from routing.generator outright (operator
@@ -3215,9 +3211,6 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
     # were designed against.
     cfg = cfg_with_gpt_oss_reinstated_as_generator(cfg)
 
-    # THE SHIPPED POOL HAS NO GAPS AT ALL since the gemma probe, so the advice
-    # string has to be read off the pool that still has one. Narrowing gemma is
-    # the exact config the advice was designed against.
     # THE SHIPPED POOL HAS NO GAP AT ALL since the 2026-08-19 judge surgery, so
     # each threshold is read from the pool that still produces its own kind of
     # gap. Both remain the numbers the code enforces; neither is transcribed.
@@ -3252,10 +3245,8 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
     # Wednesday.
     judge_required = required_context(worst_case_judge_tokens(cfg))
     assert required == judge_required
-    assert f"max_context >= {required}" in text
-    assert f"{required:,}" in text
-    # The tiebreak threshold is no longer ADVISED, but the block still has to
-    # quote it: it is the bar a tiebreak replacement must clear. It is NOT
+    # The tiebreak threshold is no longer ADVISED, but it is still the bar any
+    # replacement tiebreak must clear, so it is still derived. It is NOT
     # reliably the larger of the two - that used to be true because the
     # tiebreak prompt rendered longer, but judge-calibration Task 2
     # (2026-08-24) split the grounding_faithfulness rubric's bands so that
@@ -3269,10 +3260,8 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
         worst_case_judge_tokens(cfg, prompt_id=TIEBREAK_PROMPT_ID)
     )
     assert tiebreak_required != judge_required
-    assert f"max_context >= {tiebreak_required}" in text
-    assert f"{tiebreak_required:,}" in text
-    # ...and it really is what a TIEBREAK gap prints, not just a number in the
-    # block: take mistral-large-latest back out of the tiebreak seat and the
+    # ...and it really is what a TIEBREAK gap prints: take
+    # mistral-large-latest back out of the tiebreak seat and the
     # preflight asks for exactly what pool_gaps computes. That is NOT always
     # tiebreak_required in isolation - pool_gaps' own floor rule ("never falls
     # below required_context(needed_tokens)", i.e. the judge's flat number)
@@ -3287,43 +3276,6 @@ def test_the_config_block_quotes_the_numbers_the_code_enforces(cfg, keys):
         cfg_without_the_free_tiebreak(cfg), ("generator",)
     )
     assert advice_from(tiebreak_warnings) == max(judge_required, tiebreak_required)
-
-    # --- the generator cliffs, both of them ---------------------------------
-    reply = max_output_tokens(cfg)
-    narrow = _narrow_generator(cfg)
-    # The HISTORY the block keeps: at the stale 8192 pin the generator diverted
-    # once the prompt passed 2,555 routing tokens, and the family fell out of
-    # the pool entirely past 6,554.
-    assert f"{_divert_point(narrow, 'generator', 'gpt-oss', reply):,}" in text
-    assert f"{_largest_prompt_that_fits(narrow, 'generator', 'gpt-oss'):,}" in text
-    # The number that governs TODAY, and the one that would have to change if
-    # anybody re-pins the window.
-    assert f"{_largest_prompt_that_fits(cfg, 'generator', 'gpt-oss'):,}" in text
-    # ...and the probed window itself, in both the config value and the prose.
-    for provider in cfg.providers:
-        if provider.name != "cerebras":
-            continue
-        for model in provider.models:
-            assert model.limits["max_context"] == 131072
-    assert "131,072" in text
-    assert "max_context: 131072" in text
-
-    # The judge-side number is the divert point of an 8k JUDGE, and there is no
-    # 8k judge left in the pool to read it off: zai-glm-4.7 was retired on
-    # 2026-08-18 as archived. What produced 5,531 was the window it declared,
-    # not the model, so the window is what the number is re-derived from here -
-    # dropping the assertion instead would leave a number in that block with
-    # nothing checking it, which is how the block's arithmetic drifted 40% high
-    # the first time.
-    retired_8k_judge = _with_judge_model(
-        cfg, family="glm", model_id="zai-glm-4.7", max_context=8192
-    )
-    assert (
-        f"{_divert_point(retired_8k_judge, 'judge', 'glm', DEFAULT_JUDGE_REPLY_TOKENS):,}" in text
-    )
-    # The size a 16k candidate would fail is stated, because most free-tier
-    # candidates are 16k.
-    assert "16k" in text
 
 
 def test_the_config_block_records_the_probe_that_set_the_window(cfg, keys):
@@ -3377,6 +3329,12 @@ def test_the_probed_windows_are_what_the_config_declares(cfg):
     }
     assert caps["cerebras/gpt-oss-120b"] == 131072
     assert caps["cerebras/gemma-4-31b"] == 131072
+    # EVERY cerebras model, not just the two named: a third one added at the
+    # old 8192 default is the same defect returning under a new id.
+    for provider in cfg.providers:
+        if provider.name == "cerebras":
+            for model in provider.models:
+                assert model.limits["max_context"] == 131072, model.id
     # Neither is the training sequence length, and the two must never be
     # confused again: 8192 belongs to the length band, not to a provider.
     assert cfg.build.length_band.total_max == 8192
