@@ -159,8 +159,10 @@ train:
   # max_grad_norm. The test asserts a BAND, not this number, so that setting
   # it is an edit here and not an edit here plus an edit there.
   # max_steps: 0 is a SENTINEL - sft.py refuses to train main on it. Derive
-  # it FROM THE BUILD, not from a GPU session: read counts.train.kept out of
-  # the assemble.json push.py ships beside the corpus, set
+  # it FROM THE BUILD, not from a GPU session: read chain.counts.train.kept
+  # out of the build_manifest.json push.py ships beside the corpus (NOT
+  # assemble.json - that one stays in the builder's out/ dir; the manifest
+  # embeds it under `chain`), set
   # max_steps = kept // (bs * ga * 2), commit. That count is the rows the
   # trainer will load, because assemble.py measures every row against THIS
   # max_seq_length - through config.py, with the pinned tokenizer sft.py

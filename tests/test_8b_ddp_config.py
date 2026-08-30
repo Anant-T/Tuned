@@ -89,6 +89,32 @@ def test_main_run_shape():
     assert run.max_steps == 0
 
 
+def _pushed_filenames() -> set[str]:
+    """The filenames push.py actually uploads, read off the call itself.
+
+    Derived rather than grepped: the upload maps {filename: path}, and the
+    keys are module constants, so the AST gives the names and the module
+    gives their values. A file added to or removed from that dict changes
+    this set without anyone updating a literal here.
+    """
+    import ast
+
+    from tuned.data import push as push_mod
+
+    tree = ast.parse(Path(push_mod.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "upload":
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Dict):
+                names = [k.id for k in arg.keys if isinstance(k, ast.Name)]
+                if names:
+                    return {getattr(push_mod, n) for n in names}
+    raise AssertionError("could not find push.py's upload({...}) call")
+
+
 def test_the_max_steps_derivation_names_a_key_the_builder_actually_writes():
     """The derivation moved off a GPU probe session and onto the build's own
     manifest, so the three places that restate it now name a JSON key. A key
@@ -96,32 +122,39 @@ def test_the_max_steps_derivation_names_a_key_the_builder_actually_writes():
     one procedure that cannot be re-run cheaply - check_resume_schedule
     freezes max_steps for the whole run.
 
-    assemble.py is asked directly rather than trusted: `counts` is keyed by
-    side and each side's stats carry `kept`.
+    And it must name a file the operator can actually OPEN. The three
+    restatements said "assemble.json", which push.py does not upload - it
+    stays in the builder's out/ dir. The number is one level deeper, in the
+    build_manifest.json that push.py does ship, under its `chain` key. The
+    old test could not catch that because it checked assemble.py's own
+    filename constant instead of push.py's upload set.
     """
-    import inspect
+    from tuned.data.assemble import MANIFEST_FILENAME as ASSEMBLE_MANIFEST
+    from tuned.data.push import MANIFEST_FILENAME as SHIPPED_MANIFEST
 
-    from tuned.data.assemble import MANIFEST_FILENAME, assemble_rows, manifest_of
-
-    assert MANIFEST_FILENAME == "assemble.json"
-    signature = inspect.getsource(manifest_of)
-    assert '"counts": {side: dict(stats) for side, stats in sides.items()}' in signature
-    assert '"kept": len(kept)' in inspect.getsource(assemble_rows)
+    shipped = _pushed_filenames()
+    assert SHIPPED_MANIFEST in shipped, "push.py must ship the manifest it embeds chain into"
+    assert ASSEMBLE_MANIFEST not in shipped, (
+        "assemble.json is NOT shipped - if that changes, the derivation text "
+        "may name it again"
+    )
 
     from tuned.train.sft import check_main_max_steps
 
     with pytest.raises(SystemExit) as exc:
         check_main_max_steps("main", 0)
     message = str(exc.value)
-    assert "counts.train.kept" in message
-    assert MANIFEST_FILENAME in message
 
     config = (CONFIGS / "law_v1_8b_ddp.yaml").read_text(encoding="utf-8")
-    assert "counts.train.kept" in config
     notebook = (
         Path(__file__).parent.parent / "training" / "notebooks" / "kaggle_smoke.ipynb"
     ).read_text(encoding="utf-8")
-    assert "counts.train.kept" in notebook
+
+    for where, text in (("refusal", message), ("config", config), ("notebook", notebook)):
+        assert "chain.counts.train.kept" in text, (
+            f"the {where} must name the full key path inside the shipped manifest"
+        )
+        assert SHIPPED_MANIFEST in text, f"the {where} must name the file push.py ships"
 
 
 def test_the_length_bucket_the_builder_filters_on_is_the_one_the_trainer_trains_at():

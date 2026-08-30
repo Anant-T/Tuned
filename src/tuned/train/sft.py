@@ -26,6 +26,7 @@ import math
 import os
 import subprocess
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from tuned.train.config import Config, HubCfg, RunCfg, load_config
@@ -238,6 +239,47 @@ def _hub_file(hub: HubCfg, filename: str, download=None) -> str:
     ))
 
 
+def stratified_head(sources: Sequence[str], n: int) -> list[int]:
+    """Deterministically pick n row indexes spread across every source.
+
+    Replaces a plain head, which was silently reading one source. split.py
+    writes eval_indexes in INPUT-FILE order and the corpus is strictly
+    source-blocked, so the first 64 rows of a real eval file were 64/64
+    PredEx out of eight sources - and `synthesis`, the stream this whole
+    pipeline exists to produce, is the LAST block and could never appear in a
+    head of any size short of the entire file. P1.4 held each source out of
+    its own pool; taking a head at the trainer threw that away one commit
+    later, and the eval loss printed beside the train loss was a
+    PredEx-only number.
+
+    Determinism is preserved exactly as the head had it, and it matters for
+    the same reason: a multi-session run must report loss on the SAME rows
+    every session or the two numbers are not comparable. So there is no RNG
+    and no seed to keep in step with the trainer's - this is a round-robin
+    over sources sorted by name, taking rows in file order within each, which
+    is a pure function of the file.
+
+    Round-robin rather than proportional on purpose. At 64 rows a
+    proportional draw would give zero synthesis rows (0.3% of the corpus) and
+    reproduce the bug in a subtler form. This is a diagnostic meant to catch a
+    regression in ANY source, not an estimate of the training distribution.
+    """
+    if n <= 0:
+        return []
+    groups: dict[str, list[int]] = {}
+    for i, source in enumerate(sources):
+        groups.setdefault(source, []).append(i)
+    picked: list[int] = []
+    ordered = [groups[k] for k in sorted(groups)]
+    for depth in range(max((len(g) for g in ordered), default=0)):
+        for group in ordered:
+            if depth < len(group):
+                picked.append(group[depth])
+                if len(picked) == n:
+                    return sorted(picked)
+    return sorted(picked)
+
+
 def resolve_eval_dataset(run: RunCfg, hub: HubCfg, download=None) -> str | None:
     """The held-out file for this run, or None when it does not evaluate.
 
@@ -349,18 +391,45 @@ def resume_decision(checkpoint_dir: str | Path, max_steps: int) -> bool:
     Comparing max_steps is what makes it safe to point at the shared
     checkpoint repo: PROBE and SMOKE push there too, so "a checkpoint exists"
     alone would try to resume a 60-step smoke run into a main run.
+
+    A checkpoint on a DIFFERENT schedule splits two ways, and conflating them
+    is what made MAIN session 1 unstartable. The qualification ladder is
+    mandatory and ends with RESUME, which pushes a COMPLETE 64-step
+    checkpoint to this same repo; MAIN then wants 437, so the max_steps
+    compare fails and the old code refused the run outright - with no escape,
+    because --allow-schedule-change is only threaded through the explicit
+    --resume branch. The documented gate sequence bricked the run it gates,
+    and the only way out was deleting last-checkpoint/ from the Hub by hand.
+
+    But a SPENT checkpoint has nothing to lose. `global_step >= its own
+    max_steps` means that run finished; starting fresh past it discards no
+    progress and rebuilds no schedule mid-run, because there is no run to be
+    mid. An UNFINISHED checkpoint on a different schedule is the real hazard
+    this function exists for - a partial main session whose max_steps moved
+    under it - and still refuses.
     """
     state = Path(checkpoint_dir) / "trainer_state.json"
     if not state.is_file():
         return False
     saved = json.loads(state.read_text(encoding="utf-8"))
-    if saved.get("max_steps") != max_steps:
-        # Defer to the schedule guard, which explains the LR-rebuild hazard
-        # and offers the escape hatch. Never silently start fresh here: that
-        # is the step-0 overwrite this function exists to prevent.
+    saved_max = saved.get("max_steps")
+    step = int(saved.get("global_step") or 0)
+    if saved_max != max_steps:
+        if saved_max is not None and step >= int(saved_max):
+            print(
+                f"checkpoint at {checkpoint_dir} is a COMPLETED "
+                f"{saved_max}-step run (global_step={step}); this run wants "
+                f"max_steps={max_steps}. Nothing to resume - starting fresh. "
+                "This is the normal hand-off from the qualification ladder."
+            )
+            return False
+        # Unfinished and on a different schedule: defer to the guard, which
+        # explains the LR-rebuild hazard and offers the escape hatch. Never
+        # silently start fresh here - that is the step-0 overwrite this
+        # function exists to prevent.
         check_resume_schedule(checkpoint_dir, max_steps)
         return False
-    return int(saved.get("global_step") or 0) < max_steps
+    return step < max_steps
 
 
 def check_main_max_steps(mode: str, max_steps: int) -> None:
@@ -374,9 +443,15 @@ def check_main_max_steps(mode: str, max_steps: int) -> None:
     config.py, the trainer's own bucket, under the pinned tokenizer sft.py
     feeds the trainer - and drops what does not fit rather than truncating it.
     So the rows it wrote ARE the rows the trainer loads, and their count is
-    `counts.train.kept` in assemble.json, which push.py ships beside the
-    corpus. Deriving it needed a whole Kaggle session only because nothing
-    said that.
+    `chain.counts.train.kept` in **build_manifest.json**, which push.py ships
+    beside the corpus. Deriving it needed a whole Kaggle session only because
+    nothing said that.
+
+    The file name matters and was wrong here until 2026-08-31: push.py
+    uploads train, eval, README, build_manifest.json and stats.json - and NOT
+    assemble.json, which stays in the builder's out/ dir. build_manifest.json
+    embeds assemble.json wholesale under its `chain` key, so the number is
+    there, one level deeper than the old text said.
 
     post_filter_rows= is still printed every run, and it is still the number
     that decides: train_on_responses_only drops a fully-masked row with only a
@@ -389,9 +464,10 @@ def check_main_max_steps(mode: str, max_steps: int) -> None:
     if mode == "main" and max_steps <= 0:
         raise SystemExit(
             f"train.main.max_steps={max_steps} is the underived sentinel - derive "
-            "it from the build: read counts.train.kept from the assemble.json "
-            "beside the corpus (the builder already dropped every row over "
-            "max_seq_length, measured with the pinned tokenizer), set "
+            "it from the build: read chain.counts.train.kept from the "
+            "build_manifest.json beside the corpus (the builder already "
+            "dropped every row over max_seq_length, measured with the pinned "
+            "tokenizer), set "
             "max_steps = kept // (bs * ga * world_size) in the config and commit. "
             "Cross-check it against the post_filter_rows= line of the first "
             "session's log. It is immutable after that session "
@@ -778,13 +854,19 @@ def main(argv: list[str] | None = None) -> None:
         eval_ds = None
         if eval_path is not None:
             eval_ds = load_dataset("json", data_files=eval_path, split="train")
-            # THE DETERMINISTIC HEAD, not a sample. split.py writes its rows in
-            # a fixed order, so a head is reproducible across sessions with no
-            # RNG and no seed to keep in step with the trainer's own - the same
-            # discipline split.py follows for the split itself. A sampled eval
-            # set would make two sessions of one run report loss on two
-            # different corpora.
-            eval_ds = _as_text(eval_ds.select(range(min(run.eval_rows, len(eval_ds)))))
+            # DETERMINISTIC AND STRATIFIED - see stratified_head. Still no RNG
+            # and no seed to keep in step with the trainer's own, so two
+            # sessions of one run report loss on the same rows; but spread
+            # across sources, because split.py writes in input-file order over
+            # a source-blocked corpus and a plain head read exactly one of
+            # them.
+            keep = stratified_head(
+                [(r or {}).get("source", "") for r in eval_ds["_prov"]],
+                min(run.eval_rows, len(eval_ds)),
+            ) if "_prov" in eval_ds.column_names else list(
+                range(min(run.eval_rows, len(eval_ds)))
+            )
+            eval_ds = _as_text(eval_ds.select(keep))
             print(f"eval_rows={len(eval_ds)} <- {eval_path}")
 
     import inspect
@@ -1048,6 +1130,29 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(
             f"train_loss={stats.training_loss} - fp16 divergence; first lever: set max_grad_norm: 0.3"
         )
+
+    # ONE eval pass, here, and BEFORE the peak readings below - which is the
+    # whole point: an eval forward materialises a [1, seq, 151936] logits
+    # tensor outside unsloth's chunked-CE path, and the lane has ~2.3 GiB of
+    # headroom against a 13.5 GiB ceiling. Running it here is what puts that
+    # allocation inside the max_memory_reserved() high-water the qualification
+    # reads.
+    #
+    # Without it the ladder could never measure the thing it exists to
+    # measure. eval_steps is save_steps * 5, and every qualification mode's
+    # step budget is smaller than its own eval interval - PROBE 2 steps vs 5,
+    # SMOKE 60 vs 125, RESUME 64 vs 125 - so the periodic eval never fired
+    # and `eval_rows: 8` produced a peak byte-identical to a no-eval run. MAIN
+    # (save_steps 10 -> eval_steps 50) then met the allocation for the first
+    # time at step 50, against a ceiling _ReservedCeiling enforces by raising.
+    # The step-0 gates only run the collator, not a forward, so they cannot
+    # cover this either.
+    if trainer.eval_dataset is not None:
+        eval_metrics = trainer.evaluate()
+        eval_loss = eval_metrics.get("eval_loss")
+        if eval_loss is not None:
+            print(f"eval_loss={eval_loss:.4f}")
+        print(f"eval_rows={len(trainer.eval_dataset)}")
 
     # Binary GiB throughout (_gib): decimal-GB math under a _gb label
     # understated headroom ~0.9 GiB vs the GiB reference lines.

@@ -666,19 +666,40 @@ def test_resume_decision_declines_a_finished_run(tmp_path):
     assert resume_decision(_state(tmp_path, max_steps=1500, global_step=1500), 1500) is False
 
 
-def test_resume_decision_refuses_a_foreign_schedule_rather_than_restarting(tmp_path):
+def test_resume_decision_refuses_an_UNFINISHED_foreign_schedule(tmp_path):
     """The reason the predicate compares max_steps at all.
 
-    PROBE and SMOKE push to the SAME checkpoint repo as main, so "a checkpoint
-    exists" alone would try to resume a 60-step smoke run into a 1500-step main
-    run. Silently starting fresh instead would be worse still: the first save
-    ten steps later overwrites last-checkpoint/ at the fixed path_in_repo.
-    Defer to the schedule guard, which explains the LR-rebuild hazard.
+    Silently starting fresh over a run that still has progress in it is the
+    step-0 overwrite this guard exists for: the first save ten steps later
+    replaces last-checkpoint/ at the fixed path_in_repo, discarding a session
+    recoverable only by digging an older revision out of the Hub. A partial
+    main run whose max_steps moved under it is exactly that case, so it still
+    refuses and points at the schedule guard's explanation.
     """
     from tuned.train.sft import resume_decision
 
     with pytest.raises(SystemExit, match="allow-schedule-change"):
-        resume_decision(_state(tmp_path, max_steps=60, global_step=60), 1500)
+        resume_decision(_state(tmp_path, max_steps=800, global_step=300), 1500)
+
+
+def test_resume_decision_starts_fresh_past_a_SPENT_qualification_checkpoint(tmp_path, capsys):
+    """The ladder hand-off, which used to brick MAIN session 1.
+
+    PROBE and SMOKE push to the SAME checkpoint repo as main, and the
+    mandatory ladder ends with RESUME leaving a COMPLETE 64-step checkpoint
+    there. MAIN wants a different max_steps, so the compare fails - and
+    because --allow-schedule-change is threaded only through the explicit
+    --resume branch, refusing here left no escape but deleting
+    last-checkpoint/ from the Hub by hand.
+
+    A finished run has no progress to lose and no schedule to rebuild
+    mid-flight, so this starts fresh and says why.
+    """
+    from tuned.train.sft import resume_decision
+
+    assert resume_decision(_state(tmp_path, max_steps=64, global_step=64), 437) is False
+    out = capsys.readouterr().out
+    assert "COMPLETED" in out and "starting fresh" in out
 
 
 def test_the_production_entry_never_opts_into_a_schedule_change():
@@ -706,6 +727,96 @@ def _hub(repo="u/d", revision=None):
     from tuned.train.config import HubCfg
 
     return HubCfg(checkpoint_repo=None, dataset_repo=repo, dataset_revision=revision)
+
+
+def test_the_eval_head_reads_every_source_not_just_the_first_block():
+    """The bug, reproduced exactly: a source-BLOCKED file, which is what
+    split.py writes because it walks per-source in input-file order.
+
+    A plain head of 64 over the real corpus returned 64/64 PredEx out of eight
+    sources, and synthesis - the last block - could not appear at any head
+    size short of the whole file."""
+    from tuned.train.sft import stratified_head
+
+    blocked = ["predex"] * 600 + ["openthoughts"] * 300 + ["synthesis"] * 15
+
+    assert set(blocked[:64]) == {"predex"}, "the fixture must reproduce the head bug"
+
+    picked = [blocked[i] for i in stratified_head(blocked, 64)]
+    assert set(picked) == {"predex", "openthoughts", "synthesis"}
+    assert len(picked) == 64
+    # the rare source is not merely present, it is not crowded out either
+    assert picked.count("synthesis") >= 10
+
+
+def test_the_eval_head_is_reproducible_without_an_rng():
+    """A multi-session run must report loss on the SAME rows every session or
+    the numbers are not comparable - which is why the original was a head. A
+    seeded sample would have to keep a seed in step with the trainer's own."""
+    from tuned.train.sft import stratified_head
+
+    sources = ["a"] * 50 + ["b"] * 30 + ["c"] * 5
+    assert stratified_head(sources, 20) == stratified_head(sources, 20)
+    # and it is a pure function of the file, not of call order
+    assert stratified_head(list(sources), 20) == stratified_head(tuple(sources), 20)
+    # indexes come back in file order, so `select` preserves the file's shape
+    picked = stratified_head(sources, 20)
+    assert picked == sorted(picked)
+
+
+def test_the_eval_head_never_asks_for_more_rows_than_exist():
+    from tuned.train.sft import stratified_head
+
+    assert stratified_head(["a", "b", "c"], 99) == [0, 1, 2]
+    assert stratified_head(["a", "b"], 0) == []
+    assert stratified_head([], 8) == []
+
+
+def test_no_qualification_mode_can_reach_its_own_periodic_eval():
+    """Why a terminal evaluate() is required rather than nice to have.
+
+    eval_steps is save_steps * 5, and eval_strategy="steps" only fires on
+    global_step % eval_steps == 0. Every mode in the qualification ladder has
+    a step budget SMALLER than its own eval interval, so the periodic eval can
+    never run - which means turning smoke.eval_rows on produced a
+    peak_vram_reserved_gb byte-identical to a no-eval run, and MAIN met the
+    [1, seq, 151936] logits allocation for the first time at step 50 against a
+    13.5 GiB ceiling.
+
+    Derived from the real config and the real MODE_ARGS, so it keeps telling
+    the truth if either moves. If a future budget DOES reach its eval, this
+    fails and someone re-reads whether the terminal pass is still needed.
+    """
+    from tuned.train.supervise import MODE_ARGS
+
+    cfg = load_config(CONFIG, allow_unpinned=True)
+
+    def _override(mode, flag, fallback):
+        argv = MODE_ARGS[mode]
+        return int(argv[argv.index(flag) + 1]) if flag in argv else fallback
+
+    for mode in ("PROBE", "SMOKE", "RESUME"):
+        max_steps = _override(mode, "--max-steps", cfg.train.smoke.max_steps)
+        save_steps = _override(mode, "--save-steps", cfg.train.smoke.save_steps)
+        assert max_steps < save_steps * 5, (
+            f"{mode} would now reach its periodic eval at step {save_steps * 5} "
+            f"within {max_steps} steps - re-check whether the terminal "
+            "evaluate() is still the only way the ladder measures eval memory"
+        )
+
+
+def test_the_qualification_evaluates_before_it_reads_the_peak():
+    """The terminal eval is only a qualification if its allocation lands
+    INSIDE the high-water mark the operator reads. main() cannot be driven
+    without a GPU, so the ordering is checked as source - there is no runnable
+    surface for it."""
+    src = SFT.read_text(encoding="utf-8")
+    evaluate = src.index("trainer.evaluate()")
+    peak = src.index("peak_vram_reserved_gb=")
+    assert evaluate < peak, (
+        "evaluate() must run before max_memory_reserved is read, or the eval "
+        "forward is absent from the number the ceiling is enforced against"
+    )
 
 
 def test_a_run_that_does_not_evaluate_looks_nothing_up(tmp_path):
