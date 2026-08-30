@@ -76,12 +76,13 @@ from tuned.data.providers import (
     CONTEXT_SAFETY_MARGIN,
     DEFAULT_JUDGE_REPLY_TOKENS,
     ProviderError,
+    classify_route_failure,
     context_estimate,
     pool_gaps,
     undersized_families,
     unkeyed_roles,
 )
-from tuned.data.store import utcday, utcnow
+from tuned.data.store import set_state_fenced, utcday, utcnow
 from tuned.data.paths import DEFAULT_CONFIG
 
 # Task states this module owns. 'judging' is the hand-off to judge.py.
@@ -118,14 +119,6 @@ FORMAT_PARKED_STATE = "format_parked"
 INPUT_INELIGIBLE_STATE = "input_ineligible"
 INPUT_INELIGIBLE_SKIP = "input_ineligible"
 INPUT_INELIGIBLE_DISPOSITION = "input-ineligible:section_text"
-
-# Skip reasons that are facts about the ROW rather than about the moment or
-# the configuration. "family-excluded" here always means the context filter:
-# generate.py excludes exactly the families too small to hold this prompt, so
-# a pool emptied by it will be just as empty on the next claim. A missing key,
-# a cooling breaker and a spent daily budget are all about the fleet, and all
-# three lift without the row changing at all.
-ROW_SHAPED_SKIPS = frozenset({"family-excluded"})
 
 # How many times a task may be claimed before a regenerate-disposition stops
 # buying another attempt. Counted on task.attempts, which claim_tasks bumps -
@@ -1751,31 +1744,13 @@ async def generate_once(
         # Every attempt this call made is already ledgered by on_attempt,
         # including the 429s the client retried through.
         result.error = str(exc)
-        skips = frozenset(getattr(exc, "skipped", frozenset()))
-        result.no_eligible_model = bool(skips)
-        result.route_skips = tuple(sorted(skips))
-        # UNROUTABLE means "no model in this pool can serve this ROW", and it
-        # is the only shape that closes a task without spending its attempts.
-        # Two ways to earn it: every family that could hold the prompt was
-        # excluded by the context filter, or every model that WAS tried came
-        # back saying the prompt is longer than its window. `not retryable`
-        # is NOT one of them - a missing key is also not retryable, and
-        # treating it as row-shaped is what marked a whole keyless wave
-        # terminal with zero calls made.
-        result.unroutable = bool(exc.context_exceeded) or (
-            bool(skips) and skips <= ROW_SHAPED_SKIPS
-        )
-        # A provider answered (or refused to answer) and the fault was on its
-        # side. Only meaningful when something was actually TRIED - with a
-        # skip set, nothing was, and no_eligible_model already carries that.
-        #
-        # `not skips` is DEFENCE IN DEPTH and unpinnable by construction: the
-        # only error carrying a skip set is the "nothing was tried" one, and
-        # apply_gate_disposition consults no_eligible_model before it consults
-        # provider_fault, so no mutation of this clause can change a task's
-        # state. Kept because the two facts are different facts; never counted
-        # as mutation-verified.
-        result.provider_fault = not skips and bool(exc.retryable or exc.provider_dead)
+        # One classification for both workers - see providers.RouteFailure for
+        # what each flag means and which of its clauses are defence in depth.
+        failure = classify_route_failure(exc)
+        result.no_eligible_model = bool(failure.skips)
+        result.route_skips = failure.skips
+        result.unroutable = failure.unroutable
+        result.provider_fault = failure.provider_fault
         store.log_event(
             "generation_error",
             {
@@ -2059,12 +2034,7 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
         named = ",".join(_non_diagnostic_gates(result.failed_gates))
         state, disposition = REJECTED_STATE, "reject:" + named
 
-    moved = store.set_task_state(task_id, state, disposition, expect_worker=worker_id)
-    if not moved:
-        store.log_event(
-            "lost_lease",
-            {"task_id": task_id, "worker": worker_id, "wanted_state": state},
-        )
+    if not set_state_fenced(store, task_id, state, disposition, worker_id=worker_id):
         result.state = None
         return "lost-lease"
     result.state = state

@@ -1535,7 +1535,7 @@ def _narrow_generator(cfg):
     below instead of the pool emptying. Narrowing it alongside gpt-oss keeps
     the family-excluded mechanism doing the exclusion, rather than a
     missing-key stand-in that a real Router would classify differently (a
-    missing key is not row-shaped; see generate.ROW_SHAPED_SKIPS).
+    missing key is not row-shaped; see providers.ROW_SHAPED_SKIPS).
     """
     narrowed = cfg_with_context(
         cfg, family="gpt-oss", role="generator", max_context=NARROW_GENERATOR_CONTEXT

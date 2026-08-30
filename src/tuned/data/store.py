@@ -237,6 +237,30 @@ def utcnow() -> str:
     return datetime.now(UTC).strftime(_TS_FMT)
 
 
+def set_state_fenced(store, task_id: str, state: str, disposition: str | None,
+                     *, worker_id) -> bool:
+    """Lease-fenced state write; a lost lease is logged, never silent.
+
+    Both workers move tasks this way, and they used to do it with two copies
+    of the same six lines - one wrapped in judge.py, one inlined in
+    generate.apply_gate_disposition - which is two places for the event
+    payload to drift.
+
+    A worker that stalled past its lease (GC pause, hung socket) has already
+    had its task legitimately re-claimed by someone else, so its late write
+    must no-op rather than overwrite the live holder. The operator has to be
+    able to SEE that happening, which an unchecked return value hides - hence
+    the event, and hence the bool rather than None.
+    """
+    moved = store.set_task_state(task_id, state, disposition, expect_worker=worker_id)
+    if not moved:
+        store.log_event(
+            "lost_lease",
+            {"task_id": task_id, "worker": worker_id, "wanted_state": state},
+        )
+    return moved
+
+
 def utcday(day: str | None = None) -> str:
     """`day` if given, else today UTC as YYYY-MM-DD (the budget-ledger key)."""
     return day if day is not None else datetime.now(UTC).strftime("%Y-%m-%d")

@@ -1157,6 +1157,83 @@ class _BreakerState:
 # does; a private copy in the workers would drift.
 TRANSIENT_SKIPS = frozenset({"cooling", "over-budget"})
 
+# Skip reasons that are facts about the ROW rather than about the moment or
+# the configuration. "family-excluded" here always means the context filter:
+# generate.py excludes exactly the families too small to hold this prompt, so
+# a pool emptied by it will be just as empty on the next claim. A missing key,
+# a cooling breaker and a spent daily budget are all about the fleet, and all
+# three lift without the row changing at all.
+ROW_SHAPED_SKIPS = frozenset({"family-excluded"})
+
+
+@dataclass
+class RouteFailure:
+    """What a ProviderError means for the TASK, classified once for both workers.
+
+    The generator and the judge each used to compute this from scratch, with
+    byte-identical `unroutable` expressions and forty lines of comment each.
+    They can no longer drift on what "the pool cannot serve this row" means,
+    which judge.py already recorded as a live risk.
+
+    UNROUTABLE means "no model in this pool can serve this ROW", and it is the
+    only shape that closes a task without spending its attempts. Two ways to
+    earn it: every family that could hold the prompt was excluded by the
+    context filter (plus separation, for the judge), or every model that WAS
+    tried came back saying the prompt is longer than its window. Those are
+    facts about the row, so the caller parks rather than re-queueing - a
+    re-queue would re-pay whichever slots DID answer and hit the same wall.
+
+    `not exc.retryable` is NOT the same test, and using it was the generator's
+    round-2 bug and later the same bug in judge clothing: a missing key is
+    not retryable either, and treating that as row-shaped marks a whole
+    keyless wave terminal with zero calls made.
+
+    THE TWO DERIVED FLAGS ARE DIFFERENT FACTS, and each records its own
+    defence in depth:
+
+    * `provider_fault` (the generator reads it) - a provider answered, or
+      refused to answer, and the fault was on its side. Only meaningful when
+      something was actually TRIED; with a skip set nothing was, and the
+      caller's no_eligible_model already carries that. `not skips` is
+      unpinnable by construction - the only error carrying a skip set is the
+      "nothing was tried" one, and apply_gate_disposition consults
+      no_eligible_model first - so no mutation of that clause can change a
+      task's state. Kept because the two facts are different facts.
+
+    * `payload_error` (the judge reads it) - a provider answered and refused
+      the PAYLOAD. It matters because such a call is bought again on every
+      claim: the generator is bounded at 3 attempts and the judge at 8, so a
+      systemic payload bug costs eight passes over the wave. Two of its five
+      clauses are likewise unpinnable: through Router.complete a
+      provider_dead error is never re-raised, and a `skipped` set only ever
+      arrives on the "nothing was tried" error, which has no status.
+
+    Neither unpinnable clause is counted in any mutation-verified claim.
+    `context_exceeded` IS reachable - overflow at every ref aggregates that
+    way - and both workers pin it on their logged event.
+    """
+
+    skips: tuple[str, ...]
+    unroutable: bool
+    provider_fault: bool
+    payload_error: bool
+
+
+def classify_route_failure(exc) -> RouteFailure:
+    skips = frozenset(getattr(exc, "skipped", frozenset()))
+    return RouteFailure(
+        skips=tuple(sorted(skips)),
+        unroutable=bool(exc.context_exceeded) or (bool(skips) and skips <= ROW_SHAPED_SKIPS),
+        provider_fault=not skips and bool(exc.retryable or exc.provider_dead),
+        payload_error=(
+            exc.status is not None
+            and not exc.retryable
+            and not exc.provider_dead
+            and not exc.context_exceeded
+            and not skips
+        ),
+    )
+
 # --- context estimation -----------------------------------------------------
 #
 # Everything here is an ESTIMATE compared against a hard ceiling, so every

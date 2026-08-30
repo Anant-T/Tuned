@@ -126,7 +126,6 @@ from tuned.data.config import CALIBRATION_RULES, ModelRef
 from tuned.data.generate import (
     JUDGE_PROMPT_ID,
     PENDING_STATE,
-    ROW_SHAPED_SKIPS,
     TIEBREAK_PROMPT_ID,
     SlotError,
     build_prompt,
@@ -149,9 +148,10 @@ from tuned.data.judge_policy import (
 from tuned.data.providers import (
     DEFAULT_JUDGE_REPLY_TOKENS,
     ProviderError,
+    classify_route_failure,
     undersized_families,
 )
-from tuned.data.store import utcday, utcnow
+from tuned.data.store import set_state_fenced, utcday, utcnow
 from tuned.data.paths import DEFAULT_CONFIG
 
 # Queue states. state_from -> state_to must differ (store.claim_tasks
@@ -859,48 +859,14 @@ async def judge_slot(
             )
         except ProviderError as exc:
             outcome.error = str(exc)
-            skips = frozenset(getattr(exc, "skipped", frozenset()))
-            outcome.route_skips = tuple(sorted(skips))
-            # UNROUTABLE means "nothing in this pool can take this ROW":
-            # every family that could hold the prompt was excluded by
-            # separation plus context length, or every model tried said the
-            # prompt is longer than its window. Those are facts about the row,
-            # so the caller parks rather than re-queueing - a re-queue would
-            # re-pay whichever slots DID answer and hit the same wall.
-            #
-            # `not exc.retryable` is NOT the same test, and using it was the
-            # generator's round-2 bug in judge clothing: a missing key is not
-            # retryable either, and a keyless fleet would park every row it
-            # touched instead of leaving them where the queue found them.
-            outcome.unroutable = bool(exc.context_exceeded) or (
-                bool(skips) and skips <= ROW_SHAPED_SKIPS
-            )
-            # A provider answered and refused the PAYLOAD. The test is a
-            # status plus the absence of every per-provider explanation -
-            # never `not retryable`, which a missing key also satisfies. It
-            # matters because such a call is bought again on every claim: the
-            # generator's equivalent is bounded at 3 attempts, and the judge's
-            # at 8, so a systemic payload bug costs eight passes over the wave.
-            #
-            # Two of the five clauses are DEFENCE IN DEPTH and unpinnable by
-            # construction, which is stated here rather than left for the next
-            # reader to rediscover: through Router.complete a provider_dead
-            # error is never re-raised (it fails over, and the aggregate does
-            # not carry the flag), and a `skipped` set only ever arrives on
-            # the "nothing was tried" error, which has no status. Neither can
-            # be reached with the first clause true, so no test can fail on
-            # their removal - they are kept because each names a distinct fact
-            # a future error shape could carry, and they are NOT counted in
-            # any mutation-verified claim about this file. `context_exceeded`
-            # IS reachable (overflow at every ref aggregates that way) and is
-            # pinned on the logged event below.
-            outcome.payload_error = (
-                exc.status is not None
-                and not exc.retryable
-                and not exc.provider_dead
-                and not exc.context_exceeded
-                and not skips
-            )
+            # One classification for both workers - see providers.RouteFailure
+            # for what each flag means and which of its clauses are defence in
+            # depth. The judge reads payload_error where the generator reads
+            # provider_fault; they are different facts about the same error.
+            failure = classify_route_failure(exc)
+            outcome.route_skips = failure.skips
+            outcome.unroutable = failure.unroutable
+            outcome.payload_error = failure.payload_error
             store.log_event(
                 "judge_route_error",
                 {
@@ -995,23 +961,6 @@ async def judge_slot(
 # One task.
 # --------------------------------------------------------------------------
 
-def _set_state(store, task_id: str, state: str, disposition: str | None, *, worker_id) -> bool:
-    """Lease-fenced state write; a lost lease is logged, never silent.
-
-    Same fence generate.py uses: a worker that stalled past its lease has had
-    its task legitimately re-claimed, so its late write must no-op rather
-    than overwrite the live holder - and the operator has to be able to SEE
-    that happening, which an unchecked return value hides.
-    """
-    moved = store.set_task_state(task_id, state, disposition, expect_worker=worker_id)
-    if not moved:
-        store.log_event(
-            "lost_lease",
-            {"task_id": task_id, "worker": worker_id, "wanted_state": state},
-        )
-    return moved
-
-
 def _audit_accept(
     store,
     task_id,
@@ -1036,7 +985,7 @@ def _audit_accept(
     first ~30 rows of a UTC day, not the uniform hash sample audit_sampled's
     docstring promises.
     """
-    if not _set_state(store, task_id, ACCEPTED_STATE, disposition, worker_id=worker_id):
+    if not set_state_fenced(store, task_id, ACCEPTED_STATE, disposition, worker_id=worker_id):
         stats.lost_leases += 1
         return LOST_LEASE
     payload = {"task_id": task_id, "gen_id": int(gen["gen_id"]), "sample": sample}
@@ -1071,7 +1020,7 @@ def _park(
     the event log that no state change ever matched, and this log is what P5
     calibration reads. Same fix as the second `judge_decision`.
     """
-    if not _set_state(store, task["task_id"], state, reason, worker_id=worker_id):
+    if not set_state_fenced(store, task["task_id"], state, reason, worker_id=worker_id):
         if stats is not None:
             stats.lost_leases += 1
         return LOST_LEASE
@@ -1350,7 +1299,7 @@ async def judge_task(
                     store, task, ERROR_STATE, f"judge-slot-{slot}:{outcome.error}"[:200],
                     worker_id=worker_id, stats=stats, counter="judge_errors",
                 )
-            if not _set_state(store, task_id, JUDGE_STATE_FROM, None, worker_id=worker_id):
+            if not set_state_fenced(store, task_id, JUDGE_STATE_FROM, None, worker_id=worker_id):
                 stats.lost_leases += 1
                 return LOST_LEASE
             return JUDGE_STATE_FROM
@@ -1438,7 +1387,7 @@ async def judge_task(
                         store, task, ERROR_STATE, f"tiebreak:{tiebreak.error}"[:200],
                         worker_id=worker_id, stats=stats, counter="judge_errors",
                     )
-                if not _set_state(store, task_id, JUDGE_STATE_FROM, None, worker_id=worker_id):
+                if not set_state_fenced(store, task_id, JUDGE_STATE_FROM, None, worker_id=worker_id):
                     stats.lost_leases += 1
                     return LOST_LEASE
                 return JUDGE_STATE_FROM
@@ -1530,7 +1479,7 @@ async def judge_task(
         stats.outcomes[outcome_action] = stats.outcomes.get(outcome_action, 0) + 1
 
     if action == "accept":
-        if not _set_state(store, task_id, ACCEPTED_STATE, "judge:accept", worker_id=worker_id):
+        if not set_state_fenced(store, task_id, ACCEPTED_STATE, "judge:accept", worker_id=worker_id):
             stats.lost_leases += 1
             return LOST_LEASE
         decided(action)
@@ -1538,7 +1487,7 @@ async def judge_task(
         return ACCEPTED_STATE
     if action == "reject":
         reason = "judge:reject-tiebreak-unroutable" if tiebreak_unroutable else "judge:reject"
-        if not _set_state(store, task_id, REJECTED_STATE, reason, worker_id=worker_id):
+        if not set_state_fenced(store, task_id, REJECTED_STATE, reason, worker_id=worker_id):
             stats.lost_leases += 1
             return LOST_LEASE
         decided(action)
@@ -1571,7 +1520,7 @@ async def judge_task(
     # harshest-slot rule when the generator picks the task up. The once-only
     # cap is unaffected - has_regenerated reads `reviewer_note_applied` off
     # the persisted generation params, so a restart cannot spend it twice.
-    _set_state(store, task_id, PENDING_STATE, "judge:regenerate", worker_id=worker_id)
+    set_state_fenced(store, task_id, PENDING_STATE, "judge:regenerate", worker_id=worker_id)
     return PENDING_STATE
 
 
