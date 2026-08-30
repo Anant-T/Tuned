@@ -13,7 +13,24 @@ name: data-worker
 
 on:
   schedule:
-    - cron: "17 */6 * * *"
+    # Every 4 hours, not 6. A run is ~322-327 min end to end (--minutes 315
+    # plus the pull, the pushes and job setup), so at */6 the machine sat
+    # idle for over half an hour out of every six, four times a day. Any
+    # period BELOW the cycle chains instead: the data-build group holds one
+    # run and one pending run, so the next is already queued when the current
+    # one finishes.
+    #
+    # */4 rather than */3 because of what the group does with a SECOND
+    # pending trigger - it replaces the one already waiting. At 240 min the
+    # queued run starts ~80 min before the next cron fires, so nothing is
+    # ever displaced; at 180 it would be, once per cycle, and the thing
+    # displaced could be an operator's data-assemble dispatch.
+    #
+    # --minutes stays at 315. Raising it buys ~1.4pp of utilisation and
+    # halves the margin against timeout-minutes below, which is the wrong
+    # trade for an unattended job whose failure mode is losing the work since
+    # its last checkpoint.
+    - cron: "17 */4 * * *"
   workflow_dispatch: {}
 
 concurrency:

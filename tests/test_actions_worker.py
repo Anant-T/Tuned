@@ -1163,3 +1163,46 @@ def test_an_empty_queue_skips_both_children_and_says_so_in_the_job_summary(tmp_p
     assert pushed, "the re-open writes task states; they have to leave the host"
     assert "QUEUE EMPTY" in summary.read_text(encoding="utf-8")
     assert any("--reopen" in a for argv in ran for a in argv), "the re-open was never tried"
+
+
+def _worker_workflow() -> dict:
+    import yaml
+
+    path = Path(__file__).parent.parent / ".github" / "workflows" / "data-worker.yml"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def test_the_cron_period_is_under_the_cycle_it_schedules():
+    """The point of the change: at a period longer than one run, the machine
+    idles. The data-build group holds one running and one pending, so any
+    period below the cycle chains back to back.
+
+    The cycle is --minutes plus the pull, the pushes and setup. If --minutes
+    ever grows past the period this test is what says the schedule no longer
+    makes sense.
+    """
+    workflow = _worker_workflow()
+    crons = [entry["cron"] for entry in workflow[True]["schedule"]]
+    assert crons == ["17 */4 * * *"]
+    period_min = 4 * 60
+
+    parsed = actions_worker.main_parser().parse_args(["--phase", "worker", "--hf-repo", "u/r"])
+    cycle_min = parsed.minutes  # the floor; the pull and pushes add ~10-15
+    assert period_min < cycle_min, (
+        "a period at or above the run length leaves the machine idle between runs"
+    )
+    # and the queued run must start well before the NEXT trigger, or the
+    # group replaces a pending run - possibly an operator's assemble dispatch
+    assert cycle_min - period_min >= 60
+
+
+def test_the_job_timeout_still_leaves_the_deadline_room_to_stop_cleanly():
+    """--minutes is a clean stop that pushes; timeout-minutes is a kill that
+    loses everything since the last checkpoint. Raising --minutes toward the
+    timeout - the change deliberately NOT made with the cron - is what this
+    guards."""
+    workflow = _worker_workflow()
+    timeout = workflow["jobs"]["worker"]["timeout-minutes"]
+    parsed = actions_worker.main_parser().parse_args(["--phase", "worker", "--hf-repo", "u/r"])
+    assert parsed.minutes == 315
+    assert timeout - parsed.minutes >= 30, "not enough room for the baton pull and the final push"
