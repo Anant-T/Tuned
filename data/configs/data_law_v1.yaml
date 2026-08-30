@@ -56,7 +56,47 @@ build:
   # re-fit). Evidence: prev_rep.md 2.5 (deepseek-recalibration).
   # gpt-oss's own failure mode (think < think_min at 29.7%) is a FLOOR
   # problem and is unmoved by this ceiling, exactly as the fence records.
-  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 4000, answer_min: 120}
+  #
+  # think_max RAISED 4000 -> 4500 on 2026-08-31, and this one is a RE-FIT IN A
+  # CORRECTED CURRENCY rather than another move of the same dial.
+  #
+  # total_max is the 8192 TRAINING bucket - assemble.py drops an over-length
+  # row outright (DROP_TOO_LONG, drop-never-truncate) against max_seq_length
+  # 8192 - so it is a packing-admissibility test over the row the trainer
+  # sees. That row's user turn is seed["text"] and nothing else
+  # (decontaminate.py: "THE PROMPT IS THE GROUNDING, NOT THE RENDERED
+  # TEMPLATE"). Until 2026-08-31 the gate was handed the whole rendered
+  # message set instead, charging the persona and the craft instructions -
+  # a fixed ~806 est tokens, 695 to 918 across the fourteen generator
+  # templates - against a budget those bytes never occupy. Fixed in
+  # generate.build_prompt; the gate thresholds were all fitted against the
+  # inflated figure, so the ceiling had to be re-fitted with them.
+  #
+  # Swept over the 1,423 stored generations in the corrected currency,
+  # disposition-clean (self_verification is DIAGNOSTIC and never blocks, so
+  # it is excluded - the "12.2% clean" figure that counted it was measuring
+  # something no row is rejected for):
+  #
+  #     think_max   4000    4500    5000    6000    8192
+  #     deepseek   33.3%   37.0%   37.0%   37.0%   37.0%
+  #     pooled     29.9%   30.0%   30.0%   30.0%   30.0%
+  #
+  # 4500 is where the curve stops: past it total_max binds instead, and at
+  # 4500 ten of the twelve remaining deepseek length_band failures already
+  # carry total>total_max. Buying more would mean a bigger bucket, which
+  # seq 12288 (OOM, 2026-08-26) says is not available.
+  #
+  # deepseek baseline for comparison was 25.9% - the +11.1pp is the currency
+  # fix (+7.4) and the ceiling (+3.7) together. POOLED barely moves because
+  # 440 of the 577 length_band failures are gpt-oss's think<think_min, a
+  # FLOOR failure on a generator that no longer runs; deepseek has zero of
+  # them and fails only ceiling-side. Do not plan against the pooled profile.
+  #
+  # The cost side is unchanged: GENERATION_OUTPUT_TOKENS stays decoupled at
+  # 16,384, and the worst-case gate-legal reply at think_max 4500 is ~5,598
+  # real tokens at the measured deepseek minimum 3.93 chars/token - still
+  # covered ~3x, and the inequality test is what fails first if it is not.
+  length_band: {total_max: 8192, total_min: 300, think_min: 500, think_max: 4500, answer_min: 120}
   difficulty_target: {easy: 0.34, medium: 0.50, hard: 0.16}
   appointed_day: "2024-07-01"
 
