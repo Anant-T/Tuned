@@ -786,11 +786,24 @@ def test_index_tree_keys_are_posix_relative_paths_and_skip_partials(store, tmp_p
 # --------------------------------------------------------------------------
 
 def test_a_missing_boto3_says_how_to_install_it(monkeypatch):
+    """And names an extra that EXISTS. boto3 moved to [acquire-s3] when the
+    unattended jobs stopped resolving it, so `pip install -e .[build]` - what
+    this message used to say - now installs everything except the one library
+    it is about."""
+    import re
+    import tomllib
+
     monkeypatch.setitem(sys.modules, "boto3", None)
     with pytest.raises(AcquisitionError) as exc:
         list(S3Bucket().list_objects("data/pdf/"))
     assert "boto3" in str(exc.value)
-    assert "[build]" in str(exc.value)
+    named = re.search(r"pip install -e \.\[([a-z0-9,_-]+)\]", str(exc.value)).group(1)
+    pyproject = Path(__file__).parent.parent / "pyproject.toml"
+    extras = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ]
+    assert named in extras, f"the message names a nonexistent extra [{named}]"
+    assert any(spec.startswith("boto3") for spec in extras[named])
 
 
 def test_cli_acquires_pdfs_into_the_build_corpus(tmp_path, capsys):

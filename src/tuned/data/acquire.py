@@ -45,7 +45,11 @@ the dataset page, and they fail with that instruction rather than a
 traceback.
 
 boto3/huggingface_hub are imported lazily inside the seams, never at module
-import time, matching replay.py/seeds.py.
+import time, matching replay.py/seeds.py. They also live in DIFFERENT extras:
+huggingface_hub is in [build] because the assemble chain runs `--kind hf` for
+its eval sets, while boto3 is in [acquire-s3] alone - the S3 bucket is an
+operator-run corpus fetch that no CI job takes, and it was costing both of
+them a botocore resolve. Each seam names its own extra in its ImportError.
 
 Build:  python -m tuned.data.acquire --config data/configs/data_law_v1.yaml
         [--kind metadata|pdf|hf|all] [--years 2010-2025] [--language english]
@@ -685,7 +689,7 @@ class S3Bucket:
             except ImportError as exc:
                 raise AcquisitionError(
                     "boto3/botocore are needed to read the public judgment bucket and "
-                    "are not installed - run: pip install -e .[build]"
+                    "are not installed - run: pip install -e .[acquire-s3]"
                 ) from exc
             self._s3 = boto3.client(
                 "s3",

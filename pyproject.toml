@@ -25,14 +25,46 @@ markers = ["live: this test is allowed to use the network"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
-# Dataset-curation deps. Deliberately UNPINNED and never installed on Kaggle:
-# the build runs locally, the trainer never imports any of this, and pinning
-# here would drag heavyweight resolves into the training env.
+
+# What the UNATTENDED CRON installs, and nothing else. data-worker.yml runs
+# every few hours with no human present, and it runs exactly three modules:
+# reconcile, generate and judge. Their transitive third-party closure is
+# httpx (the provider client), huggingface_hub (the baton, via
+# actions_worker's Bundle) and pyyaml, which is a base dependency. `datasets`
+# appears in that closure ONLY inside replay._stream and
+# citations._stream_kanoongpt - lazy corpus-streaming functions the worker
+# never reaches, because gates.py imports the pure predicates beside them.
+#
+# So the cron resolved seven libraries it could not use, including semhash's
+# embedding stack and a transformers pin, on every run. Splitting them out
+# is not only speed: an unattended job that installs less has less that can
+# fail to resolve while nobody is watching.
+#
+# This list must stay a SUBSET of [build] - the assemble phase runs the
+# worker's modules too - and test_pins.py asserts that rather than trusting
+# the two lists to be edited together.
+build-worker = [
+    "httpx>=0.27",
+    "huggingface_hub",
+]
+
+# The full curation stack: the assemble chain, plus the corpus builders the
+# operator runs by hand. Deliberately UNPINNED except where a version is
+# correctness (below), and never installed on Kaggle - the trainer imports
+# none of it, and pinning here would drag heavyweight resolves into the
+# training env.
+#
+# "The build runs locally" used to be the reason the resolve could drift
+# freely. It is no longer true and has not been since 2026-08-29: the build
+# runs on GitHub Actions, unattended, and data-assemble.yml resolves this
+# whole list on a cold runner. The exposure is named rather than fixed here -
+# `cache: pip` keyed on this file reuses the wheels a previous run downloaded,
+# which is not a pin (a fresh upstream release is still picked up on a cache
+# miss), and a real lockfile is a separate decision nobody has made yet.
 build = [
     "httpx>=0.27",
     "datasets",
     "pyarrow",
-    "boto3",
     # NO datasketch: dedupe.py's candidate generator is an exact prefix-filter
     # index, not MinHashLSH, and nothing in the tree imports it.
     "semhash",
@@ -52,6 +84,14 @@ build = [
     # produced a dataset. transformers pulls no torch, so this costs ~15 MB.
     "transformers==5.5.0",
 ]
+
+# The public AWS judgment bucket, and only that. acquire.py imports boto3
+# lazily inside the S3 seam with its own message, so every other kind -
+# including the `--kind hf` eval-set fetch data-assemble.yml runs before the
+# chain - works without it. It sat in [build] costing both CI jobs a
+# botocore resolve for a code path neither of them takes.
+acquire-s3 = ["boto3"]
+
 train = [
     # Pinned: the resolver silently bumped unsloth 2026.8.3 -> 2026.8.4 between
     # otherwise-identical Kaggle runs. Every training dep that can drift is fixed.

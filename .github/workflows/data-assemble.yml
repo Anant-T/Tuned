@@ -22,6 +22,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          # cache-dependency-path is REQUIRED here, not decoration: `cache: pip`
+          # defaults to hashing requirements*.txt, this repo has none, and the
+          # step FAILS with "unable to cache dependencies" rather than skipping
+          # the cache. Keyed on pyproject.toml, so editing an extra invalidates.
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Install
         run: pip install -e ".[build]"
       # The chain's tokenizer users (assemble, stats) import transformers

@@ -39,6 +39,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          # cache-dependency-path is REQUIRED here, not decoration: `cache: pip`
+          # defaults to hashing requirements*.txt, this repo has none, and the
+          # step FAILS with "unable to cache dependencies" rather than skipping
+          # the cache. Keyed on pyproject.toml, so editing an extra invalidates.
+          cache: pip
+          cache-dependency-path: pyproject.toml
       # [build] as well as [dev]: six test modules import httpx, pyarrow,
       # transformers or huggingface_hub at module level and would otherwise
       # skip - silently, which is the failure mode this file exists to end.

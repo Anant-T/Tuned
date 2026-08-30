@@ -60,6 +60,40 @@ def test_the_build_extra_pins_the_tokenizer_the_trainer_uses():
     )
 
 
+def _names(extra: str) -> set[str]:
+    specs = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ][extra]
+    return {re.match(r"[A-Za-z0-9_.-]+", spec).group(0).lower() for spec in specs}
+
+
+def test_the_workers_extra_is_a_subset_of_the_full_build_extra():
+    """The cron installs [build-worker]; the assemble job installs [build] and
+    runs the worker's modules too (reconcile, and generate's prompt machinery
+    through the gates).
+
+    Two hand-kept lists drift, and the direction that drifts silently is the
+    dangerous one: a dependency added to [build] for a module the worker also
+    imports leaves the unattended job with a ModuleNotFoundError hours later,
+    on a host nobody is watching. So the subset relation is asserted rather
+    than remembered.
+    """
+    worker, build = _names("build-worker"), _names("build")
+    assert worker <= build, (
+        f"[build-worker] must stay a subset of [build]; extra: {sorted(worker - build)}"
+    )
+    assert worker, "the worker still has to install something"
+
+
+def test_boto3_is_only_in_the_extra_named_for_it():
+    """acquire.py imports boto3 lazily inside the S3 seam, so nothing else in
+    the tree can reach it - and neither CI job takes that path. In [build] it
+    cost every unattended run a botocore resolve for code it never ran."""
+    assert "boto3" in _names("acquire-s3")
+    for extra in ("build", "build-worker", "dev", "train"):
+        assert "boto3" not in _names(extra), f"boto3 leaked back into [{extra}]"
+
+
 def test_sft_guards_prequantized_load_before_model_download():
     src = SFT.read_text(encoding="utf-8")
     # unsloth 2026.8.3 loader.py strips the -unsloth-bnb-4bit suffix and drops

@@ -35,7 +35,10 @@ importable package both run on.
 Training deps (`[train]`: unsloth, transformers 5.5.0) install only on Kaggle.
 The template-drift test self-skips locally and runs on Kaggle. The data
 pipeline (`[build]` extra) additionally needs provider keys in `.env` (never
-committed).
+committed). Two narrower extras exist so the unattended jobs install less
+than they used to: `[build-worker]` is what the generate/judge cron needs,
+and `[acquire-s3]` is boto3 alone, for the operator-run judgment-bucket
+fetch that no CI job takes.
 
 ## Kaggle setup (once)
 
