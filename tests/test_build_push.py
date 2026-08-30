@@ -20,7 +20,7 @@ from test_build_stats import SCALE, e2e_corpus, run_pipeline, traced
 from tuned.data.acquire import sha256_file
 from tuned.data.assemble import main as assemble_main
 from tuned.data.config import PushCfg, load_build_config
-from tuned.data.decontaminate import SCRIPT_NONE
+from tuned.data.semantic import SCRIPT_NONE
 from tuned.data.dedupe import main as dedupe_main
 from tuned.data.jsonl import read_jsonl, write_jsonl
 from tuned.data.push import (

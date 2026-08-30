@@ -124,26 +124,28 @@ from tuned.data.decontaminate import (
     OUT_FILENAME as DECON_OUT_FILENAME,
 )
 from tuned.data.decontaminate import (
+    Item,
+    gram_hashes,
+    jaccard_from,
+    output_record,
+    row_prov,
+    stream_items,
+    tokens,
+    write_manifest,
+)
+from tuned.data.semantic import (
     SEMANTIC_CONTROL_ITEM,
     SEMANTIC_CONTROL_NEGATIVE,
     SEMANTIC_NO_MODEL,
     SEMANTIC_RAN,
     SEMANTIC_UNAVAILABLE,
     SEMANTIC_UNUSABLE,
-    Item,
     SemanticModelError,
     SemanticSeamError,
-    gram_hashes,
-    jaccard_from,
-    output_record,
     provenance_text,
-    row_prov,
     selected_records,
     semhash_available,
     semhash_index,
-    stream_items,
-    tokens,
-    write_manifest,
 )
 from tuned.data.paths import DEFAULT_CONFIG
 

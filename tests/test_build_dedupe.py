@@ -15,19 +15,20 @@ from test_build_decontaminate import (
 
 from tuned.data import dedupe as dedupe_module
 from tuned.data.decontaminate import (
-    EVAL_SETS,
-    SEMANTIC_NO_MODEL,
-    SEMANTIC_UNAVAILABLE,
-    SEMANTIC_UNUSABLE,
     EvalIndex,
-    EvalItem,
     NGRAM as DECON_NGRAM,
-    SemanticSeamError,
     decontaminate_items,
     gram_hashes,
     item_of,
     jaccard,
     tokens,
+)
+from tuned.data.eval_sets import EVAL_SETS, EvalItem
+from tuned.data.semantic import (
+    SEMANTIC_NO_MODEL,
+    SEMANTIC_UNAVAILABLE,
+    SEMANTIC_UNUSABLE,
+    SemanticSeamError,
 )
 from tuned.data.decontaminate import main as decon_main
 from tuned.data.dedupe import (

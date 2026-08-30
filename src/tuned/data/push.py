@@ -95,7 +95,7 @@ from pathlib import Path
 from tuned.data.acquire import sha256_file
 from tuned.data.assemble import EVAL_FILENAME, TRAIN_FILENAME
 from tuned.data.assemble import MANIFEST_FILENAME as ASSEMBLE_MANIFEST_FILENAME
-from tuned.data.decontaminate import EVAL_OK
+from tuned.data.eval_sets import EVAL_OK
 from tuned.data.decontaminate import MANIFEST_FILENAME as DECON_MANIFEST_FILENAME
 from tuned.data.decontaminate import write_manifest
 from tuned.data.dedupe import MANIFEST_FILENAME as DEDUPE_MANIFEST_FILENAME

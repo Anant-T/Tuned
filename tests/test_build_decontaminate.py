@@ -13,19 +13,7 @@ from pipeline_fakes import open_store, paths_for, temp_config
 from tuned.data.decontaminate import (
     CONTAINMENT,
     DECON_VERSION,
-    EVAL_COUNTS_VERIFIED_AT,
-    EVAL_EMPTY,
-    EVAL_MIN_SHARE,
-    EVAL_NO_FILES,
-    EVAL_NO_READER,
-    EVAL_NO_SPLIT,
-    EVAL_NO_TEXT_COLUMN,
-    EVAL_NOT_ACQUIRED,
-    EVAL_OK,
-    EVAL_SETS,
-    EVAL_TOO_FEW,
-    EVAL_UNMATCHABLE,
-    EVAL_UNREADABLE,
+    EvalIndex,
     INDEX_BYTES_PER_GRAM,
     LEVEL_CASE_ID,
     LEVEL_NARROW,
@@ -33,37 +21,10 @@ from tuned.data.decontaminate import (
     LEVEL_SHORT,
     LEVEL_TEXT,
     NGRAM,
-    SCRIPT_DEVANAGARI,
-    SCRIPT_LATIN,
-    SCRIPT_NONE,
-    SCRIPT_PARTITION_FLOOR,
-    SCRIPT_RESIDUE_MIN_SHARE,
-    SCRIPT_UNLISTED,
-    SEMANTIC_CONTROL_ROW_WORDS,
-    SEMANTIC_CONTROLS,
-    SEMANTIC_COVERED_SPAN,
-    SEMANTIC_NO_ITEMS,
-    SEMANTIC_NO_SCREENABLE_ITEMS,
-    SEMANTIC_RAN,
-    SEMANTIC_NO_MODEL,
-    SEMANTIC_PROBE_STRIDE,
-    SEMANTIC_PROBE_WORDS,
-    SEMANTIC_THRESHOLD,
-    SEMANTIC_UNAVAILABLE,
-    SEMANTIC_UNUSABLE,
     SHORT_MIN_TOKENS,
     TITLE_MIN_TOKENS,
-    EvalIndex,
-    EvalItem,
-    EvalPart,
-    SemanticFilter,
-    SemanticSeamError,
     containment,
     decontaminate_items,
-    dominant_script,
-    duplicate_provenance,
-    eval_corpora,
-    eval_corpus,
     gram_hashes,
     hits_for,
     identifiers_from_fields,
@@ -72,20 +33,63 @@ from tuned.data.decontaminate import (
     jaccard,
     level_for,
     manifest_of,
-    probe_texts,
-    probe_windows,
-    script_of,
-    script_partition,
-    script_share,
-    refusals,
     row_form,
-    selected_records,
-    screened_scripts,
-    semantic_controls,
     store_items,
     title_key,
     tokens,
     window_for,
+)
+from tuned.data.eval_sets import (
+    EVAL_COUNTS_VERIFIED_AT,
+    EVAL_EMPTY,
+    EVAL_MIN_SHARE,
+    EVAL_NOT_ACQUIRED,
+    EVAL_NO_FILES,
+    EVAL_NO_READER,
+    EVAL_NO_SPLIT,
+    EVAL_NO_TEXT_COLUMN,
+    EVAL_OK,
+    EVAL_SETS,
+    EVAL_TOO_FEW,
+    EVAL_UNMATCHABLE,
+    EVAL_UNREADABLE,
+    EvalItem,
+    EvalPart,
+    eval_corpora,
+    eval_corpus,
+    refusals,
+)
+from tuned.data.semantic import (
+    SCRIPT_DEVANAGARI,
+    SCRIPT_LATIN,
+    SCRIPT_NONE,
+    SCRIPT_PARTITION_FLOOR,
+    SCRIPT_RESIDUE_MIN_SHARE,
+    SCRIPT_UNLISTED,
+    SEMANTIC_CONTROLS,
+    SEMANTIC_CONTROL_ROW_WORDS,
+    SEMANTIC_COVERED_SPAN,
+    SEMANTIC_NO_ITEMS,
+    SEMANTIC_NO_MODEL,
+    SEMANTIC_NO_SCREENABLE_ITEMS,
+    SEMANTIC_PROBE_STRIDE,
+    SEMANTIC_PROBE_WORDS,
+    SEMANTIC_RAN,
+    SEMANTIC_THRESHOLD,
+    SEMANTIC_UNAVAILABLE,
+    SEMANTIC_UNUSABLE,
+    SemanticFilter,
+    SemanticSeamError,
+    dominant_script,
+    duplicate_provenance,
+    probe_texts,
+    probe_windows,
+    screened_scripts,
+    script_of,
+    script_partition,
+    script_share,
+    selected_records,
+    semantic_controls,
     worst_alignment_offset,
 )
 from tuned.data.decontaminate import main as decon_main
@@ -1935,7 +1939,7 @@ def test_read_rows_dispatches_on_the_suffix(tmp_path):
     where it is not, the ImportError is EVAL_NO_READER: its own rung, whose
     remedy is `pip install -e .[build]` rather than EVAL_UNREADABLE's "the file
     is corrupt, re-download it". Either way a refusal, never an empty set."""
-    from tuned.data.decontaminate import _READABLE_SUFFIXES, read_rows
+    from tuned.data.eval_sets import _READABLE_SUFFIXES, read_rows
 
     (tmp_path / "a.jsonl").write_text('{"question": "one"}\n\n{"question": "two"}\n',
                                       encoding="utf-8")
@@ -2525,7 +2529,7 @@ def test_the_semantic_layer_is_opt_in_for_every_module_in_this_suite():
     test_build_store already do - inherited an UNGUARDED semantic path by
     default. It is one suite-wide fixture in conftest now, and this is the
     assertion that it is reaching this test rather than being assumed."""
-    from tuned.data.decontaminate import semhash_available
+    from tuned.data.semantic import semhash_available
 
     assert sys.modules.get("semhash", "absent") is None
     assert semhash_available() is False
@@ -2652,14 +2656,16 @@ def test_a_seam_that_reads_the_whole_row_and_not_its_windows_fails_the_control(m
     CLEAN row of the same length is flagged too. A whole-row seam has no
     operating point at all, and the control has to fail for it."""
     install_fake_semhash(monkeypatch)
-    import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
-    monkeypatch.setattr(decon, "probe_texts", lambda text, **kw: [text] if text else [])
-    results = decon.semantic_controls()
+    # Patched on semantic, not decontaminate: semantic_controls resolves
+    # probe_texts in its own module namespace.
+    monkeypatch.setattr(sem_mod, "probe_texts", lambda text, **kw: [text] if text else [])
+    results = sem_mod.semantic_controls()
     assert "REWORDED copy" in results[SCRIPT_LATIN]
     # ... and with no script left standing, the whole layer is control-failed.
     with pytest.raises(SemanticSeamError) as exc:
-        decon.screened_scripts(results)
+        sem_mod.screened_scripts(results)
     assert "REWORDED copy" in str(exc.value)
 
 
@@ -3729,8 +3735,9 @@ def real_semhash(monkeypatch):
 def _table_seam(monkeypatch, threshold):
     real_semhash(monkeypatch)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
-    return decon.SemanticFilter(
+    return sem_mod.SemanticFilter(
         [EvalItem("bbl", f"bbl#{i}", text, frozenset())
          for i, text in enumerate(EVAL_QUESTIONS)],
         threshold=threshold,
@@ -3834,14 +3841,15 @@ def test_the_devanagari_control_half_fails_against_the_shipped_model(monkeypatch
     by anyone's assertion."""
     real_semhash(monkeypatch)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
-    results = decon.semantic_controls()
+    results = sem_mod.semantic_controls()
     assert results[SCRIPT_LATIN] == "", "the Latin half must pass, or nothing is screened"
     assert results[SCRIPT_DEVANAGARI] != ""
     assert "nothing to do with Indian law" in results[SCRIPT_DEVANAGARI]
     # ... and the consequence, end to end: an index holding one Hindi question
     # flags an unrelated Hindi row about cricket.
-    seam = decon.SemanticFilter(
+    seam = sem_mod.SemanticFilter(
         [EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset())],
         screened=[SCRIPT_DEVANAGARI],
     )
@@ -3855,11 +3863,11 @@ def test_the_devanagari_control_half_fails_against_the_shipped_model(monkeypatch
     ]
     english_clean = list(CLEAN_ROWS)
     for point in (0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95):
-        hindi = decon.SemanticFilter(
+        hindi = sem_mod.SemanticFilter(
             [EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset())],
             threshold=point, screened=[SCRIPT_DEVANAGARI],
         )
-        english = decon.SemanticFilter(
+        english = sem_mod.SemanticFilter(
             [EvalItem("bbl", "bbl#en", EVAL_QUESTIONS[0], frozenset())],
             threshold=point, screened=[SCRIPT_LATIN],
         )
@@ -3881,19 +3889,20 @@ def test_ten_devanagari_words_used_to_drop_an_english_row_and_no_longer_do(monke
     contaminated."""
     real_semhash(monkeypatch)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
     quote = " ".join(HINDI_UNRELATED.split()[:10])
     words = CLEAN_ROWS[0].split()
     row_text = " ".join([*words[:100], quote, *words[100:]])
-    probes = decon.probe_texts(row_text)
+    probes = sem_mod.probe_texts(row_text)
 
-    mixed = decon.semhash_index([HINDI_QUESTION, *EVAL_QUESTIONS])
-    english_only = decon.semhash_index(list(EVAL_QUESTIONS))
+    mixed = sem_mod.semhash_index([HINDI_QUESTION, *EVAL_QUESTIONS])
+    english_only = sem_mod.semhash_index(list(EVAL_QUESTIONS))
     dropped_by_mixed = len(
-        decon.selected_records(mixed.deduplicate(records=probes, threshold=SEMANTIC_THRESHOLD))
+        sem_mod.selected_records(mixed.deduplicate(records=probes, threshold=SEMANTIC_THRESHOLD))
     ) < len(probes)
     dropped_by_english = len(
-        decon.selected_records(
+        sem_mod.selected_records(
             english_only.deduplicate(records=probes, threshold=SEMANTIC_THRESHOLD)
         )
     ) < len(probes)
@@ -3903,7 +3912,7 @@ def test_ten_devanagari_words_used_to_drop_an_english_row_and_no_longer_do(monke
     )
 
     # ... and the shipped, per-script layer keeps it.
-    seam = decon.SemanticFilter(
+    seam = sem_mod.SemanticFilter(
         [EvalItem("bbl", "bbl#hi", HINDI_QUESTION, frozenset()),
          *(EvalItem("bbl", f"bbl#{i}", t, frozenset())
            for i, t in enumerate(EVAL_QUESTIONS))],
@@ -3976,11 +3985,12 @@ def test_the_latin_control_has_a_ceiling_against_the_shipped_model(monkeypatch):
     threshold set too high to see a rewording cannot record `ran`."""
     real_semhash(monkeypatch)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
-    assert decon.semantic_controls(threshold=SEMANTIC_THRESHOLD)[SCRIPT_LATIN] == ""
-    assert decon.semantic_controls(threshold=0.85)[SCRIPT_LATIN] == ""
+    assert sem_mod.semantic_controls(threshold=SEMANTIC_THRESHOLD)[SCRIPT_LATIN] == ""
+    assert sem_mod.semantic_controls(threshold=0.85)[SCRIPT_LATIN] == ""
     for too_high in (0.9, 0.95):
-        why = decon.semantic_controls(threshold=too_high)[SCRIPT_LATIN]
+        why = sem_mod.semantic_controls(threshold=too_high)[SCRIPT_LATIN]
         assert "REWORDED copy" in why, f"the control has no ceiling at {too_high}"
 
 
@@ -4018,6 +4028,7 @@ def test_the_script_dilution_table_collapses_when_the_probe_is_split(monkeypatch
     direction, the split is carrying nothing and should be re-argued."""
     seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
     for at in (95, 100, 103, 107):
         rows = [_hindi_row(q, at=at) for q in EVAL_QUESTIONS]
@@ -4029,16 +4040,16 @@ def test_the_script_dilution_table_collapses_when_the_probe_is_split(monkeypatch
 
     # THE FAULT, through the code path that had it: route the whole window by
     # its dominant script and probe with the window's own text.
-    original = decon.script_partition
+    original = sem_mod.script_partition
     try:
-        decon.script_partition = lambda text, **kw: (
-            {decon.dominant_script(text): text} if decon.dominant_script(text) != SCRIPT_NONE
+        sem_mod.script_partition = lambda text, **kw: (
+            {sem_mod.dominant_script(text): text} if sem_mod.dominant_script(text) != SCRIPT_NONE
             else {}
         )
         undiluted = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
         missed = sum(not undiluted.match(_hindi_row(q)) for q in EVAL_QUESTIONS)
     finally:
-        decon.script_partition = original
+        sem_mod.script_partition = original
     assert missed == 5, (
         "routing the window whole no longer loses these leaks; the dilution the split "
         "exists for has stopped reproducing and the design should be re-derived"
@@ -4058,6 +4069,7 @@ def test_a_code_switched_leak_survives_the_hindi_words_inside_it(monkeypatch):
     window geometry guarantees to hold whole)."""
     seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
     def switched(text, k):
         hindi, out, used = HINDI_UNRELATED.split(), [], 0
@@ -4069,11 +4081,11 @@ def test_a_code_switched_leak_survives_the_hindi_words_inside_it(monkeypatch):
         return " ".join([*out, *hindi[used:k]])
 
     def missed(k, split):
-        original = decon.script_partition
+        original = sem_mod.script_partition
         if not split:
-            decon.script_partition = lambda text, **kw: (
-                {decon.dominant_script(text): text}
-                if decon.dominant_script(text) != SCRIPT_NONE else {}
+            sem_mod.script_partition = lambda text, **kw: (
+                {sem_mod.dominant_script(text): text}
+                if sem_mod.dominant_script(text) != SCRIPT_NONE else {}
             )
         try:
             at = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
@@ -4081,7 +4093,7 @@ def test_a_code_switched_leak_survives_the_hindi_words_inside_it(monkeypatch):
                 not at.match(leak_row(switched(q, k), worst=True)) for q in REWORDED_LEAKS
             )
         finally:
-            decon.script_partition = original
+            sem_mod.script_partition = original
 
     assert [missed(k, split=False) for k in (0, 1, 2, 3, 4)] == [0, 0, 1, 5, 5]
     assert [missed(k, split=True) for k in (0, 1, 2, 3, 4)] == [0, 0, 0, 1, 1]
@@ -4102,6 +4114,7 @@ def test_the_dilution_cosine_table_reproduces(monkeypatch):
     separation."""
     seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
     def top(text):
         _, score, _ = duplicate_provenance(
@@ -4153,7 +4166,7 @@ def test_the_dilution_cosine_table_reproduces(monkeypatch):
             for script, part in script_partition(probe).items()
             if script == SCRIPT_LATIN
         ))
-        whole.append(top(decon.script_partition(row_text)[SCRIPT_LATIN]))
+        whole.append(top(sem_mod.script_partition(row_text)[SCRIPT_LATIN]))
     # A WINDOW's residue falls away with separation ...
     assert windowed == [0.936, 0.790, 0.485], windowed
     # ... and the WHOLE ROW's does not move at all, which is the whole-row
@@ -4169,6 +4182,7 @@ def test_a_verbatim_leak_in_a_hindi_row_scores_by_where_it_sits(monkeypatch):
     both statements quote one number for two populations."""
     seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
     def best_residue(row_text):
         return round(max(
@@ -4189,7 +4203,7 @@ def test_a_verbatim_leak_in_a_hindi_row_scores_by_where_it_sits(monkeypatch):
     anywhere, worst = [], []
     for question in EVAL_QUESTIONS:
         n = len(question.split())
-        bad = decon.worst_alignment_offset(n, _TABLE_ROW_WORDS)
+        bad = sem_mod.worst_alignment_offset(n, _TABLE_ROW_WORDS)
         for at in (0, 60, 140, 260):
             anywhere.append(best_residue(buried(question, at)))
         for at in (bad, bad + 1, bad - 1, _TABLE_ROW_WORDS - n):
@@ -4302,11 +4316,12 @@ def test_the_whole_row_probe_is_not_split_and_the_measurement_says_why(monkeypat
     windows, whose residues still carry locality."""
     real_semhash(monkeypatch)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
-    index = decon.semhash_index(list(EVAL_QUESTIONS))
+    index = sem_mod.semhash_index(list(EVAL_QUESTIONS))
 
     def residue_score(text):
-        part = decon.script_partition(text)[SCRIPT_LATIN]
+        part = sem_mod.script_partition(text)[SCRIPT_LATIN]
         _, score, _ = duplicate_provenance(
             index.deduplicate(records=[part], threshold=0.05)
         )
@@ -4331,7 +4346,7 @@ def test_the_whole_row_probe_is_not_split_and_the_measurement_says_why(monkeypat
     # The layer does not do this: the whole-row probe keeps its dominant-script
     # routing, so a Hindi row's whole-row probe goes to the Devanagari index
     # (where it is recorded unscreened) and never to the Latin one.
-    seam = decon.SemanticFilter(
+    seam = sem_mod.SemanticFilter(
         [EvalItem("bbl", f"bbl#{i}", t, frozenset()) for i, t in enumerate(EVAL_QUESTIONS)],
         screened=[SCRIPT_LATIN],
     )
@@ -4359,6 +4374,7 @@ def test_a_row_no_longer_than_one_window_is_split_like_the_window_it_is(monkeypa
     fixture and 24-30 was the screen."""
     real_semhash(monkeypatch)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
     hindi = "यह प्रश्न विधि से"
     assert len(hindi.split()) == 4
@@ -4373,7 +4389,7 @@ def test_a_row_no_longer_than_one_window_is_split_like_the_window_it_is(monkeypa
             words.append(pool[(len(words)) % len(pool)])
         return " ".join(words[:n_words])
 
-    seam = decon.SemanticFilter(
+    seam = sem_mod.SemanticFilter(
         [EvalItem("bbl", f"bbl#{i}", t, frozenset()) for i, t in enumerate(EVAL_QUESTIONS)],
         screened=[SCRIPT_LATIN],
     )
@@ -4589,12 +4605,13 @@ def test_a_statute_citation_in_an_eval_item_does_not_condemn_every_row_citing_it
     """
     real_semhash(monkeypatch)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
     items = [
         EvalItem("bbl", "bbl#hi-cite", HINDI_ITEM_CITING_ITS_STATUTE, frozenset()),
         EvalItem("bbl", "bbl#p08", HINDI_ITEM_WITH_AN_ENGLISH_CLAUSE, frozenset()),
     ]
-    seam = decon.SemanticFilter(items, screened=[SCRIPT_LATIN])
+    seam = sem_mod.SemanticFilter(items, screened=[SCRIPT_LATIN])
     # The bare citation is NOT an eval record; the real clause is.
     assert [len(tokens(t)) for t in seam.item_by_text] == [23]
     assert seam.script_report()[SCRIPT_LATIN]["residue_items"] == 1
@@ -4699,6 +4716,7 @@ def test_the_semantic_attribution_is_the_same_on_every_run(monkeypatch):
     restates it - which is the shape where an ANN has a choice to make."""
     real_semhash(monkeypatch)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
     items = []
     for i, question in enumerate(EVAL_QUESTIONS):
@@ -4708,7 +4726,7 @@ def test_the_semantic_attribution_is_the_same_on_every_run(monkeypatch):
     rows = [leak_row(q, worst=True) for q in (*EVAL_QUESTIONS, *REWORDED_LEAKS)]
 
     def attribution():
-        seam = decon.SemanticFilter(items, screened=[SCRIPT_LATIN])
+        seam = sem_mod.SemanticFilter(items, screened=[SCRIPT_LATIN])
         return [
             (hit.eval_set, hit.item_id, hit.detail.get("score"))
             if (hit := seam.match(text)) else None
@@ -4731,9 +4749,10 @@ def test_a_verbatim_leak_in_a_single_probe_row_does_not_crash_the_run(monkeypatc
     'dict'` inside `match`, on the case this module exists for."""
     real_semhash(monkeypatch)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
     question = EVAL_QUESTIONS[0]
-    seam = decon.SemanticFilter([EvalItem("bbl", "bbl#0", question, frozenset())])
+    seam = sem_mod.SemanticFilter([EvalItem("bbl", "bbl#0", question, frozenset())])
     assert len(probe_texts(question)) == 1, "the trigger is a ONE-probe query"
     hit = seam.match(question)
     assert hit is not None and (hit.eval_set, hit.item_id) == ("bbl", "bbl#0")
@@ -4741,7 +4760,7 @@ def test_a_verbatim_leak_in_a_single_probe_row_does_not_crash_the_run(monkeypatc
     assert hit.detail["probe_words"] == len(question.split())
     # The same query at the seam level, so the shape is pinned where it lands
     # rather than only through the caller that died on it.
-    result = decon.semhash_index([question]).deduplicate(records=[question], threshold=0.8)
+    result = sem_mod.semhash_index([question]).deduplicate(records=[question], threshold=0.8)
     text, score, probe = duplicate_provenance(result)
     assert (text, score, probe) == (question, 1.0, question)
 
@@ -4753,16 +4772,17 @@ def test_the_probe_geometry_closes_the_alignment_gap_against_the_shipped_model(m
     threshold - only the window."""
     seam = _table_seam(monkeypatch, SEMANTIC_THRESHOLD)
     import tuned.data.decontaminate as decon
+    import tuned.data.semantic as sem_mod
 
     caught_now = [seam.matches(leak_row(q, worst=True)) for q in REWORDED_LEAKS]
     assert all(caught_now)
 
-    original = decon.probe_texts
+    original = sem_mod.probe_texts
     try:
-        decon.probe_texts = lambda text, **kw: original(text, size=20, stride=10)
+        sem_mod.probe_texts = lambda text, **kw: original(text, size=20, stride=10)
         caught_before = [seam.matches(leak_row(q, worst=True)) for q in REWORDED_LEAKS]
     finally:
-        decon.probe_texts = original
+        sem_mod.probe_texts = original
     assert not all(caught_before), (
         "the 20/10 geometry used to miss a reworded leak at worst alignment; if it no "
         "longer does, the widening bought nothing and should be re-argued"
@@ -4865,7 +4885,7 @@ def test_a_generated_row_carries_its_teacher_and_prompt_generation(tmp_path):
 # --------------------------------------------------------------------------
 
 def _eval_items(n, words):
-    from tuned.data.decontaminate import EvalItem
+    from tuned.data.eval_sets import EvalItem
 
     return [
         EvalItem(set_key=f"set{i % 2}", item_id=str(i), text=prose(i, words),

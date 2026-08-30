@@ -632,7 +632,7 @@ def test_every_eval_set_decontamination_refuses_without_is_a_registered_snapshot
     """The join between the two registries: decontaminate.py names the set,
     acquire.py owns where it comes from, and the refusal it prints is an
     `acquire --hf-source KEY` command that has to exist."""
-    from tuned.data.decontaminate import EVAL_SETS
+    from tuned.data.eval_sets import EVAL_SETS
 
     assert set(EVAL_SETS) <= set(HF_SOURCES)
     assert {EVAL_SETS[key].repo_id for key in EVAL_SETS} == {
