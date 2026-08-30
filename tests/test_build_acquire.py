@@ -1051,6 +1051,34 @@ def test_rebase_recovers_an_eval_set_from_a_deleted_worktree(tmp_path):
     assert rebase_under_corpus(sc_recorded, sc_key, corpus) == corpus / "sc" / sc_key
 
 
+def test_rebase_reads_a_windows_record_on_a_posix_runner():
+    """The half of the repair that only breaks on the machine that needs it.
+
+    local_path is written absolute by whoever acquired the object - in
+    practice the operator's Windows checkout, since the corpus builders are
+    run by hand - and it is READ on the ubuntu runner. PosixPath does not
+    treat a backslash as a separator, so the whole recorded path arrives as
+    ONE component, nothing matches `corpus`, and the re-root gives up and
+    returns the dead path; decontaminate then refuses, which is the exact
+    2026-08-29 failure rebase_under_corpus exists to repair.
+
+    Driven through a PurePosixPath so this asserts the RUNNER's behaviour
+    from either OS - on Windows the native parse would hide the bug.
+    """
+    from pathlib import PurePosixPath
+
+    from tuned.data.acquire import _recorded_parts
+
+    as_the_runner_sees_it = PurePosixPath(
+        r"C:\old-checkout\data\build\corpus\hf\aibe\data\x.parquet"
+    )
+    assert len(as_the_runner_sees_it.parts) == 1, "the fixture must reproduce the runner"
+    assert _recorded_parts(as_the_runner_sees_it) == (
+        "C:\\", "old-checkout", "data", "build", "corpus", "hf", "aibe",
+        "data", "x.parquet",
+    )
+
+
 def test_rebase_leaves_a_live_path_alone_and_never_invents_one(tmp_path):
     from tuned.data.acquire import rebase_under_corpus
 

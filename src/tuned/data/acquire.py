@@ -61,7 +61,7 @@ import os
 import re
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from tuned.data.seeds import (
     INJUDGEMENTS_SOURCE_ID,
@@ -350,13 +350,36 @@ def rebase_under_corpus(recorded: str | Path, object_key: str, corpus_dir: str |
         return recorded
     corpus_dir = Path(corpus_dir)
     key_parts = Path(object_key).parts
-    root_parts = recorded.parts[: len(recorded.parts) - len(key_parts)]
-    if not key_parts or len(root_parts) >= len(recorded.parts):
+    root_parts = _recorded_parts(recorded)
+    root_parts = root_parts[: len(root_parts) - len(key_parts)]
+    if not key_parts or not root_parts:
         return recorded
     for i in range(len(root_parts) - 1, -1, -1):
         if root_parts[i] == corpus_dir.name:
             return corpus_dir.joinpath(*root_parts[i + 1:], *key_parts)
     return recorded
+
+
+def _recorded_parts(recorded: Path) -> tuple[str, ...]:
+    """Split a recorded path that may have been written by the OTHER OS.
+
+    This is the whole point of the function above and it did not survive the
+    move to CI. local_path is written absolute by whoever acquired the object
+    - in practice an operator's Windows checkout, since the corpus builders
+    are run by hand - and it is READ on an ubuntu runner. PosixPath does not
+    treat a backslash as a separator, so `C:\\checkout\\...\\file.parquet`
+    parses as ONE component, root_parts comes out empty, and the re-root
+    silently gives up and returns the dead path. decontaminate then refuses
+    to run, which is exactly the 2026-08-29 failure this function exists to
+    repair, reproduced on the runner.
+
+    So: fall back to Windows flavour when the native parse yields a single
+    component that clearly is not one. The reverse direction needs nothing -
+    PureWindowsPath already accepts `/` as a separator.
+    """
+    if len(recorded.parts) == 1 and "\\" in str(recorded):
+        return PureWindowsPath(str(recorded)).parts
+    return recorded.parts
 
 
 def sha256_file(path: str | Path, block: int = _READ_BLOCK) -> str:
