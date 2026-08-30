@@ -109,6 +109,78 @@ def test_notebook_is_valid_and_complete():
     assert "whoami" in joined
 
 
+# The two data-lane modules that import the TRAIN config and are still not
+# train-lane tests. Both load training/configs/law_v1_8b_ddp.yaml only to
+# cross-check it against data/configs/data_law_v1.yaml - that pin_dataset.py
+# writes to the repo push.py pushes to. That is a property of the BUILD; it
+# cannot be broken by the session the notebook is about to start, and neither
+# module is cheap. Named here rather than silently excluded, so that adding a
+# third one is a decision somebody makes on purpose.
+_DATA_LANE_TRAIN_CONFIG_READERS = {"test_build_config.py", "test_build_push.py"}
+
+
+def test_the_pytest_cell_names_every_train_lane_test_file():
+    """The notebook runs a NAMED subset of the suite, so the list has to be
+    kept true by something other than memory.
+
+    Narrowing that cell traded ~2 min per session for a real risk: a new
+    train-lane test file nobody adds here would never run on the only machine
+    that has the GPUs, and it would fail silently - by passing. The full suite
+    runs in CI on every push now, so what is checked here is coverage of the
+    CELL, not of the suite.
+
+    The rule is mechanical - a module that imports `tuned.train` is about the
+    train lane - with one named exception set, rather than a second hand-kept
+    list that could drift from the first.
+    """
+    import re
+
+    nb = json.loads(NB.read_text(encoding="utf-8"))
+    joined = "\n".join("".join(c["source"]) for c in nb["cells"])
+    tests_dir = Path(__file__).parent
+
+    listed = set(re.findall(r'"(tests/test_[a-z0-9_]+\.py)"', joined))
+    assert len(listed) >= 10, "the pytest cell no longer names its test files"
+    for name in sorted(listed):
+        assert (tests_dir / Path(name).name).is_file(), (
+            f"the notebook runs {name}, which does not exist - a rename makes "
+            "pytest exit 4 and blocks every session"
+        )
+
+    for path in sorted(tests_dir.glob("test_*.py")):
+        if path.name in _DATA_LANE_TRAIN_CONFIG_READERS:
+            continue
+        if re.search(r"^\s*(from|import) tuned\.train", path.read_text(encoding="utf-8"), re.M):
+            assert f"tests/{path.name}" in listed, (
+                f"{path.name} tests the train lane but the notebook's pytest "
+                "cell does not run it - add it to TRAIN_LANE_TESTS, or to "
+                "_DATA_LANE_TRAIN_CONFIG_READERS with the reason it is not"
+            )
+
+
+def test_main_does_not_build_the_smoke_dataset():
+    """MAIN trains the ASSEMBLED corpus, fetched from hub.dataset_repo by
+    sft.resolve_main_dataset; data/ is gitignored, so the clone cannot hold
+    it. Building smoke_v1 anyway spent a minute writing a file the production
+    run never opens.
+
+    The guard must be the SAME predicate supervise.build_command uses to
+    choose `--mode main`, or the two disagree about which dataset the session
+    needs.
+    """
+    nb = json.loads(NB.read_text(encoding="utf-8"))
+    joined = "\n".join("".join(c["source"]) for c in nb["cells"])
+    assert 'if not MODE.startswith("MAIN"):' in joined
+    smoke = [line for line in joined.splitlines() if "tuned.data.smoke" in line]
+    assert len(smoke) == 1 and smoke[0].startswith("    "), (
+        "the smoke build must sit inside the MAIN guard"
+    )
+
+    from tuned.train import supervise
+
+    assert 'mode.startswith("MAIN")' in Path(supervise.__file__).read_text(encoding="utf-8")
+
+
 def test_every_path_the_notebook_writes_has_a_parent_that_exists_in_the_clone():
     """A write into a directory the repo does not carry is a session killer.
 

@@ -1,0 +1,48 @@
+# The suite, on every push and pull request.
+#
+# Until this file existed the ONLY thing that ran these tests was a Kaggle
+# notebook cell - i.e. they ran when someone was about to spend GPU quota,
+# on a machine that costs 20 minutes to reach, and never at all for the
+# unattended data-build lane. data-worker.yml runs every 6 hours with no
+# human present against a `pip install -e .` of whatever is on main; a
+# commit that breaks an import there is discovered as a red cron run hours
+# later, if anyone looks.
+#
+# Nothing here needs secrets and nothing here touches the baton: the suite
+# is hermetic by construction - tests/conftest.py refuses the four socket
+# entry points for the network-facing modules and makes `import semhash`
+# fail suite-wide, and the handful of tests that want a real Hub or a warm
+# HF cache skip themselves rather than fetch. So this workflow carries no
+# `secrets:` block and no repository guard: a fork can run it as-is.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+# A superseded test run is worthless, unlike a superseded data-build run -
+# so this cancels in progress, and it must NEVER join the `data-build`
+# group, whose whole purpose is that its members do not cancel each other.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    # The suite is ~2 min of CPU; the rest is the install. Generous on
+    # purpose - a timeout here should mean something hung, not that a
+    # cold resolve was slow.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # [build] as well as [dev]: six test modules import httpx, pyarrow,
+      # transformers or huggingface_hub at module level and would otherwise
+      # skip - silently, which is the failure mode this file exists to end.
+      - name: Install
+        run: pip install -e ".[dev,build]"
+      - name: Tests
+        run: python -m pytest tests/ -q
