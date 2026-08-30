@@ -862,3 +862,47 @@ def test_the_ship_path_arms_the_teacher_cut():
         assert verify[3] == "tuned.data.verify"
         assert "--require-generator" in verify
         assert "--require-current-prompt" in verify
+        # And swept over the only state that can ship. Not a filter on the
+        # cut - a row this never looks at is a row decontaminate's
+        # `state = 'accepted'` select cannot read either.
+        assert verify[verify.index("--state") + 1] == "accepted"
+
+
+def test_the_ship_paths_verify_state_is_the_state_decontaminate_reads():
+    """Two spellings of "which rows ship" that must not drift apart.
+
+    If the chain re-gated a state decontaminate does not select, it would
+    spend the sweep on rows that cannot ship; if decontaminate selected a
+    state the chain does not re-gate, rows would ship whose citation gate was
+    never re-run with the real index - which is the failure verify.py exists
+    to make impossible.
+    """
+    import inspect
+
+    from tuned.data.decontaminate import generated_rows
+
+    shipped = inspect.signature(generated_rows).parameters["state"].default
+    verify = actions_worker.assemble_argvs("cfg.yaml")[0]
+    assert verify[verify.index("--state") + 1] == shipped
+
+
+def test_the_chain_fetches_exactly_the_eval_sets_decontaminate_demands():
+    """`--kind hf` with no source list snapshots all six HF_SOURCES - the
+    three eval corpora plus three full-text corpus inputs (predex,
+    tathyanyaya, injudgements) that belong to seeds/select, phases which run
+    on the operator's machine and never in this job.
+
+    The keys are derived from EVAL_SETS, so this asserts the derivation is
+    legal: every eval key must also be an acquire source, or argparse rejects
+    the whole call with exit 2, no eval set lands, and decontaminate refuses
+    the run.
+    """
+    from tuned.data.acquire import HF_SOURCES
+    from tuned.data.eval_sets import EVAL_SETS
+
+    assert set(EVAL_SETS) <= set(HF_SOURCES), (
+        f"eval sets with no acquire source: {sorted(set(EVAL_SETS) - set(HF_SOURCES))}"
+    )
+    assert set(EVAL_SETS) < set(HF_SOURCES), "nothing left to skip - is the derivation still worth it?"
+    src = Path(actions_worker.__file__).read_text(encoding="utf-8")
+    assert "for key in sorted(EVAL_SETS)" in src, "the source list must stay derived, not literal"

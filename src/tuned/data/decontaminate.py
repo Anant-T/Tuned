@@ -445,29 +445,29 @@ def tokens(text: str) -> tuple[str, ...]:
     return tuple(_TOKEN.findall((text or "").lower().translate(_ZERO_WIDTH)))
 
 
-def gram_hashes(toks: Sequence[str], n: int = NGRAM) -> frozenset[int]:
-    """Stable 64-bit hashes of every n-token window.
+def token_hashes(toks: Sequence[str]) -> list[int]:
+    """The per-token crc32 pass, on its own.
 
-    STABLE is the load-bearing word. Python's `hash()` for str is salted per
-    process (PYTHONHASHSEED), so an index keyed on it selects a different
-    candidate set - and therefore a different dataset - on every run.
-    crc32 is deterministic across runs, machines and Python versions; the
-    rolling polynomial over it is what keeps this one multiply per token
-    rather than n.
+    Split out of gram_hashes because it does not depend on n and the caller
+    that dominates this module does: EvalIndex.query grams ONE row at EVERY
+    window the index holds - a dozen of them for a real eval mix - and fused,
+    each of those windows re-encoded and re-CRC'd the row's whole token list.
+    Roughly an order of magnitude of the same work for the same numbers.
+    Nothing about the result changes; gram_hashes is still the composition.
+    """
+    return [zlib.crc32(t.encode("utf-8")) for t in toks]
 
-    A 64-bit collision can only ever ADD to a posting count, never remove
-    from one, so the error direction is the safe one - it can cost a row, not
-    hide a leak. It is NOT rejected downstream, though: the posting count IS
-    the intersection size the arithmetic divides, so a collision inflates
-    containment directly rather than proposing a candidate something later
-    throws out. (The comment here used to claim the latter, which would have
-    been a stronger guarantee than the code gives.)
+
+def grams_from(hs: Sequence[int], n: int) -> frozenset[int]:
+    """The rolling n-window, over tokens that are already hashed.
+
+    The subtract-and-shift keeps this one multiply per token rather than n.
+    See gram_hashes for why the hashes underneath have to be crc32.
     """
     if n <= 0:
         raise ValueError(f"n must be positive, got {n}")
-    if len(toks) < n:
+    if len(hs) < n:
         return frozenset()
-    hs = [zlib.crc32(t.encode("utf-8")) for t in toks]
     power = pow(_BASE, n, 1 << 64)
     window = 0
     for value in hs[:n]:
@@ -477,6 +477,29 @@ def gram_hashes(toks: Sequence[str], n: int = NGRAM) -> frozenset[int]:
         window = (window * _BASE - hs[i - n] * power + hs[i]) & _MASK
         out.append(window)
     return frozenset(out)
+
+
+def gram_hashes(toks: Sequence[str], n: int = NGRAM) -> frozenset[int]:
+    """Stable 64-bit hashes of every n-token window.
+
+    STABLE is the load-bearing word. Python's `hash()` for str is salted per
+    process (PYTHONHASHSEED), so an index keyed on it selects a different
+    candidate set - and therefore a different dataset - on every run.
+    crc32 is deterministic across runs, machines and Python versions.
+
+    A 64-bit collision can only ever ADD to a posting count, never remove
+    from one, so the error direction is the safe one - it can cost a row, not
+    hide a leak. It is NOT rejected downstream, though: the posting count IS
+    the intersection size the arithmetic divides, so a collision inflates
+    containment directly rather than proposing a candidate something later
+    throws out. (The comment here used to claim the latter, which would have
+    been a stronger guarantee than the code gives.)
+
+    This is the one-window form and stays the module's public spelling. A
+    caller that grams the SAME tokens at several windows should hash once
+    with token_hashes and window with grams_from.
+    """
+    return grams_from(token_hashes(toks), n)
 
 
 def window_for(length: int, *, n: int = NGRAM, short_min: int = SHORT_MIN_TOKENS) -> int:
@@ -835,8 +858,14 @@ class EvalIndex:
 
         Built once per row and handed to both `candidates` and the Jaccard
         diagnostic, so a row is never gramed twice at the same window.
+
+        The crc32 pass is hoisted out of the loop: the token hashes do not
+        depend on the window, and this comprehension runs once per window per
+        row - it was the module's hottest line, re-encoding every token of
+        every row about a dozen times to produce identical numbers.
         """
-        return {window: gram_hashes(toks, window) for window in self.by_gram}
+        hs = token_hashes(toks)
+        return {window: grams_from(hs, window) for window in self.by_gram}
 
     def candidates(self, query: dict[int, frozenset[int]]) -> dict[int, int]:
         """Every eval item sharing >=1 gram with the row -> how many it shares.

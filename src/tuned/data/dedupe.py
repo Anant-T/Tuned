@@ -260,10 +260,28 @@ class PrefixIndex:
         reason the plan's LSH numbers (128 perm, J=0.85/0.9) mean anything.
         """
         best: tuple[int, float] | None = None
+        n_query = len(grams)
         for ix in sorted(self.candidates(grams)):
             stored = self.grams[ix]
+            n_stored = len(stored)
+            # SIZE BAND, and it is an identity rather than a heuristic. The
+            # intersection cannot exceed the smaller set and the union cannot
+            # be smaller than the larger, so J <= min/max for every pair -
+            # which is exactly jaccard_from(min, n_a, n_b), since the union it
+            # divides by is n_a + n_b - min = max. A candidate whose best
+            # possible score is already under the threshold cannot reach it,
+            # so the membership scan below is pure cost.
+            #
+            # Computed with jaccard_from ON PURPOSE, not as `min < t * max`:
+            # it is the same arithmetic, in the same floats, as the comparison
+            # two lines down, so a pair that would land exactly ON the
+            # threshold can never be skipped by a rounding difference between
+            # the bound and the score. The brute-force golden test is the
+            # proof and passes unchanged.
+            if jaccard_from(min(n_stored, n_query), n_stored, n_query) < self.threshold:
+                continue
             shared = sum(1 for gram in stored if gram in grams)
-            score = jaccard_from(shared, len(stored), len(grams))
+            score = jaccard_from(shared, n_stored, n_query)
             if score >= self.threshold and (best is None or score > best[1]):
                 best = (ix, score)
         return best

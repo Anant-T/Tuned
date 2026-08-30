@@ -98,9 +98,19 @@ def assemble_argvs(
     # from a retired provider or a superseded template is demoted out of the
     # shippable pool rather than blended into it silently. Expect the first
     # armed run to shrink the pool - that is the ruling, not a fault.
-    verify_step = ["verify", "--require-generator", "--require-current-prompt"] + (
-        ["--index", str(citation_index)] if citation_index else []
-    )
+    #
+    # --state accepted, because only an accepted row can ship. The sweep is
+    # over latest_generations, and on a real store four fifths of that is
+    # rejected, stale_prompt, pending or generating - states decontaminate's
+    # `state = 'accepted'` select cannot reach, being re-gated so their gate
+    # rows can be recomputed for nobody. `judging` is the one state this drops
+    # that could ship LATER, and it cannot ship from THIS run: the fleet is
+    # idle by here (run_assemble waits out the leases, and verify refuses to
+    # start while one is live), so no row becomes accepted between this step
+    # and decontaminate's read. It is swept by the next build, when it is.
+    verify_step = [
+        "verify", "--require-generator", "--require-current-prompt", "--state", "accepted",
+    ] + (["--index", str(citation_index)] if citation_index else [])
     if streams:
         base = out_dir or Path("data/build/out")
         shaped = []
@@ -632,10 +642,22 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
     # the runner, before the chain: decontaminate REFUSES outright if an eval
     # set it is measured against cannot be read, which is the correct
     # behaviour and would otherwise fail this job at its first step.
+    #
+    # THE EVAL SETS, and only those. Bare `--kind hf` snapshots every key in
+    # acquire.HF_SOURCES, which is six: the three eval corpora this chain
+    # needs, plus predex, tathyanyaya and injudgements - full-text corpus
+    # inputs for seeds/select, phases that run on the operator's machine and
+    # never here. injudgements alone is the largest of them.
+    #
+    # The keys come from EVAL_SETS rather than a literal list, so the set this
+    # fetches is by construction the set decontaminate refuses to run without.
     print("== acquire eval sets ==")
+    from tuned.data.eval_sets import EVAL_SETS
+
+    eval_source_args = [a for key in sorted(EVAL_SETS) for a in ("--hf-source", key)]
     subprocess.run(
         [sys.executable, "-u", "-m", "tuned.data.acquire", "--kind", "hf",
-         "--config", args.config],
+         "--config", args.config, *eval_source_args],
         check=False,
     )
 

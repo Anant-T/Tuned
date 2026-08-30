@@ -482,6 +482,12 @@ def print_census(census: dict) -> None:
     which teacher or which template generation produced the row - and on the
     ship path it lands in the assemble job's log, ahead of every stage that
     would otherwise report a corpus without saying whose it is.
+
+    The state column is still here because an ad-hoc run sweeps every state.
+    The ship path passes --state accepted, so there it reads as one row per
+    teacher/template of the corpus that is about to be assembled, which is
+    the census that path wants: a teacher breakdown that pools in rejected
+    rows does not describe what ships.
     """
     if not census:
         return

@@ -16,7 +16,13 @@ jobs:
   assemble:
     if: github.repository == 'Anant-T/Tuned'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # 240, not 120. The chain at the 18k target was measured at 270-358 min
+    # before this pass and lands at 75-100 after it, so 120 was under the old
+    # ceiling and is comfortably over the new one - but the estimate is an
+    # estimate, and a chain killed at the cap loses the whole run's work
+    # while a chain that finishes early costs nothing. It stays a real bound:
+    # a hang still gets cut, four hours in rather than two.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
