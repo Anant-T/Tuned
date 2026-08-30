@@ -564,8 +564,9 @@ def containment(part: frozenset[int], whole: frozenset[int]) -> float:
 # --------------------------------------------------------------------------
 # The row contract.
 #
-# An assembly row is {"messages": [...], "_prov": {...}} - replay.py and
-# curated.py's shape, and the shape store rows are lifted into below. The row
+# An assembly row is {"messages": [...], "_prov": {...}} - the shape
+# replay.assembly_row builds (curated.py imports it), and the shape store rows
+# are lifted into below. The row
 # dict is never mutated: everything this pass derives lives on the Item beside
 # it, so the bytes written out are the bytes read in.
 # --------------------------------------------------------------------------
@@ -2872,8 +2873,11 @@ def generated_rows(store, cfg=None, *, state: str = "accepted") -> Iterator[dict
     think_close = getattr(cfg, "think_close", "</think>")
     # THE LICENCE TRAVELS WITH THE GROUNDING. A generated row is the model's
     # words over one seed's text, and it is that seed's source whose terms
-    # the dataset card has to state - exactly as curated.py and replay.py
-    # stamp theirs. Omitting it (until 2026-08-29) left every synthesis row
+    # the dataset card has to state - the same stamp replay.assembly_row
+    # puts on every curated and replay row. This builds its 12-key _prov as a
+    # literal rather than calling that 4-key builder and merging eight more
+    # keys onto it: the merge would be more code, not less.
+    # Omitting it (until 2026-08-29) left every synthesis row
     # licence-less, which stats' `license` gate refuses: "the dataset card
     # cannot be written over them". Read once; there are a handful of
     # sources and tens of thousands of rows.

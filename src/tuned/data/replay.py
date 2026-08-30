@@ -104,7 +104,7 @@ def empty_think(think_open: str, think_close: str) -> str:
     return f"{think_open}\n\n{think_close}"
 
 
-def _row(user: str, assistant_content: str, *, source: str, license_: str, native_id: str | None, reasoning: bool) -> dict:
+def assembly_row(user: str, assistant_content: str, *, source: str, license_: str, native_id: str | None, reasoning: bool) -> dict:
     return {
         "messages": [
             {"role": "user", "content": user},
@@ -175,7 +175,7 @@ def ot_row(raw: dict, think_open: str, think_close: str) -> tuple[dict | None, s
     content = f"{think_open}{reasoning}{think_close}{solution}"
     if has_markup(user, content):
         return None, "markup"
-    return _row(user, content, source="open-thoughts/OpenThoughts-114k", license_="Apache-2.0", native_id=None, reasoning=True), None
+    return assembly_row(user, content, source="open-thoughts/OpenThoughts-114k", license_="Apache-2.0", native_id=None, reasoning=True), None
 
 
 def nemotron_row(raw: dict, think_open: str, think_close: str) -> tuple[dict | None, str | None]:
@@ -226,7 +226,7 @@ def nemotron_row(raw: dict, think_open: str, think_close: str) -> tuple[dict | N
     content = f"{think_open}{trace}{think_close}{answer}"
     if has_markup(user, content):
         return None, "markup"
-    return _row(
+    return assembly_row(
         user, content,
         source="nvidia/Nemotron-Post-Training-Dataset-v2",
         license_="CC-BY-4.0",
@@ -260,7 +260,7 @@ def smoltalk_row(raw: dict, think_open: str, think_close: str) -> tuple[dict | N
     if has_markup(user, content):
         return None, "markup"
     sub = raw.get("source") or "smoltalk2"
-    return _row(
+    return assembly_row(
         user, content,
         source=f"HuggingFaceTB/smoltalk2:{sub}",
         license_="Apache-2.0",
@@ -290,7 +290,7 @@ def legal_qa_row(raw: dict, think_open: str, think_close: str) -> tuple[dict | N
     content = empty_think(think_open, think_close) + answer
     if has_markup(user, content):
         return None, "markup"
-    return _row(
+    return assembly_row(
         user, content,
         source="GSMS-B/Indian-Legal-QA-BNS-BNSS-BSA",
         license_="Apache-2.0",
@@ -332,7 +332,7 @@ def wildchat_row(raw: dict, think_open: str, think_close: str) -> tuple[dict | N
     content = empty_think(think_open, think_close) + answer
     if has_markup(user, content):
         return None, "markup"
-    return _row(
+    return assembly_row(
         user, content,
         source="allenai/WildChat-4.8M",
         license_="ODC-BY",

@@ -7,14 +7,16 @@ answer for reasoning rows, or the byte-exact empty block
 (think_open + "\n\n" + think_close) + answer for non-reasoning rows.
 
 Reuses replay.py's shared quality-filter primitives (is_refusal, has_emoji,
-has_markup, sha256_hex, empty_think) by import - they were already public
-there, so no edit to replay.py was needed. The row-building and combined-
-reject-reason helpers below are curated.py's own (small, mechanical, and
-not the "filter helpers" the brief's import rule is about) since this
-module's per-slice filters differ enough from replay.py's (per-field
-length bands, a code-era contamination regex, per-task licensing) that
-sharing replay's private combinators would be a worse fit than replay's
-own five converters share with each other.
+has_markup, sha256_hex, empty_think) by import, and the row builder itself
+(assembly_row) for the same reason it matters: that function stamps the
+licence every shipped row carries, and stats.py's require_license gate is
+RED on any row missing one, so a second copy of it is one edit away from a
+licence spelled differently on one stream - surfacing at the last gate of a
+multi-day build. The combined-reject-reason helper below stays curated.py's
+own, since this module's per-slice filters differ enough from replay.py's
+(per-field length bands, a code-era contamination regex, per-task
+licensing) that sharing replay's private combinators would be a worse fit
+than replay's own five converters share with each other.
 
 Per-source converters are pure: given a raw row plus the model's think
 tags, each returns (row, None) on acceptance or (None, reason) on
@@ -33,7 +35,14 @@ Build:  python -m tuned.data.curated --config data/configs/data_law_v1.yaml
 import re
 from pathlib import Path
 
-from tuned.data.replay import empty_think, has_emoji, has_markup, is_refusal, sha256_hex
+from tuned.data.replay import (
+    assembly_row,
+    empty_think,
+    has_emoji,
+    has_markup,
+    is_refusal,
+    sha256_hex,
+)
 
 SLICE_ORDER = ("predex_prediction", "aalap_safe", "pi169_audited")
 DEFAULT_COUNTS = (800, 600, 300)
@@ -92,21 +101,6 @@ AALAP_SAFE_TASKS = {
 _NEW_CODE_RE = re.compile(r"\bBNSS?\b|\bBSA\b")
 
 
-def _row(user: str, assistant_content: str, *, source: str, license_: str, native_id: str | None, reasoning: bool) -> dict:
-    return {
-        "messages": [
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": assistant_content},
-        ],
-        "_prov": {
-            "source": source,
-            "license": license_,
-            "native_id": native_id,
-            "reasoning": reasoning,
-        },
-    }
-
-
 def _quality_reject(*texts: str) -> str | None:
     """Shared tail-end checks every converter below runs on its extracted
     user/answer/trace text. Returns a reject reason, or None if clean. No
@@ -154,7 +148,7 @@ def predex_prediction_row(raw: dict, think_open: str, think_close: str) -> tuple
     if has_markup(user, content):
         return None, "markup"
 
-    return _row(
+    return assembly_row(
         user, content,
         source="L-NLProc/PredEx_Instruction-Tuning_Pred-Exp",
         license_="Apache-2.0",
@@ -208,7 +202,7 @@ def aalap_safe_row(raw: dict, think_open: str, think_close: str) -> tuple[dict |
     if has_markup(user, content):
         return None, "markup"
 
-    return _row(
+    return assembly_row(
         user, content,
         source="opennyaiorg/aalap_instruction_dataset",
         license_=license_,
@@ -247,7 +241,7 @@ def pi169_audited_row(raw: dict, think_open: str, think_close: str) -> tuple[dic
     if has_markup(user, content):
         return None, "markup"
 
-    return _row(
+    return assembly_row(
         user, content,
         source="169Pi/indian_law",
         license_="Apache-2.0",
