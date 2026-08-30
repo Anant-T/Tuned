@@ -1112,10 +1112,6 @@ def test_the_cli_limit_flag_reaches_the_driver(tmp_path, capsys, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_cli_hard_exits_after_success():
-    assert "os._exit(" in CHUNKS_SRC.read_text(encoding="utf-8")
-
-
 @pytest.mark.parametrize(
     "module, name, value",
     [

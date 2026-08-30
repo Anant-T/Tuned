@@ -947,5 +947,3 @@ def test_a_limit_of_zero_is_a_typo_not_a_diagnosis_of_the_schema(tmp_path, capsy
     assert "NOTHING SELECTED" not in capsys.readouterr().out
 
 
-def test_cli_hard_exits_after_success():
-    assert "os._exit(" in SELECT_SRC.read_text(encoding="utf-8")

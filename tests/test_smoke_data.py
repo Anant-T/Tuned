@@ -107,13 +107,3 @@ def test_build_smoke_wraps_with_think_tags(tmp_path):
     assert data["messages"][1]["content"] == "[THINK]r0[/THINK]s0"
 
 
-def test_cli_hard_exits_after_success():
-    from pathlib import Path
-
-    src = Path(__file__).parent.parent / "src" / "tuned" / "data" / "smoke.py"
-    text = src.read_text(encoding="utf-8")
-    # The abandoned streaming iterator (break at n rows) can leave non-daemon
-    # datasets/hf-xet machinery that wedges interpreter shutdown AFTER all
-    # output is written - the Kaggle cell then hangs on a finished child
-    # (observed interactively 2026-08-08). The CLI must skip shutdown.
-    assert "os._exit(0)" in text

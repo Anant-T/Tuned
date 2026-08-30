@@ -1,4 +1,3 @@
-import ast
 import json
 from pathlib import Path
 
@@ -16,7 +15,6 @@ from tuned.data.curated import (
     predex_prediction_row,
 )
 
-CURATED_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "curated.py"
 
 
 def _real_think_tags():
@@ -420,34 +418,6 @@ def test_parse_counts_wrong_length():
 def test_parse_counts_non_integer():
     with pytest.raises(ValueError):
         parse_counts("a,b,c")
-
-
-# --------------------------------------------------------------------------
-# Module-import / CLI hygiene.
-# --------------------------------------------------------------------------
-
-def test_cli_hard_exits_after_success():
-    text = CURATED_SRC.read_text(encoding="utf-8")
-    assert "os._exit(0)" in text
-
-
-def test_module_import_never_touches_datasets_at_top_level():
-    tree = ast.parse(CURATED_SRC.read_text(encoding="utf-8"))
-    banned = {"datasets", "pyarrow", "huggingface_hub"}
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            names = {alias.name.split(".")[0] for alias in node.names}
-            assert not (names & banned), f"top-level import of {names & banned}"
-        if isinstance(node, ast.ImportFrom) and node.module:
-            assert node.module.split(".")[0] not in banned, f"top-level `from {node.module} import ...`"
-
-
-def test_module_importable_without_error():
-    import importlib
-
-    import tuned.data.curated as curated_mod
-    importlib.reload(curated_mod)
-    assert hasattr(curated_mod, "build_curated")
 
 
 def test_aalap_safe_tasks_excludes_known_nc_and_unestablished_tasks():

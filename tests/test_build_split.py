@@ -746,10 +746,6 @@ def test_the_run_is_logged_to_the_store(tmp_path):
     assert event["stage"] == "split"
 
 
-def test_cli_hard_exits_after_success():
-    assert "os._exit(" in SPLIT_SRC.read_text(encoding="utf-8")
-
-
 def test_the_version_ledger_describes_the_version_the_module_ships():
     import re
 

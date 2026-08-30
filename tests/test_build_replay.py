@@ -1,4 +1,3 @@
-import ast
 import json
 from pathlib import Path
 
@@ -26,7 +25,6 @@ from tuned.data.replay import (
     wildchat_row,
 )
 
-REPLAY_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "replay.py"
 
 
 # --------------------------------------------------------------------------
@@ -736,35 +734,3 @@ def test_parse_counts_wrong_length():
 def test_parse_counts_non_integer():
     with pytest.raises(ValueError):
         parse_counts("a,b,c,d,e")
-
-
-# --------------------------------------------------------------------------
-# Module-import / CLI hygiene.
-# --------------------------------------------------------------------------
-
-def test_cli_hard_exits_after_success():
-    text = REPLAY_SRC.read_text(encoding="utf-8")
-    assert "os._exit(0)" in text
-
-
-def test_module_import_never_touches_datasets_at_top_level():
-    """datasets/pyarrow/huggingface_hub must only be imported lazily inside
-    function bodies - importing tuned.data.replay must never hit the
-    network. Verified via AST rather than sys.modules because the test
-    venv has datasets installed for other reasons."""
-    tree = ast.parse(REPLAY_SRC.read_text(encoding="utf-8"))
-    banned = {"datasets", "pyarrow", "huggingface_hub"}
-    for node in tree.body:  # module-level statements only, not nested in defs
-        if isinstance(node, ast.Import):
-            names = {alias.name.split(".")[0] for alias in node.names}
-            assert not (names & banned), f"top-level import of {names & banned}"
-        if isinstance(node, ast.ImportFrom) and node.module:
-            assert node.module.split(".")[0] not in banned, f"top-level `from {node.module} import ...`"
-
-
-def test_module_importable_without_error():
-    import importlib
-
-    import tuned.data.replay as replay_mod
-    importlib.reload(replay_mod)
-    assert hasattr(replay_mod, "build_replay")

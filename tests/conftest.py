@@ -57,7 +57,16 @@ import sys
 import pytest
 
 _GUARDED_MODULES = frozenset(
-    {"test_build_decontaminate", "test_build_dedupe", "test_build_acquire"}
+    {
+        "test_build_decontaminate",
+        "test_build_dedupe",
+        "test_build_acquire",
+        # reloads three CLI modules to prove import touches nothing heavy;
+        # the AST guard beside it proves the same thing statically, and only
+        # this one would catch an import-time call through an already-
+        # imported client.
+        "test_cli_conventions",
+    }
 )
 
 # The socket entry points that are refused. Named rather than inlined so the

@@ -3473,10 +3473,6 @@ def test_a_reader_with_kwargs_beside_the_required_options_may_use_them_for_the_r
 
 # ---------------------------------------------------------------------- CLI
 
-def test_cli_hard_exits_after_success():
-    assert "os._exit(" in EXTRACT_SRC.read_text(encoding="utf-8")
-
-
 def test_the_version_ledger_describes_the_version_the_module_ships():
     # `extract_version` is the third resume input: rows written under older
     # rules are re-extracted, rows at this version are left alone. So a rule

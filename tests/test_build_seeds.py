@@ -1,6 +1,3 @@
-import ast
-from pathlib import Path
-
 import pytest
 
 from tuned.data.seeds import (
@@ -18,7 +15,6 @@ from tuned.data.seeds import (
 )
 from tuned.data.store import Store
 
-SEEDS_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "seeds.py"
 
 
 # --------------------------------------------------------------------------
@@ -315,34 +311,6 @@ def test_load_seeds_dedups_repeated_native_id_within_one_call(store):
     assert stats["predex"]["accepted"] == 1
     assert stats["predex"]["rejected"] == 2
     assert store.seed_count(PREDEX_SOURCE_ID) == 1
-
-
-# --------------------------------------------------------------------------
-# Module-import / CLI hygiene.
-# --------------------------------------------------------------------------
-
-def test_cli_hard_exits_after_success():
-    text = SEEDS_SRC.read_text(encoding="utf-8")
-    assert "os._exit(0)" in text
-
-
-def test_module_import_never_touches_datasets_at_top_level():
-    tree = ast.parse(SEEDS_SRC.read_text(encoding="utf-8"))
-    banned = {"datasets", "pyarrow", "huggingface_hub"}
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            names = {alias.name.split(".")[0] for alias in node.names}
-            assert not (names & banned), f"top-level import of {names & banned}"
-        if isinstance(node, ast.ImportFrom) and node.module:
-            assert node.module.split(".")[0] not in banned, f"top-level `from {node.module} import ...`"
-
-
-def test_module_importable_without_error():
-    import importlib
-
-    import tuned.data.seeds as seeds_mod
-    importlib.reload(seeds_mod)
-    assert hasattr(seeds_mod, "load_seeds")
 
 
 def test_source_order_matches_default_limits_keys():

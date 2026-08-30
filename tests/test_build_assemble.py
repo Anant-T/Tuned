@@ -715,10 +715,6 @@ def test_the_real_template_renders_what_the_fake_pretends_to():
 # Conventions.
 # --------------------------------------------------------------------------
 
-def test_cli_hard_exits_after_success():
-    assert "os._exit(" in ASSEMBLE_SRC.read_text(encoding="utf-8")
-
-
 def test_the_version_ledger_describes_the_version_the_module_ships():
     import re
 

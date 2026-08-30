@@ -6,7 +6,6 @@ snapshot_download), so every resume/durability property is driven from
 fixtures.
 """
 
-import ast
 import hashlib
 import os
 import sys
@@ -45,7 +44,6 @@ from tuned.data.acquire import (
 from tuned.data.acquire import _READ_BLOCK as READ_BLOCK
 from tuned.data.store import Store
 
-ACQUIRE_SRC = Path(__file__).parent.parent / "src" / "tuned" / "data" / "acquire.py"
 
 
 # --------------------------------------------------------------------------
@@ -787,27 +785,12 @@ def test_index_tree_keys_are_posix_relative_paths_and_skip_partials(store, tmp_p
 # Seams and CLI.
 # --------------------------------------------------------------------------
 
-def test_module_import_never_touches_the_heavy_clients():
-    tree = ast.parse(ACQUIRE_SRC.read_text(encoding="utf-8"))
-    banned = {"boto3", "botocore", "huggingface_hub", "datasets", "pyarrow"}
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            names = {alias.name.split(".")[0] for alias in node.names}
-            assert not (names & banned), f"top-level import of {names & banned}"
-        if isinstance(node, ast.ImportFrom) and node.module:
-            assert node.module.split(".")[0] not in banned, f"top-level from {node.module}"
-
-
 def test_a_missing_boto3_says_how_to_install_it(monkeypatch):
     monkeypatch.setitem(sys.modules, "boto3", None)
     with pytest.raises(AcquisitionError) as exc:
         list(S3Bucket().list_objects("data/pdf/"))
     assert "boto3" in str(exc.value)
     assert "[build]" in str(exc.value)
-
-
-def test_cli_hard_exits_after_success():
-    assert "os._exit(" in ACQUIRE_SRC.read_text(encoding="utf-8")
 
 
 def test_cli_acquires_pdfs_into_the_build_corpus(tmp_path, capsys):
