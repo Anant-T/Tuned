@@ -1086,10 +1086,17 @@ def test_the_db_clock_only_advances_on_a_push_that_landed():
     assert "if with_db:" in src[advance - 120:advance]
 
 
-def test_the_reopen_on_empty_list_is_the_two_pool_failures_and_no_others():
-    """gen_unroutable and format_parked are POOL failures - no key, every
-    model down, soft-gate attempts exhausted - which a fleet or policy change
-    makes valid again.
+def test_the_reopen_on_empty_list_is_the_free_parks_and_no_others():
+    """Every member is a park that costs NOTHING to retry, and that is the
+    rule rather than a hand-kept list.
+
+    gen_unroutable and format_parked are POOL failures - no key, every model
+    down, soft-gate attempts exhausted - which a fleet or policy change makes
+    valid again. off_teacher is the 2026-08-30 one-teacher cut: the row must
+    be bought again from the current teacher, and nothing else recovers it,
+    because it is invisible to the queue (not claimable) while still counting
+    as live to the planner (not terminally dead), so a re-plan inserts
+    nothing.
 
     judge_error is reopenable by hand and must NEVER be automatic: its
     attempts RESET on re-open, so a state that comes back with a full budget
@@ -1100,12 +1107,40 @@ def test_the_reopen_on_empty_list_is_the_two_pool_failures_and_no_others():
     """
     from tuned.data.tasks import REOPEN_STATES, TERMINALLY_DEAD
 
-    assert actions_worker.REOPEN_ON_EMPTY == ("gen_unroutable", "format_parked")
-    for state in actions_worker.REOPEN_ON_EMPTY:
-        assert state in REOPEN_STATES, f"{state} is not a re-openable state"
-        assert state not in TERMINALLY_DEAD
+    assert actions_worker.REOPEN_ON_EMPTY == (
+        "gen_unroutable", "format_parked", "off_teacher",
+    )
+    # DERIVED, not a second copy of the list: the members are exactly the
+    # re-openable states that go back to the GENERATOR and can still leave
+    # under their own power. Re-opening to "judging" (judge_error,
+    # judge_unroutable) resets attempts already spent on a good answer, and a
+    # TERMINALLY_DEAD state re-parks before any render. If someone adds a
+    # state to REOPEN_STATES that satisfies both, this fails until they
+    # decide about it deliberately.
+    expected = tuple(
+        s for s, back_to in REOPEN_STATES.items()
+        if back_to == "pending" and s not in TERMINALLY_DEAD
+    )
+    assert set(actions_worker.REOPEN_ON_EMPTY) == set(expected)
     assert "judge_error" not in actions_worker.REOPEN_ON_EMPTY
     assert "stale_prompt" not in actions_worker.REOPEN_ON_EMPTY
+
+
+def test_off_teacher_is_unrecoverable_without_the_automatic_reopen():
+    """The demotion is a one-way door unless REOPEN_ON_EMPTY names it.
+
+    P1.1 says the demoted rows "must regenerate". They cannot reach a worker
+    on their own: off_teacher is not claimable, so the queue reads empty; and
+    it is not terminally dead, so _existing_in_queue counts those rows as
+    live and the planner reports "already at target" without inserting. This
+    pins both halves of that trap, so a future edit to either list cannot
+    quietly re-close the door.
+    """
+    from tuned.data.tasks import TERMINALLY_DEAD
+
+    assert "off_teacher" not in actions_worker.CLAIMABLE_STATES
+    assert "off_teacher" not in TERMINALLY_DEAD
+    assert "off_teacher" in actions_worker.REOPEN_ON_EMPTY
 
 
 def test_the_reopen_runs_only_when_there_is_nothing_left_to_claim():
