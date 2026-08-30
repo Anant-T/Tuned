@@ -324,8 +324,9 @@ def seed_token_budget(cfg) -> int:
 def _candidate_seeds(
     store, *, limit: int, sources: Sequence[str] | None, stream: str,
     max_seed_tokens: int,
-) -> list[tuple[str, int]]:
-    """(seed_id, tasks already planned on it), fewest-first, under the cap.
+) -> list[tuple[str, int, bool]]:
+    """(seed_id, tasks already planned on it, could-be-statute-QA), fewest-
+    first, under the cap.
 
     Ordered (n_tasks ASC, seed_id ASC): unused seeds before resampled ones,
     and a total order inside each tier so the choice never depends on SQLite's
@@ -408,7 +409,24 @@ def _candidate_seeds(
         params.extend(sources)
     params.append(limit)
     rows = store.conn.execute(
-        "SELECT s.seed_id, COALESCE(t.n, 0) AS n_tasks FROM seed s "
+        "SELECT s.seed_id, COALESCE(t.n, 0) AS n_tasks, "
+        # THE CHEAP HALF of the statute-QA predicate, answered by the query
+        # that already visited the row. The planner used to re-read every
+        # candidate seed one point-lookup at a time to ask whether it carried
+        # a section_text at all - `wanted` extra round trips, thousands of
+        # them on a real wave, to discard most of the answers.
+        #
+        # It is deliberately NOT the whole predicate. The real test is
+        # `" ".join(x.split())` on both sides and then a comparison, and
+        # SQLite's TRIM strips spaces but not tabs or newlines - so this is
+        # allowed to say "maybe" where the real one says no, and never the
+        # reverse. statute_qa_section_eligible stays the single authority and
+        # still runs on everything this lets through; all this removes is the
+        # lookups for seeds that could never have passed.
+        "CASE WHEN json_valid(s.meta_json) AND TRIM(COALESCE("
+        "  json_extract(s.meta_json, '$.section_text'), '')) != '' "
+        "THEN 1 ELSE 0 END AS maybe_statute "
+        "FROM seed s "
         "LEFT JOIN (SELECT seed_id, COUNT(*) AS n FROM task "
         "           WHERE state != 'input_ineligible' "
         "             AND NOT (task_type = 'statute_qa' "
@@ -419,7 +437,7 @@ def _candidate_seeds(
         "ORDER BY n_tasks ASC, s.seed_id ASC LIMIT ?",
         params,
     ).fetchall()
-    return [(row[0], int(row[1])) for row in rows]
+    return [(row[0], int(row[1]), bool(row[2])) for row in rows]
 
 
 def _sample_counts(store, seed_ids: Sequence[str]) -> dict[tuple[str, str], int]:
@@ -479,15 +497,20 @@ def plan_rows(
     )
     if not candidates:
         return []
-    pair_counts = _sample_counts(store, [seed_id for seed_id, _ in candidates])
-    used = {seed_id: n_tasks for seed_id, n_tasks in candidates}
-    order = [seed_id for seed_id, _ in candidates]
+    pair_counts = _sample_counts(store, [seed_id for seed_id, _, _ in candidates])
+    used = {seed_id: n_tasks for seed_id, n_tasks, _ in candidates}
+    order = [seed_id for seed_id, _, _ in candidates]
     statute_ok: set[str] | None = None
     if "statute_qa" in quota:
         from tuned.data.generate import seed_meta, statute_qa_section_eligible
 
         statute_ok = set()
-        for seed_id, _ in candidates:
+        for seed_id, _, maybe_statute in candidates:
+            # The query already answered "does this seed carry a section_text
+            # at all", so only the seeds that could pass are re-read. The
+            # comparison itself stays here, in the one function that owns it.
+            if not maybe_statute:
+                continue
             seed = store.get_seed(seed_id)
             if seed is None:
                 continue

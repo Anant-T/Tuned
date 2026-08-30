@@ -1051,3 +1051,54 @@ def test_off_teacher_is_the_one_billed_park_that_gets_its_budget_back():
     assert FREE_PARK_DISPOSITIONS == {
         "unroutable:generator", "exhausted:provider-fault", "verify:off-teacher",
     }
+
+
+@pytest.mark.parametrize(
+    "section_text",
+    [
+        None,                      # no key at all
+        "",                        # present and empty
+        "   ",                     # spaces - SQLite TRIM strips these
+        "\t\n",                    # tabs/newlines - TRIM does NOT
+        SEED_TEXT,                 # present, but not distinct from the seed
+        STATUTE_SECTION_TEXT,      # the genuine article
+    ],
+)
+def test_the_sql_statute_hint_never_hides_a_seed_the_real_predicate_accepts(
+    tmp_path, section_text
+):
+    """_candidate_seeds answers the CHEAP half of the statute-QA test in the
+    query that already visited the row, so the planner stops re-reading every
+    candidate one point-lookup at a time.
+
+    The direction is the whole safety argument. SQLite's TRIM strips spaces
+    but not tabs or newlines, while the real predicate collapses all
+    whitespace - so the hint is allowed to say "maybe" where
+    statute_qa_section_eligible says no, and never the reverse. This asserts
+    exactly that implication over every shape the column can hold.
+    """
+    from tuned.data.generate import seed_meta, statute_qa_section_eligible
+    from tuned.data.tasks import _candidate_seeds
+
+    meta = {} if section_text is None else {"section_text": section_text}
+    store = open_store(tmp_path, n_seeds=1, meta=meta)
+    if section_text is None:  # seed_rows always writes one; take it back out
+        store.upsert_seeds([dict(seed_rows(1)[0], meta_json={})])
+    try:
+        candidates = _candidate_seeds(
+            store, limit=10, sources=None, stream="synthesis", max_seed_tokens=10**6
+        )
+        assert len(candidates) == 1
+        seed_id, _, maybe = candidates[0]
+
+        seed = store.get_seed(seed_id)
+        truth = statute_qa_section_eligible(
+            seed.get("text") or "", seed_meta(seed).get("section_text")
+        )
+        assert not truth or maybe, (
+            f"the hint hid a seed the real predicate accepts ({section_text!r})"
+        )
+        if section_text == STATUTE_SECTION_TEXT:
+            assert truth and maybe  # the case that must survive both
+    finally:
+        store.close()

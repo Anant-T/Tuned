@@ -1084,3 +1084,82 @@ def test_the_db_clock_only_advances_on_a_push_that_landed():
     failure = src.index("push_failures += 1")
     assert advance < failure, "the advance must sit in the success branch"
     assert "if with_db:" in src[advance - 120:advance]
+
+
+def test_the_reopen_on_empty_list_is_the_two_pool_failures_and_no_others():
+    """gen_unroutable and format_parked are POOL failures - no key, every
+    model down, soft-gate attempts exhausted - which a fleet or policy change
+    makes valid again.
+
+    judge_error is reopenable by hand and must NEVER be automatic: its
+    attempts RESET on re-open, so a state that comes back with a full budget
+    every time the queue empties is an unbounded re-spend loop, not a
+    recovery. stale_prompt is in TERMINALLY_DEAD - generate.py re-parks it
+    before any render, so re-opening it 6x a day churns the store to arrive
+    back where it started.
+    """
+    from tuned.data.tasks import REOPEN_STATES, TERMINALLY_DEAD
+
+    assert actions_worker.REOPEN_ON_EMPTY == ("gen_unroutable", "format_parked")
+    for state in actions_worker.REOPEN_ON_EMPTY:
+        assert state in REOPEN_STATES, f"{state} is not a re-openable state"
+        assert state not in TERMINALLY_DEAD
+    assert "judge_error" not in actions_worker.REOPEN_ON_EMPTY
+    assert "stale_prompt" not in actions_worker.REOPEN_ON_EMPTY
+
+
+def test_the_reopen_runs_only_when_there_is_nothing_left_to_claim():
+    """Unconditionally, it is a churn loop against a pool gap that is usually
+    still there - re-open, fail to route, park, re-open - six times a day. On
+    the empty branch it is the last thing tried before declaring the queue
+    dead."""
+    import inspect
+
+    src = inspect.getsource(actions_worker.run_worker)
+    guard = src.index("if counts is not None and not _claimable(counts):")
+    reopen = src.index("REOPEN_ON_EMPTY", guard)
+    spawn = src.index("subprocess.Popen")
+    assert guard < reopen < spawn, "the re-open must sit inside the empty branch, before the children"
+    assert src.count("REOPEN_ON_EMPTY") == 3  # the print, the argv, the report
+
+
+def test_an_empty_queue_skips_both_children_and_says_so_in_the_job_summary(tmp_path, monkeypatch, capsys):
+    """5.25 h of two processes polling an empty queue, a pull, a push and a
+    cron slot, to report what the first SELECT already knew."""
+    root = tmp_path / "build"
+    _tiny_db(root / actions_worker.DB_RELPATH, "x").close()
+    conn = sqlite3.connect(root / actions_worker.DB_RELPATH)
+    conn.execute("CREATE TABLE task (state TEXT)")
+    conn.executemany("INSERT INTO task VALUES (?)", [("rejected",), ("stale_prompt",)])
+    conn.commit()
+    conn.close()
+
+    ran = []
+
+    def _run(argv, **kwargs):
+        ran.append(argv)
+        return type("R", (), {"returncode": 0})()
+
+    def _popen(*args, **kwargs):
+        pytest.fail("a child was spawned on an empty queue")
+
+    monkeypatch.setattr(actions_worker, "pull_and_restore", lambda b, r: None)
+    monkeypatch.setattr(actions_worker, "stage_bundle", lambda r, s, db=True: s)
+    monkeypatch.setattr(actions_worker.subprocess, "run", _run)
+    monkeypatch.setattr(actions_worker.subprocess, "Popen", _popen)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+    pushed = []
+
+    class _Bundle:
+        repo_id = "u/r"
+
+        def push(self, staging, message):
+            pushed.append(message)
+
+    args = actions_worker.main_parser().parse_args(["--phase", "worker", "--hf-repo", "u/r"])
+    assert actions_worker.run_worker(args, root, _Bundle()) == 0
+    assert pushed, "the re-open writes task states; they have to leave the host"
+    assert "QUEUE EMPTY" in summary.read_text(encoding="utf-8")
+    assert any("--reopen" in a for argv in ran for a in argv), "the re-open was never tried"

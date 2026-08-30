@@ -351,6 +351,44 @@ def _claimable(counts: dict[str, int]) -> int:
     return sum(counts.get(state, 0) for state in CLAIMABLE_STATES)
 
 
+def _report(lines: Sequence[str]) -> None:
+    """Say it on stdout AND in the Actions job summary.
+
+    The summary is the only surface an operator sees without opening the run,
+    so anything worth ending a job over belongs in both. Extracted from
+    _finish when the queue-empty exit became a second thing that ends a run
+    early and has to be exactly as visible as a crash.
+    """
+    text = "\n".join(lines)
+    print(text)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with open(summary, "a", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        except OSError as exc:
+            print(f"step summary unavailable ({exc})")
+
+
+# Parked states worth one automatic re-open when the queue has run dry, and
+# the only two. Both are POOL failures rather than decisions about an answer:
+# gen_unroutable is a wave that could not route at all (no key, every model
+# down) and format_parked is a row that exhausted its soft-gate attempts,
+# which a template or policy change makes valid again.
+#
+# NOT judge_error, though it is reopenable by hand: its attempts RESET on
+# re-open (a judge park happens after a good generation exists, so the
+# attempts were spent on the answer, not on discovering the pool was short),
+# and a state that comes back with a full budget every time the queue empties
+# is an unbounded re-spend loop rather than a recovery.
+#
+# NOT stale_prompt either: it is in TERMINALLY_DEAD. The row was planned
+# against template bytes that no longer exist, so generate.py's guard re-parks
+# it before any render - re-opening it 6x/day churns the store to arrive back
+# where it started. Only a re-plan produces a usable row for that seed.
+REOPEN_ON_EMPTY = ("gen_unroutable", "format_parked")
+
+
 def _is_baton_conflict(exc: BaseException) -> bool:
     """A 412 from the Hub means our parent_commit is no longer the head."""
     status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -589,15 +627,7 @@ def _finish(
     if not final_push_ok:
         report.append("FINAL PUSH FAILED - work since the last checkpoint is unrecovered")
 
-    text = "\n".join(report)
-    print(text)
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        try:
-            with open(summary, "a", encoding="utf-8") as fh:
-                fh.write(text + "\n")
-        except OSError as exc:
-            print(f"step summary unavailable ({exc})")
+    _report(report)
     return 1 if (gen_died_early or not final_push_ok) else 0
 
 
@@ -610,6 +640,44 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
     )
 
     staging = root.parent / "bundle_out"
+
+    # NOTHING TO CLAIM? Do not spend 5.25 h finding that out.
+    #
+    # Both children poll a queue; with none of CLAIMABLE_STATES populated they
+    # poll an empty one until the deadline, and the run costs a full job slot,
+    # a pull, a push and a cron cycle to report a fact the first SELECT knew.
+    # Denser cron only multiplies that.
+    #
+    # The re-open runs ONLY on this branch. Doing it every run would be a
+    # churn loop against a pool gap that is usually still there - re-open,
+    # fail to route, park, re-open - 6x a day. Here it is the last thing to
+    # try before declaring the queue dead, and it either finds work (in which
+    # case the run proceeds normally) or it does not.
+    counts = _task_counts(root / DB_RELPATH)
+    if counts is not None and not _claimable(counts):
+        print(f"no claimable work: {counts} - trying {', '.join(REOPEN_ON_EMPTY)}")
+        subprocess.run(
+            [sys.executable, "-m", "tuned.data.tasks", "--config", args.config,
+             *[a for state in REOPEN_ON_EMPTY for a in ("--reopen", state)]],
+            check=False,
+        )
+        counts = _task_counts(root / DB_RELPATH) or counts
+        if not _claimable(counts):
+            _report([
+                "task states: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())),
+                "QUEUE EMPTY - nothing left to claim, and re-opening "
+                f"{'/'.join(REOPEN_ON_EMPTY)} found nothing either. Skipped both "
+                "children. Re-plan with `python -m tuned.data.tasks --config "
+                "<cfg> --n <rows>`; until then every run of this workflow will "
+                "end here in ~3 min.",
+            ])
+            # Pushed because the re-open above writes task states, and exit 0
+            # because an empty queue is a fact about the plan, not a fault in
+            # this job - a red run here would train the operator to ignore red.
+            _push(bundle, root, staging, "queue-empty checkpoint", attempts=3)
+            return 0
+        print(f"re-open found work: {_claimable(counts)} claimable - continuing")
+
     deadline = time.monotonic() + args.minutes * 60
     next_push = time.monotonic() + args.push_every
     next_db_push = time.monotonic() + args.db_every
