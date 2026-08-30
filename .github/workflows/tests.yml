@@ -3,7 +3,7 @@
 # Until this file existed the ONLY thing that ran these tests was a Kaggle
 # notebook cell - i.e. they ran when someone was about to spend GPU quota,
 # on a machine that costs 20 minutes to reach, and never at all for the
-# unattended data-build lane. data-worker.yml runs every 6 hours with no
+# unattended data-build lane. data-worker.yml runs every 4 hours with no
 # human present against a `pip install -e .` of whatever is on main; a
 # commit that breaks an import there is discovered as a red cron run hours
 # later, if anyone looks.

@@ -93,16 +93,23 @@ model-parallel lanes this one replaced — and detailed metrics.
 ## Dataset build: unattended on GitHub Actions
 
 The build runs itself (since 2026-08-29): `.github/workflows/data-worker.yml`
-launches a ~5.5 h generate+judge job every 6 hours, resuming from a state
-baton in the private HF dataset repo `tantan01/tuned-law-state` (SQLite
-snapshot + raw NDJSON + streams, pushed back every 15 min). Judging runs in
+launches a ~5.5 h generate+judge job every 4 hours, resuming from a state
+baton in the private HF dataset repo `tantan01/tuned-law-state` (raw NDJSON +
+streams pushed back every 15 min, the SQLite snapshot hourly — the DB is the
+expensive half, so it moves on its own clock and bounds a crash to 60 min of
+generation). Judging runs in
 **audit mode** — a 5% hash-sample gets the full dual-judge treatment, the
 rest of the gate-clean rows ship as `audit:gate-accept`.
 
 Operator surface:
 
 - **Watch**: the repo's Actions tab; per-job logs also land in the baton
-  (`logs/gen.log`, `logs/judge.log`).
+  (`logs/gen.log`, `logs/judge.log`). Each run writes child exit codes, task
+  counts and the audit rate to the job summary, so a silent no-op is visible
+  without opening the log.
+- **Tests**: `.github/workflows/tests.yml` runs the whole suite on every push
+  and PR. It needs no secrets and touches no baton, so a fork can run it
+  as-is.
 - **Ship a dataset cut**: Actions -> `data-assemble` -> Run workflow. It
   reconciles, verifies, assembles, and pushes to the HF dataset repo only if
   `stats` is green; the `out/` artifacts upload to the baton either way.
