@@ -147,6 +147,16 @@ def snapshot_db(state_db: Path, dest: Path) -> None:
 
 INDEX_RELPATH = Path("corpus") / "citation_index.txt"
 
+# The baton's WORKING state - the only part of the repo a new holder needs.
+# One definition, used twice: restore_bundle walks these, and Bundle.pull
+# turns them into the allow_patterns it downloads. The repo also carries
+# `logs/` (staged for the operator to read, never restored) and `out/` (the
+# assembly artifacts, which grow with every dispatch), and pulling those was
+# hundreds of megabytes per run fetched so that restore_bundle could skip
+# them. Two lists would drift into either a sub that is downloaded and
+# ignored or - much worse - one that is restored and was never fetched.
+RESTORE_SUBS = ("state", "raw", "streams", "corpus")
+
 
 def stage_bundle(root: Path, staging: Path) -> Path:
     """Copy everything the baton carries into a clean staging tree.
@@ -174,7 +184,7 @@ def restore_bundle(bundle: Path, root: Path) -> None:
     bundle's copy of a file wins, and any stale -wal/-shm beside the DB is
     dropped (the snapshot is self-contained; a leftover WAL from a previous
     life would be replayed over it)."""
-    for sub in ("state", "raw", "streams", "corpus"):
+    for sub in RESTORE_SUBS:
         src = bundle / sub
         if not src.is_dir():
             continue
@@ -184,6 +194,23 @@ def restore_bundle(bundle: Path, root: Path) -> None:
             shutil.copy2(f, dest)
     for suffix in ("-wal", "-shm"):
         (root / DB_RELPATH).with_name(DB_RELPATH.name + suffix).unlink(missing_ok=True)
+
+
+def pull_and_restore(bundle: "Bundle", root: Path) -> None:
+    """Land the baton in `root`, then delete the copy it was landed from.
+
+    The pull writes a whole second copy of the working state onto the runner
+    disk and restore_bundle then copies it into place; keeping it afterwards
+    doubles the baton's footprint for the rest of the job, and every byte of
+    it is either already in `root` or in a sub restore_bundle does not read.
+    Both phases did these steps in the same order, so the drop lives here
+    rather than being remembered separately in each of them.
+    """
+    pulled = bundle.pull(root.parent / "bundle_in")
+    restore_bundle(pulled, root)
+    # ignore_errors: failing to reclaim disk must not fail a job that has
+    # already restored successfully.
+    shutil.rmtree(pulled, ignore_errors=True)
 
 
 class Bundle:
@@ -210,6 +237,12 @@ class Bundle:
             snapshot_download(
                 self.repo_id, repo_type="dataset",
                 revision=self.head, local_dir=dest,
+                # Only what restore_bundle will actually land, from the one
+                # list that decides it. `logs/` and `out/` live in this repo
+                # too and neither is ever restored, so downloading them was
+                # bandwidth and runner disk spent to be ignored - and `out/`
+                # accumulates a full set of assembly artifacts per dispatch.
+                allow_patterns=[f"{sub}/**" for sub in RESTORE_SUBS],
             )
         )
 
@@ -551,8 +584,7 @@ def _finish(
 def run_worker(args, root: Path, bundle: Bundle) -> int:
     from tuned.data.store import Store  # local, like run_assemble's - see the module head
 
-    pulled = bundle.pull(root.parent / "bundle_in")
-    restore_bundle(pulled, root)
+    pull_and_restore(bundle, root)
     subprocess.run(
         [sys.executable, "-m", "tuned.data.reconcile", "--config", args.config], check=False
     )
@@ -647,8 +679,7 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
     from tuned.data.store import Store
     from tuned.data.verify import live_leases
 
-    pulled = bundle.pull(root.parent / "bundle_in")
-    restore_bundle(pulled, root)
+    pull_and_restore(bundle, root)
     subprocess.run(
         [sys.executable, "-m", "tuned.data.reconcile", "--config", args.config], check=False
     )
@@ -756,6 +787,21 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
             repo_id=bundle.repo_id, repo_type="dataset",
             folder_path=str(out_dir), path_in_repo="out",
             commit_message="assembly artifacts",
+            # THIS KWARG IS ONLY SAFE BESIDE path_in_repo="out". delete_patterns
+            # is resolved RELATIVE TO path_in_repo, so here it means "delete
+            # everything under out/ that this upload did not just write" - and
+            # with the path_in_repo line removed or changed it would mean the
+            # whole repo, i.e. the baton. They are one decision and are pinned
+            # together in one test for that reason; do not edit either alone.
+            #
+            # It exists because out/ is the only part of this repo that
+            # accumulates: each dispatch writes a fresh set of artifacts under
+            # the same names, but a run whose chain stopped early leaves the
+            # PREVIOUS run's later stages sitting beside the new ones, where
+            # they read as this run's output. Replacing the directory makes
+            # out/ mean "the last assembly", which is the only thing anyone
+            # reads it as.
+            delete_patterns=["**"],
         )
     _push(bundle, root, root.parent / "bundle_out", "post-assembly checkpoint")
     return rc

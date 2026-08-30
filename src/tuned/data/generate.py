@@ -1604,8 +1604,24 @@ def _gen_envelope(task: Mapping, attempt: int, ref: ModelRef, model_family, resp
         "prompt_sha": task["prompt_sha"],
         "reviewer_note": reviewer_note,
         "messages": [dict(m) for m in bundle.messages],
-        "response_text": response.text,
-        "response_reasoning": response.reasoning,
+        # NULLED WHEN BYTE-IDENTICAL to a field already on this line, which is
+        # almost always: `content` is response.text verbatim when the model
+        # returned no separable reasoning, `answer` is it when the model did,
+        # and `think` is response.reasoning stripped. Measured over the local
+        # raw log that is 19.5% off every generation line - the baton carries
+        # these files whole, several times an hour, forever.
+        #
+        # Compared by CONTENT rather than by which branch assemble_content
+        # took, because the branch that matters is the one where they differ:
+        # a model that inlined <think> had its text re-emitted in canonical
+        # form, so response.text is the only record of the wire bytes and it
+        # survives here untouched. Same for a reply with outer whitespace.
+        #
+        # A null is NOT evidence of an empty reply - it means "recoverable
+        # from the fields beside it". finish_reason and status are what say
+        # the provider returned nothing.
+        "response_text": None if response.text in (content, answer) else response.text,
+        "response_reasoning": None if response.reasoning == think else response.reasoning,
         "status": response.status,
     }
 

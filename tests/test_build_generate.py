@@ -360,6 +360,66 @@ def test_assemble_content_never_fabricates_a_trace(cfg):
     assert cfg.think_open not in content
 
 
+def _envelope(cfg, response):
+    """One raw line for `response`, through the same assembly the CLI uses."""
+    from tuned.data.generate import PromptBundle, _gen_envelope
+
+    content, think, answer = assemble_content(cfg, response)
+    task = {
+        "task_id": "t1", "stream": "synthesis", "task_type": "irac",
+        "seed_id": "sd0", "prompt_id": "p1", "prompt_sha": "sha1",
+    }
+    bundle = PromptBundle(
+        messages=[{"role": "user", "content": "q"}], grounding="g", judge_source="g",
+        slots={}, prompt_est_tokens=10, context_est_tokens=12,
+    )
+    return _gen_envelope(
+        task, 1, ModelRef("bai", "deepseek-v4-flash"), "deepseek", response,
+        content, think, answer, {}, bundle, None,
+    )
+
+
+def test_the_raw_line_drops_a_response_field_that_repeats_one_beside_it(cfg):
+    """The baton carries these files whole, several times an hour, forever,
+    and response_text was a verbatim second copy of content or answer on all
+    but a handful of lines.
+
+    A null here means "recoverable from the fields beside it", NOT that the
+    provider returned nothing - finish_reason and status say that.
+    """
+    # Separate reasoning channel: text is the answer, reasoning is the think.
+    env = _envelope(cfg, chat_response("ANSWER", "TRACE"))
+    assert env["response_text"] is None and env["answer"] == "ANSWER"
+    assert env["response_reasoning"] is None and env["think"] == "TRACE"
+
+    # No trace at all: content IS the text.
+    env = _envelope(cfg, chat_response("just an answer", None))
+    assert env["response_text"] is None and env["content"] == "just an answer"
+
+
+def test_the_raw_line_still_records_the_wire_bytes_when_they_differ(cfg):
+    """The branch that matters. An inlined <think> is re-emitted in canonical
+    form, so response.text is the ONLY record of what the model actually sent
+    - as is any reply that arrived with outer whitespace."""
+    inline = f"{cfg.think_open}TRACE{cfg.think_close}\nANSWER"
+    env = _envelope(cfg, chat_response(inline, None))
+    assert env["response_text"] == inline
+    assert env["content"] != inline  # canonicalised, which is why it is kept
+
+    padded = "  ANSWER  \n"
+    env = _envelope(cfg, chat_response(padded, "TRACE"))
+    assert env["response_text"] == padded
+    assert env["answer"] == "ANSWER"
+
+
+def test_content_is_never_dropped(cfg):
+    """verify.content_for reads its PRESENCE to label a re-gate raw-vs-rebuilt,
+    and it is the exact string the gates scored - the whole reason a re-gate
+    months later can score the same bytes."""
+    for response in (chat_response("ANSWER", "TRACE"), chat_response("plain", None)):
+        assert _envelope(cfg, response)["content"]
+
+
 @pytest.mark.parametrize("attempt", [1, 2, 3, 4])
 def test_a_retry_re_rolls_the_same_request_and_never_bumps_effort(cfg, attempt):
     """RETIRED LADDER (2026-08-18). This used to assert the opposite -

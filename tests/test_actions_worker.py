@@ -957,3 +957,69 @@ def test_a_lease_that_outlives_the_wait_stops_the_chain_by_name():
     assert "return 5" in src[refusal:acquire]
     # distinct from the audit-collapse refusal, so a red run says which one
     assert "rc = 4" in src
+
+
+def test_the_pull_fetches_only_what_the_restore_will_land():
+    """`logs/` and `out/` live in the baton repo and neither is ever restored,
+    so downloading them was bandwidth and runner disk spent to be ignored -
+    and out/ gains a full set of assembly artifacts per dispatch.
+
+    Both the download filter and the restore walk read RESTORE_SUBS, because
+    two lists drift into either a sub that is fetched and ignored or - far
+    worse - one that is restored and was never fetched.
+    """
+    import inspect
+
+    from huggingface_hub.utils import filter_repo_objects
+
+    assert "RESTORE_SUBS" in inspect.getsource(actions_worker.restore_bundle)
+    assert "RESTORE_SUBS" in inspect.getsource(actions_worker.Bundle.pull)
+
+    patterns = [f"{sub}/**" for sub in actions_worker.RESTORE_SUBS]
+    repo = [
+        "state/law_v1.sqlite3", "raw/gen/2026-08-29/gen.ndjson",
+        "streams/replay.jsonl", str(actions_worker.INDEX_RELPATH).replace("\\", "/"),
+        "logs/run-1/gen.log", "out/assemble.json", "out/law_v1_train.jsonl",
+    ]
+    kept = set(filter_repo_objects(repo, allow_patterns=patterns))
+    assert "logs/run-1/gen.log" not in kept
+    assert not any(p.startswith("out/") for p in kept)
+    # everything restore_bundle would look for still arrives
+    assert kept == {p for p in repo if p.split("/")[0] in actions_worker.RESTORE_SUBS}
+
+
+def test_the_pulled_copy_is_dropped_once_it_has_been_restored(tmp_path, monkeypatch):
+    """The pull writes a second whole copy of the working state onto the
+    runner and restore_bundle copies it into place; keeping it doubles the
+    baton's footprint for the rest of the job."""
+    root = tmp_path / "build"
+    root.mkdir(parents=True)
+
+    class _FakeBundle:
+        def pull(self, dest):
+            (dest / "streams").mkdir(parents=True)
+            (dest / "streams" / "replay.jsonl").write_text('{"row":1}\n', encoding="utf-8")
+            return dest
+
+    actions_worker.pull_and_restore(_FakeBundle(), root)
+    assert (root / "streams" / "replay.jsonl").read_text(encoding="utf-8") == '{"row":1}\n'
+    assert not (root.parent / "bundle_in").exists(), "the pulled copy is still on disk"
+
+
+def test_the_out_upload_deletes_only_because_it_is_scoped_to_out():
+    """delete_patterns is resolved RELATIVE TO path_in_repo. With
+    path_in_repo="out" it clears the previous assembly's artifacts; without
+    it, the same ["**"] means the whole repo - which is the baton. The two
+    kwargs are one decision, so they are pinned in one place.
+    """
+    import inspect
+
+    src = inspect.getsource(actions_worker.run_assemble)
+    call = src[src.index("out_dir = root / \"out\""):]
+    call = call[:call.index(")\n", call.index("delete_patterns"))]
+    assert 'path_in_repo="out"' in call
+    assert 'delete_patterns=["**"]' in call
+    # and nowhere else in the file may pass it - a second, unscoped use is
+    # the failure this test exists for
+    whole = Path(actions_worker.__file__).read_text(encoding="utf-8")
+    assert whole.count("delete_patterns=") == 1
