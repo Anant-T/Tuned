@@ -308,7 +308,12 @@ MANIFEST_FILENAME = "decontamination.json"
 #    every 21-word span of a row lies wholly inside one window at every offset;
 #    and a filtered eval set whose filter selects nothing is a REFUSAL rather
 #    than a silent read-everything fallback.
-DECON_VERSION = 4
+# 5: the exact index MEASURES ITSELF - grams and an estimated footprint, per
+#    eval set and in total - and `--max-index-grams` turns a memory-kill during
+#    construction into a named refusal that says which set crossed the line.
+#    No rule changed; the manifest gained the numbers that decide whether the
+#    index has to be sharded.
+DECON_VERSION = 5
 
 # The n-gram window AT ITS WIDEST. 13 tokens is long enough that ordinary
 # legal phrasing does not collide by accident; window_for narrows it for items
@@ -323,6 +328,16 @@ CONTAINMENT = 0.5
 SHORT_MIN_TOKENS = 5
 # A case title shorter than this is not a usable identifier ("state v kumar").
 TITLE_MIN_TOKENS = 4
+
+# WHAT ONE GRAM COSTS IN THE INVERTED INDEX. Measured 2026-08-30 with
+# tracemalloc over three synthetic corpora (200 items x 2k words, 400 x 2k,
+# 100 x 8k): 176.5-176.8 bytes per gram, flat in both item count and item
+# length. It is an UPPER bound for real text, where a repeated gram appends to
+# an existing posting list instead of opening a new dict entry - so an estimate
+# built on it errs toward refusing early, which is the right direction for a
+# guard against a memory kill. It does NOT cover the eval items' own text,
+# which decontaminate_items holds alongside the index.
+INDEX_BYTES_PER_GRAM = 177
 
 LEVEL_TEXT = "text"
 LEVEL_NARROW = "narrow"
@@ -1317,6 +1332,19 @@ REFUSAL_HEADER = (
 # The index: exact candidate generation over the eval side.
 # --------------------------------------------------------------------------
 
+class EvalIndexTooLarge(RuntimeError):
+    """The exact index would not fit. Refuse by name rather than by OOM kill.
+
+    A memory kill inside EvalIndex is exit 137 with no output at all: no
+    manifest, no counts, nothing that says WHICH eval set grew. The eval
+    surface is chosen by split NAME across whole IL-TUR configs, so one
+    upstream re-release can multiply it without a line of this repo changing.
+    This carries the gram count, the estimate and the set that crossed the
+    line, so the next decision - raise the cap, shard the index, narrow the
+    selection - is made on numbers instead of on a second 90-minute run.
+    """
+
+
 class EvalIndex:
     """Inverted index over eval-item n-grams, ONE TABLE PER WINDOW.
 
@@ -1333,9 +1361,14 @@ class EvalIndex:
     """
 
     def __init__(self, items: Iterable[EvalItem], *, n: int = NGRAM,
-                 short_min: int = SHORT_MIN_TOKENS):
+                 short_min: int = SHORT_MIN_TOKENS, max_grams: int | None = None):
         self.n = n
         self.short_min = short_min
+        # Grams are the index's size in the only unit that predicts its
+        # footprint, and they are counted per set because a pooled total
+        # cannot say which set to shard.
+        self.total_grams = 0
+        self.grams_by_set: dict[str, int] = {}
         self.items: list[EvalItem] = []
         # COUNTS, not the sets. The posting walk already yields the exact
         # intersection size, so the only thing the arithmetic still needs from
@@ -1357,6 +1390,24 @@ class EvalIndex:
             self.windows.append(window)
             grams = gram_hashes(toks, window) if window else frozenset()
             self.gram_counts.append(len(grams))
+            self.total_grams += len(grams)
+            self.grams_by_set[item.set_key] = (
+                self.grams_by_set.get(item.set_key, 0) + len(grams)
+            )
+            if max_grams is not None and self.total_grams > max_grams:
+                # Checked as it grows, not at the end: the point is to beat
+                # the allocation that would have killed the process.
+                raise EvalIndexTooLarge(
+                    f"the exact eval index passed {max_grams:,} grams while reading "
+                    f"{item.set_key!r} (item {ix + 1}): {self.total_grams:,} grams, "
+                    f"~{self.total_grams * INDEX_BYTES_PER_GRAM / 1024 ** 3:.1f} GiB "
+                    f"estimated at {INDEX_BYTES_PER_GRAM} bytes/gram.\n"
+                    f"  per set so far: "
+                    f"{', '.join(f'{k}={v:,}' for k, v in sorted(self.grams_by_set.items()))}\n"
+                    f"  raise --max-index-grams if the machine has the memory, or shard "
+                    f"the index by eval set. Screening nothing is not an option here: "
+                    f"the whole module exists to make that impossible."
+                )
             if window:
                 table = self.by_gram.setdefault(window, {})
                 for gram in grams:
@@ -1370,6 +1421,16 @@ class EvalIndex:
 
     def __len__(self) -> int:
         return len(self.items)
+
+    @property
+    def bytes_estimate(self) -> int:
+        """Estimated resident size of the postings. See INDEX_BYTES_PER_GRAM.
+
+        An ESTIMATE, and named one: it is the measured per-gram cost times the
+        grams actually indexed, which is an upper bound for real text and
+        excludes the item text held beside it.
+        """
+        return self.total_grams * INDEX_BYTES_PER_GRAM
 
     def query(self, toks: Sequence[str]) -> dict[int, frozenset[int]]:
         """The row's grams at every window this index holds.
@@ -3015,6 +3076,15 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
                 "row_shortfall_measured": corpus.spec.expect_rows is not None,
                 "row_surplus": corpus.surplus,
                 "items": len(corpus.items),
+                # WHAT THIS SET COSTS THE INDEX. The eval surface is selected
+                # by split NAME across whole configs, so an upstream
+                # re-release can multiply one set without anything here
+                # changing - and until these were written down, the only
+                # symptom would have been exit 137.
+                "index_grams": index.grams_by_set.get(key, 0),
+                "index_bytes_estimate": (
+                    index.grams_by_set.get(key, 0) * INDEX_BYTES_PER_GRAM
+                ),
                 "text_field": corpus.text_field,
                 "detail": corpus.detail,
                 # The token-length histogram, by the level that screens each
@@ -3038,6 +3108,14 @@ def manifest_of(stats: dict, corpora: dict[str, EvalCorpus], index: EvalIndex, *
             key: entry["unmatchable"] for key, entry in sorted(lengths.items())
         },
         "unmatchable_eval_items_total": len(index.unmatchable),
+        # The total the operator sets --max-index-grams from, beside the
+        # constant the estimate is built on so a later reader can re-derive it
+        # rather than trust it.
+        "eval_index": {
+            "grams": index.total_grams,
+            "bytes_estimate": index.bytes_estimate,
+            "bytes_per_gram": INDEX_BYTES_PER_GRAM,
+        },
         "case_identifier_coverage": round(coverage, 4),
         "case_identifier_level_inert": not stats["with_identifier"] or not index.by_identifier,
         "eval_identifiers": len(index.by_identifier),
@@ -3113,6 +3191,16 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
     parser.add_argument("--no-case-id-from-text", action="store_true",
                         help="take a row's case identifiers from _prov only, not from the "
                              "citations its grounding names")
+    parser.add_argument(
+        "--max-index-grams", type=int, default=None, metavar="N",
+        help=(
+            "refuse rather than build an exact index larger than N grams. "
+            "OFF by default: no measured peak for this chain exists yet, and a "
+            "guessed ceiling that fires on today's eval surface would block the "
+            "ship path for a number nobody has read. Set it from the "
+            "`eval_index` block this run writes into decontamination.json."
+        ),
+    )
     parser.add_argument("--require-semantic", action="store_true",
                         help="refuse to run when semhash is unavailable")
     parser.add_argument("--state", default="accepted", choices=TASK_STATES,
@@ -3240,7 +3328,19 @@ def main(argv: Sequence[str] | None = None, *, reader=read_rows) -> int:
         else:
             print(f"read {len(items)} stream rows (generations NOT screened: --no-generated)")
 
-        index = EvalIndex([item for c in corpora.values() for item in c.items])
+        try:
+            index = EvalIndex(
+                [item for c in corpora.values() for item in c.items],
+                max_grams=args.max_index_grams,
+            )
+        except EvalIndexTooLarge as exc:
+            print(f"decontaminate REFUSES TO RUN: {exc}\n  nothing was written.")
+            return 2
+        print(
+            f"eval index: {index.total_grams:,} grams, "
+            f"~{index.bytes_estimate / 1024 ** 3:.2f} GiB estimated"
+            + (f" (cap {args.max_index_grams:,})" if args.max_index_grams else "")
+        )
         manifest_bands = index.length_report()
         for key in sorted(corpora):
             corpus = corpora[key]

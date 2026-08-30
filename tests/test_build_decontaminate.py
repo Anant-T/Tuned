@@ -26,6 +26,7 @@ from tuned.data.decontaminate import (
     EVAL_TOO_FEW,
     EVAL_UNMATCHABLE,
     EVAL_UNREADABLE,
+    INDEX_BYTES_PER_GRAM,
     LEVEL_CASE_ID,
     LEVEL_NARROW,
     LEVEL_SEMANTIC,
@@ -2188,9 +2189,23 @@ def test_the_cli_writes_the_rows_the_drops_and_the_manifest(tmp_path, capsys):
     assert manifest["thresholds"]["ngram"] == NGRAM
     # The version travels with the shape: a manifest that changed what it says
     # while still claiming the old number cannot be read years later.
-    assert manifest["decon_version"] == DECON_VERSION == 4
+    assert manifest["decon_version"] == DECON_VERSION == 5
     assert "split" not in manifest["eval_sets"]["bbl"], "replaced by `selection`"
     assert "screened 2  kept 1  dropped 1" in out
+
+    # The index writes down what it cost, per set and in total. Until it did,
+    # the only symptom of an eval surface that had outgrown the runner was
+    # exit 137 - no manifest, no counts, nothing naming the set that grew.
+    bbl = manifest["eval_sets"]["bbl"]
+    assert bbl["index_grams"] > 0
+    assert bbl["index_bytes_estimate"] == bbl["index_grams"] * INDEX_BYTES_PER_GRAM
+    total = manifest["eval_index"]
+    assert total["bytes_per_gram"] == INDEX_BYTES_PER_GRAM
+    assert total["grams"] == sum(
+        s["index_grams"] for s in manifest["eval_sets"].values()
+    )
+    assert total["bytes_estimate"] == total["grams"] * INDEX_BYTES_PER_GRAM
+    assert "eval index:" in out
 
 
 # --------------------------------------------------------------------------
@@ -4834,3 +4849,70 @@ def test_a_generated_row_carries_its_teacher_and_prompt_generation(tmp_path):
     # shipped row and a pool entry compare without either side parsing.
     assert prov["teacher"] == "p/m"
     assert prov["prompt_sha"] == "abc"
+
+
+# --------------------------------------------------------------------------
+# The size guard. The eval surface is selected by split NAME across whole
+# IL-TUR configs, so one upstream re-release can multiply it without a line of
+# this repo changing - and an exact index is the one thing here that cannot be
+# made approximate.
+# --------------------------------------------------------------------------
+
+def _eval_items(n, words):
+    from tuned.data.decontaminate import EvalItem
+
+    return [
+        EvalItem(set_key=f"set{i % 2}", item_id=str(i), text=prose(i, words),
+                 identifiers=frozenset())
+        for i in range(n)
+    ]
+
+
+def test_the_index_counts_its_own_grams_per_set():
+    from tuned.data.decontaminate import EvalIndex
+
+    index = EvalIndex(_eval_items(4, 60))
+    assert sum(index.grams_by_set.values()) == index.total_grams
+    assert set(index.grams_by_set) == {"set0", "set1"}
+    assert index.total_grams == sum(index.gram_counts)
+    assert index.bytes_estimate == index.total_grams * INDEX_BYTES_PER_GRAM
+
+
+def test_an_oversized_index_refuses_by_name_instead_of_being_killed():
+    """Exit 137 writes no manifest and names no set. This says which one grew,
+    how far past the cap it went, and what the estimate was - so the next
+    decision is made on numbers, not on a second 90-minute run."""
+    from tuned.data.decontaminate import EvalIndex, EvalIndexTooLarge
+
+    with pytest.raises(EvalIndexTooLarge) as exc:
+        EvalIndex(_eval_items(4, 60), max_grams=20)
+    message = str(exc.value)
+    assert "20 grams" in message
+    assert "set0" in message and "per set so far" in message
+    assert "--max-index-grams" in message
+
+
+def test_the_guard_refuses_while_it_builds_not_after():
+    """The whole point is to beat the allocation that would have killed the
+    process, so the check cannot wait for the last item."""
+    from tuned.data.decontaminate import EvalIndex, EvalIndexTooLarge
+
+    items = _eval_items(40, 60)
+    full = EvalIndex(items)
+    with pytest.raises(EvalIndexTooLarge) as exc:
+        EvalIndex(items, max_grams=full.total_grams // 4)
+    # Stopped early: the count it reports is barely over the cap, nowhere near
+    # the total it would have reached.
+    reported = int(str(exc.value).split(" grams,")[0].rsplit(" ", 1)[-1].replace(",", ""))
+    assert reported <= full.total_grams // 4 + max(full.gram_counts)
+    assert reported < full.total_grams
+
+
+def test_the_guard_is_off_unless_a_number_is_given():
+    """No measured peak for this chain exists yet, and a guessed ceiling that
+    fired on today's eval surface would block the ship path for a number
+    nobody has read."""
+    from tuned.data.decontaminate import EvalIndex
+
+    index = EvalIndex(_eval_items(40, 60))
+    assert index.total_grams > 0  # would have refused under any guessed cap
