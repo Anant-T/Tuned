@@ -143,10 +143,18 @@ train:
   # grow: 10 x ~224 s ~= 37 min, the cadence band the lane qualified at
   # (25 x 74.7 s ~= 31 min). 50 would have been ~3.1 h between checkpoints.
   # max_steps: 0 is a SENTINEL - sft.py refuses to train main on it. Derive
-  # it from the POST-FILTER row count (train_on_responses_only drops fully
-  # masked rows with only a print): run a 2-step --no-hub probe on the real
-  # dataset, read post_filter_rows=, set max_steps = rows // (bs * ga * 2),
-  # commit. check_resume_schedule then freezes it for every later session.
+  # it FROM THE BUILD, not from a GPU session: read counts.train.kept out of
+  # the assemble.json push.py ships beside the corpus, set
+  # max_steps = kept // (bs * ga * 2), commit. That count is the rows the
+  # trainer will load, because assemble.py measures every row against THIS
+  # max_seq_length - through config.py, with the pinned tokenizer sft.py
+  # feeds the trainer - and drops what does not fit rather than truncating.
+  # Cross-check against post_filter_rows= in session 1's log, which is still
+  # the number that decides: train_on_responses_only drops a fully-masked row
+  # with only a print, so the manifest count is an upper bound (they agree in
+  # practice - built_row guarantees the shape and the step-0 label_coverage
+  # gate refuses an all-mask batch). check_resume_schedule then freezes
+  # whatever session 1 trained with, for every later session.
   main:
     max_seq_length: 8192
     per_device_train_batch_size: 1

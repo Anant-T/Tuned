@@ -452,15 +452,23 @@ def test_reserved_gate_is_enforced_in_code_not_prose():
 
 
 def test_main_mode_refuses_the_underived_max_steps_sentinel():
-    # train.main.max_steps ships as 0 on purpose: the real value must come
-    # from the POST-FILTER row count (train_on_responses_only DROPS fully
-    # masked rows with only a print) and check_resume_schedule then freezes
-    # it for every later session. Training on the sentinel would build a
-    # nonsense LR schedule; refuse before any GPU work.
+    # train.main.max_steps ships as 0 on purpose: check_resume_schedule
+    # freezes whatever the first session trains with, so the sentinel would
+    # build a nonsense LR schedule for the whole run. Refuse before any GPU
+    # work.
+    #
+    # The refusal must send the operator to the BUILD (counts.train.kept in
+    # assemble.json), not to a GPU probe session: assemble.py already dropped
+    # every row over this max_seq_length with the pinned tokenizer, so the
+    # rows it wrote are the rows the trainer loads. post_filter_rows= stays
+    # the cross-check and must still be named, because
+    # train_on_responses_only can drop a fully-masked row with only a print.
     from tuned.train.sft import check_main_max_steps
 
-    with pytest.raises(SystemExit, match="post-filter"):
+    with pytest.raises(SystemExit, match="counts.train.kept") as exc:
         check_main_max_steps("main", 0)
+    assert "post_filter_rows" in str(exc.value)
+    assert "probe" not in str(exc.value).lower(), "the derivation no longer costs a GPU session"
     check_main_max_steps("main", 1500)  # derived value: fine
     check_main_max_steps("smoke", 60)  # smoke unaffected
     src = SFT.read_text(encoding="utf-8")

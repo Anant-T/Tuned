@@ -364,18 +364,37 @@ def resume_decision(checkpoint_dir: str | Path, max_steps: int) -> bool:
 
 
 def check_main_max_steps(mode: str, max_steps: int) -> None:
-    """train.main.max_steps ships as 0 - a deliberate sentinel. The real value
-    must come from the POST-FILTER row count: train_on_responses_only DROPS
-    fully-masked rows with only a print, so the raw file line count over-counts,
-    and check_resume_schedule freezes whatever value the first session trains
-    with. Training on the sentinel would build a nonsense LR schedule."""
+    """train.main.max_steps ships as 0 - a deliberate sentinel. The value is
+    derived from the corpus the builder emitted, and check_resume_schedule
+    freezes whatever the first session trains with, so the sentinel would
+    build a nonsense LR schedule for the whole run.
+
+    THE NUMBER COMES OFF THE BUILD, not off a GPU session. assemble.py
+    measures every row against `train.main.max_seq_length` - resolved through
+    config.py, the trainer's own bucket, under the pinned tokenizer sft.py
+    feeds the trainer - and drops what does not fit rather than truncating it.
+    So the rows it wrote ARE the rows the trainer loads, and their count is
+    `counts.train.kept` in assemble.json, which push.py ships beside the
+    corpus. Deriving it needed a whole Kaggle session only because nothing
+    said that.
+
+    post_filter_rows= is still printed every run, and it is still the number
+    that decides: train_on_responses_only drops a fully-masked row with only a
+    print, so the manifest count is an upper bound. In practice they agree -
+    assemble.py's built_row guarantees the shape, and the step-0
+    label_coverage gate refuses a batch that is entirely mask - but the print
+    is the cross-check, not decoration, and a disagreement means read the
+    print and not this docstring.
+    """
     if mode == "main" and max_steps <= 0:
         raise SystemExit(
             f"train.main.max_steps={max_steps} is the underived sentinel - derive "
-            "it first from the post-filter row count: run a 2-step --no-hub probe "
-            "on the real dataset, read the post_filter_rows= line, set "
-            "max_steps = post_filter_rows // (bs * ga * world_size) in the config "
-            "and commit. It is immutable after the first main session "
+            "it from the build: read counts.train.kept from the assemble.json "
+            "beside the corpus (the builder already dropped every row over "
+            "max_seq_length, measured with the pinned tokenizer), set "
+            "max_steps = kept // (bs * ga * world_size) in the config and commit. "
+            "Cross-check it against the post_filter_rows= line of the first "
+            "session's log. It is immutable after that session "
             "(check_resume_schedule refuses a changed schedule on resume)."
         )
 

@@ -9,6 +9,8 @@ repo - none of it may drift without re-running the ladder."""
 
 from pathlib import Path
 
+import pytest
+
 from tuned.train.config import load_config
 
 CONFIGS = Path(__file__).parent.parent / "training" / "configs"
@@ -71,3 +73,51 @@ def test_main_run_shape():
     # it immutable for the whole multi-session run. sft.py refuses to train
     # main with the sentinel still in place.
     assert run.max_steps == 0
+
+
+def test_the_max_steps_derivation_names_a_key_the_builder_actually_writes():
+    """The derivation moved off a GPU probe session and onto the build's own
+    manifest, so the three places that restate it now name a JSON key. A key
+    that drifts leaves the operator reading a field that is not there, on the
+    one procedure that cannot be re-run cheaply - check_resume_schedule
+    freezes max_steps for the whole run.
+
+    assemble.py is asked directly rather than trusted: `counts` is keyed by
+    side and each side's stats carry `kept`.
+    """
+    import inspect
+
+    from tuned.data.assemble import MANIFEST_FILENAME, assemble_rows, manifest_of
+
+    assert MANIFEST_FILENAME == "assemble.json"
+    signature = inspect.getsource(manifest_of)
+    assert '"counts": {side: dict(stats) for side, stats in sides.items()}' in signature
+    assert '"kept": len(kept)' in inspect.getsource(assemble_rows)
+
+    from tuned.train.sft import check_main_max_steps
+
+    with pytest.raises(SystemExit) as exc:
+        check_main_max_steps("main", 0)
+    message = str(exc.value)
+    assert "counts.train.kept" in message
+    assert MANIFEST_FILENAME in message
+
+    config = (CONFIGS / "law_v1_8b_ddp.yaml").read_text(encoding="utf-8")
+    assert "counts.train.kept" in config
+    notebook = (
+        Path(__file__).parent.parent / "training" / "notebooks" / "kaggle_smoke.ipynb"
+    ).read_text(encoding="utf-8")
+    assert "counts.train.kept" in notebook
+
+
+def test_the_length_bucket_the_builder_filters_on_is_the_one_the_trainer_trains_at():
+    """What makes the manifest count usable at all. assemble.py measures every
+    row against the TRAINER's max_seq_length and drops rather than truncates,
+    so the rows it emitted are the rows the trainer loads. If a builder ever
+    carried its own bucket, the derived max_steps would describe a corpus
+    nobody trains on."""
+    import inspect
+
+    from tuned.data.assemble import main as assemble_main
+
+    assert "max_tokens=cfg.max_seq_length" in inspect.getsource(assemble_main)
