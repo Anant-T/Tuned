@@ -655,10 +655,36 @@ def test_the_passing_variant_flows_all_the_way_through_and_exits_zero(tmp_path):
     ]
     # And the split really did hold cases together.
     split_manifest = json.loads((paths.out_dir / "split.json").read_text(encoding="utf-8"))
-    assert split_manifest["assignment"]["date_assigned_units"] == 5
-    assert split_manifest["assignment"]["hash_assigned_units"] == 0
-    assert split_manifest["assignment"]["date_boundary"] == "2002-00-00"
-    assert (paths.out_dir / SUMMARY_FILENAME).read_text(encoding="utf-8").startswith("#")
+    assignment = split_manifest["assignment"]
+    assert assignment["date_assigned_units"] == 3
+    assert assignment["hash_assigned_units"] == 4
+    assert assignment["date_boundary"] == "2004-00-00"
+
+    # THE HELD-OUT SET IS THE SAME CORPUS AS THE TRAINING SET, which is what
+    # the per-source walk bought. Under the pooled walk every DATED atom went
+    # to eval before a single date-less one did, and only the citation-bearing
+    # sources carry dates - so the eval side was a sample of PredEx. Each
+    # source now contributes its own tenth.
+    assert {k: v["eval_rows"] for k, v in assignment["by_source"].items()} == {
+        "L-NLProc/PredEx_Instruction-Tuning_Pred-Exp": 2,
+        "open-thoughts/OpenThoughts-114k": 2,
+        "synthesis": 6,
+    }
+    for source, side in assignment["by_source"].items():
+        assert side["eval_rows"] >= side["eval_target_rows"], source
+        assert side["eval_target_rows"] == round(side["rows"] * 0.1), source
+
+    # ...and stats can now SEE it. The gates still grade train+eval pooled -
+    # that is what the mix targets are sized for - so the held-out reading is
+    # report-only and grades nothing.
+    side = report["eval_side"]
+    assert side["rows"] == 10 and side["grades_nothing"] is True
+    assert side["gates"][GATE_TRACE]["detail"]["share"] == 0.8
+    assert report["red"] == []  # an eval-side red cannot redden the build
+    summary = (paths.out_dir / SUMMARY_FILENAME).read_text(encoding="utf-8")
+    assert summary.startswith("#")
+    assert "eval side (10 rows, report-only, grades nothing)" in summary
+    assert "grounded_synthesis 60.0%/60.0%" in summary
 
 
 def test_the_over_length_row_is_dropped_by_assemble_and_named(tmp_path):
@@ -927,7 +953,7 @@ def test_the_run_is_logged_to_the_store(tmp_path):
 def test_the_report_names_the_tokenizer_that_measured_the_lengths(tmp_path):
     _codes, report, _paths = run_pipeline(tmp_path, e2e_corpus())
     assert report["tokenizer"]["repo"] == "unsloth/Qwen3-8B-unsloth-bnb-4bit"
-    assert report["stats_version"] == STATS_VERSION == 1
+    assert report["stats_version"] == STATS_VERSION == 2
 
 
 BANNED_THRESHOLDS = ("0.80", "0.18", "0.20", "0.005", "8192", "2.0", "60", "16", "24")

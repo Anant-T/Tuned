@@ -778,7 +778,7 @@ def test_dry_run_renders_a_green_card_and_manifest_with_measured_numbers(tmp_pat
     assert manifest["push_version"] == PUSH_VERSION == 2
     assert manifest["counts"] == {"rows": 100, "train": 90, "eval": 10}
     assert manifest["module_versions"] == {
-        "decontaminate": 4, "dedupe": 4, "split": 1, "assemble": 2, "stats": 1, "push": 2,
+        "decontaminate": 4, "dedupe": 4, "split": 2, "assemble": 2, "stats": 2, "push": 2,
         "extract": "per-document in the build store (document.extract_version); "
                   "not reachable from the file chain",
     }
@@ -899,7 +899,7 @@ def test_module_versions_reads_every_reachable_stage(tmp_path):
     cfg_path, report, paths = green_pipeline(tmp_path)
     versions = module_versions(paths.out_dir, report)
     assert versions == {
-        "decontaminate": 4, "dedupe": 4, "split": 1, "assemble": 2, "stats": 1, "push": 2,
+        "decontaminate": 4, "dedupe": 4, "split": 2, "assemble": 2, "stats": 2, "push": 2,
         # M1: extract.py's absence named, not silent - see module_versions'
         # own docstring for why a string here changes nothing about the gate.
         "extract": "per-document in the build store (document.extract_version); "

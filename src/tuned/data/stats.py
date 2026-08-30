@@ -93,7 +93,13 @@ SUMMARY_FILENAME = "stats.md"
 # 1  the first version. Eight measurements over assemble's output plus the
 #    custody-chain walk, thresholds read from assembly.gates and mix targets
 #    from the named profile, non-zero exit on any red gate.
-STATS_VERSION = 1
+# 2  the report carries `eval_side`: the same measurements taken over the
+#    HELD-OUT rows alone. REPORT-ONLY - not in `gates`, never in `red`, and it
+#    cannot fail a build. Until it existed the gates ran on train+eval pooled,
+#    so a held-out set that was trace-poor or mix-skewed relative to train read
+#    exactly like one that was not, and split.py's own stratification could not
+#    be checked from the report it feeds.
+STATS_VERSION = 2
 
 GATE_LENGTH = "length"
 GATE_MIX = "mix"
@@ -514,8 +520,31 @@ def measure(rows: Sequence[dict], *, cfg, tokenizer, profile: str,
 # The report.
 # --------------------------------------------------------------------------
 
+def eval_side_of(gates: Sequence[Gate], measurements: dict) -> dict:
+    """The eval side's own measurements, flattened for the report.
+
+    Statuses and summaries only, deliberately NOT Gate objects and NOT merged
+    into `report["gates"]`: a name that appears there is a name `red` can
+    contain, and a held-out set of a few hundred rows cannot be held to a mix
+    target sized for the whole corpus. This is here to be READ - by an
+    operator, and by anyone asking whether the eval rows are the same corpus
+    as the train rows - not to gate.
+    """
+    return {
+        "rows": measurements["rows"],
+        "length": measurements["length"],
+        "gates": {
+            g.name: {"status": g.status, "summary": g.summary, "detail": g.detail}
+            for g in gates
+        },
+        # Named so nobody has to infer it from the absence of a `red` key.
+        "grades_nothing": True,
+    }
+
+
 def report_of(gates: Sequence[Gate], measurements: dict, *, profile: str, sides: dict,
-              inputs: Sequence[str], custody: dict, tokenizer_id: dict) -> dict:
+              inputs: Sequence[str], custody: dict, tokenizer_id: dict,
+              eval_side: dict | None = None) -> dict:
     from tuned.data.store import utcnow
 
     red = [g.name for g in gates if g.is_red]
@@ -537,6 +566,12 @@ def report_of(gates: Sequence[Gate], measurements: dict, *, profile: str, sides:
         },
         "red": red,
         "verdict": "red" if red else "green",
+        # The same measurements over the HELD-OUT rows alone. Report-only: the
+        # gates above still grade train+eval pooled, which is what the mix and
+        # trace targets were sized for. This says whether the eval side is the
+        # same corpus as the train side - the question a pooled report cannot
+        # ask of itself.
+        "eval_side": eval_side,
         "assemble_check": custody,
     }
 
@@ -562,6 +597,33 @@ def summary_of(report: dict) -> str:
     for name in GATES:
         gate = report["gates"][name]
         lines.append(f"| {name} | {_MARKS[gate['status']]} | {gate['summary']} |")
+    side = report.get("eval_side")
+    if side:
+        # THE SHARES SIDE BY SIDE, not a second pass/fail. The question this
+        # answers is "is the held-out set the same corpus as the training
+        # set" - which is a COMPARISON, and grading a few hundred eval rows
+        # against a mix tolerance sized for the whole corpus would print a red
+        # on every healthy build until nobody read the line at all. The full
+        # eval-side gate block is in stats.json for anyone who wants it.
+        def _shares(rep, gate):
+            return ((rep["gates"].get(gate) or {}).get("detail") or {}).get("shares") or {}
+
+        def _share(rep, gate):
+            detail = (rep["gates"].get(gate) or {}).get("detail") or {}
+            return detail.get("share", 0.0)
+
+        corpus = _shares(report, GATE_MIX)
+        held = _shares(side, GATE_MIX)
+        mix = ", ".join(
+            f"{name} {held.get(name, 0.0):.1%}/{corpus.get(name, 0.0):.1%}"
+            for name in sorted(corpus)
+        )
+        lines += [
+            "",
+            f"- eval side ({side['rows']} rows, report-only, grades nothing) "
+            f"held-out/corpus: {mix}, traces "
+            f"{_share(side, GATE_TRACE):.1%}/{_share(report, GATE_TRACE):.1%}",
+        ]
     if report["red"]:
         lines += ["", f"RED: {', '.join(report['red'])}. Nothing downstream should publish "
                       f"this corpus until each is answered at the stage that produced it."]
@@ -631,6 +693,15 @@ def main(argv: Sequence[str] | None = None, *, tokenizer=None) -> int:
     gates, measurements = measure(
         rows, cfg=cfg, tokenizer=tokenizer, profile=profile, manifest=upstream
     )
+    # The same instrument, pointed at the held-out rows alone. Same tokenizer
+    # and same profile so the two readings are comparable; an empty eval side
+    # produces no block rather than a row of zeroes that reads like a failure.
+    eval_side = None
+    if eval_rows:
+        eval_gates, eval_measurements = measure(
+            eval_rows, cfg=cfg, tokenizer=tokenizer, profile=profile, manifest=upstream
+        )
+        eval_side = eval_side_of(eval_gates, eval_measurements)
     report = report_of(
         gates, measurements,
         profile=profile,
@@ -638,6 +709,7 @@ def main(argv: Sequence[str] | None = None, *, tokenizer=None) -> int:
         inputs=[str(in_train), str(in_eval)],
         custody=custody,
         tokenizer_id=(upstream.get("tokenizer") or {}),
+        eval_side=eval_side,
     )
     write_manifest(report_path, report)
     summary_path = report_path.parent / SUMMARY_FILENAME

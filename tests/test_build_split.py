@@ -620,7 +620,7 @@ def test_a_verified_input_carries_the_whole_upstream_manifest_forward(tmp_path):
     cfg, paths = _deduped(tmp_path, corpus())
     assert split_main(["--config", cfg]) == 0
     manifest = json.loads((paths.out_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
-    assert manifest["split_version"] == SPLIT_VERSION == 1
+    assert manifest["split_version"] == SPLIT_VERSION == 2
     assert manifest["dedupe_check"]["status"] == CUSTODY_VERIFIED
     # WHOLE, not summarised: decontamination's own record has to survive to
     # stats.py through this.
@@ -758,3 +758,85 @@ def test_the_version_ledger_describes_the_version_the_module_ships():
     assert entries == sorted(entries)
     assert entries[-1] == SPLIT_VERSION
     assert entries[0] == 1
+
+
+# --------------------------------------------------------------------------
+# Stratification: the held-out set is the same corpus as the training set.
+#
+# Only the citation-bearing sources carry dates, so one pooled newest-first
+# walk took every DATED atom before it reached a single date-less one - the
+# eval side was a sample of PredEx, trace-poor and mix-skewed, and nothing
+# downstream could see it because stats.py grades train and eval POOLED.
+# --------------------------------------------------------------------------
+
+def test_each_source_is_held_out_of_its_own_pool(tmp_path):
+    """The failure this replaces, in one fixture: 20 dated rows from one
+    source and 20 date-less rows from another. Pooled, the entire eval side
+    comes from the dated source and the other contributes nothing."""
+    dated = [
+        keyed(i, source="dated-source", cnr=cnr("KAHC", 2000 + i))
+        for i in range(20)
+    ]
+    undated = [keyed(100 + i, source="undated-source") for i in range(20)]
+    train, evaluation, stats = assign_units(items(*dated, *undated), fraction=0.25)
+
+    assert len(evaluation) == 10  # 5 per source, not 10 from one
+    by_source = stats["by_source"]
+    assert by_source["dated-source"]["eval_rows"] == 5
+    assert by_source["undated-source"]["eval_rows"] == 5
+    assert len(train) == 30
+    assert sorted(train + evaluation) == list(range(40))
+
+
+def test_the_newest_first_rule_still_holds_inside_each_bucket(tmp_path):
+    """Stratifying must not become "sample at random". Within a source the
+    order is unchanged: newest first, then content hash."""
+    rows = [keyed(i, source="s", cnr=cnr("KAHC", 2000 + i)) for i in range(10)]
+    _train, evaluation, stats = assign_units(items(*rows), fraction=0.3)
+
+    # 2007, 2008, 2009 - the three newest, in whatever order the walk took them.
+    assert sorted(evaluation) == [7, 8, 9]
+    assert stats["by_source"]["s"]["date_boundary"] == "2007-00-00"
+
+
+def test_a_case_that_spans_two_sources_is_still_one_atom(tmp_path):
+    """Bucketing is by ATOM, not by row - which is what keeps assert_disjoint
+    true. A case whose rows came from two sources lands whole in one bucket,
+    and the manifest says which."""
+    shared = cnr("KAHC", 2011)
+    rows = [
+        keyed(1, source="zebra", cnr=shared),
+        keyed(2, source="alpha", cnr=shared),
+        *[keyed(10 + i, source="alpha") for i in range(8)],
+    ]
+    train, evaluation, stats = assign_units(items(*rows), fraction=0.5)
+
+    # Lexicographic minimum, not first-seen: the atom's stratum must not
+    # depend on which of its rows the input happened to list first.
+    assert "zebra" not in stats["by_source"]
+    assert stats["by_source"]["alpha"]["rows"] == 10
+    # Whole, either way.
+    assert ({0, 1} <= set(evaluation)) or ({0, 1} <= set(train))
+
+
+def test_the_per_source_targets_sum_to_the_corpus_target_give_or_take_rounding():
+    """Rounding is per bucket now, so the achieved eval size can differ from
+    the corpus-level target by a row or two. Stated rather than asserted away."""
+    rows = [keyed(i, source=f"s{i % 3}") for i in range(31)]
+    _train, evaluation, stats = assign_units(items(*rows), fraction=0.1)
+
+    per_source = sum(v["eval_target_rows"] for v in stats["by_source"].values())
+    assert abs(per_source - stats["eval_target_rows"]) <= len(stats["by_source"])
+    assert len(evaluation) >= per_source
+
+
+def test_a_single_source_corpus_splits_exactly_as_it_always_did():
+    """The fixture every other test in this file uses carries one source, so
+    the bucket walk and the pooled walk are the same walk - which is why this
+    change landed without moving a single one of them."""
+    rows = [keyed(i, cnr=cnr("KAHC", 2000 + i)) for i in range(10)]
+    _train, evaluation, stats = assign_units(items(*rows), fraction=0.2)
+
+    assert set(stats["by_source"]) == {"test"}  # the fixture row builder's source
+    assert stats["by_source"]["test"]["eval_rows"] == len(evaluation) == 2
+    assert stats["by_source"]["test"]["eval_target_rows"] == stats["eval_target_rows"]

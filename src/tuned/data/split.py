@@ -108,7 +108,14 @@ MANIFEST_FILENAME = "split.json"
 #    newest-first from the case identifier's year with a content-keyed hash
 #    filling the remainder, disjointness and drop-nothing asserted as refusals,
 #    and dedupe's manifest carried forward against its output digest.
-SPLIT_VERSION = 1
+# 2  the newest-first walk runs PER SOURCE. One pooled walk drained every
+#    DATED atom into eval before it reached a date-less one, and only the
+#    citation-bearing sources carry dates - so the held-out set was a sample of
+#    PredEx rather than a sample of the corpus, and nothing downstream could
+#    see it (stats grades train+eval POOLED). Same atoms, same order, same
+#    refusals; the target is apportioned by source and split.json records the
+#    per-source assignment.
+SPLIT_VERSION = 2
 
 # The `_prov` fields that could carry a date, strongest first: a full date
 # beats a bare year, and an explicit decision date beats an unqualified one.
@@ -256,6 +263,10 @@ class Unit:
     case_id: str | None
     date: str | None
     channel: str
+    # The stratum this atom is held out within. The atom, NOT the row: a case
+    # whose rows came from two sources is still one atom, so bucketing here
+    # rather than at the row level is what keeps assert_disjoint true.
+    source: str
     indexes: tuple[int, ...]
 
     @property
@@ -293,10 +304,17 @@ def units_of(items: Sequence[Item]) -> list[Unit]:
     order: list[str] = []
     grouped: dict[str, list[int]] = {}
     facts: dict[str, tuple[str | None, str | None, str]] = {}
+    # Lexicographic minimum rather than first-seen: an atom's stratum must not
+    # depend on which of its rows the input happened to list first, for the
+    # same reason the date tie-break above breaks on the channel rather than on
+    # arrival order. A mixed atom lands in one bucket and the manifest says so.
+    sources: dict[str, str] = {}
     for index, item in enumerate(items):
         case_id = case_id_of(item)
         key = case_id if case_id is not None else f"row:{item.key}"
         date, channel = item_date(item, case_id)
+        source = str(row_prov(item.row).get("source") or "")
+        sources[key] = source if key not in sources else min(sources[key], source)
         if key not in grouped:
             order.append(key)
             grouped[key] = []
@@ -313,7 +331,7 @@ def units_of(items: Sequence[Item]) -> list[Unit]:
         grouped[key].append(index)
     return [
         Unit(key=key, case_id=facts[key][0], date=facts[key][1], channel=facts[key][2],
-             indexes=tuple(grouped[key]))
+             source=sources[key], indexes=tuple(grouped[key]))
         for key in order
     ]
 
@@ -347,27 +365,67 @@ def ordered_units(units: Sequence[Unit]) -> tuple[list[Unit], list[Unit]]:
 
 
 def assign_units(items: Sequence[Item], *, fraction: float) -> tuple[list[int], list[int], dict]:
-    """(train indexes, eval indexes, stats) - whole atoms, newest first.
+    """(train indexes, eval indexes, stats) - whole atoms, newest first, PER SOURCE.
 
-    The walk stops as soon as the eval side has reached the target, so it can
-    overshoot by at most one atom's worth of rows minus one (at most two rows,
-    with dedupe's cap of three in force). Overshooting is preferred to
-    undershooting: the fraction is a floor on how much is held out, and a rule
-    that stopped short would silently shrink the eval set whenever the newest
-    case happened to be large.
+    The walk stops as soon as a source's eval side has reached that source's
+    target, so it can overshoot by at most one atom's worth of rows minus one
+    (at most two rows, with dedupe's cap of three in force). Overshooting is
+    preferred to undershooting: the fraction is a floor on how much is held
+    out, and a rule that stopped short would silently shrink the eval set
+    whenever the newest case happened to be large.
+
+    THE WALK IS PER SOURCE, and that is the whole of version 2. Only the
+    citation-bearing sources carry dates at all, so one pooled newest-first
+    walk took every dated atom before it reached a single date-less one: the
+    held-out set was a sample of PredEx, not a sample of the corpus - trace-poor
+    and mix-skewed - and nothing downstream could see it, because stats.py
+    grades train and eval POOLED. Bucketing by source and apportioning the
+    fraction inside each bucket makes the eval side the same corpus as train.
+
+    One property is genuinely weaker for it. `date_boundary` was a single cut
+    point: everything newer than it was held out. Under stratification the band
+    is per source - a row newer than the global boundary can sit in train
+    because its OWN source's target was already full - so the global figure is
+    the oldest date on the eval side and no longer a corpus-wide cut. The
+    per-source boundaries are recorded and are the ones that carry the claim.
+
+    Rounding is per bucket, so the achieved eval rows can differ from the
+    corpus-level `eval_target_rows` by a row or two either way; each bucket's
+    own target is in `by_source`.
     """
     units = units_of(items)
     total_rows = sum(u.rows for u in units)
     target = eval_target(total_rows, fraction)
-    dated, dateless = ordered_units(units)
+
+    buckets: dict[str, list[Unit]] = {}
+    for unit in units:
+        buckets.setdefault(unit.source, []).append(unit)
 
     chosen: list[Unit] = []
-    rows = 0
-    for unit in [*dated, *dateless]:
-        if rows >= target:
-            break
-        chosen.append(unit)
-        rows += unit.rows
+    by_source: dict[str, dict] = {}
+    for source in sorted(buckets):
+        bucket = buckets[source]
+        bucket_rows = sum(u.rows for u in bucket)
+        bucket_target = eval_target(bucket_rows, fraction)
+        dated, dateless = ordered_units(bucket)
+        taken: list[Unit] = []
+        rows = 0
+        for unit in [*dated, *dateless]:
+            if rows >= bucket_target:
+                break
+            taken.append(unit)
+            rows += unit.rows
+        chosen += taken
+        taken_dated = [u for u in taken if u.date is not None]
+        by_source[source] = {
+            "rows": bucket_rows,
+            "units": len(bucket),
+            "eval_target_rows": bucket_target,
+            "eval_rows": rows,
+            "eval_units": len(taken),
+            # The cut point that actually carries the temporal claim now.
+            "date_boundary": min((u.date for u in taken_dated), default=None),
+        }
 
     picked = {u.key for u in chosen}
     eval_indexes = sorted(i for u in chosen for i in u.indexes)
@@ -384,11 +442,14 @@ def assign_units(items: Sequence[Item], *, fraction: float) -> tuple[list[int], 
         "eval_units": len(chosen),
         "date_assigned_units": len(date_assigned),
         "hash_assigned_units": len(chosen) - len(date_assigned),
-        # The oldest date that still made the eval side - everything newer than
-        # this is held out, which is the sentence the temporal split is for.
-        # None when no dated atom was taken at all.
+        # The oldest date that still made the eval side. NOT a corpus-wide cut
+        # point since version 2 - the newest-first band is per source, so a row
+        # newer than this can sit in train because its own source's target was
+        # full. `by_source[*].date_boundary` is the figure that carries the
+        # temporal claim. None when no dated atom was taken at all.
         "date_boundary": min((u.date for u in date_assigned), default=None),
         "dated_units": sum(1 for u in units if u.date is not None),
+        "by_source": by_source,
         "by_date_channel": {
             channel: sum(1 for u in units if u.channel == channel)
             for channel in DATE_CHANNELS
@@ -647,6 +708,10 @@ def manifest_of(stats: dict, *, inputs: Sequence[str], outputs: Sequence[dict],
             "hash_assigned_units": stats["hash_assigned_units"],
             "date_boundary": stats["date_boundary"],
             "by_date_channel": stats["by_date_channel"],
+            # PER SOURCE, because that is where the walk runs. Rows, units,
+            # the target apportioned to the bucket, what was taken, and the
+            # date boundary that actually holds inside it.
+            "by_source": stats["by_source"],
             "eval_fraction_achieved": stats["eval_fraction_achieved"],
             # The assert's known blind spot, as a number. See the docstring.
             "cross_side_identifiers": stats["cross_side_identifiers"],
