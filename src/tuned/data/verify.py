@@ -51,7 +51,7 @@ re-checks its OWN row's lease immediately before writing - the opening check
 is a snapshot, and a sweep over tens of thousands of rows outlives it.
 
 Run:  python -m tuned.data.verify --config data/configs/data_law_v1.yaml
-      [--index data/build/corpus/citations.txt] [--state accepted]
+      [--index data/build/corpus/citation_index.txt] [--state accepted]
       [--require-generator [--generator provider/model]] [--require-current-prompt]
 """
 

@@ -1580,10 +1580,14 @@ def check_banned_meta(think: str | None, ctx: GateContext) -> GateResult:
     return GateResult("banned_meta", not hits, {"hits": hits})
 
 
-def restated_opening(text: str) -> bool:
-    """True when the first tokens of `text` echo the instruction packet."""
-    opening = _norm_ws(text).lower()
-    return any(opening.startswith(prefix) for prefix in RESTATEMENT_OPENINGS)
+def restated_opening(lowered: str) -> bool:
+    """True when the first tokens echo the instruction packet.
+
+    Takes text that is ALREADY `_norm_ws`-ed and lowered - its only caller
+    computes exactly that on the next line, and doing it twice was two full
+    passes over the trace for one answer.
+    """
+    return any(lowered.startswith(prefix) for prefix in RESTATEMENT_OPENINGS)
 
 
 def check_prompt_echo(think: str | None, ctx: GateContext) -> GateResult:
@@ -1598,8 +1602,8 @@ def check_prompt_echo(think: str | None, ctx: GateContext) -> GateResult:
     if think is None:
         return GateResult("prompt_echo", True, {"skipped": "no-think"})
 
-    opening = restated_opening(think)
     lowered = _norm_ws(think).lower()
+    opening = restated_opening(lowered)
     spans = [span for span in INSTRUCTION_ECHO_SPANS if span in lowered]
     return GateResult(
         "prompt_echo",

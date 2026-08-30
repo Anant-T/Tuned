@@ -506,15 +506,11 @@ def _usd_per_1m(limits: Mapping, *, completion: bool) -> float:
 def _provider_usd_cap(cfg, provider: str) -> float | None:
     """Shared USD wallet for `provider`, if the config declared one.
 
-    Formerly `_openai_usd_cap`, which iterated cfg.providers and `continue`d
-    past every block whose name was not literally "openai" - so a usd_cap
-    declared on any OTHER provider (lightning, in this build) was silently
-    unreachable: budget_ok never looked, and the config could express a
-    fence that did not exist. This takes the provider name as an argument
-    instead of hardcoding one, so whichever provider declares a cap gets it
-    enforced. Precedence is unchanged from the original: a `usd_cap`
-    attribute on the provider itself wins, otherwise the first model whose
-    `limits` carries `usd_cap`. None still means uncapped.
+    Whichever provider declares a cap gets it enforced - the fence used to
+    read only the block literally named "openai", so a cap on any other
+    provider was silently unreachable. Precedence: a `usd_cap` attribute on
+    the provider wins, otherwise the first model whose `limits` carries one.
+    None means uncapped.
     """
     for p in cfg.providers:
         if p.name != provider:
@@ -531,14 +527,11 @@ def _provider_usd_cap(cfg, provider: str) -> float | None:
 def _provider_usd_spent(store, cfg, provider: str, *, day: str | None = None) -> float:
     """Total spend to date against `provider`'s shared wallet.
 
-    Formerly `_openai_usd_spent`, hardcoded to the provider literally named
-    "openai" the same way `_provider_usd_cap` was. Sums across every model
-    under `provider` (not just the model being called) so a shared cap like
-    the openai gpt-5-mini/gpt-5-nano wallet stays shared for any provider,
-    not just that one. A missing usd_per_1m_prompt/usd_per_1m_completion key
-    still reads as 0.0 via `_usd_per_1m` - unchanged on purpose, since the
-    openai fence's correctness depends on both price keys being present
-    beside usd_cap rather than on a missing price failing loudly.
+    Sums across every model under `provider`, not just the one being called,
+    so a wallet shared between two models stays shared. A missing
+    usd_per_1m_prompt/usd_per_1m_completion key reads as 0.0 via `_usd_per_1m`
+    - deliberate: a cap's correctness depends on both price keys being present
+    beside it, not on a missing price failing loudly.
     """
     spent = 0.0
     for p in cfg.providers:

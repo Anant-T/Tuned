@@ -582,14 +582,18 @@ def _bai_request_hook(payload: dict, model: ModelCfg, role: str | None) -> dict:
     emits it FIRST - so a budget that looks generous as an answer allowance is
     consumed by thinking and the answer never starts.  This hook raises UP.
 
-    The number that matters: ``GENERATION_OUTPUT_TOKENS`` ships at 4000, and
-    the measured empty-content rate at 4096 was 10/20 on the real synthesis
-    prompt against 0/4 at 12288.  The shipped budget sits exactly on the 50%
-    point, so half of all lead-generator calls would return nothing - and the
-    survivors would be biased toward SHORT traces, which is silent selection on
-    the corpus rather than honest sampling.
+    WHAT IT MEASURED, and why the hook survives the re-fit: the empty-content
+    rate at 4096 was 10/20 on the real synthesis prompt against 0/4 at 12288.
+    ``GENERATION_OUTPUT_TOKENS`` sat at 4000 then - exactly on the 50% point,
+    so half of all lead-generator calls returned nothing, and the survivors
+    were biased toward SHORT traces, which is silent selection on the corpus
+    rather than honest sampling. It ships at 16384 since the 2026-08-28
+    re-fit, which is the value this hook had been putting on the wire all
+    along; the caller and the wire now agree instead of the hook correcting
+    for a fiction.
 
-    This is the only layer that can fix it.  ``build_payload`` applies
+    It is kept rather than deleted because it is the only layer that can fix
+    it if the caller's number ever drops again.  ``build_payload`` applies
     ``req.max_tokens`` AFTER merging the model's params, so neither ``params``
     nor ``role_params`` can raise the number the caller passed.
 
@@ -696,7 +700,6 @@ QUIRKS: dict[str, Quirk] = {
         response_hook=_default_response_hook,
         retry_after=_default_retry_after,
     ),
-    "openrouter": DEFAULT_QUIRK,
 }
 
 
