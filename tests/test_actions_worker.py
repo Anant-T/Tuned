@@ -459,24 +459,31 @@ class _CallRecorder:
         return type("R", (), {"returncode": 0})()
 
 
-def _run_assemble(tmp_path, monkeypatch, dispositions):
+def _run_assemble(tmp_path, monkeypatch, dispositions, with_out=False):
     from pipeline_fakes import temp_config
 
     cfg_path = temp_config(tmp_path)
     root = _assemble_root_with(tmp_path, dispositions)
+    if with_out:
+        # The artifact-upload branch is guarded by out_dir.is_dir(); in
+        # production paths.ensure() has always made it, so leaving it out of
+        # the fixture is what kept that branch unexecuted by the suite.
+        (root / "out").mkdir(parents=True)
+        (root / "out" / "stats.json").write_text("{}", encoding="utf-8")
     args = actions_worker.main_parser().parse_args(
         ["--phase", "assemble", "--hf-repo", "u/r", "--config", cfg_path]
     )
     recorder = _CallRecorder()
     monkeypatch.setattr(actions_worker.subprocess, "run", recorder)
     monkeypatch.setattr(actions_worker.time, "sleep", lambda s: None)
-    rc = actions_worker.run_assemble(args, root, _FakeBundle())
-    return rc, recorder.argvs
+    bundle = _FakeBundle()
+    rc = actions_worker.run_assemble(args, root, bundle)
+    return rc, recorder.argvs, bundle
 
 
 def test_run_assemble_refuses_the_push_step_on_a_collapsed_sample(tmp_path, monkeypatch, capsys):
     dispositions = ["judge:accept"] * 5 + ["judge:reject"] * 95
-    rc, argvs = _run_assemble(tmp_path, monkeypatch, dispositions)
+    rc, argvs, _ = _run_assemble(tmp_path, monkeypatch, dispositions)
     assert rc != 0
     assert not any("tuned.data.push" in argv for argv in argvs)
     assert "AUDIT SAMPLE COLLAPSE" in capsys.readouterr().out
@@ -484,9 +491,30 @@ def test_run_assemble_refuses_the_push_step_on_a_collapsed_sample(tmp_path, monk
 
 def test_run_assemble_pushes_when_the_sample_is_healthy(tmp_path, monkeypatch):
     dispositions = ["judge:accept"] * 90 + ["judge:reject"] * 10
-    rc, argvs = _run_assemble(tmp_path, monkeypatch, dispositions)
+    rc, argvs, _ = _run_assemble(tmp_path, monkeypatch, dispositions)
     assert rc == 0
     assert any("tuned.data.push" in argv for argv in argvs)
+
+
+def test_the_artifacts_upload_through_the_fence_and_before_the_checkpoint(
+    tmp_path, monkeypatch
+):
+    """Covers the branch that shipped broken because nothing executed it.
+
+    run_assemble uploads out/ and then pushes the post-assembly checkpoint.
+    Both must go through Bundle, in that order: the artifact commit moves the
+    remote head, so a checkpoint that does not fence against IT is refused as
+    a 412 and re-raised as BATON STOLEN - which is what discarded the re-gate
+    results and the off_teacher demotions on every dispatch.
+    """
+    dispositions = ["judge:accept"] * 90 + ["judge:reject"] * 10
+    rc, _, bundle = _run_assemble(
+        tmp_path, monkeypatch, dispositions, with_out=True
+    )
+    assert rc == 0
+    assert bundle.pushes == [
+        "replace_dir:out", "post-assembly checkpoint",
+    ], "the artifacts go up through Bundle, then the checkpoint fences on them"
 
 
 # --------------------------------------------------------------------------
@@ -540,6 +568,13 @@ class _FakeBundle:
             self._fail -= 1
             raise RuntimeError("HF 503")
         self.pushes.append(message)
+
+    def replace_dir(self, local, path_in_repo, message):
+        # Recorded into the SAME list as push() so a test can assert the
+        # ORDER of the two - the artifact upload has to land before the
+        # post-assembly checkpoint, and it is the head it leaves behind that
+        # the checkpoint fences against.
+        self.pushes.append(f"replace_dir:{path_in_repo}")
 
 
 class _FakePump:
@@ -1006,23 +1041,51 @@ def test_the_pulled_copy_is_dropped_once_it_has_been_restored(tmp_path, monkeypa
     assert not (root.parent / "bundle_in").exists(), "the pulled copy is still on disk"
 
 
-def test_the_out_upload_deletes_only_because_it_is_scoped_to_out():
+def test_the_out_upload_deletes_only_because_it_is_scoped_to_out(tmp_path):
     """delete_patterns is resolved RELATIVE TO path_in_repo. With
     path_in_repo="out" it clears the previous assembly's artifacts; without
     it, the same ["**"] means the whole repo - which is the baton. The two
-    kwargs are one decision, so they are pinned in one place.
+    kwargs are one decision, so replace_dir's signature makes the scope
+    non-optional and this drives the real call to prove they travel together.
     """
-    import inspect
+    api = _RecordingApi(head="pulled-sha")
+    bundle = _bundle_with(api)
+    bundle.head = "pulled-sha"
 
-    src = inspect.getsource(actions_worker.run_assemble)
-    call = src[src.index("out_dir = root / \"out\""):]
-    call = call[:call.index(")\n", call.index("delete_patterns"))]
-    assert 'path_in_repo="out"' in call
-    assert 'delete_patterns=["**"]' in call
+    bundle.replace_dir(tmp_path, "out", "assembly artifacts")
+
+    kw = api.uploads[-1]
+    assert kw["path_in_repo"] == "out"
+    assert kw["delete_patterns"] == ["**"]
     # and nowhere else in the file may pass it - a second, unscoped use is
-    # the failure this test exists for
+    # the failure this test exists for. File-scope, so it cannot be driven.
     whole = Path(actions_worker.__file__).read_text(encoding="utf-8")
     assert whole.count("delete_patterns=") == 1
+
+
+def test_the_out_upload_fences_and_hands_the_head_on(tmp_path):
+    """The bug this replaces: a bare api.upload_folder for out/ still makes a
+    commit, so the remote head moved while bundle.head did not, and the very
+    next push - the post-assembly checkpoint carrying the re-gate results and
+    the off_teacher demotions - was refused as a 412 and re-raised as BATON
+    STOLEN. Every dispatch ended in a false alarm and lost its DB write.
+
+    So: the artifact upload must declare the head it saw, and must hand the
+    commit it made to whatever pushes next.
+    """
+    api = _RecordingApi(head="pulled-sha")
+    bundle = _bundle_with(api)
+    bundle.head = "pulled-sha"
+
+    bundle.replace_dir(tmp_path, "out", "assembly artifacts")
+    assert api.uploads[-1]["parent_commit"] == "pulled-sha", "the artifact upload must fence too"
+    assert bundle.head == "new-sha", "it must adopt the commit it just made"
+
+    bundle.push(tmp_path, "post-assembly checkpoint")
+    assert api.uploads[-1]["parent_commit"] == "new-sha", (
+        "the checkpoint must fence against the artifact commit, not the pull - "
+        "this is the 412 that made every assemble dispatch cry BATON STOLEN"
+    )
 
 
 def test_a_db_less_stage_keeps_everything_else(tmp_path):

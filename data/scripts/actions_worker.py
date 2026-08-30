@@ -282,6 +282,47 @@ class Bundle:
         )
         # Track our own commit so successive pushes in one job chain correctly
         # (the second push's parent is the first push's commit, not the pull).
+        self._advance(info)
+
+    def replace_dir(self, local: Path, path_in_repo: str, message: str) -> None:
+        """Make one SUBDIRECTORY of the baton equal to `local`, and fence it.
+
+        Separate from push() rather than a kwarg on it, because the two have
+        opposite delete semantics and only one of them may ever delete.
+        push() is additive by construction - that is what lets a db=False
+        checkpoint leave the last store in place - so a delete_patterns kwarg
+        there would put the whole baton one caller mistake away from erasure.
+        Here the delete is safe only because it is resolved RELATIVE TO
+        path_in_repo, which this signature makes non-optional: "delete
+        everything under <path_in_repo> that this upload did not just write".
+        The two are one decision, so they are one call site.
+
+        It exists because out/ is the only part of the baton that accumulates:
+        each dispatch writes a fresh set of artifacts under the same names,
+        but a run whose chain stopped early leaves the PREVIOUS run's later
+        stages sitting beside the new ones, where they read as this run's
+        output. Replacing the directory makes out/ mean "the last assembly",
+        which is the only thing anyone reads it as.
+
+        Fenced and head-tracking for the same reason push() is, and it is the
+        absence of exactly this that made every assemble dispatch end in a
+        false BATON STOLEN: a bare api.upload_folder here still creates a
+        commit, so the remote head moves while self.head does not, and the
+        NEXT push - the post-assembly checkpoint carrying the re-gate results
+        and the off_teacher demotions - is refused as a conflict and re-raises.
+        """
+        info = self.api.upload_folder(
+            repo_id=self.repo_id, repo_type="dataset",
+            folder_path=str(local), path_in_repo=path_in_repo,
+            commit_message=message,
+            parent_commit=getattr(self, "head", None),
+            delete_patterns=["**"],
+        )
+        self._advance(info)
+
+    def _advance(self, info) -> None:
+        """Point head at the commit we just made, so the next push fences
+        against it rather than against the pull."""
         oid = getattr(info, "oid", None)
         if oid:
             self.head = oid
@@ -907,26 +948,12 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
 
     out_dir = root / "out"
     if out_dir.is_dir():
-        bundle.api.upload_folder(
-            repo_id=bundle.repo_id, repo_type="dataset",
-            folder_path=str(out_dir), path_in_repo="out",
-            commit_message="assembly artifacts",
-            # THIS KWARG IS ONLY SAFE BESIDE path_in_repo="out". delete_patterns
-            # is resolved RELATIVE TO path_in_repo, so here it means "delete
-            # everything under out/ that this upload did not just write" - and
-            # with the path_in_repo line removed or changed it would mean the
-            # whole repo, i.e. the baton. They are one decision and are pinned
-            # together in one test for that reason; do not edit either alone.
-            #
-            # It exists because out/ is the only part of this repo that
-            # accumulates: each dispatch writes a fresh set of artifacts under
-            # the same names, but a run whose chain stopped early leaves the
-            # PREVIOUS run's later stages sitting beside the new ones, where
-            # they read as this run's output. Replacing the directory makes
-            # out/ mean "the last assembly", which is the only thing anyone
-            # reads it as.
-            delete_patterns=["**"],
-        )
+        # Fenced and head-tracking, like every other write to this repo - see
+        # Bundle.replace_dir. The post-assembly checkpoint below is what
+        # carries the re-gate results and the off_teacher demotions home, and
+        # it is refused as a conflict if this call moves the head behind its
+        # back.
+        bundle.replace_dir(out_dir, "out", "assembly artifacts")
     _push(bundle, root, root.parent / "bundle_out", "post-assembly checkpoint")
     return rc
 
