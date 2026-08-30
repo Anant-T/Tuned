@@ -561,6 +561,29 @@ def render_card(
         "FIR through appeal. Answer keys are derived from statute text and the audited "
         "IPC-to-BNS mapping table, never model-generated."
     )
+    # P1.7: the audit-mode disclosure the card owes its reader. Fixed prose,
+    # not a measured section - like "Known risk" below, it states a fact
+    # about the PIPELINE'S policy, not a number pulled from this run's stats
+    # report (audit sample fraction/counts are not in `report`; see the
+    # module docstring's rule against inventing what is not there). NOT a
+    # PUSH_VERSION bump: nothing here changes build_manifest.json's shape,
+    # only prose text in README.md - the ledger above tracks the former.
+    lines.append("")
+    lines.append("## Quality process: gate-qualified, not judge-calibrated")
+    lines.append("")
+    lines.append(
+        "This corpus is gate-qualified, not judge-calibrated. Under this pipeline's audit "
+        "judge mode, most rows ship on automated gate checks alone (format, citation "
+        "existence, length, license); only a hash-selected fraction of rows also receives a "
+        "dual-judge accept/reject verdict from two independent judge models, and that "
+        "fraction is the only quality evidence for the rows that shipped on gates alone. The "
+        "dual-judged sample's accept rate is DESCRIPTIVE - a measurement of that sample - not "
+        "a fitted quality threshold: no judge_threshold has been fitted for this build. The "
+        "gold labels held in the build store are themselves model-generated, not "
+        "human-authored, and were never used to fit or calibrate anything - a model-written "
+        "gold label would calibrate the judges against a judge, which this pipeline's own "
+        "calibration rules forbid outright."
+    )
     lines.append("")
     lines.append("## Known risk: teacher legal error")
     lines.append("")

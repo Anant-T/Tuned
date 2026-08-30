@@ -181,6 +181,17 @@ class RoutingCfg:
     probe: tuple[str, ...]
     family_separation: bool
     judge_mode: str
+    # A COLLAPSE detector on the audit sample's Wilson-upper-bound accept
+    # rate (actions_worker._audit_collapse_refusal), not a quality target -
+    # see DEFAULT_JUDGE_COLLAPSE_FLOOR and the routing.judge_collapse_floor
+    # comment in data_law_v1.yaml for what it means and why it is this low.
+    judge_collapse_floor: float
+    # When audit mode began. Judgements older than this were made under the
+    # DUAL regime by a fleet since retired, and pooling them into the audit
+    # sample's accept rate is what made "30.4%" look like an audit number
+    # when it is 56 pre-audit verdicts. Read by audit_readout.summarize's
+    # `since` and by the collapse gate that acts on it.
+    judge_mode_since: str | None
 
 
 @dataclass(frozen=True)
@@ -201,6 +212,30 @@ def _parse_ref(ref: str) -> ModelRef:
 # pins the two together - the same treatment JUDGE_MAX_TOKENS /
 # DEFAULT_JUDGE_REPLY_TOKENS already get.
 JUDGE_SCORE_RANGE = (1, 5)
+
+# routing.judge_collapse_floor's default when a config omits the key -
+# `.get()`, not a required raw["routing"] entry like judge_mode, so a fixture
+# config written before this floor existed keeps loading rather than KeyError
+# on a key it never had reason to carry. 0.20 is a COLLAPSE floor, not a
+# quality target: see the routing.judge_collapse_floor comment in
+# data_law_v1.yaml for the full justification (the only accept-rate figure
+# this pipeline has ever measured, 30.4%, is 56 PRE-audit verdicts from a
+# retired provider and cannot found a fitted number - this floor exists only
+# to catch "the sample says almost nothing is acceptable").
+DEFAULT_JUDGE_COLLAPSE_FLOOR = 0.20
+
+# routing.judge_mode_since's default: the commit that shipped audit mode
+# (732557c, 2026-08-29T01:47:03+05:30 = 2026-08-28T20:17:03Z), in store.utcnow's
+# format so it compares as a plain string against judgement.created_at.
+#
+# THE GATE IS BIASED WITHOUT IT, and not in the safe direction. verify.py's
+# armed cut demotes off-teacher rows out of `accepted`/`judging` and rewrites
+# their disposition - so a pre-audit ACCEPT leaves the `judge:%` population -
+# but a `rejected` row is a decision verify never touches, so a pre-audit
+# REJECT stays in it. Pooling the two eras therefore drops old accepts and
+# keeps old rejects, depressing the measured rate and making a FALSE collapse
+# refusal more likely, not less.
+DEFAULT_JUDGE_MODE_SINCE = "2026-08-28T20:17:03.000000Z"
 
 # The decision rules calibrate.py fits over. Owned here for the same reason:
 # `calibration.rules` is validated at load, calibrate.py imports this tuple
@@ -383,6 +418,11 @@ def _validate(cfg: BuildConfig) -> None:
     if cfg.routing.judge_mode not in ("dual", "audit"):
         raise ValueError(
             f"routing.judge_mode must be 'dual' or 'audit', got {cfg.routing.judge_mode!r}"
+        )
+    if not (0.0 <= cfg.routing.judge_collapse_floor <= 1.0):
+        raise ValueError(
+            f"routing.judge_collapse_floor must be in [0, 1], got "
+            f"{cfg.routing.judge_collapse_floor}"
         )
     mix_total = sum(cfg.build.mix.values())
     if abs(mix_total - 1.0) > 0.001:
@@ -928,6 +968,8 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
         probe=tuple(r["probe"]),
         family_separation=r["family_separation"],
         judge_mode=r["judge_mode"],
+        judge_collapse_floor=r.get("judge_collapse_floor", DEFAULT_JUDGE_COLLAPSE_FLOOR),
+        judge_mode_since=r.get("judge_mode_since", DEFAULT_JUDGE_MODE_SINCE),
     )
 
     # build.train_config is repo-root-relative, same convention the tests

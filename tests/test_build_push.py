@@ -586,6 +586,26 @@ def test_render_card_names_screened_sets_waived_holes_and_script_gaps():
     assert "**latin**" not in card
 
 
+def test_render_card_discloses_gate_qualified_not_judge_calibrated():
+    """P1.7 part 3: the card must carry the disclosure, and the audit accept
+    rate must never be quoted anywhere on the card as a calibrated number -
+    nothing in _card_fixture's report supplies one, so a render_card that
+    tried to quote it would raise or invent, either of which this test would
+    catch."""
+    report, decon, rows, push_cfg, versions = _card_fixture()
+    card = render_card(report=report, decon=decon, rows=rows, push_cfg=push_cfg, versions=versions)
+    assert "gate-qualified, not judge-calibrated" in card
+    assert "hash-selected fraction" in card and "dual-judge accept/reject verdict" in card
+    assert "DESCRIPTIVE" in card and "not a fitted quality threshold" in card
+    assert "model-generated, not human-authored" in card
+    assert "never used to fit or calibrate anything" in card
+    # the audit accept rate itself is never quoted as a calibrated number -
+    # nothing in the fixture report supplies one for the card to invent.
+    import re
+
+    assert re.search(r"\d+(\.\d+)?%\s+accept", card) is None
+
+
 def test_render_card_refuses_without_a_decon_version():
     report, _decon, rows, push_cfg, versions = _card_fixture()
     with pytest.raises(CardDataMissing, match="decon_version"):

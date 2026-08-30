@@ -1318,3 +1318,35 @@ routing:
   # "audit:gate-accept", and the sample's accept rate is the batch's quality
   # evidence. Flip back to dual when judge capacity returns.
   judge_mode: audit       # dual | audit
+  # A COLLAPSE detector, NOT a quality target. assemble's run refuses to push
+  # (actions_worker._audit_collapse_refusal) when the dual-judged sample has
+  # at least 50 decided rows AND the Wilson score interval's UPPER bound on
+  # its accept rate is below this floor - the certain case, not the point
+  # estimate, so a small unlucky sample cannot fail a build on noise.
+  #
+  # 0.20 is not fitted, and cannot be: judge_threshold is empty (calibrate.py
+  # has never run against a legitimate gold set), and the only accept-rate
+  # figure this pipeline has ever measured - 30.4% - is 56 verdicts from
+  # BEFORE audit mode shipped, decided by a provider since retired, so it
+  # cannot found a threshold either. What 0.20 actually asserts: even in the
+  # best case a >=50-row sample is consistent with, an accept rate this low
+  # means the sample is telling us almost nothing is acceptable - a dead
+  # judge fleet, a broken prompt template, a routing regression - not that
+  # the corpus is merely mediocre. A healthy build should sit far above it;
+  # if this floor ever actually trips, look at the judge fleet and the
+  # routing config before doubting the corpus.
+  judge_collapse_floor: 0.20
+  # When audit mode began - the commit that shipped it (732557c,
+  # 2026-08-29T01:47:03+05:30), in store.utcnow's format so it compares as a
+  # plain string against judgement.created_at. The collapse gate and the
+  # operator readout both restrict the dual-judged sample to judgements at or
+  # after this, because everything older was decided under the DUAL regime by
+  # a fleet since retired.
+  #
+  # Leaving it null pools both eras, and NOT harmlessly: verify.py's armed cut
+  # rewrites an off-teacher row's disposition out of `judge:%` when it sits in
+  # accepted/judging, but never touches a `rejected` row - so pooling drops the
+  # old ACCEPTS and keeps the old REJECTS, depressing the rate and making a
+  # false collapse refusal more likely. Set it forward, never back, if audit
+  # mode is ever restarted against a new fleet.
+  judge_mode_since: "2026-08-28T20:17:03.000000Z"

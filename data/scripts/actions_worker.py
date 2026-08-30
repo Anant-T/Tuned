@@ -27,6 +27,7 @@ key value - CI logs on a public repo are public.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import shutil
 import sqlite3
@@ -360,7 +361,20 @@ def _tail(path: Path, lines: int = 20) -> list[str]:
         return []
 
 
-def _audit_summary(state_db: Path) -> list[str]:
+def _audit_readout():
+    """Import data/scripts/audit_readout.py. That directory sits outside the
+    `tuned` package, so it is only reachable by putting this file's own
+    directory on sys.path first - shared by every call site below rather
+    than each repeating the same two lines."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:  # called per push; sys.path is not a log
+        sys.path.insert(0, here)
+    import audit_readout
+
+    return audit_readout
+
+
+def _audit_summary(state_db: Path, since: str | None = None) -> list[str]:
     """The dual-judged sample's accept rate, computed where the operator will
     see it. audit_readout.py has been the documented ship gate since
     2026-08-29 while being invoked by no workflow at all, so the one number
@@ -369,13 +383,103 @@ def _audit_summary(state_db: Path) -> list[str]:
     if not state_db.is_file():
         return []
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import audit_readout
-
+        audit_readout = _audit_readout()
         with sqlite3.connect(f"file:{state_db.as_posix()}?mode=ro", uri=True) as conn:
-            return audit_readout.format_summary(audit_readout.summarize(conn))
+            return audit_readout.format_summary(
+                audit_readout.summarize(conn, since=since)
+            )
     except Exception as exc:  # noqa: BLE001 - a readout must never fail a run
         return [f"audit readout unavailable ({type(exc).__name__}: {exc})"]
+
+
+# Two-sided 95% critical value. Not tuned for this pipeline - it is the
+# conventional default for "is this number believable at all", the question
+# the collapse refusal below is actually asking.
+WILSON_Z = 1.96
+
+# Below this many DECIDED rows, the sample is too small to say anything: a
+# 10-row sample at 0% accepted still has a Wilson upper bound near 30%, so in
+# practice it would rarely trip a 0.20 floor anyway - requiring 50 decided
+# rows up front is the more legible statement of the same fact. The refusal
+# below names "the sample is too small to judge" instead of leaning on an
+# interval that happens to average out.
+MIN_SAMPLE_FOR_COLLAPSE_CHECK = 50
+
+
+def wilson_upper_bound(successes: int, n: int, *, z: float = WILSON_Z) -> float:
+    """The Wilson score interval's UPPER bound for a binomial proportion.
+
+    Solves |p_hat - p| = z*sqrt(p*(1-p)/n) for p directly, rather than the
+    naive p_hat +/- z*sqrt(p_hat*(1-p_hat)/n) - the naive interval can
+    undershoot 0 or overshoot 1 and is a poor approximation exactly where a
+    collapsing accept rate lives (p_hat near 0, n in the tens rather than the
+    thousands). Reading only the UPPER root is deliberate: the refusal below
+    must be CERTAIN the batch has collapsed, so it asks "even in the best
+    case this sample is consistent with, is the accept rate still below the
+    floor?" - never the point estimate, which an unlucky small sample could
+    dip under by chance alone.
+
+        p_hat      = successes / n
+        denom      = 1 + z^2/n
+        center     = (p_hat + z^2/(2n)) / denom
+        half_width = (z/denom) * sqrt(p_hat*(1-p_hat)/n + z^2/(4n^2))
+        upper      = center + half_width
+
+    n<=0 returns 1.0 (no evidence at all is not evidence of collapse) - the
+    caller's MIN_SAMPLE_FOR_COLLAPSE_CHECK gate never lets n=0 reach here in
+    practice, but the function stays total rather than raising on it.
+    """
+    if n <= 0:
+        return 1.0
+    p_hat = successes / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p_hat + z2 / (2 * n)) / denom
+    half_width = (z / denom) * math.sqrt(p_hat * (1 - p_hat) / n + z2 / (4 * n * n))
+    return center + half_width
+
+
+def _audit_collapse_refusal(
+    state_db: Path, floor: float, since: str | None = None
+) -> str | None:
+    """None if the build may proceed to push; else the refusal message.
+
+    Reads audit_readout.summarize() straight - the SAME sampled_decided /
+    sampled_accepted the operator-facing readout prints - so this gate and
+    the number the operator reads before publishing can never disagree. No
+    state DB is not this function's refusal to make (an earlier step already
+    failed the run in that case); it returns None rather than raising.
+
+    `since` IS LOAD-BEARING, not a nicety. Without it the sample pools both
+    judge regimes, and verify.py's armed cut makes that pooling ASYMMETRIC:
+    it rewrites an off-teacher row's disposition out of `judge:%` when the
+    row sits in accepted/judging, but a `rejected` row is a decision verify
+    never touches - so the pre-audit ACCEPTS leave the population and the
+    pre-audit REJECTS stay in it, depressing the rate this gate reads and
+    making a FALSE refusal more likely, not less. routing.judge_mode_since
+    is where the window comes from.
+    """
+    if not state_db.is_file():
+        return None
+    audit_readout = _audit_readout()
+    with sqlite3.connect(f"file:{state_db.as_posix()}?mode=ro", uri=True) as conn:
+        s = audit_readout.summarize(conn, since=since)
+    decided, accepted = s["sampled_decided"], s["sampled_accepted"]
+    if decided < MIN_SAMPLE_FOR_COLLAPSE_CHECK:
+        return None
+    upper = wilson_upper_bound(accepted, decided)
+    if upper >= floor:
+        return None
+    return (
+        f"AUDIT SAMPLE COLLAPSE - refusing to push. {accepted}/{decided} dual-judged "
+        f"rows accepted since {since or 'the beginning of the store'}; the Wilson "
+        f"upper bound on that rate is {upper:.1%}, below the "
+        f"{floor:.0%} collapse floor (routing.judge_collapse_floor). This is not a "
+        f"quality bar - it means the sample is consistent with almost nothing being "
+        f"acceptable even in the best case. Check the judge fleet (provider outage, a "
+        f"broken prompt template, a routing regression) before assuming the corpus "
+        f"itself is bad; a build that is merely mediocre would not trip this floor."
+    )
 
 
 def _finish(
@@ -552,10 +656,22 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
             print(f"{step} exited rc={rc} - stopping the chain")
             break
     if rc == 0:
-        print("== push ==")
-        rc = subprocess.run(
-            [sys.executable, "-u", "-m", "tuned.data.push", "--config", args.config]
-        ).returncode
+        from tuned.data.config import load_build_config
+
+        cfg = load_build_config(args.config)
+        refusal = _audit_collapse_refusal(
+            root / DB_RELPATH,
+            cfg.routing.judge_collapse_floor,
+            cfg.routing.judge_mode_since,
+        )
+        if refusal:
+            print(refusal)
+            rc = 4  # this refusal's own code - distinct from a bubbled-up chain-step rc
+        else:
+            print("== push ==")
+            rc = subprocess.run(
+                [sys.executable, "-u", "-m", "tuned.data.push", "--config", args.config]
+            ).returncode
     else:
         print("stats not green - push.py skipped, artifacts still uploaded")
 

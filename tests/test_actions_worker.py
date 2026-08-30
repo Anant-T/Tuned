@@ -166,19 +166,25 @@ def test_stage_and_restore_round_trip_the_baton(tmp_path):
 import audit_readout  # noqa: E402  (same data/scripts sys.path as above)
 
 
-def test_audit_readout_computes_the_sample_accept_rate(tmp_path):
-    db = tmp_path / "law_v1.sqlite3"
+def _audit_db(tmp_path, rows, name="law_v1.sqlite3"):
+    """rows: (task_id, state, disposition, stream) tuples."""
+    db = tmp_path / name
     conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE task (task_id TEXT, state TEXT, disposition TEXT)")
-    rows = (
-        [("a%d" % i, "accepted", "audit:gate-accept") for i in range(7)]
-        + [("s%d" % i, "accepted", "judge:accept") for i in range(3)]
-        + [("r0", "rejected", "judge:reject")]
-        + [("p0", "pending", None)]
-    )
-    conn.executemany("INSERT INTO task VALUES (?, ?, ?)", rows)
+    conn.execute("CREATE TABLE task (task_id TEXT, state TEXT, disposition TEXT, stream TEXT)")
+    conn.executemany("INSERT INTO task VALUES (?, ?, ?, ?)", rows)
     conn.commit()
     conn.close()
+    return db
+
+
+def test_audit_readout_computes_the_sample_accept_rate(tmp_path):
+    rows = (
+        [("a%d" % i, "accepted", "audit:gate-accept", "synthesis") for i in range(7)]
+        + [("s%d" % i, "accepted", "judge:accept", "synthesis") for i in range(3)]
+        + [("r0", "rejected", "judge:reject", "synthesis")]
+        + [("p0", "pending", None, "synthesis")]
+    )
+    db = _audit_db(tmp_path, rows)
 
     ro = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     s = audit_readout.summarize(ro)
@@ -190,16 +196,297 @@ def test_audit_readout_computes_the_sample_accept_rate(tmp_path):
 
 
 def test_audit_readout_survives_an_unjudged_store(tmp_path):
-    db = tmp_path / "law_v1.sqlite3"
-    conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE task (task_id TEXT, state TEXT, disposition TEXT)")
-    conn.commit()
-    conn.close()
+    db = _audit_db(tmp_path, [])
     ro = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     s = audit_readout.summarize(ro)
     ro.close()
     assert s["sample_accept_rate"] is None
     assert s["audit_accepts"] == 0
+
+
+def test_audit_readout_breaks_the_sample_out_by_stream(tmp_path):
+    """(b) of P1.7: a pooled-only rate cannot tell an operator WHICH stream
+    is failing - synthesis and transition here disagree completely, and the
+    pooled rate alone (2/4 = 50%) hides that."""
+    rows = (
+        [("s0", "accepted", "judge:accept", "synthesis"),
+         ("s1", "accepted", "judge:accept", "synthesis"),
+         ("t0", "rejected", "judge:reject", "transition"),
+         ("t1", "rejected", "judge:reject", "transition")]
+    )
+    db = _audit_db(tmp_path, rows)
+    ro = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    s = audit_readout.summarize(ro)
+    ro.close()
+    assert s["by_stream"]["synthesis"] == {"decided": 2, "accepted": 2, "accept_rate": 1.0}
+    assert s["by_stream"]["transition"] == {"decided": 2, "accepted": 0, "accept_rate": 0.0}
+    lines = "\n".join(audit_readout.format_summary(s))
+    assert "synthesis: 2 decided, 2 accepted -> accept rate 100.0%" in lines
+    assert "transition: 2 decided, 0 accepted -> accept rate 0.0%" in lines
+
+
+def test_audit_readout_since_excludes_pre_window_judgements(tmp_path):
+    """(a) of P1.7: since=None pools everything (today's behaviour,
+    unchanged); a since timestamp restricts the sample to judgements whose
+    LATEST judgement.created_at falls on or after it. judgement.created_at,
+    not task.updated_at, is what dates a judgement - see summarize's own
+    docstring for why."""
+    db = tmp_path / "law_v1.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE task (task_id TEXT, state TEXT, disposition TEXT, stream TEXT)")
+    conn.execute("CREATE TABLE generation (gen_id INTEGER PRIMARY KEY, task_id TEXT)")
+    conn.execute("CREATE TABLE judgement (gen_id INTEGER, judge_slot TEXT, created_at TEXT)")
+    conn.executemany(
+        "INSERT INTO task VALUES (?, ?, ?, ?)",
+        [
+            ("old", "accepted", "judge:accept", "synthesis"),   # pre-window
+            ("new", "rejected", "judge:reject", "synthesis"),   # in-window
+        ],
+    )
+    conn.execute("INSERT INTO generation VALUES (1, 'old')")
+    conn.execute("INSERT INTO generation VALUES (2, 'new')")
+    conn.execute("INSERT INTO judgement VALUES (1, 'A', '2026-08-01T00:00:00Z')")
+    conn.execute("INSERT INTO judgement VALUES (2, 'A', '2026-08-30T00:00:00Z')")
+    conn.commit()
+    conn.close()
+
+    ro = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    unfiltered = audit_readout.summarize(ro)
+    assert (unfiltered["sampled_decided"], unfiltered["sampled_accepted"]) == (2, 1)
+
+    windowed = audit_readout.summarize(ro, since="2026-08-15T00:00:00Z")
+    ro.close()
+    assert (windowed["sampled_decided"], windowed["sampled_accepted"]) == (1, 0)
+    assert windowed["since"] == "2026-08-15T00:00:00Z"
+    assert "since=2026-08-15T00:00:00Z" in "\n".join(audit_readout.format_summary(windowed))
+
+
+def test_audit_readout_since_uses_the_latest_judgement_per_task(tmp_path):
+    """A task with two judge slots (a tiebreak) is windowed on the LATEST
+    slot's created_at, not the earliest - the disposition is only decided
+    once every required slot is in, so the last slot is when that decision
+    was actually made. A task whose slot A predates the window but whose
+    slot B (the tiebreak) falls inside it must still be counted."""
+    db = tmp_path / "law_v1.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE task (task_id TEXT, state TEXT, disposition TEXT, stream TEXT)")
+    conn.execute("CREATE TABLE generation (gen_id INTEGER PRIMARY KEY, task_id TEXT)")
+    conn.execute("CREATE TABLE judgement (gen_id INTEGER, judge_slot TEXT, created_at TEXT)")
+    conn.execute(
+        "INSERT INTO task VALUES ('t0', 'accepted', 'judge:accept', 'synthesis')"
+    )
+    conn.execute("INSERT INTO generation VALUES (1, 't0')")
+    # slot A well before the window, slot B (tiebreak) inside it.
+    conn.execute("INSERT INTO judgement VALUES (1, 'A', '2026-08-01T00:00:00Z')")
+    conn.execute("INSERT INTO judgement VALUES (1, 'B', '2026-08-30T00:00:00Z')")
+    conn.commit()
+    conn.close()
+
+    ro = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    s = audit_readout.summarize(ro, since="2026-08-15T00:00:00Z")
+    ro.close()
+    assert s["sampled_decided"] == 1
+
+
+# --------------------------------------------------------------------------
+# The audit-sample collapse refusal (P1.7 part 2): a Wilson upper bound on
+# the dual-judged sample, gating run_assemble's push step. Hand-checked
+# against the closed-form Wilson formula independently of the implementation.
+# --------------------------------------------------------------------------
+
+def test_wilson_upper_bound_hand_checked_cases():
+    assert abs(actions_worker.wilson_upper_bound(0, 50) - 0.071350) < 1e-5
+    assert abs(actions_worker.wilson_upper_bound(25, 50) - 0.633557) < 1e-5
+
+
+def test_wilson_upper_bound_sits_above_the_point_estimate():
+    """The whole reason the refusal reads the upper bound instead of the raw
+    accepted/decided ratio: it must be the BEST case the sample is
+    consistent with, not the (noisier) point estimate."""
+    accepted, decided = 5, 100
+    upper = actions_worker.wilson_upper_bound(accepted, decided)
+    assert upper > accepted / decided
+    assert abs(upper - 0.111752) < 1e-5
+
+
+def test_wilson_upper_bound_of_no_evidence_is_not_collapse():
+    assert actions_worker.wilson_upper_bound(0, 0) == 1.0
+
+
+# routing.judge_mode_since ships as the commit that turned audit mode on.
+# A judgement stamped before it was made under the DUAL regime by a fleet
+# since retired, and pooling the two eras is what made "30.4%" look like an
+# audit number.
+AUDIT_ERA = "2026-08-30T12:00:00.000000Z"
+PRE_AUDIT = "2026-08-01T12:00:00.000000Z"
+
+
+def _judged_tables(conn):
+    """The three tables the windowed sample reads, with the real column names.
+
+    A task carrying a `judge:%` disposition and NO judgement row is not a
+    shape the store can produce - record_judgement is what puts the verdict
+    there in the first place - so a fixture that omits them is testing a
+    population that cannot exist.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS task (task_id TEXT, state TEXT, disposition TEXT, "
+        "stream TEXT, claimed_at TEXT)"
+    )
+    conn.execute("CREATE TABLE IF NOT EXISTS generation (gen_id INTEGER, task_id TEXT)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS judgement (gen_id INTEGER, judge_slot TEXT, created_at TEXT)"
+    )
+
+
+def _judged_rows(conn, dispositions, *, at=AUDIT_ERA, stream="synthesis"):
+    for i, disposition in enumerate(dispositions):
+        conn.execute(
+            "INSERT INTO task (task_id, state, disposition, stream, claimed_at) "
+            "VALUES (?, 'accepted', ?, ?, NULL)",
+            (f"t{i}-{stream}-{at}", disposition, stream),
+        )
+        gen_id = conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] + 1
+        conn.execute("INSERT INTO generation VALUES (?, ?)",
+                     (gen_id, f"t{i}-{stream}-{at}"))
+        conn.execute("INSERT INTO judgement VALUES (?, 'a', ?)", (gen_id, at))
+
+
+def _collapse_db(tmp_path, dispositions, *, at=AUDIT_ERA):
+    db = tmp_path / "law_v1.sqlite3"
+    conn = sqlite3.connect(db)
+    _judged_tables(conn)
+    _judged_rows(conn, dispositions, at=at)
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_collapse_refusal_none_below_the_minimum_sample_even_at_zero_percent(tmp_path):
+    """Below MIN_SAMPLE_FOR_COLLAPSE_CHECK the sample says nothing - it must
+    not refuse even when every decided row so far was rejected."""
+    db = _collapse_db(tmp_path, ["judge:reject"] * 49)
+    assert actions_worker._audit_collapse_refusal(db, 0.20) is None
+
+
+def test_collapse_refusal_fires_on_a_large_sample_below_the_floor(tmp_path):
+    db = _collapse_db(tmp_path, ["judge:accept"] * 5 + ["judge:reject"] * 95)
+    msg = actions_worker._audit_collapse_refusal(db, 0.20)
+    assert msg is not None
+    assert "AUDIT SAMPLE COLLAPSE" in msg
+    assert "5/100" in msg
+
+
+def test_collapse_refusal_none_on_a_large_sample_above_the_floor(tmp_path):
+    db = _collapse_db(tmp_path, ["judge:accept"] * 70 + ["judge:reject"] * 30)
+    assert actions_worker._audit_collapse_refusal(db, 0.20) is None
+
+
+def test_collapse_refusal_none_when_the_state_db_does_not_exist(tmp_path):
+    assert actions_worker._audit_collapse_refusal(tmp_path / "nope.sqlite3", 0.20) is None
+
+
+def test_the_window_keeps_the_pre_audit_era_out_of_the_gate(tmp_path):
+    """The reason `since` is load-bearing rather than a nicety.
+
+    verify.py's armed cut rewrites an off-teacher row's disposition out of
+    `judge:%` when the row sits in accepted/judging - but a `rejected` row is
+    a decision verify never touches. Pooling the eras therefore drops the old
+    ACCEPTS and keeps the old REJECTS, which depresses the rate this gate
+    reads and makes a FALSE refusal more likely, not less. Here that is the
+    difference between refusing and not.
+    """
+    db = tmp_path / "law_v1.sqlite3"
+    conn = sqlite3.connect(db)
+    _judged_tables(conn)
+    # The old regime's rejects survive verify's cut (a rejected row is a
+    # decision it never touches) while its accepts do not, so this is the
+    # asymmetry the window exists to undo - not a contrived ratio.
+    _judged_rows(conn, ["judge:reject"] * 400, at=PRE_AUDIT)
+    _judged_rows(conn, ["judge:accept"] * 50, at=AUDIT_ERA)
+    conn.commit()
+    conn.close()
+
+    # Pooled, the old rejects swamp a healthy audit era and the gate refuses.
+    assert actions_worker._audit_collapse_refusal(db, 0.20) is not None
+    # Windowed, it reads the era it is actually gating.
+    assert actions_worker._audit_collapse_refusal(db, 0.20, AUDIT_ERA) is None
+
+
+def test_a_verdict_the_window_cannot_date_is_left_out(tmp_path):
+    """Conservative on purpose: a `judge:%` row with no judgement to date is
+    dropped from the sample rather than assumed to be in it. A smaller sample
+    is harder to trip a collapse floor with, which is the right direction for
+    a refusal that has to be certain."""
+    db = tmp_path / "law_v1.sqlite3"
+    conn = sqlite3.connect(db)
+    _judged_tables(conn)
+    conn.executemany(
+        "INSERT INTO task (task_id, state, disposition, stream, claimed_at) "
+        "VALUES (?, 'accepted', 'judge:reject', 'synthesis', NULL)",
+        [(f"orphan{i}",) for i in range(100)],
+    )
+    conn.commit()
+    conn.close()
+
+    assert actions_worker._audit_collapse_refusal(db, 0.20, AUDIT_ERA) is None
+    # ...and pooled, with no window to date them against, they still count.
+    assert actions_worker._audit_collapse_refusal(db, 0.20) is not None
+
+
+def _assemble_root_with(tmp_path, dispositions):
+    root = tmp_path / "build"
+    db = root / actions_worker.DB_RELPATH
+    db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db)
+    _judged_tables(conn)
+    _judged_rows(conn, dispositions)
+    conn.commit()
+    conn.close()
+    return root
+
+
+class _CallRecorder:
+    """Stands in for subprocess.run across run_assemble's whole chain: every
+    step reports rc=0, and every argv is kept so a test can tell whether
+    push.py was actually invoked."""
+
+    def __init__(self):
+        self.argvs: list[list[str]] = []
+
+    def __call__(self, argv, *a, **k):
+        self.argvs.append(argv)
+        return type("R", (), {"returncode": 0})()
+
+
+def _run_assemble(tmp_path, monkeypatch, dispositions):
+    from pipeline_fakes import temp_config
+
+    cfg_path = temp_config(tmp_path)
+    root = _assemble_root_with(tmp_path, dispositions)
+    args = actions_worker.main_parser().parse_args(
+        ["--phase", "assemble", "--hf-repo", "u/r", "--config", cfg_path]
+    )
+    recorder = _CallRecorder()
+    monkeypatch.setattr(actions_worker.subprocess, "run", recorder)
+    monkeypatch.setattr(actions_worker.time, "sleep", lambda s: None)
+    rc = actions_worker.run_assemble(args, root, _FakeBundle())
+    return rc, recorder.argvs
+
+
+def test_run_assemble_refuses_the_push_step_on_a_collapsed_sample(tmp_path, monkeypatch, capsys):
+    dispositions = ["judge:accept"] * 5 + ["judge:reject"] * 95
+    rc, argvs = _run_assemble(tmp_path, monkeypatch, dispositions)
+    assert rc != 0
+    assert not any("tuned.data.push" in argv for argv in argvs)
+    assert "AUDIT SAMPLE COLLAPSE" in capsys.readouterr().out
+
+
+def test_run_assemble_pushes_when_the_sample_is_healthy(tmp_path, monkeypatch):
+    dispositions = ["judge:accept"] * 90 + ["judge:reject"] * 10
+    rc, argvs = _run_assemble(tmp_path, monkeypatch, dispositions)
+    assert rc == 0
+    assert any("tuned.data.push" in argv for argv in argvs)
 
 
 # --------------------------------------------------------------------------
@@ -334,12 +621,18 @@ def test_a_failed_final_push_is_reported_and_fails_the_job(tmp_path, monkeypatch
 
 
 def _store_with(tmp_path, rows):
+    """rows: (state, disposition) pairs. Every row gets a fixed stream -
+    these tests exercise the run report, not the per-stream breakdown, and
+    summarize() now always selects task.stream (see audit_readout.py P1.7)."""
     root = tmp_path / "build"
     db = root / actions_worker.DB_RELPATH
     db.parent.mkdir(parents=True)
     conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE task (state TEXT, disposition TEXT)")
-    conn.executemany("INSERT INTO task VALUES (?, ?)", rows)
+    conn.execute("CREATE TABLE task (state TEXT, disposition TEXT, stream TEXT)")
+    conn.executemany(
+        "INSERT INTO task (state, disposition, stream) VALUES (?, ?, ?)",
+        [(state, disposition, "synthesis") for state, disposition in rows],
+    )
     conn.commit()
     conn.close()
     return root
