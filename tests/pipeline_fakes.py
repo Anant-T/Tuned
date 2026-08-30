@@ -335,49 +335,6 @@ def paths_for(tmp_path):
     return build_paths(tmp_path / "build").ensure()
 
 
-def cfg_without_the_paid_judges(cfg: BuildConfig) -> BuildConfig:
-    """The shipped config minus the openai backstop - the pool before 2026-08-15.
-
-    A whole family of rules here is ABOUT a judge pool that runs out: slot B
-    parking a row that has already paid for slot A, an under-sized judge being
-    fatal rather than a warning, `--allow-pool-gaps` having short rows left to
-    run. The shipped pool no longer runs out - that is what closing the gap
-    means - so those rules need a pool that does, and this is the one they were
-    written against. It is not hypothetical either: it is exactly what an
-    operator who has not funded OPENAI_API_KEY is running.
-
-    Routing only, on purpose. What empties the slot is the ref not being in the
-    list; leaving the provider block reachable through `cfg.model_for` keeps
-    every walk the same shape it has in production.
-    """
-    from dataclasses import replace
-
-    def drop(refs):
-        return tuple(r for r in refs if not r.startswith("openai/"))
-
-    patched = replace(
-        cfg,
-        routing=replace(
-            cfg.routing, judge=drop(cfg.routing.judge), tiebreak=drop(cfg.routing.tiebreak)
-        ),
-    )
-    # The prefix trap the config comment warns about: "groq/openai/gpt-oss-20b"
-    # is a GROQ ref whose MODEL id starts with "openai/". Dropping it here would
-    # quietly empty the tiebreak pool and make every rule below pass for a
-    # reason nobody chose.
-    assert "groq/openai/gpt-oss-20b" in patched.routing.tiebreak
-    # SINCE 2026-08-28 the shipped lists carry no openai refs at all (the paid
-    # backstops were deleted with their provider block - free fleet only), so
-    # this helper is an identity on the live config and the "pool that runs
-    # out" it used to construct IS the shipped pool. Kept so the rules it
-    # serves keep working if a paid backstop ever returns.
-    assert len(patched.routing.judge) in (
-        len(cfg.routing.judge),
-        len(cfg.routing.judge) - 2,
-    )
-    return patched
-
-
 def cfg_with_fourth_judge_family(cfg: BuildConfig, *, max_context: int = 131072) -> BuildConfig:
     """The shipped config plus the 32k+ fourth-family judge it is missing.
 
@@ -792,7 +749,7 @@ def cfg_without_the_promoted_judge(cfg: BuildConfig) -> BuildConfig:
     condition its own name promises. Widening it here is what keeps the next
     promotion from being debugged in the wrong file.
 
-    Composed with cfg_without_the_paid_judges this restores the shape those
+    Composed with cfg_without_the_promoted_judge this restores the shape those
     rules were written against, by ROUTING only: the dropped models keep their
     tiebreak seats and their provider blocks, so every other walk has the shape
     it has in production.
@@ -874,79 +831,15 @@ def cfg_with_context(cfg: BuildConfig, *, family: str, role: str, max_context: i
     return patched
 
 
-def temp_config(tmp_path, *, two_generator_families: bool = False) -> str:
+def temp_config(tmp_path) -> str:
     """The real build config with its workdir redirected into tmp_path.
 
     For the CLI tests: `main()` resolves its own paths from the config, and
     the shipped one points at the operator's live data/build.
-
-    `two_generator_families` is the file-level twin of
-    cfg_with_two_generator_families. It is the same idea applied to the config
-    FILE rather than to a loaded BuildConfig: the judge pool's only remaining
-    hole is reachable ONLY from a mistral generation - that is what removes
-    mistral from the judge pool and empties slot B - and mistral stopped being a
-    generator on 2026-08-18.
-
-    IT HAS NO CALLERS, and the correction is worth recording because the wrong
-    version of this comment was believed. An earlier draft said "one CLI test
-    genuinely needs it"; that was checked on 2026-08-27 and is false at HEAD and
-    was false at c3e01a9 - every use of the NAME in the suite is of
-    cfg_with_two_generator_families, the BuildConfig-level twin, which is heavily
-    used and is not this. So this branch is dead code today. It is kept rather
-    than deleted because the scenario it builds is real and awkward to
-    reconstruct, and a CLI test that needs a two-family config file is a
-    plausible near-term need. Anyone who deletes it is not breaking a test; and
-    anyone who cites it as load-bearing should re-run the grep first.
     """
     raw = DATA_CONFIG.read_text(encoding="utf-8")
     redirected = raw.replace("workdir: data/build", f"workdir: {(tmp_path / 'build').as_posix()}")
     assert redirected != raw
-    if two_generator_families:
-        # The file-level twin of cfg_with_two_generator_families, and it
-        # synthesises the same family for the same reason: it used to promote
-        # the shipped mistral-small block, which no longer exists.
-        #
-        # THE ANCHOR IS A WHOLE MODEL, down to its params line. Anchoring on
-        # the first lines alone inserts the new block between that model's
-        # `roles` and its `limits`, which silently hands the new model's limits
-        # to it and leaves the real one with none.
-        anchor = (
-            "      - id: gemma-4-31b\n"
-            "        family: gemma\n"
-            "        roles: [judge, tiebreak]\n"
-            "        limits: {rpm: 5, tpm: 30000, tpd: 1000000, "
-            "max_context: 131072, max_output: 4096}\n"
-            "        params: {temperature: 0.2}\n"
-        )
-        injected = anchor + (
-            "      - id: second-generator\n"
-            f"        family: {SECOND_GENERATOR_FAMILY}\n"
-            "        roles: [generator, judge]\n"
-            "        limits: {rpm: 30, tpm: 8000, tpd: 200000, "
-            f"max_context: {SECOND_GENERATOR_CONTEXT}, max_output: 8192}}\n"
-            "        params: {}\n"
-            "        role_params:\n"
-            "          generator: {temperature: 0.7, top_p: 0.95}\n"
-            "          judge: {temperature: 0.2}\n"
-        )
-        for old, new in (
-            (anchor, injected),
-            # Anchor matches routing.generator's CURRENT order - gpt-oss
-            # reclaimed the lead slot from deepseek on 2026-08-27 (Task 1).
-            # This branch has no callers today (see the docstring above), so
-            # nothing exercises a stale anchor here and it can go quietly out
-            # of sync with the live config, which is exactly what happened to
-            # this same anchor once already. Keep it matched on every
-            # reorder even though nothing currently runs it.
-            ("  generator: [cerebras/gpt-oss-120b, bai/deepseek-v4-flash,\n"
-             "              lightning/lightning-ai/gpt-oss-120b]",
-             "  generator: [cerebras/gpt-oss-120b, bai/deepseek-v4-flash,\n"
-             f"              lightning/lightning-ai/gpt-oss-120b, {SECOND_GENERATOR_REF}]"),
-            ("  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,",
-             f"  judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b, {SECOND_GENERATOR_REF},"),
-        ):
-            assert redirected.count(old) == 1, old
-            redirected = redirected.replace(old, new)
     path = tmp_path / "cfg.yaml"
     path.write_text(redirected, encoding="utf-8")
     return str(path)

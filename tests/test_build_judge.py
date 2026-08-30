@@ -15,7 +15,6 @@ from pipeline_fakes import (
     cfg_with_gpt_oss_as_sole_generator,
     cfg_with_two_generator_families,
     cfg_without_the_free_tiebreak,
-    cfg_without_the_paid_judges,
     cfg_without_the_promoted_judge,
     chat_response,
     judge_reply,
@@ -1094,12 +1093,12 @@ def test_slot_b_can_be_unroutable_after_slot_a_has_been_paid_for(tmp_path, cfg, 
     takes qwen - and slot B has nothing left. The row parks having already
     paid for judge A, which is the money this costs.
 
-    Run against the pool WITHOUT the paid backstop. The shipped pool no longer
+    Run against a pool that RUNS OUT. The shipped pool no longer
     has this hole - closing it is what the openai judges are for - but the
     handling is what is under test here, not the config: a slot B that comes
     back empty must bank judge A and park recoverably, and that has to keep
     working for any pool that runs out. It is also the live behaviour for an
-    operator who has not funded OPENAI_API_KEY."""
+    operator whose second judge family is unreachable."""
     # The row under test is LONG, and a long row only reaches a judge if a
     # generator can hold it. mistral was demoted to judge-only on 2026-08-18,
     # so the second generator family is supplied explicitly - otherwise this
@@ -1108,12 +1107,10 @@ def test_slot_b_can_be_unroutable_after_slot_a_has_been_paid_for(tmp_path, cfg, 
     # 2026-08-19 probe it holds this row comfortably, so without the narrowing
     # the prompt never diverts and the divert is this test's premise.
     # The JUDGE pool also has to run out, which the shipped one no longer
-    # does: gemma took the second judge seat on 2026-08-19, so dropping only
-    # the paid backstop still leaves qwen for slot A and gemma for slot B.
+    # does: gemma took the second judge seat on 2026-08-19, so it is gemma's
+    # demotion that empties slot B and leaves qwen alone in slot A.
     holed = _narrow_generator(
-        cfg_without_the_promoted_judge(
-            cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
-        )
+        cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     )
     store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
     plan_wave(store, holed, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})
@@ -1146,7 +1143,7 @@ def test_a_reopened_row_never_re_pays_the_judge_it_already_bought(tmp_path, cfg,
     """The other half of R2-C3: parking is only survivable if something can
     un-park it, and the re-opened row must cost one call, not two.
 
-    On the backstop-less pool, for the same reason as the test above - the
+    On a pool that runs out, for the same reason as the test above - the
     shipped pool parks nothing here, and what is under test is the recovery,
     which has to work for any pool that ran out."""
     # The row under test is LONG, and a long row only reaches a judge if a
@@ -1157,12 +1154,10 @@ def test_a_reopened_row_never_re_pays_the_judge_it_already_bought(tmp_path, cfg,
     # 2026-08-19 probe it holds this row comfortably, so without the narrowing
     # the prompt never diverts and the divert is this test's premise.
     # The JUDGE pool also has to run out, which the shipped one no longer
-    # does: gemma took the second judge seat on 2026-08-19, so dropping only
-    # the paid backstop still leaves qwen for slot A and gemma for slot B.
+    # does: gemma took the second judge seat on 2026-08-19, so it is gemma's
+    # demotion that empties slot B and leaves qwen alone in slot A.
     holed = _narrow_generator(
-        cfg_without_the_promoted_judge(
-            cfg_without_the_paid_judges(cfg_with_two_generator_families(cfg))
-        )
+        cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     )
     store = open_store(tmp_path, n_seeds=1, text=LONG_SEED_TEXT)
     plan_wave(store, holed, "synthesis", 1, task_type_mix={"irac_analysis": 1.0})

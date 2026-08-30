@@ -1234,39 +1234,6 @@ def test_contract_from_config_reads_think_min_and_teacher(tmp_path):
     assert control_c.gate_contract == tuple(GATE_ORDER)
 
 
-def _cohort_selection(strata, *, n_per=20, gen_id_start=1):
-    """A Selection with dummy MatchedRows, shaped only enough for
-    cohort_manifest (seed_id/task_type/task_id/gen_id/attempt)."""
-    pairs = []
-    gen_id = gen_id_start
-    for task_type in strata:
-        for i in range(n_per):
-            seed_id = f"{task_type}-{i:03d}"
-            pairs.append(
-                E.MatchedRow(
-                    seed_id=seed_id,
-                    task_type=task_type,
-                    task_id=f"{seed_id}:{task_type}",
-                    gen_id=gen_id,
-                    attempt=1,
-                    state="accepted",
-                    model="dummy",
-                    finish_reason="stop",
-                    gates={},
-                    judgements={},
-                )
-            )
-            gen_id += 1
-    return E.Selection(
-        pairs=pairs,
-        blocked=False,
-        stratum_counts={t: n_per for t in strata},
-        excluded={},
-        decision=None,
-        reason="",
-    )
-
-
 def test_live_style_store_event_is_seen_on_latest_unit(store):
     gen_id = _plant_unit(
         store,

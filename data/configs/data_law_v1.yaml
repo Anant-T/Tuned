@@ -1253,6 +1253,12 @@ routing:
   # The two openai/gpt-5-* refs that used to close this list (fenced to $0,
   # unreachable by design) were DELETED 2026-08-28 with their provider block
   # - free fleet only. See prev_rep.md for the blocks and the fence history.
+  # THE PREFIX TRAP, and it outlived the refs that made it matter:
+  # `groq/openai/gpt-oss-20b` is a GROQ ref whose MODEL id begins "openai/".
+  # Any future filter that drops paid refs by prefix must key on the PROVIDER
+  # segment, not on `startswith("openai/")` - the latter quietly empties both
+  # this list's last slot and tiebreak's second, and every rule about a pool
+  # that runs out then passes for a reason nobody chose.
   judge: [groq/qwen/qwen3.6-27b, cerebras/gemma-4-31b,
           bai/deepseek-v4-flash, groq/openai/gpt-oss-20b]
   # TIEBREAK: mistral sits third, ahead of the paid backstops and behind the

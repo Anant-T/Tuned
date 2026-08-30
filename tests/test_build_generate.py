@@ -2694,37 +2694,6 @@ def _isolated_experiment_doc(tmp_path, *, require=True, manifest_path=None, s1=F
     return doc
 
 
-def _complete_pretreatment_manifest(path, cfg):
-    from tuned.data.eval_matched import TASK_TYPES, contract_from_config
-    from tuned.data.gates import GATE_ORDER
-
-    contract = contract_from_config(cfg)
-    pairs = []
-    for task_type in TASK_TYPES:
-        for i in range(20):
-            pairs.append(
-                {
-                    "seed_id": f"{task_type}-{i:03d}",
-                    "task_type": task_type,
-                    "control_task_id": f"{task_type}-{i:03d}:t",
-                    "control_gen_id": i + 1,
-                    "control_attempt": 1,
-                }
-            )
-    payload = {
-        "n": 80,
-        "n_per_stratum": 20,
-        "task_types": list(TASK_TYPES),
-        "think_min": contract.think_min,
-        "teacher_family": contract.teacher_family,
-        "teacher_model": contract.teacher_model,
-        "gate_contract": list(GATE_ORDER),
-        "pairs": pairs,
-    }
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return payload
-
-
 def _trap_generate_side_effects(monkeypatch):
     hits = []
 

@@ -26,7 +26,6 @@ from pipeline_fakes import (  # noqa: E402
     cfg_with_gpt_oss_reinstated_as_generator,
     cfg_with_two_generator_families,
     cfg_with_split_pools,
-    cfg_without_the_paid_judges,
     judge_prompt_overlay_with_pinned_tiebreak_gap,
 )
 
@@ -234,19 +233,6 @@ def _narrow_judge(cfg):
     which touches routing only.
     """
     return cfg_with_context(cfg, family="gemma", role="judge", max_context=8192)
-
-
-def _pre_probe_pool(cfg):
-    """The cerebras pool exactly as it was before the 2026-08-19 probes.
-
-    BOTH windows, not just one, and the difference is measurable rather than
-    tidy: the generator's window feeds the per-family judge sizing, so with it
-    at 8192 the gpt-oss family is checked at 19,108 tokens instead of 23,733,
-    and the advice a tiebreak gap prints is 29,661 rather than 29,666. A
-    fixture that narrowed only the tiebreak would reproduce the gap but not
-    the number, which is the whole of what the config block is pinned against.
-    """
-    return _narrow_judge(_narrow_generator(cfg))
 
 
 def _unset(monkeypatch, *names: str) -> None:
@@ -2190,7 +2176,7 @@ def test_the_shipped_config_has_no_fatal_judge_hole_left(cfg, keys):
     # ...and the hole really is closed by the ADDITION, not by the check going
     # quiet: take the backstop back out and the old gap is reported verbatim.
     before = pool_gaps(
-        cfg_without_the_promoted_judge(cfg_without_the_paid_judges(cfg)),
+        cfg_without_the_promoted_judge(cfg),
         needed_tokens=worst_case_judge_tokens(cfg),
     )
     judge_gaps = [g for g in before if g.role == "judge"]
@@ -2290,11 +2276,10 @@ def test_a_16k_fourth_family_judge_is_a_fatal_pool_gap(cfg, keys):
     build makes. It has to be reported as the gap it is, before the fleet
     starts.
 
-    Run against the pool WITHOUT the paid backstop, because that is the pool in
-    which a fourth-family judge is the thing filling slot B. With the 400k
-    openai judges in the list the slot is filled whatever the 16k model does,
-    so the fixture would guarantee the null result and prove nothing about
-    size."""
+    Run against a pool whose slot B is empty, because that is the pool in
+    which a fourth-family judge is the thing filling it. With a promoted judge
+    in the list the slot is filled whatever the 16k model does, so the fixture
+    would guarantee the null result and prove nothing about size."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
@@ -2303,7 +2288,7 @@ def test_a_16k_fourth_family_judge_is_a_fatal_pool_gap(cfg, keys):
     # cannot occur. See cfg_without_the_promoted_judge.
     cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     size = 16384
-    patched = _with_fourth_judge(cfg_without_the_paid_judges(cfg), max_context=size)
+    patched = _with_fourth_judge(cfg, max_context=size)
     needed = worst_case_judge_tokens(patched)
     assert "fourth" in undersized_families(patched, "judge", needed)
     fatal = [g for g in pool_gaps(patched, needed_tokens=needed) if g.fatal]
@@ -2399,9 +2384,9 @@ def test_a_context_shaped_judge_gap_has_row_sizes_the_pool_still_serves(cfg, key
     16k fourth-family judge empties slot B only ABOVE a size, so short rows
     really are servable and running them is a real choice.
 
-    Without the paid backstop, for the same reason as the 16k test above: a
-    400k judge in the list fills slot B at every size, so there would be no
-    context-shaped gap to have sizes on either side of."""
+    On the same emptied slot B as the 16k test above: any wide judge left in
+    the list fills slot B at every size, so there would be no context-shaped
+    gap to have sizes on either side of."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
     # mistral demotion. See cfg_with_two_generator_families.
@@ -2409,7 +2394,7 @@ def test_a_context_shaped_judge_gap_has_row_sizes_the_pool_still_serves(cfg, key
     # 2026-08-19, so slot B fills at every size and the gap under test here
     # cannot occur. See cfg_without_the_promoted_judge.
     cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
-    sixteen_k = _with_fourth_judge(cfg_without_the_paid_judges(cfg), max_context=16384)
+    sixteen_k = _with_fourth_judge(cfg, max_context=16384)
     assert [g for g in pool_gaps(sixteen_k, needed_tokens=2000) if g.fatal] == []
     assert [g for g in pool_gaps(sixteen_k, needed_tokens=8000) if g.fatal] == []
     fatal = [g for g in pool_gaps(sixteen_k, needed_tokens=20000) if g.fatal]
@@ -2550,7 +2535,7 @@ def test_unservable_is_asked_at_the_smallest_call_this_build_can_make(cfg, keys)
     floor = min_judge_tokens(cfg)
     tiny = 3000
     assert tiny < required_context(floor), "the fixture has to be under the real floor"
-    # Without the paid backstop: an unbounded judge in the list serves the
+    # Slot B has to be empty: any unbounded judge left in the list serves the
     # short rows too, so nothing would be unservable and the rule would have
     # no case.
     #
@@ -2560,8 +2545,7 @@ def test_unservable_is_asked_at_the_smallest_call_this_build_can_make(cfg, keys)
     # slot B serves the short rows, one whose slot B serves none - both need a
     # judge whose window is the only thing that moved between them.
     base = _with_judge_model(
-        cfg_without_the_paid_judges(cfg),
-        family="small", model_id="small-judge", max_context=8192,
+        cfg, family="small", model_id="small-judge", max_context=8192,
     )
     patched = cfg_with_context(base, family="small", role="judge", max_context=tiny)
 
@@ -2712,9 +2696,9 @@ def test_pool_gaps_walks_the_generator_role_through_the_routers_own_filter(cfg, 
     that cannot occur - and a spurious refusal is not free, it is the operator
     reaching for --allow-pool-gaps.
 
-    Run without the paid backstop, so that the gap the unkeyed family would
-    contribute is a FATAL one and the rule is tested where it costs: with the
-    400k judges in the list every judge slot fills for every family, and the
+    Run on the emptied slot B, so that the gap the unkeyed family would
+    contribute is a FATAL one and the rule is tested where it costs: with a
+    promoted judge in the list every judge slot fills for every family, and the
     only thing an unkeyed generator could add is another tiebreak warning."""
     # Two generator families: this property is about the ALGORITHM that walks
     # them, and the shipped config has carried only one since the 2026-08-18
@@ -2725,7 +2709,7 @@ def test_pool_gaps_walks_the_generator_role_through_the_routers_own_filter(cfg, 
     # out of families, which since the 2026-08-19 promotion it does not.
     cfg = cfg_without_the_promoted_judge(cfg_with_two_generator_families(cfg))
     patched = _with_extra_generator(
-        cfg_without_the_paid_judges(cfg), family="qwen", api_key_env="FOURTHPARTY_API_KEY"
+        cfg, family="qwen", api_key_env="FOURTHPARTY_API_KEY"
     )
     _unset(monkeypatch, "FOURTHPARTY_API_KEY")
     needed = worst_case_judge_tokens(patched)
@@ -3380,6 +3364,11 @@ def test_the_probed_windows_are_what_the_config_declares(cfg):
     to a research note that read this build's 8192 TRAINING sequence length as
     the provider's context window - while the provider served 131,072. It cost
     85% of the statute_qa stream.
+
+    What the wrong number cost downstream, measured: the generator's window
+    feeds the per-family judge sizing, so at 8192 the gpt-oss family was
+    checked at 19,108 tokens rather than 23,733, and the advice a tiebreak gap
+    printed was 29,661 rather than 29,666.
     """
     caps = {
         f"{p.name}/{m.id}": m.limits.get("max_context")

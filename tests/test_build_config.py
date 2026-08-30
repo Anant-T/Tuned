@@ -890,35 +890,3 @@ def test_eval_cohort_strata_refuses_empty_duplicate_and_non_string(tmp_path):
             load_build_config(path, allow_unpinned=True)
 
 
-def _assert_ds_ab_common_fences(cfg, path: Path, live) -> None:
-    """The four invariants every arm of the 2026-08-28 clause/cap A/B shares:
-    single-ref deepseek generator, the openai cost fence, the live band, and
-    LF-only bytes. Factored out so both pairing tests below check the same
-    ground before comparing the one key each is allowed to differ on."""
-    import yaml
-
-    from tuned.data.generate import _provider_usd_cap
-
-    assert list(cfg.routing.generator) == ["bai/deepseek-v4-flash"]
-    assert _provider_usd_cap(cfg, "openai") == 0.0
-    openai = next(p for p in cfg.providers if p.name == "openai")
-    for model in openai.models:
-        assert model.limits["usd_cap"] == 0.0
-        assert model.limits["usd_per_1m_prompt"] > 0
-        assert model.limits["usd_per_1m_completion"] > 0
-    assert cfg.build.length_band == live.build.length_band
-    assert cfg.build.length_band.think_max == 4000
-    assert cfg.build.length_band.total_max == 8192
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    for key in ("harmony_completions", "harmony_prefill", "harmony_s1_continue",
-                "require_pretreatment_manifest", "pretreatment_manifest"):
-        assert key not in raw["build"], key
-    assert path.read_bytes().count(b"\r") == 0
-
-
-    # This arm is generate-only (see header) and was forked from the older
-    # data_law_v1_exp_deepseek.yaml lineage rather than today's live
-    # data_law_v1.yaml, so its judge/tiebreak/probe lists are not asserted
-    # against the live config's - they were never meant to track it.
-
-
