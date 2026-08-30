@@ -550,3 +550,22 @@ def test_seed_push_refuses_to_clobber_a_remote_that_owns_the_baton(tmp_path, cap
     assert rc == 3
     assert "REFUSING" in capsys.readouterr().out
     assert api.uploads == []  # nothing was overwritten
+
+
+def test_the_ship_path_arms_the_teacher_cut():
+    """(b) of P1.1, and the only place it is armed.
+
+    verify's filters default OFF so an operator re-gating between waves cannot
+    demote the corpus by accident - which means the corpus that actually
+    leaves this machine is only one teacher at current prompts if THIS chain
+    says so. Both flags, on the verify step, with or without an index.
+    """
+    for argvs in (
+        actions_worker.assemble_argvs("cfg.yaml"),
+        actions_worker.assemble_argvs("cfg.yaml", citation_index=Path("x/i.txt")),
+        actions_worker.assemble_argvs("cfg.yaml", streams=["replay"], out_dir=Path("w/out")),
+    ):
+        verify = argvs[0]
+        assert verify[3] == "tuned.data.verify"
+        assert "--require-generator" in verify
+        assert "--require-current-prompt" in verify

@@ -113,12 +113,20 @@ def test_a_clean_row_survives_the_rerun(tmp_path, paths, cfg, index_path):
     store, task_id = generated_store(tmp_path, paths, cfg)
     with store:
         counts = rerun_gates(store, cfg, citation_index_path=index_path)
+        census = counts.pop("provenance")
         assert counts == {
             "scanned": 1, "regated": 1, "clean": 1, "demoted": 0, "soft_fail": 0,
             "diagnostic": 0, "missing_seed": 0, "slot_error": 0,
             "input_ineligible": 0, "held_by_worker": 0, "rebuilt_content": 0,
-            "unverified": 0,
+            "unverified": 0, "off_teacher": 0, "stale_prompt_sha": 0,
         }
+        # The census is filled on EVERY run, armed or not - the whole point of
+        # it is that a pass which demotes nothing still says who wrote the rows.
+        assert list(census.values()) == [1]
+        (state, teacher, _prompt_id, sha_state), = census
+        assert (state, teacher, sha_state) == (
+            "accepted", "bai/deepseek-v4-flash", "current",
+        )
         assert store.conn.execute("SELECT state FROM task").fetchone()[0] == "accepted"
         gen = store.latest_generation(task_id)
         assert gate_detail(store, gen["gen_id"], "citations")["novel"] == []
@@ -416,3 +424,245 @@ def test_verify_shares_the_stores_lease_constants(tmp_path):
     from tuned.data import verify as verify_module
 
     assert verify_module.DEFAULT_LEASE_S is store_module.DEFAULT_LEASE_S
+
+
+# --------------------------------------------------------------------------
+# The cut: one teacher, at the prompt templates on disk.
+#
+# Verified in the live store on 2026-08-30: all 17 accepted rows and 73 of 80
+# judging rows were written by RETIRED providers at retired prompt shas, while
+# only 27 of 1,423 generations came from the configured generator. Nothing
+# downstream can see any of that - decontaminate.generated_rows selects on
+# `state = 'accepted'` and no other column - so a cut assembled then would
+# have blended two teachers under one dataset card without a word.
+# --------------------------------------------------------------------------
+
+RETIRED_TEACHER = ("cerebras", "gpt-oss-120b")
+RETIRED_SHA = "97185cd2068e"
+
+
+def retire_teacher(store, provider=RETIRED_TEACHER[0], model=RETIRED_TEACHER[1]):
+    store.conn.execute("UPDATE generation SET provider = ?, model = ?", (provider, model))
+    store.conn.commit()
+
+
+def retire_prompt_sha(store, sha=RETIRED_SHA):
+    store.conn.execute("UPDATE task SET prompt_sha = ?", (sha,))
+    store.conn.commit()
+
+
+def census_of(counts):
+    return {(teacher, sha): n for (_state, teacher, _pid, sha), n in counts["provenance"].items()}
+
+
+def test_the_census_names_a_retired_teacher_without_being_asked(tmp_path, paths, cfg, index_path):
+    """(a) of P1.1: the readout is unconditional.
+
+    An operator running an ordinary verify pass must be able to answer "who
+    wrote these rows" from its output alone - that question has no other
+    reader in the whole chain.
+    """
+    store, _ = generated_store(tmp_path, paths, cfg)
+    with store:
+        retire_teacher(store)
+        retire_prompt_sha(store)
+        counts = rerun_gates(store, cfg, citation_index_path=index_path)
+        assert census_of(counts) == {("cerebras/gpt-oss-120b", "stale"): 1}
+        # ...and nothing was demoted for it. The census reports; the filter
+        # rules, and it was not armed here.
+        assert counts["off_teacher"] == 0 and counts["stale_prompt_sha"] == 0
+        assert counts["regated"] == 1
+        assert store.conn.execute("SELECT state FROM task").fetchone()[0] == "accepted"
+
+
+def test_an_off_teacher_row_is_parked_not_rejected(tmp_path, paths, cfg, index_path):
+    """Demote-only. The row is wrong about NOTHING - the seed, the law and the
+    plan are all still good - so `rejected` would close a row that a change of
+    ruling, or a regeneration, makes shippable again."""
+    store, task_id = generated_store(tmp_path, paths, cfg)
+    with store:
+        retire_teacher(store)
+        counts = rerun_gates(
+            store, cfg, citation_index_path=index_path,
+            generators=("bai/deepseek-v4-flash",),
+        )
+        assert counts["off_teacher"] == 1
+        assert counts["demoted"] == 0
+        state, disposition = store.conn.execute(
+            "SELECT state, disposition FROM task"
+        ).fetchone()
+        assert (state, disposition) == ("off_teacher", "verify:off-teacher")
+        event = json.loads(store.events("verify_off_cut")[-1]["detail_json"])
+        assert event["reason"] == "off_teacher"
+        assert event["teacher"] == "cerebras/gpt-oss-120b"
+
+
+def test_an_off_cut_row_is_not_re_gated(tmp_path, paths, cfg, index_path):
+    """Why the filter runs BEFORE the gates rather than after.
+
+    A stale-sha row re-gated against today's template is scored against a
+    question it was never asked; the gates read clean and the row stays
+    accepted forever, which is how the live store came to hold 17 of them.
+    """
+    store, _ = generated_store(tmp_path, paths, cfg)
+    with store:
+        retire_prompt_sha(store)
+        counts = rerun_gates(
+            store, cfg, citation_index_path=index_path, require_current_prompt=True
+        )
+        assert counts["scanned"] == 1
+        assert counts["regated"] == 0
+        assert counts["clean"] == 0
+        assert counts["stale_prompt_sha"] == 1
+        state, disposition = store.conn.execute(
+            "SELECT state, disposition FROM task"
+        ).fetchone()
+        # generate.py's own state, not a second name for one fact.
+        assert (state, disposition) == ("stale_prompt", "verify:stale-prompt-sha")
+
+
+def test_a_row_with_no_recorded_prompt_sha_is_not_current(tmp_path, paths, cfg, index_path):
+    """The deliberate disagreement with generate.py's live guard.
+
+    That guard reads `if planned_sha and planned_sha != live_sha` - a row it
+    cannot prove stale gets its call. This pass is deciding whether an answer
+    ALREADY BOUGHT belongs in a cut described as "one teacher at current
+    prompts", and a row whose prompt generation was never recorded does not
+    meet that description.
+    """
+    store, _ = generated_store(tmp_path, paths, cfg)
+    with store:
+        # task.prompt_sha is NOT NULL, so the reachable shape of "nothing was
+        # recorded" is the empty string, not a null.
+        store.conn.execute("UPDATE task SET prompt_sha = ''")
+        store.conn.commit()
+        counts = rerun_gates(
+            store, cfg, citation_index_path=index_path, require_current_prompt=True
+        )
+        assert census_of(counts) == {("bai/deepseek-v4-flash", "unrecorded"): 1}
+        assert counts["stale_prompt_sha"] == 1
+
+
+def test_both_filters_are_off_unless_asked_for(tmp_path, paths, cfg, index_path):
+    """An ad-hoc verify run stays a pure citation re-check. The cut is armed on
+    the ship path (assemble_argvs) and nowhere else, so an operator re-gating
+    between waves cannot demote the corpus by accident."""
+    store, _ = generated_store(tmp_path, paths, cfg)
+    with store:
+        retire_teacher(store)
+        retire_prompt_sha(store)
+        counts = rerun_gates(store, cfg, citation_index_path=index_path)
+        assert (counts["off_teacher"], counts["stale_prompt_sha"]) == (0, 0)
+        assert store.conn.execute("SELECT state FROM task").fetchone()[0] == "accepted"
+
+
+def test_the_cut_only_touches_states_it_may_demote(tmp_path, paths, cfg, index_path):
+    """A rejected row is already out of the pool, and re-writing its state
+    would overwrite the verdict that put it there."""
+    store, _ = generated_store(tmp_path, paths, cfg, state="rejected")
+    with store:
+        retire_teacher(store)
+        counts = rerun_gates(
+            store, cfg, citation_index_path=index_path,
+            generators=("bai/deepseek-v4-flash",),
+        )
+        assert counts["off_teacher"] == 0
+        assert census_of(counts) == {("cerebras/gpt-oss-120b", "current"): 1}
+        assert store.conn.execute("SELECT state FROM task").fetchone()[0] == "rejected"
+
+
+def test_the_cut_defers_to_a_live_lease_like_every_other_demotion(
+    tmp_path, paths, cfg, index_path
+):
+    """The third demotion path has to be behind the same fence as the other
+    two - which is why there is one fence and not three copies of it."""
+    store, _ = generated_store(tmp_path, paths, cfg, state="judging")
+    with store:
+        retire_teacher(store)
+        store.claim_tasks("judge-1", 1, state_from="judging", state_to="judging_active")
+        counts = rerun_gates(
+            store, cfg, citation_index_path=index_path,
+            generators=("bai/deepseek-v4-flash",),
+        )
+        assert counts["off_teacher"] == 0
+        assert counts["held_by_worker"] == 1
+        assert store.conn.execute("SELECT state FROM task").fetchone()[0] == "judging_active"
+
+
+def test_an_off_teacher_row_comes_back_with_a_budget_to_regenerate_with(
+    tmp_path, paths, cfg, index_path
+):
+    """The whole recovery path for decision 4, end to end.
+
+    The ~90 rows the ruling removes must be REGENERATED, and their task_ids
+    are hashes of (seed, task_type, prompt_id, sample_ix) - so a re-plan is
+    INSERT OR IGNORE'd straight back into the existing row and cannot produce
+    a substitute. Re-opening the row itself is the only route, and a row
+    handed back at MAX_ATTEMPTS is one the generator will never claim.
+    """
+    from tuned.data.tasks import reopen_tasks
+
+    store, task_id = generated_store(tmp_path, paths, cfg)
+    with store:
+        retire_teacher(store)
+        store.conn.execute("UPDATE task SET attempts = 3")
+        store.conn.commit()
+        rerun_gates(
+            store, cfg, citation_index_path=index_path,
+            generators=("bai/deepseek-v4-flash",),
+        )
+        skipped: dict = {}
+        assert reopen_tasks(store, ["off_teacher"], skipped=skipped) == {"off_teacher": 1}
+        assert not skipped  # not "out of budget" - the park was a ruling, not a failure
+        state, attempts = store.conn.execute(
+            "SELECT state, attempts FROM task"
+        ).fetchone()
+        assert (state, attempts) == ("pending", 0)
+
+
+def test_the_cli_pool_defaults_to_the_configured_generator(
+    tmp_path, paths, cfg, index_path, capsys
+):
+    """--require-generator with no --generator means "whoever routing.generator
+    says the teacher is today", never a second list that can drift from it."""
+    config_path = temp_config(tmp_path)
+    store, _ = generated_store(tmp_path, paths, cfg, db_path=paths.state_db)
+    with store:
+        retire_teacher(store)
+
+    assert verify_main(
+        ["--config", config_path, "--index", index_path, "--require-generator"]
+    ) == 0
+    out = capsys.readouterr().out
+    assert f"cut: generator in {', '.join(cfg.routing.generator)}" in out
+    assert "provenance (rows by state" in out and "cerebras/gpt-oss-120b" in out
+    with Store.open(paths.state_db) as reopened:
+        assert reopened.conn.execute("SELECT state FROM task").fetchone()[0] == "off_teacher"
+
+
+def test_the_cli_pool_can_be_overridden_without_editing_the_config(
+    tmp_path, paths, cfg, index_path
+):
+    """--generator implies the filter, so naming a pool cannot silently do
+    nothing - and it is what re-admits a retired teacher for a one-off
+    measurement without touching the shipped routing."""
+    config_path = temp_config(tmp_path)
+    store, _ = generated_store(tmp_path, paths, cfg, db_path=paths.state_db)
+    with store:
+        retire_teacher(store)
+
+    assert verify_main(
+        ["--config", config_path, "--index", index_path,
+         "--generator", "cerebras/gpt-oss-120b"]
+    ) == 0
+    with Store.open(paths.state_db) as reopened:
+        assert reopened.conn.execute("SELECT state FROM task").fetchone()[0] == "accepted"
+
+
+def test_a_retired_prompt_id_reads_as_stale_rather_than_raising():
+    """The bytes the teacher saw are gone whether the template was edited or
+    deleted, and a census that raises on a retired id reports nothing at all."""
+    from tuned.data.verify import prompt_sha_state
+
+    assert prompt_sha_state({"prompt_id": "gen_no_such_template", "prompt_sha": "abc"}) == "stale"
+    assert prompt_sha_state({"prompt_id": "gen_no_such_template"}) == "unrecorded"

@@ -775,10 +775,10 @@ def test_dry_run_renders_a_green_card_and_manifest_with_measured_numbers(tmp_pat
     assert "**bbl**" in readme and "**aibe**" in readme and "**devanagari**" in readme
 
     manifest = json.loads((paths.out_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
-    assert manifest["push_version"] == PUSH_VERSION == 1
+    assert manifest["push_version"] == PUSH_VERSION == 2
     assert manifest["counts"] == {"rows": 100, "train": 90, "eval": 10}
     assert manifest["module_versions"] == {
-        "decontaminate": 4, "dedupe": 4, "split": 1, "assemble": 2, "stats": 1, "push": 1,
+        "decontaminate": 4, "dedupe": 4, "split": 1, "assemble": 2, "stats": 1, "push": 2,
         "extract": "per-document in the build store (document.extract_version); "
                   "not reachable from the file chain",
     }
@@ -899,7 +899,7 @@ def test_module_versions_reads_every_reachable_stage(tmp_path):
     cfg_path, report, paths = green_pipeline(tmp_path)
     versions = module_versions(paths.out_dir, report)
     assert versions == {
-        "decontaminate": 4, "dedupe": 4, "split": 1, "assemble": 2, "stats": 1, "push": 1,
+        "decontaminate": 4, "dedupe": 4, "split": 1, "assemble": 2, "stats": 1, "push": 2,
         # M1: extract.py's absence named, not silent - see module_versions'
         # own docstring for why a string here changes nothing about the gate.
         "extract": "per-document in the build store (document.extract_version); "
@@ -1219,3 +1219,49 @@ def test_the_hub_client_seam_is_the_only_place_that_imports_the_library():
         if ln.startswith("import huggingface_hub") or ln.startswith("from huggingface_hub")
     ]
     assert top_level_imports == []
+
+
+def test_the_manifest_records_which_teachers_composed_the_cut():
+    """No cut leaves the machine without saying who taught it.
+
+    decontamination.json, dedupe.json, split.json, assemble.json and
+    stats.json all key on stream and state, so without this a corpus built
+    from two teachers at three template generations ships looking exactly
+    like one built by the teacher configured today.
+    """
+    from tuned.data.push import teacher_mixture
+
+    rows = [
+        {"_prov": {"teacher": "bai/deepseek-v4-flash", "prompt_sha": "aaaa"}},
+        {"_prov": {"teacher": "bai/deepseek-v4-flash", "prompt_sha": "aaaa"}},
+        {"_prov": {"teacher": "cerebras/gpt-oss-120b", "prompt_sha": "bbbb"}},
+        # replay and curated rows are copied in whole, never generated.
+        {"_prov": {"source": "replay"}},
+    ]
+    assert teacher_mixture(rows) == {
+        "bai/deepseek-v4-flash @ aaaa": 2,
+        "cerebras/gpt-oss-120b @ bbbb": 1,
+        # Counted under a name, not dropped: "no teacher" is a fact about the
+        # mix, and a total that silently sums short of the corpus is how a
+        # card under-reports itself.
+        "not-generated @ -": 1,
+    }
+
+
+def test_the_mixture_is_measured_on_the_rows_that_shipped():
+    """Not at accept time. dedupe drops duplicate clusters and split holds
+    rows back for eval, so a census taken in the store counts teachers for
+    rows the dataset does not contain."""
+    from tuned.data.push import build_manifest
+
+    manifest = build_manifest(
+        report={}, decon=None, push_cfg=_PushCfg(), versions={}, outputs=[], chain=None,
+        rows=[{"_prov": {"teacher": "bai/deepseek-v4-flash", "prompt_sha": "aaaa"}}],
+    )
+    assert manifest["teacher_mixture"] == {"bai/deepseek-v4-flash @ aaaa": 1}
+
+
+class _PushCfg:
+    repo_id = "x/y"
+    private = True
+    card_extra = None

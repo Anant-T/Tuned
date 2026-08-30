@@ -2828,6 +2828,16 @@ def generated_rows(store, cfg=None, *, state: str = "accepted") -> Iterator[dict
                 "neutral_citation": seed.get("neutral_citation"),
                 "task_type": gen.get("task_type"),
                 "prompt_id": gen.get("prompt_id"),
+                # THE TEACHER TRAVELS WITH THE ROW, for the same reason the
+                # licence does: the store holds it and the file chain drops
+                # it, so by the time push.py writes the manifest there is no
+                # other channel left that can say which model wrote which row.
+                # `prompt_sha` beside it because "which teacher" and "which
+                # version of the question" are one provenance fact, not two -
+                # verify.py demotes on either. Spelled provider/model, the
+                # way config.py spells a routing pool entry.
+                "teacher": f"{gen.get('provider')}/{gen.get('model')}",
+                "prompt_sha": gen.get("prompt_sha"),
                 "seed_id": gen.get("seed_id"),
                 "gen_id": gen.get("gen_id"),
                 "score": round(sum(scores) / len(scores), 3) if scores else None,

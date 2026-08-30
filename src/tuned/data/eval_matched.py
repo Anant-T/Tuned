@@ -50,6 +50,10 @@ OPERATIONAL_STATES = frozenset(
         "format_parked",
         "input_ineligible",
         "stale_prompt",
+        # verify.py's teacher cut. Removed from the pool by a ruling about
+        # the FLEET, so counting it as a reject would depress an accept rate
+        # with rows no judge ever declined.
+        "off_teacher",
     }
 )
 PSEUDO_GOLD = "high-confidence pseudo-gold"

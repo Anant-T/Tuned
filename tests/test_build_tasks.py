@@ -18,6 +18,7 @@ from tuned.data.tasks import main as tasks_main
 from tuned.data.generate import MAX_ATTEMPTS
 from tuned.data.tasks import (
     CURATED_C2_MIX,
+    FREE_PARK_DISPOSITIONS,
     PER_SEED_CAP,
     REPLY_RESERVE_TOKENS,
     REOPEN_STATES,
@@ -1016,3 +1017,37 @@ def test_reopen_reports_a_budget_skip_distinctly_from_an_empty_filter(tmp_path, 
             "judge_error": 0
         }
         assert empty_skip == {}
+
+
+def test_off_teacher_reopens_to_the_generator_and_is_not_terminally_dead():
+    """Back to the GENERATOR, not the judges: the recovery this park exists
+    for is re-generating the row with the teacher the cut is defined over, not
+    accepting the old teacher's answer after all.
+
+    NOT terminally dead, for the same reason format_parked is not - the row is
+    re-openable and keeps the judgements it already paid for, so counting it
+    dead would have plan_wave top up a replacement as well and quietly double
+    the wave.
+    """
+    assert REOPEN_STATES["off_teacher"] == "pending"
+    assert "off_teacher" not in TERMINALLY_DEAD
+
+
+def test_off_teacher_is_the_one_billed_park_that_gets_its_budget_back():
+    """The default is to preserve, and this is the deliberate exception.
+
+    The attempts were spent producing an answer a later RULING removed from
+    the cut - a fact about the fleet, not about the answer - and the row
+    cannot be replaced by any other route, task_id_for hashing (seed,
+    task_type, prompt_id, sample_ix) so a re-plan is INSERT OR IGNORE'd back
+    into the row it was meant to replace. Handed back at MAX_ATTEMPTS it is a
+    park that is terminal in everything but name.
+    """
+    from tuned.data.verify import OFF_TEACHER_DISPOSITION
+
+    assert OFF_TEACHER_DISPOSITION in FREE_PARK_DISPOSITIONS
+    # ...and the other two entries stay what they were: parks that never
+    # reached a provider at all.
+    assert FREE_PARK_DISPOSITIONS == {
+        "unroutable:generator", "exhausted:provider-fault", "verify:off-teacher",
+    }

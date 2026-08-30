@@ -4815,3 +4815,22 @@ def test_the_generated_licence_is_read_from_the_source_table_not_assumed(tmp_pat
     store.upsert_source(source_id, "CC-BY-4.0")
     assert next(iter(generated_rows(store, state="accepted")))["_prov"]["license"] == "CC-BY-4.0"
     store.close()
+
+
+def test_a_generated_row_carries_its_teacher_and_prompt_generation(tmp_path):
+    """The store holds provider/model and prompt_sha; the file chain drops
+    every column it is not explicitly handed. By the time push.py writes the
+    manifest, `_prov` is the only channel left that can say which model wrote
+    which row - and a dataset card for a distilled corpus that cannot name its
+    teacher is a card missing its central fact."""
+    from tuned.data.decontaminate import generated_rows
+
+    store = open_store(tmp_path, n_seeds=1)
+    _accept_generation(store, seed_id="seed000", think="reasoning", answer="the answer")
+    prov = next(iter(generated_rows(store, state="accepted")))["_prov"]
+    store.close()
+
+    # provider/model, the way config.py spells a routing pool entry - so a
+    # shipped row and a pool entry compare without either side parsing.
+    assert prov["teacher"] == "p/m"
+    assert prov["prompt_sha"] == "abc"

@@ -89,7 +89,13 @@ def assemble_argvs(
     shaped names are a pure function of the stem, so they can be named here
     before shape has run.
     """
-    verify_step = ["verify"] + (
+    # THE CUT IS ARMED HERE AND ONLY HERE. An ad-hoc `verify` run stays a
+    # pure citation re-check; the corpus that leaves this machine is one
+    # teacher at the prompt templates on disk (2026-08-30 ruling), so a row
+    # from a retired provider or a superseded template is demoted out of the
+    # shippable pool rather than blended into it silently. Expect the first
+    # armed run to shrink the pool - that is the ruling, not a fault.
+    verify_step = ["verify", "--require-generator", "--require-current-prompt"] + (
         ["--index", str(citation_index)] if citation_index else []
     )
     if streams:
