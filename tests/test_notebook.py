@@ -30,8 +30,6 @@ def test_notebook_is_valid_and_complete():
     # every rank must see BOTH GPUs (rank N places itself on cuda:N): a leaked
     # single-GPU mask killed rank 1 with "invalid device ordinal" on 2026-08-06
     assert 'os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"' in joined
-    # torchrun unconditionally - one rank per GPU, full model per rank
-    assert 'launcher = ["torchrun", "--nproc_per_node=2"]' in joined
     # the chunked-CE env var must be set BEFORE `import unsloth` in the
     # torchrun children, so it has to sit in the parent env. 32, not 16: the
     # CE transient scales with sequence length; the qualified peaks were
@@ -48,19 +46,13 @@ def test_notebook_is_valid_and_complete():
     # raised FileNotFoundError in every mode before any GPU work - the lane
     # could not start at all. Deriving it from CONFIG cannot drift again.
     assert 'Path(CONFIG).with_name("law_v1_run.yaml")' in joined
-    # PROBE runs the long probe dataset (short unpacked examples would make
-    # the long-seq VRAM probe a false green) and now PUSHES: the checkpoint
-    # path does not depend on row length, so the old separate SAVETEST mode
-    # cost a second model load for nothing.
-    assert '"data/probe_long.jsonl"' in joined
+    # PROBE_SEQ is still set here (cell 1) and still read by the launch cell;
+    # the --max-seq-length flag it becomes now lives in tuned.train.supervise
+    # (test_supervise.test_probe_seq_only_reaches_the_probe_mode).
     assert "PROBE_SEQ" in joined
-    assert "--max-seq-length" in joined
     assert "tuned.data.probe" in joined
-    probe_line = next(
-        line for line in joined.splitlines() if line.strip().startswith('"PROBE":')
-    )
-    assert '"--save-steps", "1"' in probe_line
-    assert "--no-hub" not in probe_line, "the merged gate must push a checkpoint"
+    # the PROBE gate's own flags moved with the launcher into
+    # tuned.train.supervise (test_supervise.test_the_probe_gate_is_one_gate)
     assert '"SAVETEST"' not in joined, "SAVETEST is retired into the PROBE gate"
     # 8192 is the qualified cap; 12288 OOM'd on 2026-08-26 and was reverted
     assert "PROBE_SEQ = 8192" in joined
@@ -89,9 +81,6 @@ def test_notebook_is_valid_and_complete():
     # to the bounded hub download
     assert "TUNED_MODEL_PATH" in joined
     assert "qwen3-8b-staged/REVISION.txt" in joined
-    # progress pushes must never block the watchdog loop (a hung upload would
-    # freeze heartbeats AND the timeout check)
-    assert "_push_inflight" in joined
     assert "hf_" not in joined.replace("hf_cache", "").replace("hf_transfer", "").replace("HF_", "")
     # hf_transfer must be explicitly disabled: unsloth_zoo force-enables it when
     # the var is absent, and its no-retry fast path can stall downloads silently
@@ -106,54 +95,7 @@ def test_notebook_is_valid_and_complete():
     # interactive sessions when the smoke-build child hung at interpreter
     # shutdown after finishing its work (2026-08-08; likely v9's real stall)
     assert 'CONFIG], timeout=20 * 60' in joined
-    assert joined.count("_probe_cmd, timeout=5 * 60") == 2
-    # RESUME must extend past the smoke run's 60 steps: SMOKE's final checkpoint
-    # sits AT max_steps, so a bare --resume loads it and exits without stepping
-    # - a no-op false green. Forcing 4 extra steps proves optimizer/scaler/rng
-    # state actually reloads and trains (2026-08-08 SMOKE-green lesson).
-    # --allow-schedule-change is REQUIRED here: sft.py refuses a resume whose
-    # max_steps differs from the checkpoint's, because warmup and the decay
-    # denominator are rebuilt from the session's max_steps while scheduler.pt
-    # restores only the step counter (the gate's LR jumped +134% at step 62).
-    # The gate accepts that jump; the main run must never opt into it.
-    assert '"RESUME": ["--resume", "--max-steps", "64", "--allow-schedule-change"]' in joined
-    # MAIN/MAIN_RESUME are the production entries (2026-08-09 audit): they
-    # carry the clean-stop budget (10.5 h, ~30 min inside the 11 h watchdog
-    # SIGKILL - without it every session discards up to save_steps-1 steps,
-    # worst case ~30 min of compute) and must NEVER carry
-    # --allow-schedule-change: a schedule change on a production resume is
-    # the +134% LR jump the guard exists to prevent.
-    # ONE production entry: MAIN_RESUME carried nothing the checkpoint repo did
-    # not already hold, and forgetting to flip MODE on session 2 restarted at
-    # step 0 - whose first save overwrites last-checkpoint/ at the fixed
-    # path_in_repo, silently discarding a session of a multi-session epoch.
-    assert '"MAIN": ["--resume-if-available", "--time-budget-s", "37800"]' in joined
-    assert "MAIN_RESUME" not in joined
-    for line in joined.splitlines():
-        if '"MAIN' in line:
-            assert "--allow-schedule-change" not in line, line
-    # the child's --mode follows the notebook MODE: gates run the smoke
-    # config block, MAIN* runs train.main (ga=6, save_steps=10, law_v1)
-    assert 'MODE.startswith("MAIN")' in joined
-    # watchdog kill correctness (2026-08-09 adjudication): without
-    # start_new_session the child shares the KERNEL's process group - any
-    # killpg would take the kernel down and Kaggle discards its buffered
-    # output. And torchrun spawns each rank as its own session leader, so
-    # killing the launcher's group alone orphans two ~13 GiB processes:
-    # SIGTERM lets torchrun reap its own workers (killpg TERM -> 30s -> KILL
-    # per rank), the /proc ppid sweep SIGKILLs any survivor.
-    assert "start_new_session=True" in joined
-    assert "signal.SIGTERM" in joined
-    assert "os.killpg" in joined
-    assert "_rank_pids(" in joined
-    assert "proc.kill()" not in joined
-    # MAIN's corpus is NOT a local file the notebook can check for: data/ is
-    # gitignored, so the assembled corpus never reaches this clone and the old
-    # `Path(main_dataset).exists()` belt refused every MAIN run. sft.py's
-    # resolve_main_dataset fetches it from the private HF dataset repo at the
-    # pinned revision and refuses on a sha256 mismatch, which is both earlier
-    # and a better message than an assert here could give.
-    assert '["train"]["main"]["dataset"]' not in joined
+    assert joined.count("_probe_cmd, timeout=5 * 60") == 1
     # the 13.5 abort line applies to RESERVED (the allocator high-water that
     # actually OOMs) - the PROBE bullet used to point readers at the smaller
     # allocated number, and the two mentions disagreed with each other

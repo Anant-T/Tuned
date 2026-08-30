@@ -7,7 +7,7 @@ had:
 
   * Five copies asserted the literal `os._exit(0)` and seven asserted
     `os._exit(`. The strict form is not a stricter test, it is a WRONG one -
-    nine of the seventeen CLIs exit with the code `main()` returned
+    more than half the CLIs exit with the code `main()` returned
     (`os._exit(exit_code)`, `os._exit(code)`), so the strict form could never
     have been copied onto them. `os._exit(` is the form that means the thing
     the convention is about: shutdown is skipped.
@@ -67,6 +67,10 @@ HARD_EXIT = (
     "data.smoke",
     "data.split",
     "data.stats",
+    # last thing a Kaggle session runs: a shutdown hang there is
+    # indistinguishable from a training stall, and it holds an hf upload
+    # thread when it finishes
+    "train.supervise",
 )
 
 # Runs interpreter shutdown normally, and must keep doing so. `data.verify` and
