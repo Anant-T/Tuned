@@ -344,6 +344,29 @@ def test_resume_path_runs_the_schedule_guard_before_training():
     assert download < guard < train
 
 
+def test_the_clip_instrument_did_not_become_a_fourth_callback():
+    """The one thing here that source alone can settle.
+
+    _NonFiniteGuard is already subscribed to the grad_norm log key and already
+    runs on every logged step; a second subscriber would be two readers of one
+    stream. The file has three callback classes and that is the budget - the
+    rest of this instrument is tested as behaviour in test_nan_guard.py.
+    """
+    src = SFT.read_text(encoding="utf-8")
+    body = src[
+        src.index("class _NonFiniteGuard(TrainerCallback):"):
+        src.index("class _TimeBudget(TrainerCallback):")
+    ]
+    assert src.count("(TrainerCallback):") == 3
+    assert "clip_report(" in body
+    # Off the args object the callback already receives - no new config key,
+    # no new CLI flag, no second copy of the limit to drift from the first.
+    assert "args.max_grad_norm" in body
+    # PRE-clip is what makes the comparison a binding test rather than a
+    # tautology against a value the clip has already flattened to the limit.
+    assert "PRE-clip" in body
+
+
 def test_time_budget_saves_and_stops_instead_of_raising():
     # Kaggle's 12h ceiling and the notebook watchdog both SIGKILL the child,
     # discarding up to save_steps-1 steps every session. Opposite call to

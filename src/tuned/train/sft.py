@@ -68,6 +68,83 @@ class _NonFiniteWindow:
         return self._streak >= self.window
 
 
+def clip_binding_rate(norms, limit: float) -> float:
+    """Fraction of logged grad_norm values that were AT OR ABOVE max_grad_norm.
+
+    P1.6 instrument: max_grad_norm=0.3 was fitted on smoke-lane OpenThoughts
+    gradients (build_sft_config's comment records the 0.08-0.19 band that
+    justified it) and has never been measured on the legal/think corpus it
+    now clips in main. A clip that binds on nearly every step silently turns
+    the configured LR schedule into a normalised-gradient schedule - a
+    different optimizer than the one the config claims to run - so this is a
+    genuine measurement, not decoration. A pure function, not a method on
+    _NonFiniteGuard: it must stay importable with no torch/transformers on
+    the path, same reason _NonFiniteWindow above is pure.
+
+    Edge cases, decided and not left implicit:
+
+    - Empty input returns 0.0 rather than raising. "No steps observed" and
+      "no steps bound" are different questions, but this function has no
+      caller context to tell them apart (the caller - _NonFiniteGuard.on_log
+      - is what knows whether n is meaningful, and it only prints once n=50
+      logs have accumulated). A free function should not raise on an empty
+      window; 0.0 is also the literal correct answer to "what fraction of
+      nothing is >= limit".
+    - Non-finite (nan/inf) and unparseable entries are EXCLUDED from the
+      binding count - a non-finite grad_norm is the divergence _NonFiniteWindow
+      and _NonFiniteGuard's RuntimeError already own, not evidence the clip
+      bound - but they are NOT dropped from the denominator (len(norms)).
+      Shrinking n would make the printed rate look like it was computed over
+      more, cleaner data than it actually was; keeping them in the
+      denominator instead makes a run with many non-finite logs read as a
+      LOWER binding rate, which is honest: this function cannot certify
+      "the clip bound" for a step whose norm it could not read.
+    """
+    norms = list(norms)
+    if not norms:
+        return 0.0
+    binding = 0
+    for raw in norms:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue  # unparseable: same non-advancing treatment as observe()
+        if not math.isfinite(value):
+            continue  # _NonFiniteGuard's failure mode, not this one
+        if value >= limit:
+            binding += 1
+    return binding / len(norms)
+
+
+# The early window the clip is measured over, and the rate above which the
+# reading gets a WARN beside it. 50 steps is long enough to be past the
+# warm-up spike and short enough to reach an operator in session one.
+CLIP_WINDOW_STEPS = 50
+CLIP_BINDING_WARN = 0.30
+
+
+def clip_report(norms, limit: float) -> list[str]:
+    """The lines the guard prints once the early window has filled.
+
+    A pure function returning LINES rather than printing them, for the same
+    reason clip_binding_rate is pure: the guard that calls it is nested inside
+    main() and cannot be constructed without torch, so anything left inside it
+    can only be tested by reading the source back as a string. The threshold
+    and the sentence a reader will act on both belong out here where a test
+    can exercise them.
+    """
+    rate = clip_binding_rate(norms, limit)
+    lines = [f"clip_binding_rate={rate:.3f} max_grad_norm={limit} n={len(list(norms))}"]
+    if rate > CLIP_BINDING_WARN:
+        lines.append(
+            f"WARN clip_binding_rate={rate:.3f} exceeds {CLIP_BINDING_WARN:.2f} - "
+            "max_grad_norm was fitted on smoke-lane OpenThoughts gradients, never "
+            "on this corpus; the clip may be running this as a normalised-gradient "
+            "schedule instead of the configured LR curve"
+        )
+    return lines
+
+
 def resolve_model_source(
     repo: str, revision: str | None, staged_path: str | None
 ) -> tuple[str, str | None]:
@@ -690,10 +767,24 @@ def main(argv: list[str] | None = None) -> None:
         budget. Must RAISE, not set control.should_training_stop: that flag
         ends the run rc=0 - the exact flag normal completion uses - so the
         notebook supervisor would read a divergence as green. Under torchrun
-        the raising rank takes the whole job down nonzero."""
+        the raising rank takes the whole job down nonzero.
+
+        Also carries the P1.6 clip-binding instrument. max_grad_norm=0.3 (see
+        build_sft_config's "0.08-0.19" comment for where that number came
+        from) has only ever been measured against smoke-lane OpenThoughts
+        grad_norms, never the legal/think corpus this guard actually watches
+        in main. It piggybacks HERE rather than in a fourth callback class
+        because this is already the callback subscribed to the grad_norm log
+        key and already running every logged step - a second subscriber
+        would just be two readers of the same stream for no reason."""
 
         def __init__(self):
             self._window = _NonFiniteWindow()
+            # Collected only through CLIP_WINDOW_STEPS - a fixed early
+            # window, not the whole run, so the print below fires once and the
+            # list never grows unbounded across a multi-thousand-step main run.
+            self._clip_norms = []
+            self._clip_reported = False
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs or "grad_norm" not in logs:
@@ -704,6 +795,22 @@ def main(argv: list[str] | None = None) -> None:
                     f"(through step {state.global_step}) - fp16 divergence; "
                     "aborting early to save quota. First lever: max_grad_norm: 0.3"
                 )
+            # logs["grad_norm"] is the PRE-clip norm - the Trainer computes
+            # and logs it before torch.nn.utils.clip_grad_norm_ rescales the
+            # gradients - so comparing it against args.max_grad_norm below is
+            # a genuine test of whether the clip is binding, not a tautology
+            # against a value the clip has already flattened to the limit.
+            if state.global_step <= CLIP_WINDOW_STEPS:
+                self._clip_norms.append(logs["grad_norm"])
+            # >=, not ==. logging_steps is 1 today so step 50 is certain to be
+            # logged, but that is a config value - at logging_steps: 3 the logs
+            # run 48, 51 and an equality test would print nothing at all, which
+            # is the silent-instrument failure this file refuses everywhere
+            # else. _clip_reported already makes it fire once.
+            if state.global_step >= CLIP_WINDOW_STEPS and not self._clip_reported:
+                self._clip_reported = True
+                for line in clip_report(self._clip_norms, args.max_grad_norm):
+                    print(line)
 
     class _TimeBudget(TrainerCallback):
         """Spend the wall-clock budget, then checkpoint and stop cleanly.
