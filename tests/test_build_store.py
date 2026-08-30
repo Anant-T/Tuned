@@ -301,6 +301,59 @@ def test_claim_filters_by_stream(store):
     assert store.get_task("t-an")["state"] == "pending"
 
 
+def test_release_claims_unclaims_without_moving_any_state(store):
+    """The supervisor calls this once its children are dead, so the next host
+    is not fenced out of rows nobody holds.
+
+    The state has to survive: a generating row that this bounced back to
+    pending would lose the attempts accounting and, on the judge queue, the
+    difference between "waiting to be judged" and "was being judged". Leaving
+    the state alone works because claim_tasks already reads a NULL stamp on an
+    in-flight row as stale.
+    """
+    _populate(store, n=3)
+    claimed = [r["task_id"] for r in store.claim_tasks("worker-A", 2)]
+    assert len(claimed) == 2
+    before = {t: store.get_task(t)["state"] for t in claimed}
+
+    assert store.release_claims() == 2
+    for task_id in claimed:
+        row = store.get_task(task_id)
+        assert row["state"] == before[task_id] == "generating"
+        assert row["claimed_by"] is None
+        assert row["claimed_at"] is None
+
+    # Idempotent: a second call finds nothing to release.
+    assert store.release_claims() == 0
+
+
+def test_a_released_task_is_claimable_again_immediately(store):
+    """The point of the method. Left to expire, these rows are unqueueable for
+    the rest of DEFAULT_LEASE_S and the next assembly waits the same window
+    out before it may write task states."""
+    _populate(store, n=2)
+    mine = {r["task_id"] for r in store.claim_tasks("worker-A", 2)}
+    assert store.claim_tasks("worker-B", 2) == []  # fenced, as it should be
+
+    store.release_claims()
+    theirs = {r["task_id"] for r in store.claim_tasks("worker-B", 2)}
+    assert theirs == mine
+    assert all(store.get_task(t)["claimed_by"] == "worker-B" for t in theirs)
+
+
+def test_release_claims_leaves_rows_that_hold_no_lease_alone(store):
+    """Scoped by the stamp, not by state: a finished row already had its lease
+    cleared by set_task_state, and its updated_at must not be churned by a
+    sweep that has nothing to do with it."""
+    _populate(store, n=2)
+    claimed = [r["task_id"] for r in store.claim_tasks("worker-A", 1)]
+    store.set_task_state(claimed[0], "accepted")
+    settled = store.get_task(claimed[0])
+
+    assert store.release_claims() == 0
+    assert store.get_task(claimed[0]) == settled
+
+
 def test_two_handles_on_one_db_never_double_claim(tmp_path):
     db = tmp_path / "state" / "law_v1.sqlite3"
     a = Store.open(db)

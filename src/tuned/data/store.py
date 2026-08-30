@@ -973,6 +973,42 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def release_claims(self) -> int:
+        """Drop every lease stamp. Returns how many rows were unclaimed.
+
+        FOR A SUPERVISOR WHOSE WORKERS ARE ALREADY DEAD, and for nothing else.
+        A lease is the fence that stops two workers running one task, so
+        clearing one out from under a live worker is precisely the corruption
+        the lease exists to prevent - the caller must have reaped its children
+        first.
+
+        It clears the stamp and leaves the STATE alone, which is the whole
+        trick: claim_tasks already treats `claimed_at IS NULL` on an in-flight
+        row as stale ("unowned by construction"), so a released task is
+        immediately re-claimable without this method needing to know which
+        queue it came from or what its pre-claim state was. Nulling
+        claimed_by with it means a straggler's fenced write fails closed
+        rather than landing on a row somebody else now holds.
+
+        Without this, a killed fleet's leases expire on the clock instead:
+        every task the workers held stays fenced for the rest of
+        DEFAULT_LEASE_S, so the next assembly waits them out before it may
+        write task states, and the rows sit unqueueable for the same 15
+        minutes.
+
+        No worker_id filter. The obvious signature takes one and updates that
+        worker's rows, but the supervisor spawns children that mint their own
+        ids and never reports them back, so the only thing it could match on
+        is a guessed prefix - and a prefix that silently matches nothing is
+        this method quietly doing nothing at all.
+        """
+        cur = self._write(
+            "UPDATE task SET claimed_by = NULL, claimed_at = NULL, updated_at = ? "
+            "WHERE claimed_at IS NOT NULL",
+            (utcnow(),),
+        )
+        return cur.rowcount
+
     def set_task_state(
         self,
         task_id: str,

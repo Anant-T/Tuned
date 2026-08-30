@@ -549,6 +549,8 @@ def _finish(
 
 
 def run_worker(args, root: Path, bundle: Bundle) -> int:
+    from tuned.data.store import Store  # local, like run_assemble's - see the module head
+
     pulled = bundle.pull(root.parent / "bundle_in")
     restore_bundle(pulled, root)
     subprocess.run(
@@ -605,6 +607,30 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
         _stop(procs)
         for t in pumps:
             t.join(timeout=30)
+        # AFTER _stop, never before: a lease is what stops two workers running
+        # one task, so releasing one out from under a live child is the
+        # corruption the lease exists to prevent. By here both children have
+        # been terminated and waited on, so every remaining stamp belongs to a
+        # process that no longer exists.
+        #
+        # Left alone they expire on the clock, 15 minutes after the last
+        # claim - which is 15 minutes the NEXT assembly spends waiting for
+        # permission to write task states, and 15 minutes those rows are
+        # unqueueable for a worker that could have re-claimed them
+        # immediately. The push below carries the released stamps out with
+        # the rest of the DB, so the next host restores a store with no
+        # phantom holders in it.
+        #
+        # Caught, because this runs in a `finally`: an exception raised here
+        # would REPLACE whatever sent us into it, and losing the real failure
+        # of an unattended run to a bookkeeping error is a bad trade. The
+        # leases still expire on the clock if this cannot write.
+        try:
+            with Store.open(root / DB_RELPATH) as store:
+                released = store.release_claims()
+            print(f"released {released} lease(s) held by the stopped children")
+        except Exception as exc:  # noqa: BLE001 - see above
+            print(f"could not release leases ({exc!r}); they expire on the clock instead")
 
     # attempts=3: the periodic path delegates recovery to this push, so this
     # is the one that must not fail on a transient 5xx.
@@ -627,14 +653,39 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
         [sys.executable, "-m", "tuned.data.reconcile", "--config", args.config], check=False
     )
 
-    # verify refuses while any lease is live (it writes states unfenced);
-    # a just-killed worker's leases expire within DEFAULT_LEASE_S = 900.
+    # verify refuses while any lease is live (it writes states unfenced).
+    #
+    # 120 s, not the old 900. A worker that stopped normally now releases its
+    # own claims before it pushes (run_worker's finally), so the expected
+    # number of live leases here is zero and the loop should not run at all.
+    # 900 was DEFAULT_LEASE_S - the time a stamp takes to age out on the
+    # clock - and waiting a full lease window was how this job paid for the
+    # release that had not been written yet. What is left to wait for is a
+    # baton snapshot taken mid-flight, whose stamps are already most of a
+    # lease old, so two minutes is the margin, not the mechanism.
+    #
+    # And it REFUSES by name rather than falling through. Past the wait,
+    # verify would exit on its own live-lease check with the chain half
+    # started; worse, a lease still live after the release means something is
+    # holding this baton that this job does not know about - a worker whose
+    # concurrency fence failed - and the right move there is to stop, not to
+    # assemble a corpus underneath it.
     waited = 0
     with Store.open(root / DB_RELPATH) as store:
-        while live_leases(store) and waited < 900:
+        while live_leases(store) and waited < 120:
             print(f"waiting for {live_leases(store)} live lease(s) to expire...")
             time.sleep(30)
             waited += 30
+        still_live = live_leases(store)
+    if still_live:
+        print(
+            f"REFUSING: {still_live} lease(s) still live after {waited}s. A worker "
+            "that stopped cleanly releases its claims, so this means either a run "
+            "that died without its finally block (wait out DEFAULT_LEASE_S = 900s "
+            "and re-dispatch) or another host holding this baton right now, which "
+            "the data-build concurrency group is supposed to make impossible."
+        )
+        return 5  # this refusal's own code, distinct from a chain step's rc
 
     # The eval sets decontaminate screens against (~1 GB of hub parquet) are
     # deliberately NOT in the baton - they are public and re-fetchable, and a

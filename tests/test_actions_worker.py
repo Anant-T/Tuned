@@ -906,3 +906,54 @@ def test_the_chain_fetches_exactly_the_eval_sets_decontaminate_demands():
     assert set(EVAL_SETS) < set(HF_SOURCES), "nothing left to skip - is the derivation still worth it?"
     src = Path(actions_worker.__file__).read_text(encoding="utf-8")
     assert "for key in sorted(EVAL_SETS)" in src, "the source list must stay derived, not literal"
+
+
+def test_the_worker_releases_its_leases_only_after_the_children_are_dead():
+    """Ordering is the whole safety argument.
+
+    A lease is what stops two workers running one task, so clearing one while
+    a child still holds it is exactly the corruption the lease exists to
+    prevent. release_claims() therefore has to sit AFTER _stop() and after the
+    pumps are joined - and before the end-of-job push, or the released stamps
+    never leave this host.
+    """
+    import inspect
+
+    src = inspect.getsource(actions_worker.run_worker)
+    stop = src.index("_stop(procs)")
+    release = src.index("release_claims()")
+    push = src.index('"end-of-job checkpoint"')
+    assert stop < release < push, "release_claims must run after _stop and before the final push"
+
+
+def test_the_assembly_no_longer_waits_out_a_whole_lease_window():
+    """900 was DEFAULT_LEASE_S: this job was paying, every dispatch, for the
+    lease release the worker had not been written to do yet. With the worker
+    releasing its own claims the expected count here is zero, so what is left
+    to absorb is a baton snapshotted mid-flight - stamps already most of a
+    lease old."""
+    import inspect
+
+    from tuned.data.store import DEFAULT_LEASE_S
+
+    src = inspect.getsource(actions_worker.run_assemble)
+    assert "waited < 120" in src
+    assert f"waited < {DEFAULT_LEASE_S}" not in src
+    assert 120 < DEFAULT_LEASE_S
+
+
+def test_a_lease_that_outlives_the_wait_stops_the_chain_by_name():
+    """Falling through was the old behaviour and it is the wrong one twice
+    over: verify would refuse anyway, mid-chain, and a lease still live after
+    the worker's release means another host is holding this baton - which the
+    data-build concurrency group is supposed to make impossible. Assembling a
+    corpus underneath it is worse than not assembling one."""
+    import inspect
+
+    src = inspect.getsource(actions_worker.run_assemble)
+    refusal = src.index("REFUSING")
+    acquire = src.index("acquire eval sets")
+    assert refusal < acquire, "the refusal must precede any chain work"
+    assert "return 5" in src[refusal:acquire]
+    # distinct from the audit-collapse refusal, so a red run says which one
+    assert "rc = 4" in src
