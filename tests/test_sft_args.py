@@ -681,3 +681,130 @@ def test_the_production_entry_never_opts_into_a_schedule_change():
     # the auto path must go through resume_decision, never straight to resume
     auto = src.find("elif resume_decision(")
     assert auto != -1
+
+
+# --------------------------------------------------------------------------
+# The held-out signal (P1.5). The training lane has never loaded an eval file:
+# split.py has written one since it existed, decision 5 asks for 64 rows, and
+# a run with no eval signal cannot tell overfitting from progress.
+# --------------------------------------------------------------------------
+
+def _eval_run(**fields):
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    return dataclasses.replace(cfg.train.main, **fields)
+
+
+def _hub(repo="u/d", revision=None):
+    from tuned.train.config import HubCfg
+
+    return HubCfg(checkpoint_repo=None, dataset_repo=repo, dataset_revision=revision)
+
+
+def test_a_run_that_does_not_evaluate_looks_nothing_up(tmp_path):
+    from tuned.train.sft import resolve_eval_dataset
+
+    def _never(**kw):
+        raise AssertionError("eval_rows: 0 must not reach the hub")
+
+    run = _eval_run(eval_rows=0, eval_dataset="data/law_v1_eval.jsonl")
+    assert resolve_eval_dataset(run, _hub(), _never) is None
+
+
+def test_a_local_eval_file_wins_over_the_hub(tmp_path):
+    from tuned.train.sft import resolve_eval_dataset
+
+    local = tmp_path / "law_v1_eval.jsonl"
+    local.write_text("{}\n", encoding="utf-8")
+
+    def _never(**kw):
+        raise AssertionError("a local eval file must not be re-fetched")
+
+    run = _eval_run(eval_rows=8, eval_dataset=str(local))
+    assert resolve_eval_dataset(run, _hub(), _never) == str(local)
+
+
+def test_the_eval_half_is_fetched_at_the_corpus_revision(tmp_path):
+    """The same revision, not merely the same repo. split.py guarantees
+    train/eval disjointness PER BUILD, so an eval file from another build can
+    contain rows this one trained on - and nothing downstream would notice."""
+    from tuned.train.sft import EVAL_DATASET_FILENAME, resolve_eval_dataset
+
+    seen = {}
+
+    def _download(**kw):
+        seen.update(kw)
+        return str(tmp_path / "fetched.jsonl")
+
+    run = _eval_run(eval_rows=64, eval_dataset="data/law_v1_eval.jsonl")
+    path = resolve_eval_dataset(run, _hub(revision="abc123"), _download)
+    assert path == str(tmp_path / "fetched.jsonl")
+    assert seen["filename"] == EVAL_DATASET_FILENAME
+    assert seen["revision"] == "abc123"
+    assert seen["repo_type"] == "dataset"
+
+
+def test_an_unresolvable_eval_file_refuses_rather_than_training_blind(tmp_path):
+    """eval_rows is a PROMISE. A run configured to carry a held-out signal and
+    silently training without one is indistinguishable, in the log, from one
+    that was never asked for it."""
+    from tuned.train.sft import resolve_eval_dataset
+
+    run = _eval_run(eval_rows=64, eval_dataset="data/nowhere.jsonl")
+    with pytest.raises(SystemExit, match="eval_rows=64"):
+        resolve_eval_dataset(run, _hub(repo=None))
+
+
+def test_the_eval_knobs_appear_only_when_the_run_evaluates(tmp_path):
+    from tuned.train.sft import build_sft_config
+
+    cfg = load_config(CONFIG, allow_unpinned=True)
+    off = build_sft_config(cfg, cfg.train.main, str(tmp_path))
+    assert "eval_strategy" not in off and "per_device_eval_batch_size" not in off
+
+    on = build_sft_config(cfg, cfg.train.main, str(tmp_path), evaluating=True)
+    assert on["eval_strategy"] == "steps"
+    # Tied to the save cadence, not a second free-standing number.
+    assert on["eval_steps"] == cfg.train.main.save_steps * 5
+    # bs=1: the eval forward materialises a [1, seq, 151936] logits tensor
+    # outside unsloth's chunked-CE path, so this is a direct multiplier on a
+    # peak with ~2.3 GiB of headroom.
+    assert on["per_device_eval_batch_size"] == 1
+
+
+def test_the_lane_is_config_driven_and_never_gated_on_the_mode():
+    """A `mode == "main"` gate would mean the production memory shape is never
+    exercised by the PROBE/SMOKE ladder - on a lane whose peaks are
+    12.98/13.18 GiB against a 13.5 GiB abort line enforced by RAISING."""
+    src = SFT.read_text(encoding="utf-8")
+    body = src[src.index("def resolve_eval_dataset("):src.index("def check_dataset_pin(")]
+    assert "mode" not in body
+    assert "run.eval_rows" in body
+
+
+def test_the_shipped_config_carries_the_eval_half_on_main_and_the_probe_switch():
+    import yaml
+
+    raw = yaml.safe_load(
+        (Path(__file__).parent.parent / "training/configs/law_v1_8b_ddp.yaml")
+        .read_text(encoding="utf-8")
+    )
+    main, smoke = raw["train"]["main"], raw["train"]["smoke"]
+    assert main["eval_rows"] == 64          # decision 5
+    assert main["eval_dataset"] == "data/law_v1_eval.jsonl"
+    # Off in the smoke lane by default: smoke_v1 has no held-out half, and the
+    # PROBE qualification is the operator turning this one line on.
+    assert smoke["eval_rows"] == 0
+    assert smoke["eval_dataset"] == "data/law_v1_eval.jsonl"
+
+
+def test_the_eval_mask_gate_refuses_two_numbers_that_are_not_one_quantity():
+    """If this build's train_on_responses_only leaves eval_dataset unmasked,
+    eval_loss is computed over prompt tokens too - lower, smoother, and not
+    comparable to the train loss printed beside it."""
+    src = SFT.read_text(encoding="utf-8")
+    assert "prompt_masked=" in src
+    assert "NOT the same" in src
+    # A refusal, not a warning: the two numbers appear side by side in the
+    # log and nothing downstream re-derives which is which.
+    gate = src[src.index("eval_label_coverage="):]
+    assert "raise SystemExit(" in gate[:1200]

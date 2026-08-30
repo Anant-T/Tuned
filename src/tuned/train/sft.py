@@ -34,6 +34,7 @@ from tuned.train.config import Config, HubCfg, RunCfg, load_config
 # assemble.TRAIN_FILENAME). Named here rather than imported: the data lane
 # must never be importable from the GPU process.
 MAIN_DATASET_FILENAME = "law_v1_train.jsonl"
+EVAL_DATASET_FILENAME = "law_v1_eval.jsonl"
 
 
 class _NonFiniteWindow:
@@ -214,16 +215,57 @@ def resolve_main_dataset(
             "(data/ is gitignored, so it is never in the clone). Set "
             "hub.dataset_repo and pin it with training/scripts/pin_dataset.py."
         )
+    path = _hub_file(hub, MAIN_DATASET_FILENAME, download)
+    return path, sha256_file(path)
+
+
+def _hub_file(hub: HubCfg, filename: str, download=None) -> str:
+    """One file out of the pinned dataset repo, at the pinned revision.
+
+    One function for both halves of the corpus: the train side and the eval
+    side must come from the SAME revision or the eval set is not the held-out
+    half of what is being trained - split.py's disjointness guarantee is per
+    build, and two builds' halves can overlap freely.
+    """
     if download is None:  # pragma: no cover - exercised by the fake in tests
         from huggingface_hub import hf_hub_download as download
 
-    path = download(
+    return str(download(
         repo_id=hub.dataset_repo,
-        filename=MAIN_DATASET_FILENAME,
+        filename=filename,
         revision=hub.dataset_revision,
         repo_type="dataset",
-    )
-    return str(path), sha256_file(path)
+    ))
+
+
+def resolve_eval_dataset(run: RunCfg, hub: HubCfg, download=None) -> str | None:
+    """The held-out file for this run, or None when it does not evaluate.
+
+    `eval_rows: 0` means no evaluation and returns None before anything is
+    looked up. A POSITIVE eval_rows that cannot be resolved is a refusal, not
+    a fallback: a run configured to carry a held-out signal and silently
+    training without one is the failure this whole step exists to remove, and
+    in the log it would be indistinguishable from a run never asked for one.
+
+    No sha256 pin, unlike the training corpus. The eval file does not feed the
+    LengthGroupedSampler permutation, so the resume hazard resolve_main_dataset
+    guards cannot reach it - it is loaded fresh each session and never resumed
+    into. The revision pin is what ties it to the right build.
+    """
+    if not run.eval_rows:
+        return None
+    local = Path(run.eval_dataset) if run.eval_dataset else None
+    if local is not None and local.is_file():
+        return str(local)
+    if not hub.dataset_repo:
+        raise SystemExit(
+            f"eval_rows={run.eval_rows} asks for a held-out signal, but "
+            f"eval_dataset={run.eval_dataset!r} does not exist and hub.dataset_repo "
+            "is null. Set hub.dataset_repo (the eval half rides in the same repo "
+            "as the training corpus) or set eval_rows: 0 to say plainly that this "
+            "run does not evaluate."
+        )
+    return _hub_file(hub, EVAL_DATASET_FILENAME, download)
 
 
 def check_dataset_pin(digest: str, pinned: str | None, mode: str) -> None:
@@ -401,7 +443,8 @@ def check_eos_in_labels(eos_kept: int, mode: str) -> None:
 
 
 def build_sft_config(
-    cfg: Config, run: RunCfg, output_dir: str, bf16_supported: bool = False
+    cfg: Config, run: RunCfg, output_dir: str, bf16_supported: bool = False,
+    *, evaluating: bool = False,
 ) -> dict:
     kw = {
         "output_dir": output_dir,
@@ -456,6 +499,20 @@ def build_sft_config(
         # Kaggle batch runs, which flush output only per completed cell.
         "report_to": "wandb" if os.environ.get("WANDB_API_KEY") else "none",
     }
+    if evaluating:
+        kw.update(
+            eval_strategy="steps",
+            # EVERY save_steps * 5, tied to the save cadence rather than given
+            # its own number: both are session-relative, and one moving
+            # without the other is how a 2-4 minute eval ends up running more
+            # often than the checkpoint that lets you resume past it.
+            eval_steps=run.save_steps * 5,
+            # ONE sequence at a time. The eval forward materialises a
+            # [1, seq, 151936] logits tensor outside unsloth's chunked-CE
+            # path, so this is a direct multiplier on the peak the lane has
+            # ~2.3 GiB of headroom against.
+            per_device_eval_batch_size=1,
+        )
     if cfg.hub.checkpoint_repo is not None:
         kw.update(
             push_to_hub=True,
@@ -679,19 +736,41 @@ def main(argv: list[str] | None = None) -> None:
         # checkpoint, whether or not a pin is set.
         print(f"dataset_sha256={dataset_digest}")
         check_dataset_pin(dataset_digest, cfg.hub.dataset_sha256, args.mode)
-        ds = load_dataset("json", data_files=dataset_path, split="train")
-        ds = ds.map(
-            lambda ex: {
-                "text": tokenizer.apply_chat_template(
-                    ex["messages"], tokenize=False, add_generation_prompt=False
-                )
-            },
-            remove_columns=ds.column_names,
-        )
+
+        def _as_text(dataset):
+            return dataset.map(
+                lambda ex: {
+                    "text": tokenizer.apply_chat_template(
+                        ex["messages"], tokenize=False, add_generation_prompt=False
+                    )
+                },
+                remove_columns=dataset.column_names,
+            )
+
+        ds = _as_text(load_dataset("json", data_files=dataset_path, split="train"))
+        # The held-out half, inside the SAME barrier: rank 0 fetches and
+        # tokenizes, rank 1 takes the cache hit, exactly as the training
+        # corpus above does. Resolving it here rather than beside the trainer
+        # keeps every hub read on one side of one barrier.
+        eval_path = resolve_eval_dataset(run, cfg.hub)
+        eval_ds = None
+        if eval_path is not None:
+            eval_ds = load_dataset("json", data_files=eval_path, split="train")
+            # THE DETERMINISTIC HEAD, not a sample. split.py writes its rows in
+            # a fixed order, so a head is reproducible across sessions with no
+            # RNG and no seed to keep in step with the trainer's own - the same
+            # discipline split.py follows for the split itself. A sampled eval
+            # set would make two sessions of one run report loss on two
+            # different corpora.
+            eval_ds = _as_text(eval_ds.select(range(min(run.eval_rows, len(eval_ds)))))
+            print(f"eval_rows={len(eval_ds)} <- {eval_path}")
 
     import inspect
 
-    sft_kw = build_sft_config(cfg, run, output_dir, bf16_supported=is_bfloat16_supported())
+    sft_kw = build_sft_config(
+        cfg, run, output_dir, bf16_supported=is_bfloat16_supported(),
+        evaluating=eval_ds is not None,
+    )
     if "max_length" not in inspect.signature(SFTConfig.__init__).parameters:
         sft_kw["max_seq_length"] = sft_kw.pop("max_length")
 
@@ -705,6 +784,7 @@ def main(argv: list[str] | None = None) -> None:
             model=model,
             processing_class=tokenizer,
             train_dataset=ds,
+            eval_dataset=eval_ds,
             args=SFTConfig(
                 dataset_text_field="text",
                 **sft_kw,
@@ -759,6 +839,35 @@ def main(argv: list[str] | None = None) -> None:
             "masking padding; every one of them trains the model to emit "
             "<|endoftext|> mid-sequence"
         )
+
+    # Fifth gate, and it only exists because eval does: TWO NUMBERS CALLED
+    # "loss" MUST BE THE SAME QUANTITY. train_on_responses_only rewrites the
+    # labels of the dataset(s) the trainer holds; if this build's unsloth
+    # rewrites only train_dataset, the eval forward scores prompt tokens as
+    # well as response tokens and the eval loss printed beside the train loss
+    # is measuring something else entirely - lower, smooth, and completely
+    # uncomparable. The tell is an attended position that carries a label
+    # where the prompt should have been masked out.
+    if trainer.eval_dataset is not None:
+        eval_probe = [
+            trainer.eval_dataset[i] for i in range(min(4, len(trainer.eval_dataset)))
+        ]
+        eval_batch = trainer.data_collator(eval_probe)
+        eval_labels, attended = eval_batch["labels"], eval_batch["attention_mask"] == 1
+        eval_masked = int(((eval_labels == -100) & attended).sum())
+        eval_kept = int(((eval_labels != -100) & attended).sum())
+        print(f"eval_label_coverage={eval_kept}/{int(attended.sum())} "
+              f"prompt_masked={eval_masked}")
+        if eval_masked == 0 or eval_kept == 0:
+            raise SystemExit(
+                f"the eval set's response mask did not apply (prompt_masked="
+                f"{eval_masked}, response_labels={eval_kept}) - this build's "
+                "train_on_responses_only left eval_dataset unmasked, so eval_loss "
+                "would be computed over prompt tokens too and is NOT the same "
+                "quantity as the train loss beside it. Do not read the two "
+                f"together: set train.{args.mode}.eval_rows: 0 to run without an "
+                "eval signal, or apply the mask to eval_dataset before trusting it."
+            )
 
     from transformers import TrainerCallback
 

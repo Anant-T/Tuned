@@ -45,6 +45,21 @@ class RunCfg:
     max_steps: int
     save_steps: int
     dataset: str
+    # The held-out half of the SAME build. CONFIG-DRIVEN, NOT MODE-GATED: an
+    # `if mode == "main"` in the code would mean the production memory shape
+    # is never exercised by the PROBE/SMOKE ladder, on a lane whose measured
+    # peaks are 12.98/13.18 GiB against the 13.5 GiB line _ReservedCeiling
+    # enforces by RAISING. An eval forward materialises a [1, seq, 151936]
+    # logits tensor outside unsloth's chunked-CE path, so this genuinely
+    # moves the profile and goes through PROBE first like any other change to
+    # it - which is only possible if the smoke lane can turn it on from the
+    # config alone.
+    #
+    # eval_rows: 0 is "this run does not evaluate". A positive value is a
+    # PROMISE: if the file cannot be resolved the run REFUSES rather than
+    # quietly training without an eval signal.
+    eval_dataset: str | None = None
+    eval_rows: int = 0
 
 
 @dataclass

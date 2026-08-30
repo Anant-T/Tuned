@@ -117,6 +117,15 @@ train:
     max_steps: 60
     save_steps: 25
     dataset: data/smoke_v1.jsonl
+    # 0 = this run does not evaluate, so the smoke lane stays self-contained
+    # (smoke_v1 has no held-out half). THE PROBE QUALIFICATION IS THIS LINE:
+    # set it to 8 once the corpus is pushed and run PROBE before MAIN. An
+    # eval forward materialises a [1, seq, 151936] logits tensor outside
+    # unsloth's chunked-CE path, which moves the memory profile, and the
+    # repo's rule is that any change to the profile goes through PROBE first.
+    # Nothing in the code gates on the mode - this is the whole switch.
+    eval_dataset: data/law_v1_eval.jsonl
+    eval_rows: 0
   # The production run. ga=6, not packing: the 2026-08-09 audit verified
   # packing=True would NOT contaminate on this pinned stack (TRL bfd forces
   # padding-free, seq_lengths -> position_ids survive the collator because
@@ -145,6 +154,14 @@ train:
     max_steps: 0
     save_steps: 10
     dataset: data/law_v1.jsonl
+    # The held-out half of the SAME build, fetched from hub.dataset_repo at
+    # the same pinned revision as the corpus above - split.py's disjointness
+    # guarantee is per build, so two builds' halves can overlap freely.
+    # 64 rows at bs=1 is ~2-4 min per eval, roughly 1-2% of a session, every
+    # save_steps * 5. Raise it only after session 1's measured eval_runtime
+    # and peak_vram_reserved_gb say the headroom is there.
+    eval_dataset: data/law_v1_eval.jsonl
+    eval_rows: 64
 
 hub:
   # Private, and scoped to this base model + launch shape - a repo shared with
