@@ -1788,3 +1788,87 @@ def test_the_reopen_decision_is_left_on_the_baton_too(tmp_path, monkeypatch):
     written = (root / "logs" / actions_worker._run_scope()
                / "worker.log").read_text(encoding="utf-8")
     assert "no claimable work:" in written
+
+
+class _FakeStorageApi:
+    """Enough of HfApi to answer "how much of the account quota is left".
+
+    `boom` makes every reading raise, which is the case that must not be able
+    to take a run down: a quota READING is a convenience, and the job's work
+    does not depend on it.
+    """
+
+    def __init__(self, sizes, boom=False):
+        self.sizes, self.boom = sizes, boom
+
+    def list_models(self, author=None):
+        return [type("R", (), {"id": i})() for i in self.sizes if "ckpt" in i]
+
+    def list_datasets(self, author=None):
+        return [type("R", (), {"id": i})() for i in self.sizes if "ckpt" not in i]
+
+    def repo_info(self, repo_id, repo_type=None, expand=None):
+        if self.boom:
+            raise RuntimeError("hub down")
+        return type("I", (), {"used_storage": self.sizes[repo_id]})()
+
+
+class _StorageBundle(_FakeBundle):
+    repo_id = "u/r"
+
+    def __init__(self, api, **kw):
+        super().__init__(**kw)
+        self.api = api
+
+
+def test_the_run_reports_how_much_of_the_storage_quota_is_left(tmp_path, monkeypatch):
+    """The quota wall is a recurring, unattended failure - so it has to count
+    itself down.
+
+    The private-storage quota is ACCOUNT-WIDE, and the build walks into it
+    every few days: the baton is an LFS repo that keeps every version of
+    everything it has ever pushed. Twice now the wall has been found by an
+    agent measuring it by hand, and the second measurement was 2.8x the first.
+    A run that states its own headroom turns that into a number in every log,
+    so the next person to look does not have to re-derive it.
+    """
+    api = _FakeStorageApi({"u/r": 44_000_000_000, "u/x-ckpt": 6_000_000_000})
+    rc, _ = _run_worker(tmp_path, monkeypatch, [_FakeProc(), _FakeProc()],
+                        bundle=_StorageBundle(api))
+    assert rc == 0
+    written = (tmp_path / "build" / "logs" / actions_worker._run_scope()
+               / "worker.log").read_text(encoding="utf-8")
+    assert "storage: 50.0 GB of 100 used, 50.0 GB headroom" in written
+
+
+def test_the_storage_line_names_no_repo_because_the_actions_log_is_public(
+    tmp_path, monkeypatch
+):
+    """`_run_log` prints to stdout, and this repo's Actions logs are public.
+
+    The account being measured is full of PRIVATE repositories, and their
+    names are the one thing in the reading that is not already public. Totals
+    say everything an operator needs; the ids say nothing they need and leak
+    what the account holds.
+    """
+    api = _FakeStorageApi({"u/r": 1_000_000_000, "u/secret-lane-ckpt": 2_000_000_000})
+    rc, _ = _run_worker(tmp_path, monkeypatch, [_FakeProc(), _FakeProc()],
+                        bundle=_StorageBundle(api))
+    assert rc == 0
+    written = (tmp_path / "build" / "logs" / actions_worker._run_scope()
+               / "worker.log").read_text(encoding="utf-8")
+    assert "storage:" in written
+    assert "secret-lane-ckpt" not in written
+
+
+def test_a_storage_reading_that_fails_does_not_fail_the_run(tmp_path, monkeypatch):
+    """Same rule as _run_log: a run must not die because it could not narrate
+    itself. The Hub being unreachable for a metadata call says nothing about
+    whether this job can generate rows."""
+    api = _FakeStorageApi({"u/r": 1_000_000_000}, boom=True)
+    rc, _ = _run_worker(tmp_path, monkeypatch, [_FakeProc(), _FakeProc()],
+                        bundle=_StorageBundle(api))
+    assert rc == 0
+    written = (tmp_path / "build" / "logs" / actions_worker._run_scope()
+               / "worker.log").read_text(encoding="utf-8")
+    assert "storage: reading unavailable" in written

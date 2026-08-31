@@ -494,6 +494,49 @@ def _run_scope() -> str:
     return os.environ.get("GITHUB_RUN_ID", "local")
 
 
+ACCOUNT_STORAGE_QUOTA_GB = 100.0
+
+
+def _log_storage_headroom(root: Path, api, repo_id: str) -> None:
+    """Say how much of the account-wide storage quota is left, every run.
+
+    The private-storage quota is per ACCOUNT, not per repo, and this build
+    walks into it every few days: the baton is an LFS-backed git repo, so it
+    keeps every version of every file it has ever pushed, and a checkpoint
+    re-sends any file whose bytes changed as a whole new blob. Nothing in the
+    job notices. Twice the wall has been found by an agent measuring it by
+    hand, and the second measurement came out 2.8x the first - which is the
+    argument for reading it rather than deriving it, and for reading it here
+    rather than in whatever session happens to be watching.
+
+    One line per run is enough to recover the RATE as well as the level:
+    logs/ is scoped per run and never restored, so consecutive runs leave
+    consecutive readings ~5.3 h apart on the baton, and the slope between two
+    of them is the countdown.
+
+    TOTALS ONLY, NEVER REPO IDS. This goes to stdout and this repo's Actions
+    logs are public; the account being summed is mostly private repositories,
+    and their names are the one part of the reading that is not already
+    public. Best-effort throughout, like _run_log: the Hub being unreachable
+    for a metadata call says nothing about whether this job can generate rows.
+    """
+    if api is None:
+        return
+    author = repo_id.split("/")[0]
+    used = 0
+    try:
+        for kind, lister in (("model", api.list_models), ("dataset", api.list_datasets)):
+            for repo in lister(author=author):
+                info = api.repo_info(repo.id, repo_type=kind, expand=["usedStorage"])
+                used += getattr(info, "used_storage", None) or 0
+    except Exception as exc:  # noqa: BLE001 - a reading must not end a run
+        _run_log(root, f"storage: reading unavailable ({exc})")
+        return
+    gb = used / 1e9
+    _run_log(root, f"storage: {gb:.1f} GB of {ACCOUNT_STORAGE_QUOTA_GB:.0f} used, "
+             f"{ACCOUNT_STORAGE_QUOTA_GB - gb:.1f} GB headroom")
+
+
 def _task_counts(state_db: Path) -> dict[str, int] | None:
     if not state_db.is_file():
         return None
@@ -870,6 +913,8 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
     )
 
     staging = root.parent / "bundle_out"
+    _log_storage_headroom(root, getattr(bundle, "api", None),
+                          getattr(bundle, "repo_id", ""))
 
     # NOTHING TO CLAIM? Do not spend 5.25 h finding that out.
     #
