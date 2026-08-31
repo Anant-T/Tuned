@@ -71,9 +71,16 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 1b | Make `cooldown_s`/`breaker_threshold` configurable; set `routing.cooldown_s: 60` | **DONE** `bc244e1` |
 | 2 | Live 5-10 row test on a scratch DB copy; then force a breaker trip | **DONE** - both halves green |
 | 3 | Push, dispatch `data-worker`, watch the armed reopen recover ~5,190 rows | **DONE** - run #9 generating |
-| 4 | Measure the breaker trip rate; report (do not act) | IN PROGRESS - 0 trips so far |
-| 5 | Root-cause the `transition` stream's 99% reject rate | **DONE** - planner bug, fixed `708d455` |
-| 6 | Widen the queue, sized to measured yield | TODO - arithmetic below |
+| 4 | Measure the breaker trip rate; report (do not act) | **DONE** - 0 trips in 180 gens; 4.72 gen/min, ~23.6 accepted/hr (F17) |
+| 5 | Root-cause the `transition` stream's 99% reject rate | **DONE** - 96% was the planner bug (`708d455`); the rest is a 95.7% `statutory_quotation` compliance gap (F18) |
+| 6 | Widen the queue, sized to measured yield | **SIZED, deliberately not dispatched** - synthesis-only, ~+500 accepted (~1,515 tasks); window and reasoning in F16 |
+| 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
+
+**The one open blocker:** `curated_c2` is over-generated against synthesis and
+generated rows cannot be dropped, so `shape` refuses at the true composition.
+Structural requirement is 1.46:1 synthesis:curated; the queue delivers 1.12:1.
+Closing it needs ~+469 accepted synthesis rows beyond what the queue will yield.
+Nothing is broken - the corpus is short, and only in one bucket.
 
 Full plan: `~/.claude/plans/mossy-sauteeing-riddle.md` (not in the repo).
 
@@ -629,6 +636,61 @@ compete for the *same* bucket as synthesis and could in principle have closed th
 roughly 30 accepted rows. **The shortfall has to be closed by synthesis**, which
 is what Step 6 already says. Transition stays a moat feature, not a volume
 source.
+
+
+### F19. The corpus has a hard ceiling at ~10,021 rows, and the pools were built for it
+
+Asking `shape.plan` across the whole (synthesis x curated) grid instead of one
+point turns the "we are short on synthesis" story into something more precise,
+and corrects my own first reading of it.
+
+**The constraint is two-sided.** For every synthesis count there is a *window*
+of feasible curated_c2 counts, roughly `gs/2.18 <= gc <= gs/1.47`, about 300-400
+rows wide. Too many generated curated rows overfill the curated/trace bucket;
+too few leave the curated/trace POOL (only 300 rows) unable to fill it. So
+"freeze curated_c2" is wrong - it breaks the lower bound as synthesis grows:
+
+     gen_synth |  min gc |  max gc | corpus       POOLS ON HAND
+           455 |      10 |     310 |   1512         curated/nothink 1400
+          1000 |     360 |     680 |   3322         curated/trace    300
+          1546 |     710 |    1050 |   5136         replay/trace    3120
+          2015 |    1010 |    1380 |   6694         replay/nothink  1200
+          3000 |    1640 |    2050 |   9967
+          3212 |       - |    2060 |  10021  <- CEILING
+          3218 |  infeasible at any curated count
+
+**Bisected ceiling: gen_synth 3,212 -> 10,021 rows.** One row more and it
+refuses: *"replay/nothink needs 1,281 rows (to keep 1,246 after losses) but the
+pool holds 1,200."* The binding pool is **replay/nothink**.
+
+**The `--replay-nothink-share` knob cannot lift it** - I tested, rather than
+assuming, because the refusal names that lever and agent_0 had it logged as an
+unmade operator decision. The pool's as-built share is 0.278 and that is already
+optimal; moving it down shifts demand onto replay/trace, which binds sooner:
+
+    as-built 0.278 -> 3,204 synth / 10,021 rows      0.15 -> 2,784 / 8,704
+        0.24 -> 3,120 / 9,749                        0.05 -> 2,364 / 7,404
+
+**This is a design point, not a defect.** The replay pool is 4,320 rows and the
+replay target is 41.9%; 4,320 / 0.419 = 10,310. The pools were sized for a
+~10.3k-row corpus and they deliver almost exactly that. Nothing is
+mis-provisioned.
+
+What it does mean, concretely:
+- **The real synthesis target is ~3,212 accepted rows, not the ~3,617 the plan
+  carried.** Generating past ~3,212 does not buy a bigger corpus - it makes the
+  corpus *unshippable*, because generated rows cannot be dropped and the mix
+  then cannot be hit within +/-2pp at any size.
+- A corpus beyond ~10k - the 15-20k the 2026-08-07 dataset spec asks for -
+  requires **rebuilding the replay and curated pools larger**, which is
+  downloaded public data and costs no generator time at all. That work is
+  independent of everything the fleet is doing and is the single cheapest way
+  to raise the ceiling.
+- The queue's endpoint (synth 1,546 / curated 1,377) sits *above* the window's
+  top for that synthesis count (1,050), which is the same shortfall F16
+  measured, seen from the other side.
+
+Suite green at the time of writing: **3,752 passed, 19 skipped**.
 
 
 ## 6. Constants interrogated
