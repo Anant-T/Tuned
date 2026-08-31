@@ -1511,6 +1511,43 @@ the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
 
+### F47. PLAN DECISION 1 (ALIGN `default_profile`) - TRIED, MEASURED, REVERTED
+
+The plan's Decision 1 was "align `assembly.default_profile` to what CI grades":
+the config says `v1.1-full` while `actions_worker.PROFILE` is `v1.0-MVP`. It was
+recorded and never executed, so it was executed tonight, test-first. The test
+failed for the right reason (`'v1.1-full' == 'v1.0-MVP'`), the one-line config
+change turned it green - **and the full suite went from 3,828 passing to 33
+failures.**
+
+**The failures are the point.** 33 gate tests build their fixture corpus at
+60 / 16 / 24 and grade it with no `--profile`, so the fixture's proportions and
+the default profile are ONE decision expressed in two places. Flip the default
+and every one of them reports `mix FAIL curated 16.0% (target 28%),
+grounded_synthesis 60.0% (target 30%), replay 24.0% (target 42%)` - the gate
+working correctly against targets the fixture was never built for.
+
+Reverted, both sides, rather than rewriting 33 gate fixtures unattended.
+
+**And the footgun it was meant to close is smaller than it looked.** Every
+`stats` report names its profile on the third line (`- profile: v1.0-MVP`), and
+the supervisor passes `--profile` explicitly to both `shape` and `stats`, so a
+misgraded ad-hoc reading announces itself. That is not nothing, but it does not
+buy 33 fixture edits made while nobody is awake to review them.
+
+**The two-step for whoever takes it awake**, in this order:
+
+1. Make the gate fixtures derive their proportions from
+   `cfg.assembly.targets()` instead of hardcoding 60 / 16 / 24. They then test
+   what they mean - "a corpus at the graded profile's proportions passes mix" -
+   and stop encoding a profile choice by accident.
+2. Then flip `default_profile` to `v1.0-MVP`, with the cross-file test that
+   pins it to `actions_worker.PROFILE` (the same drift guard
+   `test_the_supervisor_default_sample_is_the_judges_own_constant` already
+   applies to `DEFAULT_AUDIT_SAMPLE`).
+
+Step 1 is worth doing on its own merits even if the default never moves.
+
 ### F46. THE VARIANT EFFECT, MEASURED PER TASK: v1 64%, v4 28%
 
 F36 and F37 measured the variant effect per GENERATION. Sizing a wave needs it
@@ -2794,9 +2831,12 @@ new work.
 
 ## 7. Decision log
 
-1. **Ship profile `v1.0-MVP`.** CI already hardcodes it (`actions_worker.py:79`)
+1. **Ship profile `v1.0-MVP`.** CI already hardcodes it (`actions_worker.py:94`)
    while `assembly.default_profile` says `v1.1-full` (`yaml:119`). MVP needs
-   ~3,617 accepted synthesis rows vs ~12,600. Align config to what CI grades.
+   ~3,617 accepted synthesis rows vs ~12,600. **The "align config" half was
+   tried on 2026-08-31 and REVERTED** - 33 gate fixtures encode the default
+   profile in their own proportions, so the flip needs a fixture change first
+   (F47). The SHIP decision stands; only the config default is unchanged.
 2. **Cancelled run #8** (2026-08-31T01:38Z). Pre-guard sha, claiming nothing,
    holding the `data-build` concurrency group; holds no leases (claimed=0), and
    leases expire on a 900 s clock regardless. Cancelling loses nothing.
