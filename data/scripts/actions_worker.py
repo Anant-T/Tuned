@@ -72,7 +72,13 @@ from tuned.data.shape import SHAPED_PREFIX
 #
 # The asymmetry decides it rather than any forecast of throughput: stopping
 # now is reversible, and generated rows cannot be dropped, so overshooting is
-# not. Re-add the string once synthesis has actually earned the headroom.
+# not.
+#
+# THE THROTTLE EXPIRES. A frozen curated count caps synthesis from the other
+# side too - too few curated rows underfill the bucket just as surely. At 391
+# accepted curated the feasible accepted-synthesis range is 636..1,196, so the
+# chain starts assembling again at ~636 with no further curated rows, and the
+# string must go back BEFORE ~1,196. `shape --headroom` prints the live band.
 #
 # transition STAYS despite being drained. `budget = n_workers * len(streams)`
 # and the top-up walks this tuple in order, so a drained stream donates its

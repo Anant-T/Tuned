@@ -174,7 +174,8 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it. The 5 transition rows are already read: 1 is wrong (F30) |
 | 16 | Stop the card claiming a citation check that never ran | **DONE** (F34) |
 | 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
-| 18 | Decide the ceiling remedy | **DONE** - curated_c2 throttled off `STREAMS`; reversible, re-open at ~1,300 accepted synthesis (F35) |
+| 18 | Decide the ceiling remedy | **DONE** - curated_c2 throttled off `STREAMS`; reversible, re-open at ~1,100 accepted synthesis, and BEFORE ~1,196 (F35) |
+| 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **OPEN - the throttle's expiry, check with `shape --headroom`** (F35) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
 
@@ -1589,12 +1590,29 @@ whether they respect STREAMS is precisely the silent-disagreement trap.
 
 #### When to turn it back on
 
-Re-add `"curated_c2"` to `STREAMS` when accepted synthesis crosses ~**1,300**,
-and only up to the accepted-curated figure the table above gives for whatever
-synthesis has actually reached. `shape --headroom` prints the live band, so the
-condition is checkable in one command and does not depend on this table staying
-fresh. The rows already accepted (391) are inside the window for a synthesis
-landing of 800-1,200, so nothing generated so far is wasted.
+**The throttle has an expiry, and it is sooner than first written.** Freezing
+curated at 391 does not only stop an overshoot - it also caps synthesis from
+the other side, because a curated count that is too LOW underfills its share
+just as surely. Measured directly at 391 accepted (371 effective):
+
+    feasible accepted synthesis, curated frozen at 391:   636 .. 1,196
+    today                                                 409   -> OUT (below)
+
+Two things follow, and the first is the useful one:
+
+1. **The corpus is unassemblable today because synthesis is too SMALL, and
+   the throttle is what fixes that** - it redirects the fleet's whole budget
+   onto the one stream that closes the gap. At ~636 accepted synthesis the
+   chain starts assembling again with not one further curated row.
+2. **Re-open curated_c2 before accepted synthesis reaches ~1,196**, not at the
+   1,300 first written here - that figure was past the edge, and acting on it
+   would have walked out of the band on the low side while congratulating
+   itself on the throttle. Around ~1,100 accepted synthesis is the cue.
+
+`shape --headroom` prints the live band, so the condition is checkable in one
+command and does not depend on this table staying fresh. The 391 rows already
+accepted are inside the window for a synthesis landing of 636-1,196, so
+nothing generated so far is wasted.
 
 The remaining alternative, if synthesis does reach full MVP and more curated is
 wanted than the ceiling allows: **rebuild `replay/nothink` larger.**
