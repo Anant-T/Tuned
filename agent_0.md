@@ -1569,7 +1569,15 @@ this, the DB is ~95% of what is left. Two levers exist and neither was taken:
   change. NOT taken tonight: it changes how the crown jewel is restored, and a
   bug there loses the entire build. The raw shard was safe because its
   invariant was a glob depth that could be asserted in one line; this one is
-  not. It wants a live verification window, not an unattended night.
+  not. It wants a live verification window, not an unattended night. **The
+  specific trap, so the next attempt does not walk into it:** `Bundle.push`
+  passes no `delete_patterns`, so the moment `state/law_v1.sqlite3.gz` appears
+  the UNCOMPRESSED `state/law_v1.sqlite3` stays on the remote forever, stale.
+  `restore_bundle` copies every file it finds under `state/`, so a bundle
+  carrying both would land a fresh DB and a stale one and the winner would be
+  decided by iteration order. Any implementation has to make the compressed
+  copy win explicitly AND delete the stale one - restoring a two-day-old
+  database over a good one is a worse failure than the quota.
 - **`--db-every` 3600 -> 7200.** Halves the DB term, one reversible flag. NOT
   taken: it doubles the window in which a crash loses task state and
   gate_result, and `stage_bundle`'s own docstring records that skipping the DB
@@ -1577,6 +1585,16 @@ this, the DB is ~95% of what is left. Two levers exist and neither was taken:
   back as `pending` and get paid for twice. It is the emergency lever if the
   wall closes again before a squash lands - reversible, so it can be pulled and
   put back.
+
+**Automating the squash was considered and rejected.** The worker holds the
+only lock and has just pushed when a job ends, so end-of-job is exactly the
+quiet window `super_squash_history` needs, and it would retire task 27 for
+good. Rejected anyway: the baton's history is the ONLY way back from a
+corrupt push. An unattended build that writes a bad database and then destroys
+every earlier copy of it in the same job has no recovery at all, and that
+trade is much worse than a chore the operator does every few days. At ~19.5
+GB/day a squash is due roughly every five days; the compression lever above
+would stretch that to about twenty.
 
 Two tests, both written first and watched fail. Suite **3,832 / 19** (+2).
 
