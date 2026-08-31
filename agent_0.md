@@ -171,7 +171,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 15 | Carry the allowlist through `--phase plan` and `data-plan.yml` | **DONE** - 3 tests (F33) |
 | 11 | Stop shipping the answer's second deliberation | **DONE** `fb611f5` (F28) |
 | 12 | Build the 50-example review packet the card requires, and pre-screen it | **DONE** `4505840` - reproducible CLI, 4/50 flagged (the first 12/50 was a screen bug, F29) |
-| 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it. The 5 transition rows are already read: 1 is wrong (F30) |
+| 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it. The 5 transition rows are already read: 1 is wrong (F30). **Re-rendered 2026-08-31 11:2xZ against the SWEPT store** (935 accepted, post-`verify` so none of the 84 off-teacher rows can waste a reader's attention): 21 curated_c2/irac, 18 synthesis/irac, 5 summarization, 3 drafting, 3 transition; 3 of 50 cite an authority the source never names - read those first. `data/build/out/review_packet.html`, gitignored |
 | 16 | Stop the card claiming a citation check that never ran | **DONE** (F34) |
 | 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
 | 18 | Decide the ceiling remedy | **DONE** - hand throttle shipped, then REPLACED same day by a measured guard (`be25afd`): `STREAMS` lists all three, `served_streams` drops curated_c2 within 150 effective of the ceiling and on any ceiling it cannot measure (F35) |
