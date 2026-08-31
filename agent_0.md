@@ -174,9 +174,10 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it. The 5 transition rows are already read: 1 is wrong (F30) |
 | 16 | Stop the card claiming a citation check that never ran | **DONE** (F34) |
 | 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
-| 18 | Decide the ceiling remedy | **DONE** - curated_c2 throttled off `STREAMS`; reversible, re-open at ~1,100 accepted synthesis, and BEFORE ~1,196 (F35) |
-| 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **OPEN - the throttle's expiry, check with `shape --headroom`** (F35) |
-| 20 | Plan the synthesis top-up on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN - do it WITH the curated re-open, not before; would displace the queued worker** (F36) |
+| 18 | Decide the ceiling remedy | **DONE** - hand throttle shipped, then REPLACED same day by a measured guard (`be25afd`): `STREAMS` lists all three, `served_streams` drops curated_c2 within 150 effective of the ceiling and on any ceiling it cannot measure (F35) |
+| 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **CLOSED - obsolete.** The re-open was the hand throttle's expiry; the guard now decides per run, so there is no date to remember. Live: serving, 466 effective against a 2,050 ceiling (F35) |
+| 20 | Plan the synthesis top-up on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN** - no longer coupled to a curated re-open. 3,162 synthesis tasks are still pending, so a top-up wave is not urgent; plan it when the queue thins (F36) |
+| 21 | Verify the ceiling guard's first live run | **OPEN** - run `33375922778` starts ~12:35Z when `33363831595` ends. Expect `ceiling guard: serving every stream - 466 effective ... ceiling of 2050`, then curated_c2 claims resuming (F35) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
 
@@ -1578,17 +1579,27 @@ the proven genre. Adding a FILE does not change any existing template's sha, so
 no pending task is parked; EDITING one parks every pending task on it. That is
 the whole reason the rule is "add, never delete or edit".
 
-### F35. curated_c2 IS RUNNING OPEN-LOOP AHEAD OF SYNTHESIS, INTO A ONE-WAY DOOR
+### F35. THE CURATED CEILING IS A ONE-WAY DOOR, AND IT IS NOW GUARDED BY MEASUREMENT
 
 This is the most important thing in this file. It is not a throughput problem
 and the door does not open again.
 
-**Corrected 2026-08-31, after inverting the band.** The first write-up of F35
-said the corpus was "~11 accepted rows" from a wall it would hit in days. The
-ceiling number was right; the framing was wrong in a way that mattered. The
-corpus is not approaching the boundary - **it is already outside the feasible
-band today**, and has been since curated_c2 overtook synthesis. See "What the
-band actually requires" below, which supersedes the projection.
+**Rewritten twice on 2026-08-31. Both corrections are kept, because the way
+each one was wrong is more useful than the numbers.**
+
+1. *"~11 accepted rows from a wall it would hit in days."* The ceiling number
+   was right; the framing was not. That figure measured the distance to where
+   damage becomes PERMANENT and read it as the distance to trouble. The corpus
+   had already left the feasible band - `shape` refuses from both sides, and it
+   was refusing then.
+2. *"So throttle curated_c2 off `STREAMS`."* The asymmetry behind that was
+   sound and the arithmetic under it was not: it multiplied PENDING tasks by a
+   JUDGED-accept rate, which is the wrong denominator by ~32 points, and it
+   never priced the throttle. Freezing curated caps the corpus at 3,655 rows
+   where draining it reaches 8,430.
+
+The standing answer is neither: the run now MEASURES its distance to the
+ceiling and stops curated_c2 on the reading. See the DECISION section.
 
 **`shape` refuses from BOTH sides.** Too few generated synthesis rows and the
 curated bucket overfills its share of the mix; too many and the corpus outgrows
@@ -1611,18 +1622,31 @@ existing.**
 
 #### Where the build is heading, unattended
 
-    headroom now                        ~1,769 more ACCEPTED curated rows
-    pending curated_c2 tasks             1,825, accepting at 96.3% -> ~1,758
-    margin                               ~11 rows
-    plus format_parked curated              116, which REOPEN_ON_EMPTY re-opens
-                                            automatically when the queue drains
+**The 96.3% in the first version of this block is the accept rate among JUDGED
+rows. It is not the yield of a pending task, and using it as one is the error
+that produced the throttle.** A pending task must clear the format gates
+before a judge ever sees it, and `format_parked` is where most of the losses
+are. Both denominators, measured 2026-08-31 over 2,360 curated_c2 tasks:
 
-So the projected landing is **2,157 effective against a 2,050-2,065 ceiling** -
-over it - and the thing that pushes it over is a recovery path the worker runs
-BY ITSELF (`REOPEN_ON_EMPTY = ("gen_unroutable", "format_parked", "off_teacher")`).
-Nothing warns; `shape` is not run by the worker, only by `data-assemble`.
-The failure would first be visible as a `REFUSED` on a dispatch days later,
+    judged accept rate      491 / 508  = 96.7%   <- what the first version used
+    per-task yield          491 / 756  = 64.9%   <- accepted / everything decided
+
+`format_parked` sits between them and is not cleanly terminal: `REOPEN_ON_EMPTY`
+re-opens those rows when the queue drains, so some fraction of them eventually
+pass. The landing is therefore bracketed, not known:
+
+    at 96.7%   2,277 accepted = 2,163 effective   -> BREACHES the 2,050 ceiling
+    at 64.9%   1,691 accepted = 1,607 effective   -> 443 effective clear
+
+**So the concern was real and the arithmetic was not.** One end of that range
+does breach a door that never reopens, driven by a recovery path the worker
+runs BY ITSELF. Nothing warns: `shape` is not run by the worker, only by
+`data-assemble`, so the failure would first surface as a `REFUSED` days later,
 by which time the rows that caused it are unremovable.
+
+What follows from a range this wide is not a better forecast. It is that the
+build must stop on a MEASUREMENT rather than on either estimate - see the
+decision below, which is what actually shipped.
 
 Timeline, as first written: "the queue holds ~2.4 days ... days away, not
 hours. No emergency tonight." **That was wrong, and it is the reason this
@@ -1660,27 +1684,39 @@ cannot conjure rows into a pool that holds 1,200.
 `synthesis_band` inverted - for a realised accepted-synthesis count, the
 accepted curated_c2 counts that admit ANY corpus at all:
 
-    accepted synthesis   accepted curated_c2 that admits it
-              409  (today)          0 ..   237
-              800                 184 ..   474
-            1,200                 421 ..   738
-            1,550  (queue lands)  632 ..   948
-            2,000                 869 .. 1,212
-            2,600               1,238 .. 1,581
-            3,617  (full MVP)   1,818 .. 2,160
+    accepted curated_c2    accepted synthesis that admits it   max corpus
+              491  (today)           817 .. 1,342                    3,655
+              700                  1,138 .. 1,721                    5,082
+              900                  1,459 .. 2,071
+            1,100                  1,809 .. 2,421                    6,465
+            1,300                  2,130 .. 2,742
+            1,526  (drain @64.9%)  2,480 .. 3,151                    8,430
+            1,800                  2,917 .. 3,617                    9,691
+            2,000                  3,238 .. 3,734                   10,021
+            2,158  (the ceiling)   3,501 .. 3,734                   10,021
 
-Read the top row: at today's 409 accepted synthesis the corpus admits at most
-**237** accepted curated_c2, and the store holds **391**. That is the refusal
-the chain already reports; it is not a future risk. The ratio the corpus wants
-is roughly **half an accepted curated row per accepted synthesis row**, and
-curated_c2 is at ~0.96 - about **twice** its share, with 1,825 more queued.
+Re-measured 2026-08-31 09:30Z on live counts, and stated the other way round
+from the first version because curated is the axis with the one-way door on
+it. Two readings matter. First, **the band RISES with curated** - more curated
+rows admit a bigger corpus, which is why freezing the count is not a free
+safety measure. Second, **full-MVP synthesis (3,617) is reachable only if
+curated lands in ~1,800..2,158**; frozen at 491 the corpus tops out at 3,655
+rows.
 
-Draining that queue lands ~2,149 accepted. That is feasible ONLY if synthesis
-also reaches full MVP (1,818..2,160), and it sits within 26 rows of the
-absolute ceiling. Synthesis has 3,453 pending at a ~33% terminal accept rate,
-so the queue as planned lands it near **1,550** - where the admissible
-curated_c2 is 632..948. The projected pair is (2,149 curated, 1,550 synthesis)
-and it is outside the region on both axes at once.
+Read the top row: at today's 491 accepted curated_c2 the corpus needs
+817..1,342 accepted synthesis, and the store holds **531**. That is the refusal
+the chain already reports - it is a present fact, not a future risk - and it is
+on the LOW side: synthesis is short, not curated long. The ratio the corpus
+wants is roughly **two accepted synthesis rows per accepted curated row**, and
+the pair is currently at ~1.08.
+
+The projected pair is what the throttle got wrong. Synthesis has 3,162 pending
+and curated_c2 1,592; at their measured per-task yields those land near (1,526
+curated, ~2,000 synthesis), which is inside the band and admits ~8,430 rows.
+The first version of this section projected (2,149 curated, 1,550 synthesis) by
+crediting curated with a 96.3% judged-accept rate and synthesis with a 33%
+terminal rate - two different denominators on the two axes, which is exactly
+how a pair lands outside a region it is actually inside.
 
 #### Verified end to end, not just computed
 
@@ -1722,71 +1758,83 @@ this is the design, not a coincidence. **The design budget for curated_c2 is
 budget since it was planned; the ceiling is just where over-budget becomes
 permanent.
 
-#### DECISION: curated_c2 is throttled off, 2026-08-31
+#### DECISION, as it ended up: a measured ceiling guard, 2026-08-31
 
-Taken on the asymmetry, which does not require forecasting throughput:
+**This was a hand throttle for about four hours, and then it was not. The
+round trip is the finding.**
 
-- Stopping now is **reversible**. The 1,825 tasks stay `pending`, untouched;
-  `shape` only ever counts ACCEPTED generations, so pending rows cost nothing.
-  Restoring one string resumes them.
-- Letting it drain is **not**. Generated rows cannot be dropped, so if
-  synthesis lands short of full MVP the corpus is unassemblable at this
-  profile, permanently.
+What shipped first: `STREAMS = ("synthesis", "transition")`, curated_c2 simply
+never claimed. Taken on the asymmetry - stopping is reversible because pending
+rows cost nothing, draining is not because generated rows cannot be dropped.
+The asymmetry argument was sound. The number it was applied to was not, and
+the price of applying it was never checked.
 
-Stopping preserves both futures; draining bets the corpus on synthesis
-reaching 3,617. So: **`STREAMS` at `actions_worker.py` is now
-`("synthesis", "transition")`.** `--stream` becomes
-`claim_tasks(stream=...)`, so the fleet simply never claims curated_c2 - no
-store write, no baton, picked up by the cron on its next run. It also closes
-the `REOPEN_ON_EMPTY` hole by itself: the 116 `format_parked` curated rows may
-re-open freely now, because nothing will serve them.
+**The price, measured afterwards.** Freezing curated at 491 accepted does not
+merely pause a stream; it caps the corpus, because the curated count sets how
+large a corpus the fixed shares admit:
+
+    curated accepted     max synthesis (accepted)    MAX CORPUS
+        491 (frozen)                      1,342          3,655
+      1,526 (drained at 64.9%)            3,151          8,430
+      2,000                               3,734         10,021
+
+**The throttle cost ~4,800 rows of assembled corpus** to prevent a breach only
+the pessimistic end of the yield range could cause. Neither hardcoded answer
+was right: serving curated_c2 unconditionally risks a permanent door, holding
+it unconditionally pays 4,800 rows for that safety.
+
+**What shipped instead (`be25afd`): the decision became a measurement**, taken
+once per run after the baton is restored and before anything is claimed.
+
+    ceiling_state(config, root)   -> (effective generated-curated, ceiling)
+                                     ACCEPTED rows, retention-corrected, for
+                                     the profile the chain actually assembles
+    served_streams(STREAMS, ...)  -> drops curated_c2 within
+                                     CEILING_MARGIN_EFFECTIVE (150) of it
+
+`STREAMS` lists all three again. On live counts the guard serves curated_c2 now
+(466 effective) and will hold it at 1,900 effective - about 2,000 accepted -
+against the 2,050 ceiling. It costs 2.9 s per run. Both ends of the yield range
+are now safe without either being predicted, which is the point: **a margin
+does not have to be forecast if the build stops on the reading.**
+
+It **fails closed.** An unmeasurable ceiling - no store, no stream files, a
+config that will not load, a cold checkout before the baton is unpacked - holds
+curated_c2 rather than serving it. The asymmetry that justified the hand
+throttle is exactly right for the UNKNOWN case; it was only wrong as a
+substitute for looking.
+
+Three things stopped being restated while they were load-bearing:
+
+- the served stream list now reaches `child_argvs` and `_finish` as an
+  argument. The module constant no longer knows what a given run decided, and a
+  report reading the constant would describe the wrong run.
+- `PROFILE` is one constant. A ceiling is a property of a profile - the shares
+  decide which pool binds - so a guard measuring `v1.0-MVP` while the chain
+  assembled something else would clear a stream on the wrong number.
+- `_task_counts` still reads the WHOLE store while `_claimable_in(db, streams)`
+  answers "is there anything THIS run serves". Keeping both matters: with only
+  the whole-store count, unserved rows read as work forever, the queue-empty
+  guard never fires, `REOPEN_ON_EMPTY` never runs, and every run sits its full
+  ~5 h claiming nothing - the exact stall this session opened by fixing.
+  Holding a stream would otherwise silently disarm the recovery.
 
 `transition` STAYS although it is drained (0 pending, 2,177 rejected).
-`budget = n_workers * len(streams)` and the top-up walks the tuple in order,
-so a drained stream donates its floor to synthesis. Dropping it as well would
-have cut the fleet from 2xN to N calls in flight - a throttle on the one
-stream that must not be throttled.
+`budget = n_workers * len(streams)` and the top-up walks the tuple in order, so
+a drained stream donates its floor to synthesis. Dropping it would cut the
+fleet from 2xN to N calls in flight.
 
-**Second-order break, found and fixed before shipping.** `_task_counts` reads
-`SELECT state, COUNT(*)` across the WHOLE store, so 1,825 permanently-pending
-curated_c2 rows would have read as work forever: the queue-empty guard would
-never fire, `REOPEN_ON_EMPTY` would never run, and every run would sit its full
-~5 h claiming nothing - the exact stall this whole session began by fixing.
-Throttling a stream would have silently disarmed the recovery. Now
-`_claimable_in(db, STREAMS)` answers "is there anything THIS run will serve",
-while `_task_counts` stays whole so the throttled backlog remains visible in
-the job summary. The old whole-store `_claimable` is deleted rather than left
-beside it, because two definitions of "is there work" that differ only in
-whether they respect STREAMS is precisely the silent-disagreement trap.
+#### The low side still binds, and the guard does not touch it
 
-#### When to turn it back on
+None of the above changes the fact that **the corpus is unassemblable TODAY,
+and on the LOW side**: at 491 accepted curated the feasible accepted-synthesis
+band is 817..1,342, and synthesis stands at 531. The remedy is to generate
+synthesis, which is what the fleet is doing.
 
-**The throttle has an expiry, and it is sooner than first written.** Freezing
-curated at 391 does not only stop an overshoot - it also caps synthesis from
-the other side, because a curated count that is too LOW underfills its share
-just as surely. Measured directly at 391 accepted (371 effective):
-
-    feasible accepted synthesis, curated frozen at 391:   636 .. 1,196
-    today                                                 409   -> OUT (below)
-
-Two things follow, and the first is the useful one:
-
-1. **The corpus is unassemblable today because synthesis is too SMALL, and
-   the throttle is what fixes that** - it redirects the fleet's whole budget
-   onto the one stream that closes the gap. At ~636 accepted synthesis the
-   chain starts assembling again with not one further curated row.
-2. **Re-open curated_c2 as accepted synthesis approaches ~1,196**, not at the
-   1,300 first written here - that figure was past the edge. Around ~1,100 is
-   the cue.
-
-**But the deadline is SOFT, and the asymmetry is the opposite of the ceiling's
-- this matters for an unattended run.** Leaving the throttle on too long puts
-the corpus out of band on the LOW side, where the curated bucket underfills.
-That is entirely recoverable: the fix is to generate more curated rows, which
-is exactly what re-opening does. Only the HIGH side is one-way, because
-generated rows cannot be dropped. So missing ~1,196 costs assembly DELAY, never
-damage, and the throttle is safe to leave on overnight. Do not treat 1,196 as
-something worth taking a risk to hit.
+That deadline is SOFT, and its asymmetry is the opposite of the ceiling's:
+underfilling curated costs assembly DELAY and is fixed by generating more
+curated rows - which the guard now allows automatically. Only the HIGH side is
+one-way. So there is no number on this side worth taking a risk to hit.
 
 `shape --headroom` prints the live band, so the condition is checkable in one
 command and does not depend on this table staying fresh. The 391 rows already
