@@ -7,42 +7,50 @@ working state once already.
 
 ---
 
-## 0. State of play (2026-08-31, ~03:10Z)
+## 0. State of play (2026-08-31, ~03:40Z)
 
-**The pipeline works end to end. The corpus is short on one bucket, and that is
-the only thing between here and a shipped dataset.**
+**The pipeline works end to end. What is left is throughput and one prompt
+decision - no breakage anywhere.**
 
-- **Build is running and healthy.** Run #9 (`33349462956`), 288 generations,
-  **1 error, zero cooling parks, zero unroutable**. The queue-shredder fix is
-  holding under real load. ~4.7 generations/min, ~19 accepted synthesis rows/hr.
+- **Build is running and healthy.** Run #9 (`33349462956`, started 02:03Z),
+  11 batches, **1 error, zero cooling parks, zero unroutable**. Measured:
+  271 generation calls/hr, **~44 accepted rows/hr** (~23 of them synthesis).
 - **The assembly chain went GREEN for the first time** - `CHAIN RC=0`, all nine
-  gates passing at `v1.0-MVP`. The three historically-RED gates were never
+  gates passing at `v1.0-MVP`. The historically-RED gates were never
   miscalibrated; the old runs just never ran `shape` (F16).
-- **The one blocker is arithmetic, not breakage.** `curated_c2` is over-generated
-  against synthesis, so `shape` refuses. Feasible `curated_c2` is a two-sided
-  window (`gs/2.18 <= gc <= gs/1.47`); the queue delivers 1.12:1 against a
-  required 1.47:1 (F16, F19).
-- **Two targets, not one:** ~**+470** accepted synthesis makes the chain stop
-  refusing (~6,700-row corpus, ~1 day out); ~**+2,870** reaches the MVP ceiling
-  (~10,021 rows, ~6-7 days). The queue yields only ~1,209, so Step 6 needs
-  ~5,000 more synthesis tasks (F21).
+- **`transition` is finished** - 2,200 of 2,200 tasks terminal, 5 accepted. It
+  converted at 4.3% while holding a third of an account-level rate bucket, so
+  its ending is a gain, not a loss (F22).
+- **Fixed tonight:** the claim loop treated the fleet's in-flight budget as a
+  per-stream quota, so `transition` ending silently cut concurrency 36 -> 24.
+  Restored and made invariant to how many streams have work: +17% now, +68%
+  once `curated_c2` drains (F23). Suite **3,755 / 19 skipped**.
+- **Draining the whole pending queue** costs ~20,356 generation calls and
+  yields ~2,994 more accepted rows: **~2.4 days** with the fix, ~3.1 without.
+  That lands synthesis at **~2,360** accepted against the ~3,207 MVP wants -
+  so Step 6 needs roughly **1,500-1,600** more synthesis tasks, not the ~5,000
+  F21 estimated off a pooled accept rate (per-variant rates are much higher).
 - **There is a hard ceiling at ~10,021 rows**, binding on the replay/nothink
-  pool, and `--replay-nothink-share` cannot lift it. Both profiles cap there,
-  but `v1.1-full` costs ~2x the synthesis to reach it - **on current pools MVP
-  dominates** (F19, F21).
+  pool. Both profiles cap there but `v1.1-full` costs ~2x the synthesis to
+  reach it - **on current pools MVP dominates** (F19, F21).
 
 **Do not, without deciding first:**
 - dispatch `data-assemble` (it would fail at `shape` and burn a runner - F20);
-- edit any prompt template (parks the live queue as `stale_prompt`; ship a new
-  `prompt_id` instead - F15);
+- edit any prompt template in place (parks the live queue as `stale_prompt`;
+  ADD a new `prompt_id` instead - F15);
+- delete a template file (678 pending tasks are stamped with `v4` - F24);
 - reopen the 2,063 `skip:slots` transition rows (they would re-die - F18);
 - widen `curated_c2` (it raises the bar it is already above - F16).
 
-**Awaiting a decision:** the templates. Both remaining gate losses -
-`irac_placement` 63.8% and transition's `statutory_quotation` 95.7% - are
-deepseek not honouring rules the templates already state plainly (F14, F18).
-Planning a big wave locks it to today's prompt_ids, which is why Step 6 is sized
-but not fired.
+**The one decision waiting:** two prompt personas are burning half the fleet.
+`gen_irac_analysis_v4` (examiner writing a model answer) spends **15.6
+generations per accepted row** against `v1`'s 3.3; `gen_summarization_v1` (law
+reporter settling a headnote) fails `irac_placement` at 27% where `v2`
+(advocate's letter to a client) fails at 4% - **on the identical instruction
+sentence**, randomised seeds, z = 5.7. Genre beats instruction. Adding two
+variants in the proven speech/letter genre is worth 33% fewer calls and 72%
+more rows on the same tasks (F24). It needs a 10-row A/B first, which cannot
+run while CI holds the account-level rate bucket.
 
 ---
 
@@ -112,14 +120,20 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 3 | Push, dispatch `data-worker`, watch the armed reopen recover ~5,190 rows | **DONE** - run #9 generating |
 | 4 | Measure the breaker trip rate; report (do not act) | **DONE** - 0 trips in 180 gens; 4.72 gen/min, ~23.6 accepted/hr (F17) |
 | 5 | Root-cause the `transition` stream's 99% reject rate | **DONE** - 96% was the planner bug (`708d455`); the rest is a 95.7% `statutory_quotation` compliance gap (F18) |
-| 6 | Widen the queue, sized to measured yield | **SIZED, deliberately not dispatched** - synthesis-only, ~+500 accepted (~1,515 tasks); window and reasoning in F16 |
+| 6 | Widen the queue, sized to measured yield | **SIZED, deliberately not dispatched** - synthesis-only, **~1,500-1,600 tasks** (re-sized on per-variant rates, F24); blocked on the variant decision, not on capacity |
+| 8 | Fleet claim budget: restore the designed 36 in flight and make it invariant to drained streams | **DONE** - 3 tests, suite 3,755/19 (F23) |
+| 9 | Author `gen_irac_analysis_v5` + `gen_summarization_v3` in the proven speech/letter genre; 10-row A/B; then plan Step 6 on the winners | **READY, needs the bucket free** (F24) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
 
 **The one open blocker:** `curated_c2` is over-generated against synthesis and
 generated rows cannot be dropped, so `shape` refuses at the true composition.
 Structural requirement is 1.46:1 synthesis:curated; the queue delivers 1.12:1.
-Closing it needs ~+469 accepted synthesis rows beyond what the queue will yield.
 Nothing is broken - the corpus is short, and only in one bucket.
+
+Re-measured 2026-08-31T03:40Z against per-variant rates (F24), the pending queue
+now projects to **synthesis 2,360 / curated_c2 1,322** at full drain - a 1.79:1
+ratio, which is INSIDE the feasible window. The shortfall is no longer the
+ratio; it is the absolute synthesis count against the MVP's ~3,207.
 
 Full plan: `~/.claude/plans/mossy-sauteeing-riddle.md` (not in the repo).
 
@@ -695,6 +709,31 @@ is what Step 6 already says. Transition stays a moat feature, not a volume
 source.
 
 
+### F22. The 36 -> 24 batch drop is the `transition` stream ending, not the queue draining
+
+`claim_tasks(worker_id, n_workers, stream=...)` is called **once per stream**
+(`generate.py:2210`), `--n-workers` defaults to **12** (`actions_worker.py:1056`),
+and `STREAMS` has three entries. So the batch size is
+`12 x (number of streams with claimable work)` and nothing else:
+
+    36 = 3 streams x 12      batches 1-8
+    26 = transition running out mid-batch
+    24 = 2 streams x 12      batches 10, 11 - stable
+
+Baton DB at 03:03Z confirms it. `transition`: **pending=0, generating=0**,
+2,177 rejected / 17 format_parked / 5 accepted / 1 gen_unroutable = 2,200 =
+the whole planned stream. It is spent. `synthesis` still has 3,602 pending,
+`curated_c2` 1,978.
+
+**This is good news, not bad.** transition converted at 4.3% this run and was
+holding a third of an account-level rate bucket to do it. That third is now
+serving streams that convert at ~41%.
+
+**But it exposed a real throughput defect** (see F23): the claim cap is
+per-stream, so a stream ending *reduces in-flight work* with no compensation.
+The fleet went from 36 calls in flight to 24 against an unchanged rpm-8 bucket.
+
+
 ### F19. The corpus has a hard ceiling at ~10,021 rows, and the pools were built for it
 
 Asking `shape.plan` across the whole (synthesis x curated) grid instead of one
@@ -817,6 +856,132 @@ synthesis tasks, not the ~1,515 sized for the window alone** - a `data-plan`
 target of roughly `current_counted + 5,000`, synthesis only, `--mix` explicit.
 Still gated on the template decision in F14/F18, since planning locks the wave
 to today's prompt_ids.
+
+
+### F23. FIXED: the claim budget belonged to the streams, not to the fleet
+
+The bound the design chose is `n_workers * len(streams)` - sized against the
+rate bucket and the 900 s lease, and written into the comment above the loop.
+The loop did not enforce it. It asked each stream for `n_workers` and kept
+whatever came back, so the real in-flight count was
+`n_workers * (streams that still HAVE work)`. F22's drained stream therefore
+cut the fleet by a third with nothing wrong and nothing logged.
+
+The rate bucket is a `TokenBucket` per (provider, model): capacity `rpm`=8,
+refill 8/60 = one request per 7.5 s, and it **starts full**. So a batch of N
+admits 8 immediately and the rest at 7.5 s apiece, then waits on the gather
+barrier for the slowest call. Measured against run #9 - 11 batches, 5.3 min
+apart, 271 calls/hour - the model that reproduces it is:
+
+    batch_wall = 7.5 * (N - 8) + T_tail,  T_tail ~ 198 s
+
+    N = 12  (1 stream, after curated_c2 drains)   189 calls/hr
+    N = 24  (2 streams, TODAY)                    272 calls/hr   <- measured 271
+    N = 36  (the designed bound)                  318 calls/hr
+    N = 48  (3 streams x 16, the comment's own)   347 calls/hr
+
+The fix restores the designed 36 and, more importantly, makes it **invariant to
+how many streams still have work** - so when `curated_c2` drains in ~1.5 days
+the fleet stays at 36 instead of falling to 12, which is where the bigger half
+of the win is (+68%, not +17%).
+
+Implementation (`generate.py`, the claim loop): keep the per-stream ask as a
+FAIRNESS FLOOR, then spend the unspent remainder on whoever can use it.
+
+    budget = n_workers * len(streams)
+    for stream in streams:                       # floor: nobody gets starved
+        claimed.extend(store.claim_tasks(worker_id, n_workers, stream=stream))
+    for stream in streams:                       # top-up: budget is the fleet's
+        if len(claimed) >= budget: break
+        claimed.extend(store.claim_tasks(worker_id, budget - len(claimed), stream=stream))
+
+The ceiling never rises above the sized bound, and the top-up only ever asks
+streams the caller passed in - so `--stream synthesis` still means only
+synthesis. Three tests: a drained stream must not shrink the batch; a
+one-task stream must still get its task (no pre-emption); and with every
+stream full the top-up must find nothing to do. Suite **3,755 / 19 skipped**.
+
+**Not done, deliberately:** raising `--n-workers` past 12. 48 in flight is
+blessed by the comment's own lease arithmetic and would add a further ~9%, but
+it is a tuning decision on top of a bug fix, and the two should not ship in one
+commit.
+
+
+### F24. CORRECTION to F14 - `irac_placement` is not a compliance gap, it is GENRE
+
+F14 called `irac_placement` "deepseek not honouring a rule the template states
+plainly". That was wrong, and the evidence to refute it was already in the
+store. **The prompt variant rotation is a randomised controlled trial that has
+already run**, at 165-1,027 generations per arm: `pick_variant` is
+`sha256(seed_id:sample_ix) % len(pool)`, so seeds are assigned to variants by
+hash - balanced by construction, no seed-composition confound.
+
+First, the failure is not the one F14 assumed. Of 2,381 failing
+`irac_placement` gate results:
+
+    2,162   IRAC headings found INSIDE the trace        (the MSLR tripwire)
+      128   headings missing from the answer
+       91   both
+
+**94.6% is the trace tripwire.** The model is writing `Issue: / Rule: /
+Application: / Conclusion:` in its own reasoning.
+
+Now the decisive part. `gen_summarization_v1` and `v2` carry the anti-heading
+clause **as the same sentence, word for word** - "Issue, Rule, Application and
+Conclusion are not words your reasoning may put at the head of a line either".
+Their failure rates:
+
+    gen_summarization_v1   50/187 = 27%     persona: law reporter settling a HEADNOTE
+    gen_summarization_v2    7/165 =  4%     persona: advocate writing a LETTER to a client
+
+z = 5.7, p < 1e-7. Same instruction, same model, same gate, randomised seeds,
+**7x apart**. The instruction is not being ignored - it is being outvoted by
+the genre the persona evokes. The same split runs through irac_analysis:
+
+    prompt_id                gens  acc%   gens/accepted-row  irac_fail%  persona
+    gen_irac_analysis_v1      770  80.6%        3.3             43%      a judge writing judgment
+    gen_irac_analysis_v3      726  83.5%        4.2             50%      senior advocate, ALOUD to a junior
+    gen_irac_analysis_v2      784  62.3%        7.2             57%      advocate advising a client
+    gen_irac_analysis_v4     1027  44.6%       15.6             78%      examiner writing a MODEL ANSWER
+
+`v4` also leads on `banned_meta` (26% vs 10-14%) and `prompt_echo` (27% vs
+6-17%). Of course it does: a model answer written to be marked *is* a labelled
+IRAC artefact with commentary about marking. The persona asks for exactly what
+three gates forbid.
+
+**The rule: a persona whose output genre is a formally structured DOCUMENT
+(headnote, model answer) leaks that structure into the trace. A persona whose
+genre is SPEECH or a LETTER does not.** This is the same mechanism as the
+2026-08-28 harmony genre-form fix, which is now twice-confirmed.
+
+#### What it costs, in the only currency that matters
+
+`gens/accepted-row` is fleet time. `v4` spends **15.6 generations per accepted
+row against `v1`'s 3.3** - 4.7x. Over the pending pool:
+
+    the two DOCUMENT-genre variants (irac v4, summ v1):
+        2,221 tasks  ->   9,767 calls  ->    816 accepted rows
+    the same 2,221 tasks at the SPEECH/LETTER variants' measured rates:
+                     ->   6,553 calls  ->  1,401 accepted rows
+
+**33% fewer calls and 72% more rows, for the same tasks.** That is a bigger
+prize than every throughput lever in this file combined, and it is free -
+it costs one line in the Step 6 plan command.
+
+#### Why nothing shipped tonight
+
+- Retiring a variant is not possible without deleting its template file, and
+  the file must stay: 678 pending `v4` tasks are stamped with that
+  `prompt_id` and `generate.py:1701` checks the sha.
+- The safe move is ADDITIVE - land `v5`/`v6` in the proven speech/letter genre,
+  which dilutes `v4` from 25% to 17% of new tasks and touches no pending row.
+  But authoring prompts is generative work I cannot validate offline, and the
+  standing instruction is a 5-10 row test before anything lengthy.
+- Nothing is on the critical path: the pending queue holds ~2.4 days of work.
+
+**Ready for the operator, needs one decision:** author `gen_irac_analysis_v5`
+and `gen_summarization_v3` in the senior-advocate-aloud / letter genre, run a
+10-row A/B against `v4`/`v1`, and plan Step 6 on the winners.
 
 
 ## 6. Constants interrogated
