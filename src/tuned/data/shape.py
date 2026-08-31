@@ -117,7 +117,10 @@ MEASURED_RETENTION = {
     # reason is `case_id:iltur` (30 and 58) - generated rows whose seed case
     # is in the IL-TUR eval set. Dedupe took 2 rows and the length cut took 0.
     # So these figures move when the eval corpora move, not when the gates or
-    # the templates do; re-measure after a decontamination corpus changes.
+    # the templates do; re-measure after a decontamination corpus changes -
+    # or after its POLICY does. Running decontaminate with
+    # --no-case-id-from-text moves generated drops from 159 to 78 on this same
+    # store, which would put both figures well above what is recorded here.
     #
     # READ THE DENOMINATORS. These are CHAIN retentions - shipped over rows
     # ENTERING decontaminate - while generated_counts multiplies them by

@@ -178,7 +178,8 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **CLOSED - obsolete.** The re-open was the hand throttle's expiry; the guard now decides per run, so there is no date to remember. Live: serving, 401 effective against a 2,050 ceiling, 1,499 of headroom (F38) |
 | 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, not urgent** - ~27 h of queue left. Worth ~1.7x the corpus per fleet-hour when it happens (F37) |
 | 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - 401 effective ... ceiling of 2050`, then curated_c2 claims (F38, F39) |
-| 22 | Filter IL-TUR-contaminated seeds at PLAN time | **OPEN** - 9.4% of accepted generated rows are burned on seeds decontamination always deletes. No prompt sha changes, so it is cheap; helps only rows planned after it (F38) |
+| 22 | Filter IL-TUR-contaminated seeds at PLAN time | **CLOSED - wrong fix.** The drops are co-citation, not contamination: 0 of 88 match the eval item's own case. A seed filter would implement the over-firing and cost 9.6% of the pool for no integrity gain (F40) |
+| 25 | OPERATOR DECISION: turn off the row-side case_id channel (`--no-case-id-from-text`) | **OPEN** - recovers 81 generated rows (~9%) with exact containment untouched; deferred because it is an eval-integrity call and the rows are recoverable retroactively, so waiting costs nothing (F40) |
 | 23 | Re-fit `synthesis` retention after the teacher purge lands, or teach `generated_counts` to skip rows the cut will take | **OPEN** - 0.846 is a chain retention against a pre-verify store count; the two converge once the 84 legacy rows are demoted (F39b) |
 | 24 | Citation-existence half | **CLOSED** - index exists, is on the baton, is armed live, costs 8 rows of 943, and all 8 were already dropped by the chain (F39) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
@@ -1508,6 +1509,100 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F40. THE case_id CHANNEL IS DELETING 9.4% OF THE CORPUS FOR CO-CITATION, NOT CONTAMINATION
+
+This started as "filter the contaminated seeds at plan time" (task 22) and
+ended somewhere else. The premise was right and the fix was wrong.
+
+**Step 1 - the loss is seed-side and deterministic.** Of the 88 `case_id:iltur`
+drops on generated rows, the matched citation is in the SEED's materials in
+100% of cases (96% seed-only, 4% seed and answer). Not one is
+model-introduced. Three independent counts agree, which is what a
+seed-deterministic loss looks like:
+
+    9.6%  of the seed pool (61,853) cites an IL-TUR identifier
+    9.7%  of the 7,330 seeds already planned on
+    9.4%  of accepted generated rows dropped for case_id
+
+**Step 2 - so what is actually matching?** An eval item's identifiers come from
+two channels: `identifiers_from_fields` (its own case identity) and
+`identifiers_from_text` (every authority the passage cites). Classifying all
+88 drops against those two channels:
+
+    the eval item's OWN case (real overlap)                    0    0.0%
+    only an authority the eval item CITES (citation graph)    97   77.0%
+    unresolvable (multi-part ids, two unindexed files)        29   23.0%
+
+**Zero.** Not one drop is our seed discussing the case an IL-TUR item is about.
+Every classified match is a shared citation - our seed cites case X, an eval
+item also cites case X, neither is case X. Indian judgments cite the same
+landmark authorities constantly, so on judgment-derived seeds this fires
+almost at random.
+
+`decontaminate.py` predicted this exactly - "if one landmark citation turns
+out to account for a large share of the drops, that is the citation graph, not
+contamination" - and its tell never fired because the tell was the wrong shape.
+It watches for ONE landmark dominating `top_identifiers`; the reality is 114
+distinct citations with the largest at 3.2%. Diffuse, not concentrated, and
+therefore invisible to the check written for it.
+
+**Step 3 - the switch already exists, and turning it off is safe.** The same
+docstring says the row side of this channel is "separately counted and
+switchable" for this reason: `--no-case-id-from-text`. Measured on the scratch
+chain, both runs on the same store:
+
+                            baseline   --no-case-id-from-text
+      total drops               321        161
+      on GENERATED streams      159         78
+      on file sources           162         83
+      channel: case_id          179          0
+      channel: narrow            61         72
+      channel: short             69         75
+      channel: text              12         14
+
+The containment channels **go UP**, 142 to 161. That is the whole safety
+argument in one line: 19 of the 179 case_id drops really did overlap by TEXT,
+and exact n-gram containment - which is the primary defence and is untouched -
+catches every one of them. The other 160 were co-citation and nothing else.
+
+Net prize: **81 generated rows recovered (~9%), plus 79 file-source rows**, with
+contamination protection intact.
+
+#### Not flipped tonight, and the reason is not caution
+
+Three reasons, in order of weight:
+
+1. **Nothing is lost by waiting.** `decontaminate` re-reads every accepted
+   generation out of the store on every run. The 81 rows are not destroyed,
+   only excluded from today's assembly - a flip next week recovers them
+   retroactively, plus everything accumulated since. This is the opposite of
+   F35's ceiling, where the damage was permanent and waiting was the expensive
+   option. Same discipline, opposite conclusion, because the reversibility is
+   opposite.
+2. **It is an eval-integrity decision, and those belong to the operator.**
+   Every number this project will ever publish rests on the eval sets being
+   clean. The evidence above is, I think, complete enough to decide in one
+   read - but "I measured it and it looked fine" is not the standard for
+   loosening a contamination guard unattended.
+3. Nothing is blocked on it. ~27 h of queue remains.
+
+**Task 22 is CLOSED as the wrong fix.** A plan-time seed filter would have
+implemented the over-firing rather than removing it: shrinking the seed pool
+by 9.6% to avoid generating rows that a mis-aimed channel deletes. It would
+have worked, in the sense that the waste would have stopped - and it would
+have cost pool and hidden the defect. The measurement that made it look
+attractive is the same one that killed it.
+
+#### If it is flipped, two things follow
+
+- `--no-case-id-from-text` must be added to `assemble_argvs`' decontaminate
+  step, not just run by hand, or the next cron run silently reverts it.
+- **`MEASURED_RETENTION` must be re-measured.** Its generated figures (0.846,
+  0.817) are readings against the CURRENT policy, and this change moves
+  generated drops 159 -> 78. The table's own comment says re-measure when the
+  decontamination corpora change; this is the same trigger by a different
+  route.
 
 ### F39. THE CITATION-EXISTENCE HALF COSTS 0.85%, AND IT HAS BEEN ARMED ALL ALONG
 
