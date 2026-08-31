@@ -1513,6 +1513,70 @@ the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
 
+### F58. THE JUDGE BUDGET IS 95% POSTAGE - AND TWO HYPOTHESES DIED PROVING IT
+
+Measured against run `33381288057`'s judge log, pulled off the baton mid-run,
+plus two live probes. **Nothing here was shipped** - it is the evidence task 28
+needs, and one config change I was about to make and must not.
+
+**What the run actually did.** 270 rows decided: 258 accepted on gates alone
+(`audit:gate-accept`, never judged), 11 sampled but unjudged, and **1 real dual
+judgement**. It spent **77,461 judge tokens** across 11 token-spending batches
+to get that one judgement, and 77,461 is almost exactly the 83k the ledger said
+was left when the run opened. The budget was the binding constraint and the run
+drank it dry.
+
+**REFUTED #1: groq is not rate-limited or exhausted.** Live probe of both judge
+refs: HTTP 200, `x-ratelimit-remaining-requests: 999/1000`,
+`remaining-tokens: 7988/8000`, and `reset-tokens: 90ms`. That is a per-MINUTE
+bucket refilling continuously, and a request bucket refilling at 1 per 86.4 s
+(= 1000/day). Groq's server side is healthy and barely touched.
+
+**So the ceiling is OURS.** `data_law_v1.yaml:555,572` set `tpd: 200000` on each
+groq model - a CLIENT-SIDE daily cap in our own ledger, which is what
+`spent=117.4k left=83k` reads and what returns `left=0k`. It is shared across
+runs because the ledger rides the baton. F56 named this ceiling correctly at
+~36/day but attributed it to groq; the number survives, the attribution does not.
+
+**REFUTED #2: `openai/gpt-oss-20b` does NOT need `reasoning_effort` disabled.**
+This was the attractive hypothesis - the block for `qwen/qwen3.6-27b` right above
+it carries `role_params: {judge: {reasoning_effort: 'none'}}` with a long comment
+about 7 slot-B calls burning EXACTLY 1,024 completion tokens each and returning
+no verdict, and gpt-oss-20b was added to the judge seat on 08-27 with no such
+guard. It looks exactly like an oversight. **It is not.** Live probe with a
+judge-shaped prompt at the real cap: `finish_reason=stop`, **238 completion
+tokens against the 1,024 cap**, clean parseable JSON verdict. And
+`reasoning_effort: 'none'` returns **HTTP 400 - "must be one of `low`, `medium`,
+or `high`"** on this model, so the guard could not be added even if it were
+wanted. **Do not "fix" this block.** The qwen failure does not generalise to it.
+
+**WHAT THE BUDGET ACTUALLY BUYS, and the lever.** `judge.py:239` already records
+the measurement: judge prompts are **4,914-5,661 routing tokens**. The verdict
+just measured is **238**. So a judge call is ~5.5k tokens of which **~96% is the
+prompt** - the row being shipped to the judge - and ~4% is the judging.
+
+    200,000 tpd / ~5,500 per call ~= 36 calls per model per day
+    a dual judgement = 2 calls, one per family = ~36 dual judgements/day
+
+which reproduces F56's ~36 from measured quantities instead of asserting it, and
+confirms the 0.02 sample (0.02 x ~1,800 decided/day = ~36 sampled) is sized to
+the right number. **F56's fix stands; its stated reason was wrong.**
+
+The lever for task 28 is therefore NOT the sample size and NOT the fleet
+topology - it is the **~5,000-token judge prompt**. Halving it roughly doubles
+the judgement rate for free, on a budget that is 96% postage. That is the first
+thing to price if ~36/day is judged too thin to ship on. Not taken tonight: it
+means editing the judge prompt, and `task_id_for` does not hash `prompt_sha`, so
+a template edit parks pending tasks `stale_prompt` permanently. It is a
+between-waves change, not an overnight one.
+
+**Also worth keeping: `slot-err` is not an error rate.** 72 of them here against
+~11 real calls, because a sampled row whose slot returns no scores is re-claimed
+and retried across later batches, each retry counting again. The batches with
+`slot-err` and `tokens=0` made no call at all - that is the ledger refusing an
+over-budget route, not a provider failing. Reading 72 as 72 failed judgements
+overstates the problem ~6x.
+
 ### F57. 93% OF THE DATABASE IS ONE STATIC TABLE, RE-UPLOADED EVERY HOUR
 
 After F53 the database is ~95% of what the baton still burns. This is where
@@ -1564,6 +1628,13 @@ recorded here is the measurement, the mechanism and the design, so the next
 attempt starts from a number instead of a hypothesis.
 
 ### F56. THE AUDIT SAMPLE WAS 2.5x THE FLEET THAT SERVES IT - RE-SIZED TO 0.02
+
+> **Corrected by F58 (same day).** The 0.02 and the ~36/day ceiling are both
+> right, and F58 re-derives them from measured token costs. But the reason
+> stated below - that groq imposes the daily budget - is WRONG: groq's live
+> headers show 999/1000 requests and 7988/8000 tokens remaining on a per-minute
+> refill. The cap is OUR `tpd: 200000` in `data_law_v1.yaml:555,572`. Read F58
+> before acting on anything in this section.
 
 F51 said the audit sample dies when the second family does. That is now
 measured end to end off ONE completed run (`33363831595`, 07:19-12:34Z) rather
