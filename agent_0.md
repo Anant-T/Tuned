@@ -399,6 +399,86 @@ Lesson for this file: `prev_rep.md` not mentioning empty_think meant nobody had
 written a REPORT about it, not that nobody had solved it. Read the module that
 owns a concern before declaring the concern unowned.
 
+### F13. Gate forensics: `length_band` is NOT a lever, and the lever was already pulled
+
+Subagent forensics (2026-08-31) ranked `length_band` the #1 blocking gate for
+synthesis (43.9%) and #2 for curated_c2 (42.7%) and called it "a genuinely
+miscalibrated global length band". **Re-verified, and that reading is wrong.**
+
+`gate_result.detail_json` records the band *as it stood at gate time*, so the
+question "is this measurement current?" is answerable rather than assumed:
+
+    band as recorded (think_max, total_max, total_min, answer_min)
+      (4000, 8192, 300, 120) -> 1350 failures
+      (3000, 8192, 300, 120) ->  562 failures
+
+**Every recorded failure was graded under think_max 3000 or 4000. None under the
+live 4500.** Replaying `check_length_band`'s arithmetic over all 4,246 verdicts
+with total_max held at 8192:
+
+    think_max | overall | synthesis | curated_c2 | transition
+         3000 |   47.5% |     49.8% |      48.0% |      14.8%
+         4000 |   55.7% |     57.4% |      57.3% |      24.9%
+         4500 |   58.3% |     60.1% |      59.2% |      29.2%   <- live now
+         5000 |   59.6% |     61.7% |      59.7% |      32.1%
+         6000 |   60.2% |     62.4% |      60.0% |      34.0%
+         8192 |   60.3% |     62.5% |      60.0% |      34.0%   <- ceiling
+
+The shipped 3000->4500 move already banked **+10.8pp**; everything above 4500 is
+worth **+2.0pp total** and saturates by 6000. The lever is spent.
+
+It is spent because the band is not arbitrary: `total_max` is **8192, the
+training sequence length** (`drop-never-truncate >8192`), and `total` is
+prompt+think+answer. Of the 1,687 rows that still fail at an *infinite*
+think_max, **1,200 fail `total>total_max`** - they do not fit in the model's
+context and no gate setting changes that. Trace length is not steerable by
+prompt either (paired A/B 2026-08-27, all three levers exhausted).
+
+Corroboration from the other direction: `ebde9a7` bought its irac_placement fix
+at a cost of **summarization length_band -15.91pp**, logged there as a known
+follow-up. Length is the binding constraint, not a mistuned knob.
+
+Second-order finding, not chased: 469 rows (24.5% of failures, 454 of them
+synthesis) fail `think<think_min` at think_min=500 - the *opposite* direction.
+Synthesis fails this band at both ends.
+
+### F14. `irac_placement` is a deepseek compliance gap; the 08-28 precedent does not transfer
+
+Same forensics: irac_placement fails 63.8% on curated_c2/irac_analysis and 53.6%
+on synthesis/irac_analysis, but only 5.2% on statute_qa - a 15x spread that has
+the exact shape of the 2026-08-28 `irac_placement` drift. It is not that.
+
+- **Model, not task.** Same task, same prompt population: deepseek 63.8-67.8%,
+  gpt-oss 26.8%. All four irac_analysis prompt versions fail 43-78%, so no single
+  bad template edit is responsible.
+- **The 08-28 fix removed a contradiction, it did not restate a rule.** `ebde9a7`
+  dropped a headed-IRAC *answer* mandate that `gates.IRAC_ANSWER_TASK_TYPES` had
+  already stopped requiring for summarization. For irac_analysis the heading
+  mandate is correct and the gate does require it - there is no contradiction to
+  remove. The template already says the rule explicitly ("headings ... never
+  inside your reasoning"); deepseek writes them into `think` anyway.
+- The gate is firing correctly. Sampled failures (gen_id 1438, 166) contain real
+  substantive conclusions under labels inside `think` - the exact "hidden first
+  draft" the gate targets, not false positives.
+
+**No cheap win. Generator swap is foreclosed by the 2026-08-28 allocation
+directive.** Logged, not acted on.
+
+### F15. A template fix must ship as a NEW prompt_id, never as an edit
+
+`task_id_for` hashes `seed|task_type|prompt_id|sample_ix` - **not** `prompt_sha`
+(`tasks.py:239-248`), and `prompt_sha` is written once at plan time
+(`tasks.py:584`) with no re-stamp anywhere. `generate.py:1701` parks a row the
+moment planned_sha != live_sha. So editing `gen_irac_analysis_v4.md` parks every
+task already planned against it as `stale_prompt`, permanently - `--reopen
+stale_prompt` returns it to `pending` where it re-parks on the next claim.
+
+Adding `..._v5` as a new prompt_id instead yields new task_ids, plans cleanly,
+and leaves v4's pending rows generating against an unchanged v4 file. That is the
+only safe shape for any future template fix, and it is why the four existing
+versions exist.
+
+
 ## 6. Constants interrogated
 
 | Constant | Verdict |
