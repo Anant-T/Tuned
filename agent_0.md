@@ -1009,6 +1009,40 @@ then plan Step 6 on the winners. Adding two prose-genre variants dilutes `v4`
 from 25% to 17% of new tasks even if they only perform averagely.
 
 
+### F25. The diagnostic gate is not warning us about the shipped corpus
+
+`self_verification` is the one gate in `DIAGNOSTIC_GATES` (`gates.py:111`):
+recorded, never enforced. Its raw rate looks alarming - it fails **55-56% of
+all summarization generations** - and the obvious reading is that half the
+corpus teaches a trace that never doubts itself, which is the exact habit
+`gates.py:118` says the dataset must not teach.
+
+That reading is wrong, and the right denominator says so. Scored on **the
+generation that actually WON each accepted task** (its highest attempt, which
+is the text that ships):
+
+    stream      task_type        accepted   no cue      %
+    curated_c2  irac_analysis         329       32    9.7%
+    synthesis   irac_analysis         251       18    7.2%
+    synthesis   summarization          52        7   13.5%
+    synthesis   statute_qa             35        0    0.0%
+    synthesis   drafting               20        1    5.0%
+    transition  transition              5        0    0.0%
+    TOTAL                             692       58    8.4%
+
+**91.6% of shipped rows carry a verification cue.** The enforced gates are
+cleaning up the diagnostic one for free: a generation too lazy to doubt itself
+is usually also failing `length_band` or `irac_placement`, so it is regenerated
+for those, and the replacement carries a cue.
+
+So the standing question - should `self_verification` be promoted out of
+`DIAGNOSTIC_GATES`? - answers itself: **no.** Enforcing it would buy at most
+8.4pp of cue coverage and pay for it in regenerations, and `gens/accepted-row`
+is the scarcest thing this build has (F24). Same trap as the 2026-08-31 "12.2%
+clean" reading: the raw diagnostic rate is over ALL generations and measures
+the discard pile, not the corpus.
+
+
 ## 6. Constants interrogated
 
 | Constant | Verdict |
