@@ -2002,10 +2002,17 @@ a task IS its variant. The three tempting actions are all wrong right now:
   baton is held by a running worker continuously - run N+1 starts 2 seconds
   after run N ends. There is no safe window, and a writer against `data/build`
   during a run is the rule this session already broke once.
-- **Dispatching `data-plan` now** would evict itself. It shares the
-  `data-build` concurrency group, which holds one running plus one waiting run,
-  and the 4-hourly cron claims that waiting slot at 12:17Z - cancelling
-  whatever an operator queued behind it.
+- **Dispatching `data-plan` now** costs a worker cycle. CORRECTED later the
+  same day: the original claim here was that it "would evict itself" because
+  the cron claims the waiting slot. That is backwards. The group holds one
+  running plus one waiting, a new pending trigger REPLACES the waiting one, and
+  the queued run starts when the current one ends - which on a 315-minute run
+  is ~40 minutes BEFORE the next cron fires, as the workflow's own comment says
+  it is designed to do. So a `data-plan` dispatch evicts the QUEUED WORKER and
+  then runs normally. Planning is therefore possible at any time; it just costs
+  one ~5.25 h worker cycle. Not worth it while ~27 h of queue remains - and
+  worth it as soon as the top-up in F41 is the thing standing between the
+  corpus and the band.
 
 And it is not urgent: 3,162 synthesis plus 1,592 curated_c2 tasks at ~2.36
 generations each is ~27 hours of fleet work. The recommendation is for the
