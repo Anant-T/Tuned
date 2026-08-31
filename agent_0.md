@@ -562,6 +562,60 @@ parks in 180 generations. Gates remain the ceiling (~8% of generations survive),
 exactly as the 2026-08-28 finding said - not routing, not judging.
 
 
+### F18. Step 5 answered: transition died of the planner bug, and its remainder is a compliance gap
+
+The stream reads as "2,150 rejected against 3 accepted", which looks like a
+catastrophic gate problem. It is two different things, and neither is that.
+
+**96% of it never bought an answer.** Of 2,150 rejected transition tasks, only
+**87 have a generation at all**; **2,063 carry disposition `skip:slots`** -
+`build_prompt` raised SlotError, "the task cannot be rendered from what the seed
+carries", before any teacher was called. Joining task -> seed partitions it
+perfectly, with no overlap:
+
+    transition skip:slots      -> seed declares nothing : 2,063  (100%)
+    transition that generated  -> seed declares transition : 117  (100%)
+
+**That is the planner bug Step 5 already fixed** (`708d455`): `_candidate_seeds`
+offered `transition` - a CLOSED-WORLD stream, whose task is built from the
+seed's META - to seeds that declare no stream and therefore carry no transition
+metadata. `tasks.py:137` had already written down the symptom ("every one died
+`skip:slots` before a teacher was called") without the cause being closed.
+
+**These 2,063 are correctly dead. Do not reopen them** - their seeds cannot
+render a transition prompt, so they would re-die on the next claim, and
+`rejected` is TERMINALLY_DEAD for exactly this reason. The remedy is to re-plan
+transition against the 1,250-seed grid, which the shipped fix now makes the only
+thing the planner can do.
+
+**On the real seeds the yield is still 2.6% (3 of 117), and the blocker is
+`statutory_quotation` at 95.7%** (200 of 209 verdicts):
+
+    statutory_quotation  95.7% | irac_placement 76.1% | length_band 75.1%
+    prompt_echo          40.2% | answer_key     29.7% | temporal      19.6%
+
+The gate is not miscalibrated and is not misscoped - it is **transition-only by
+design**, because that stream's grounding "is not statute text at all", so a
+quoted span attributed to a section cannot be verified against any bare-act
+corpus and is refused whether it was paraphrased or invented. It is a
+`regenerate`, not a permanent gate, and the prompt already forbids the act.
+deepseek quotes statute anyway, in 96% of attempts.
+
+**So this is F14 again, in a second place**: a negative constraint the template
+states plainly and the sole generator does not honour. Together they explain the
+~8% gate survival rate directly - gates are the ceiling, as the 2026-08-28
+finding said, and what they are catching is generator non-compliance rather than
+mistuned thresholds.
+
+**Consequence for Step 6, and it is the useful one:** `source_streams` maps
+`transition: grounded_synthesis` (`data_law_v1.yaml:161`), so transition rows
+compete for the *same* bucket as synthesis and could in principle have closed the
+469-row gap. At 2.6% they cannot - re-planning the whole 1,250-seed grid buys
+roughly 30 accepted rows. **The shortfall has to be closed by synthesis**, which
+is what Step 6 already says. Transition stays a moat feature, not a volume
+source.
+
+
 ## 6. Constants interrogated
 
 | Constant | Verdict |
