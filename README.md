@@ -113,6 +113,14 @@ Operator surface:
 - **Ship a dataset cut**: Actions -> `data-assemble` -> Run workflow. It
   reconciles, verifies, assembles, and pushes to the HF dataset repo only if
   `stats` is green; the `out/` artifacts upload to the baton either way.
+- **Widen the queue**: Actions -> `data-plan` -> Run workflow, with a stream,
+  a target and a mix. This is the only operator path to the remote queue: the
+  worker never plans (it only re-opens parked rows) and `seed-push` refuses
+  once the remote owns the baton. Two things it will not let you get wrong -
+  `n` is a TARGET for the whole stream, not an increment, so re-running the
+  current number inserts nothing; and `mix` has no default, because the
+  shipped one sends 0.25 to `statute_qa`, which has no eligible seeds, and a
+  defaulted wave would quietly come up a quarter short.
 - **Corpus size follows generation**: the chain's first content stage is
   `tuned.data.shape`, which trims the pre-built pools (4,320 replay, 1,700
   curated C1 — both sized for the FINISHED corpus) down to the profile the

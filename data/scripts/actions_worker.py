@@ -958,11 +958,82 @@ def run_assemble(args, root: Path, bundle: Bundle) -> int:
     return rc
 
 
+def run_plan(args, root: Path, bundle: Bundle) -> int:
+    """Widen the queue on the baton, then hand it straight back.
+
+    There was no operator path to the queue at all before this. The worker
+    only ever RE-OPENS parked rows (REOPEN_ON_EMPTY) - it never plans - and
+    `--phase seed-push` refuses once the remote owns the baton, correctly,
+    since it would overwrite the remote with whatever this machine last held.
+    So the only way to widen the queue was to pull the baton by hand and race
+    the cron for it. This phase shares the data-build concurrency group with
+    the worker and the assemble dispatch, so it can never run beside a
+    generating host.
+
+    The planner is a TARGET, not an increment: `--plan-n 12000` tops the
+    stream up to 12,000 live tasks and re-running it inserts nothing, because
+    task_id_for hashes (seed, task_type, prompt_id, sample_ix) and the insert
+    is INSERT OR IGNORE. Terminally dead rows (rejected / stale_prompt /
+    input_ineligible) do not count toward it; recoverable parks do.
+    """
+    from tuned.data.store import Store
+    from tuned.data.verify import live_leases
+
+    pull_and_restore(bundle, root)
+    subprocess.run(
+        [sys.executable, "-m", "tuned.data.reconcile", "--config", args.config], check=False
+    )
+
+    # The same wait-then-refuse run_assemble does, for the same reason and with
+    # the same numbers: a snapshot taken mid-flight carries stamps that are
+    # already most of a lease old, so 120 s is the margin; past it, a lease
+    # still live means a host this job cannot see is holding the baton, which
+    # the concurrency group is supposed to make impossible. Planning only
+    # INSERTs, but the push that carries it home rewrites the whole DB - it
+    # would discard that host's generations, so stop rather than push.
+    waited = 0
+    with Store.open(root / DB_RELPATH) as store:
+        while live_leases(store) and waited < 120:
+            print(f"waiting for {live_leases(store)} live lease(s) to expire...")
+            time.sleep(30)
+            waited += 30
+        still_live = live_leases(store)
+    if still_live:
+        print(
+            f"REFUSING: {still_live} lease(s) still live after {waited}s. Either a "
+            "run died without its finally block (wait out DEFAULT_LEASE_S = 900s "
+            "and re-dispatch) or another host holds this baton right now. A queue "
+            "pushed over it would discard that host's work."
+        )
+        return 5
+
+    argv = [
+        sys.executable, "-u", "-m", "tuned.data.tasks",
+        "--config", args.config,
+        "--stream", args.plan_stream,
+        "--n", str(args.plan_n),
+        "--mix", args.plan_mix,
+    ]
+    print(f"== plan {args.plan_stream} -> target {args.plan_n} ({args.plan_mix}) ==")
+    rc = subprocess.run(argv).returncode
+    if rc != 0:
+        print(f"planner exited rc={rc} - baton NOT pushed, the remote queue is unchanged")
+        return rc
+
+    _push(
+        bundle, root, root.parent / "bundle_out",
+        f"plan: {args.plan_stream} target {args.plan_n}",
+    )
+    return 0
+
+
 def main_parser() -> argparse.ArgumentParser:
     """The CLI surface, separated so tests can read the DEFAULTS the
     unattended run actually uses rather than re-asserting literals."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--phase", required=True, choices=("worker", "assemble", "seed-push"))
+    parser.add_argument(
+        "--phase", required=True, choices=("worker", "assemble", "plan", "seed-push")
+    )
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--hf-repo", required=True, help="private HF dataset repo for the bundle")
     parser.add_argument("--minutes", type=float, default=315)
@@ -992,6 +1063,22 @@ def main_parser() -> argparse.ArgumentParser:
     from tuned.data.judge import DEFAULT_AUDIT_SAMPLE
 
     parser.add_argument("--audit-sample", type=float, default=DEFAULT_AUDIT_SAMPLE)
+    # --phase plan. Named apart from --n-workers so neither can be reached by
+    # an argparse abbreviation of the other.
+    parser.add_argument("--plan-stream", default="synthesis", help="--phase plan: stream to widen")
+    parser.add_argument(
+        "--plan-n", type=int,
+        help="--phase plan: TARGET live-task count for the stream, NOT an increment",
+    )
+    # REQUIRED rather than defaulted, and that is the point. tasks.SYNTHESIS_MIX
+    # sends 0.25 to statute_qa, for which statute_section_eligible refuses every
+    # seed in the store (0 carry a section_text distinct from the seed body), and
+    # 0.00 to drafting, which is parked. A wave planned on the default mix
+    # silently under-fills by a quarter and says nothing.
+    parser.add_argument(
+        "--plan-mix",
+        help="--phase plan: task_type=weight,... REQUIRED - the default mix under-fills",
+    )
     parser.add_argument(
         "--seed-push-clobbers-remote", action="store_true",
         help="allow --phase seed-push to overwrite a remote that already holds a baton",
@@ -1028,6 +1115,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         bundle.push(stage_bundle(root, root.parent / "bundle_out"), "seed: local handoff")
         print(f"seeded {args.hf_repo} from {root}")
         return 0
+    if args.phase == "plan":
+        missing = [
+            flag for flag, value in (("--plan-n", args.plan_n), ("--plan-mix", args.plan_mix))
+            if value in (None, "")
+        ]
+        if missing:
+            print(
+                f"--phase plan needs {' and '.join(missing)}. --plan-n is a TARGET for "
+                "the whole stream (re-running the current number inserts nothing), and "
+                "--plan-mix has no default on purpose: the shipped SYNTHESIS_MIX gives "
+                "0.25 to statute_qa, which has no eligible seeds, so a defaulted wave "
+                "quietly comes up a quarter short."
+            )
+            return 2
+        return run_plan(args, root, bundle)
     if args.phase == "worker":
         return run_worker(args, root, bundle)
     return run_assemble(args, root, bundle)

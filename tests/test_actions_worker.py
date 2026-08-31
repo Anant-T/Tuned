@@ -1304,3 +1304,157 @@ def test_the_job_timeout_still_leaves_the_deadline_room_to_stop_cleanly():
     parsed = actions_worker.main_parser().parse_args(["--phase", "worker", "--hf-repo", "u/r"])
     assert parsed.minutes == 315
     assert timeout - parsed.minutes >= 30, "not enough room for the baton pull and the final push"
+
+
+# --------------------------------------------------------------------------
+# --phase plan: the only operator path to the remote queue.
+# --------------------------------------------------------------------------
+
+def _plan_env(tmp_path, monkeypatch, *, leases=0, planner_rc=0):
+    """Wire main() far enough to reach run_plan without touching a real baton."""
+    api = _RecordingApi()
+    monkeypatch.setattr(actions_worker, "Bundle", lambda repo: _bundle_with(api))
+    monkeypatch.setattr(actions_worker, "pull_and_restore", lambda b, r: None)
+
+    calls: list[list[str]] = []
+
+    def _run(argv, *a, **k):
+        calls.append(list(argv))
+        rc = planner_rc if "tuned.data.tasks" in argv else 0
+        return type("CP", (), {"returncode": rc})()
+
+    monkeypatch.setattr(actions_worker.subprocess, "run", _run)
+
+    pushed: list[str] = []
+    monkeypatch.setattr(
+        actions_worker, "_push",
+        lambda bundle, root, staging, message, **kw: pushed.append(message) or True,
+    )
+
+    import tuned.data.store as data_store
+    import tuned.data.verify as data_verify
+
+    class _Store:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(data_store.Store, "open", staticmethod(lambda p: _Store()))
+    monkeypatch.setattr(data_verify, "live_leases", lambda store: leases)
+
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text("x: 1", encoding="utf-8")
+
+    class _Cfg:
+        class build:
+            workdir = str(tmp_path / "build")
+
+    import tuned.data.config as data_config
+    import tuned.data.paths as data_paths
+
+    monkeypatch.setattr(data_config, "load_build_config", lambda p: _Cfg())
+    monkeypatch.setattr(
+        data_paths, "build_paths",
+        lambda w: type("P", (), {"ensure": lambda self: type("R", (), {"root": tmp_path})()})(),
+    )
+    return cfg_path, calls, pushed
+
+
+def test_plan_refuses_without_an_explicit_mix(tmp_path, monkeypatch, capsys):
+    """The default mix under-fills SILENTLY, so the phase has no default.
+
+    tasks.SYNTHESIS_MIX sends 0.25 to statute_qa, whose seeds
+    statute_section_eligible refuses in their entirety, and 0.00 to the parked
+    drafting stream. A wave planned on it comes up a quarter short and says
+    nothing - which is the failure this refusal exists to make loud.
+    """
+    cfg_path, calls, pushed = _plan_env(tmp_path, monkeypatch)
+    rc = actions_worker.main(
+        ["--phase", "plan", "--hf-repo", "u/r", "--config", str(cfg_path), "--plan-n", "9000"]
+    )
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "--plan-mix" in out and "statute_qa" in out
+    # and it stopped BEFORE the baton moved
+    assert pushed == [] and calls == []
+
+
+def test_plan_refuses_without_a_target(tmp_path, monkeypatch, capsys):
+    cfg_path, calls, pushed = _plan_env(tmp_path, monkeypatch)
+    rc = actions_worker.main(
+        ["--phase", "plan", "--hf-repo", "u/r", "--config", str(cfg_path),
+         "--plan-mix", "irac_analysis=1.0"]
+    )
+    assert rc == 2
+    assert "--plan-n" in capsys.readouterr().out
+    assert pushed == []
+
+
+def test_plan_hands_the_target_and_the_mix_to_the_planner_then_pushes(tmp_path, monkeypatch):
+    """The whole point of the phase: widen the queue ON the baton, in one
+    fenced round trip, rather than on a laptop racing the cron."""
+    cfg_path, calls, pushed = _plan_env(tmp_path, monkeypatch)
+    rc = actions_worker.main(
+        ["--phase", "plan", "--hf-repo", "u/r", "--config", str(cfg_path),
+         "--plan-stream", "synthesis", "--plan-n", "12000",
+         "--plan-mix", "irac_analysis=0.55,summarization=0.45"]
+    )
+    assert rc == 0
+    planner = next(c for c in calls if "tuned.data.tasks" in c)
+    assert planner[planner.index("--stream") + 1] == "synthesis"
+    assert planner[planner.index("--n") + 1] == "12000"
+    assert planner[planner.index("--mix") + 1] == "irac_analysis=0.55,summarization=0.45"
+    # reconcile runs first, exactly as the assemble phase does
+    assert any("tuned.data.reconcile" in c for c in calls)
+    assert len(pushed) == 1 and "12000" in pushed[0]
+
+
+def test_plan_does_not_push_a_queue_the_planner_failed_to_build(tmp_path, monkeypatch, capsys):
+    """A failed planner leaves the REMOTE holding the pre-plan queue, which is
+    only true if nothing is pushed."""
+    cfg_path, calls, pushed = _plan_env(tmp_path, monkeypatch, planner_rc=7)
+    rc = actions_worker.main(
+        ["--phase", "plan", "--hf-repo", "u/r", "--config", str(cfg_path),
+         "--plan-n", "12000", "--plan-mix", "irac_analysis=1.0"]
+    )
+    assert rc == 7
+    assert pushed == []
+    assert "remote queue is unchanged" in capsys.readouterr().out
+
+
+def test_plan_refuses_to_push_over_a_host_that_still_holds_the_baton(tmp_path, monkeypatch, capsys):
+    """Same refusal as run_assemble and for the same reason: planning only
+    INSERTs, but the push that carries it home rewrites the whole DB."""
+    cfg_path, calls, pushed = _plan_env(tmp_path, monkeypatch, leases=2)
+    monkeypatch.setattr(actions_worker.time, "sleep", lambda s: None)
+    rc = actions_worker.main(
+        ["--phase", "plan", "--hf-repo", "u/r", "--config", str(cfg_path),
+         "--plan-n", "12000", "--plan-mix", "irac_analysis=1.0"]
+    )
+    assert rc == 5
+    assert "REFUSING" in capsys.readouterr().out
+    assert pushed == []
+    assert not any("tuned.data.tasks" in c for c in calls)
+
+
+def test_the_plan_workflow_serializes_against_the_worker(tmp_path):
+    """The fence, read off the workflow rather than asserted about it.
+
+    A plan that ran beside a worker would push a queue over the generations
+    that worker had not checkpointed yet. `data-build` is what makes that
+    impossible, and it only works if all three workflows name it.
+    """
+    import yaml
+
+    root = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    groups = {
+        name: yaml.safe_load((root / f"{name}.yml").read_text(encoding="utf-8"))
+        for name in ("data-plan", "data-worker", "data-assemble")
+    }
+    assert {g["concurrency"]["group"] for g in groups.values()} == {"data-build"}
+    assert all(g["concurrency"]["cancel-in-progress"] is False for g in groups.values())
+
+    plan = groups["data-plan"]
+    # Dispatch-only: a planner on a cron would widen the queue unattended.
+    assert set(plan[True]) == {"workflow_dispatch"}
+    inputs = plan[True]["workflow_dispatch"]["inputs"]
+    assert all(inputs[k]["required"] for k in ("stream", "n", "mix"))

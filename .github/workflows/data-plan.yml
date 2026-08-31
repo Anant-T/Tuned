@@ -1,0 +1,64 @@
+# Widen the task queue on the bundle repo's current state: pull the baton,
+# reconcile, plan a wave, push it back. Dispatched by the operator (browser
+# or phone); shares the data-build concurrency group so it serializes against
+# a running worker instead of racing it for the baton.
+#
+# This is the ONLY path from an operator to the remote queue. The worker never
+# plans - it only re-opens parked rows - and `--phase seed-push` refuses once
+# the remote owns the baton, so before this workflow the queue could be
+# widened only by pulling the baton onto a laptop and racing the cron.
+name: data-plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      stream:
+        description: "Stream to widen"
+        required: true
+        default: synthesis
+        type: choice
+        options: [synthesis, transition, curated_c2]
+      n:
+        description: "TARGET live-task count for the stream (not an increment)"
+        required: true
+        type: string
+      mix:
+        description: "task_type=weight,... (no default: statute_qa has no eligible seeds)"
+        required: true
+        default: "irac_analysis=0.55,summarization=0.45"
+        type: string
+
+concurrency:
+  group: data-build
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.repository == 'Anant-T/Tuned'
+    runs-on: ubuntu-latest
+    # Minutes, not hours: the planner is three SELECTs and a batched INSERT.
+    # What dominates is the baton round trip (~565 MB DB down and back up),
+    # and 60 leaves room for a slow hub without letting a hang sit all day.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # cache-dependency-path is REQUIRED here, not decoration: `cache: pip`
+          # defaults to hashing requirements*.txt, this repo has none, and the
+          # step FAILS with "unable to cache dependencies" rather than skipping
+          # the cache. Keyed on pyproject.toml, so editing an extra invalidates.
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: pip install -e ".[build-worker]"
+      - name: Plan the wave
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: >
+          python data/scripts/actions_worker.py --phase plan
+          --hf-repo tantan01/tuned-law-state
+          --plan-stream "${{ inputs.stream }}"
+          --plan-n "${{ inputs.n }}"
+          --plan-mix "${{ inputs.mix }}"
