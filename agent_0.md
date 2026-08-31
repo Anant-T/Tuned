@@ -1659,6 +1659,26 @@ is the strongest confirmation the yield model has had. (Count the batch
 lines with care: `_finish` tails gen.log into its own report, so the last 20
 appear TWICE in the archived log and a naive grep reads 76 batches, not 56.)
 
+#### WATCH ITEM: err ran 4x higher in the next run, and it is not our doing
+
+Run `33381288057` opened at 9 err in its first 14 batches (504 claimed,
+**1.8%**) against the completed run's 9 in 2,016 (**0.45%**). Under the old
+rate the expectation was 2.3, so this is not noise (Poisson p ~ 0.0009).
+
+What it is NOT: a regression from tonight's commits. `git diff 0227bdd..c84fb1f`
+over `src/tuned/data/` and `data/configs/` touches ONLY `push.py` and
+`shape.py` - not `generate.py`, not `tasks.py`, not routing. The generation
+path is identical in both runs, and both served curated_c2 (the `dcb1d8d`
+hand throttle postdates `0227bdd` and `be25afd` reverted it). The difference
+is which TASKS are being worked: the queue is FIFO by rowid per stream, so
+the fleet has drained into a later slice with different seeds.
+
+Not diagnosable from outside the store, for the reason above - and low
+impact: `gen-ok` holds at 34-36 of 36 and `gated-out` at 25-29, so
+throughput is untouched. **Threshold: if err exceeds ~5% sustained, or
+`gen-ok` drops below ~32/36, read the `worker_task_error` events in the
+store.** Below that it is not worth a 565 MB download.
+
 #### `err` in the batch line is NOT a failure rate
 
 It reads like one and it is not. `generate.py:491` increments `stats.errors`
