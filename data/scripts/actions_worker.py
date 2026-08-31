@@ -47,6 +47,7 @@ from typing import Sequence
 # reason: it moved once already in the 2026-08-28 restructure.
 from tuned.data.paths import DEFAULT_CONFIG
 from tuned.data.shape import SHAPED_PREFIX
+from tuned.data.tasks import PLANNABLE_STREAMS
 
 # The streams the fleet may CLAIM. `--stream` becomes claim_tasks(stream=...),
 # so a stream left out here is never served and its planned tasks simply stay
@@ -85,6 +86,12 @@ from tuned.data.shape import SHAPED_PREFIX
 # floor to synthesis - the bucket the corpus is short on. Dropping it too
 # would cut the fleet from 2*n_workers calls in flight to n_workers.
 STREAMS = ("synthesis", "transition")
+# Every stream that can hold a task, served or not - IMPORTED, not restated.
+# Only the run report uses it, to say how much of the queue this run was never
+# going to touch, and a hand-copied list would drift the moment a stream is
+# added: the report would then under-count the throttled backlog and say
+# nothing, which is the failure mode it exists to prevent.
+ALL_STREAMS = PLANNABLE_STREAMS
 DB_RELPATH = Path("state") / "law_v1.sqlite3"
 GRACE_S = 90  # SIGTERM -> this long -> SIGKILL, wide enough for a final fsync
 
@@ -722,6 +729,19 @@ def _finish(
     counts = _task_counts(root / DB_RELPATH)
     if counts is not None:
         report.append("task states: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+        # The line above counts the WHOLE store on purpose - a throttled
+        # stream's backlog is the cue to re-open it. But it then overstates
+        # what this run could ever have done, so where the two diverge, say
+        # both. Silence when they agree: a second number restating the first
+        # is noise in the one readout an operator reads.
+        served = _claimable_in(root / DB_RELPATH, STREAMS) or 0
+        everywhere = _claimable_in(root / DB_RELPATH, ALL_STREAMS) or 0
+        if everywhere > served:
+            report.append(
+                f"  of which {served} claimable in {', '.join(STREAMS)}; "
+                f"{everywhere - served} pending in streams this run does not "
+                f"serve (throttled - see STREAMS)"
+            )
         if not _claimable_in(root / DB_RELPATH, STREAMS):
             report.append(
                 "QUEUE EMPTY - nothing left to claim; re-plan with "

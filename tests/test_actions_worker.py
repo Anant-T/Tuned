@@ -688,7 +688,7 @@ def _store_with(tmp_path, rows):
     conn.execute("CREATE TABLE task (state TEXT, disposition TEXT, stream TEXT)")
     conn.executemany(
         "INSERT INTO task (state, disposition, stream) VALUES (?, ?, ?)",
-        [(state, disposition, "synthesis") for state, disposition in rows],
+        [(r[0], r[1], r[2] if len(r) > 2 else "synthesis") for r in rows],
     )
     conn.commit()
     conn.close()
@@ -736,6 +736,47 @@ def test_a_queue_with_work_left_does_not_claim_to_be_empty(tmp_path, capsys):
     actions_worker._finish(root, [_FakeProc()], ("gen",),
                            gen_died_early=False, final_push_ok=True)
     assert "QUEUE EMPTY" not in capsys.readouterr().out
+
+
+def test_the_report_separates_servable_work_from_a_throttled_backlog(tmp_path, capsys):
+    """`task states:` counts the WHOLE store, which is right - a throttled
+    stream's backlog is the operator's cue to re-open it. On its own, though,
+    it overstates what the run will do: with curated_c2 off STREAMS the live
+    summary reads pending=5,278 while only 3,465 of those are servable. Both
+    numbers have to appear, or the line quietly describes a queue 1,837 rows
+    deeper than the one the fleet can touch.
+    """
+    root = _store_with(tmp_path, [
+        ("pending", None, "synthesis"),
+        ("pending", None, "curated_c2"),
+        ("pending", None, "curated_c2"),
+    ])
+    actions_worker._finish(root, [_FakeProc()], ("gen",),
+                           gen_died_early=False, final_push_ok=True)
+    out = capsys.readouterr().out
+    assert "pending=3" in out, "the whole-store line must not shrink"
+    assert "1 claimable in synthesis, transition" in out
+    assert "2 pending in streams this run does not serve" in out
+
+
+def test_the_backlog_report_covers_every_plannable_stream(tmp_path, capsys):
+    """ALL_STREAMS must track the planner, not a copy of it. If a new stream
+    were added and this list were hand-maintained, the report would silently
+    stop counting its backlog - failing exactly where it is needed."""
+    from tuned.data.tasks import PLANNABLE_STREAMS
+
+    assert set(actions_worker.ALL_STREAMS) == set(PLANNABLE_STREAMS)
+    assert set(actions_worker.STREAMS) <= set(actions_worker.ALL_STREAMS)
+
+
+def test_the_servable_line_is_absent_when_every_stream_is_served(tmp_path, capsys):
+    """It exists to explain a DIVERGENCE. With nothing throttled there is
+    none, and a second count saying the same as the first is noise in the
+    one readout an operator actually reads."""
+    root = _store_with(tmp_path, [("pending", None, "synthesis")])
+    actions_worker._finish(root, [_FakeProc()], ("gen",),
+                           gen_died_early=False, final_push_ok=True)
+    assert "does not serve" not in capsys.readouterr().out
 
 
 def test_logs_are_scoped_per_run_so_the_baton_stops_overwriting_them(monkeypatch):
