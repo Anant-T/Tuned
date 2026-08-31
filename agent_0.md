@@ -1599,6 +1599,37 @@ spent in slot A or B and then be excluded from the tiebreak seat it exists to
 fill. At rpm 2 it could serve ~630 calls in a 315-minute run - ample for
 tiebreaks, nowhere near 393 rows. The config refuted this before I did.
 
+#### The arithmetic for whoever decides, so the call is cheap
+
+Measured on the completed run, not modelled:
+
+    groq spend    qwen +83.2k, gpt-oss +61.7k  = 144.9k for 15 dual judgements
+    per judgement 9.7k groq  +  6.7k cerebras  (gemma already carries one slot)
+    daily groq    ~400k (200k per model)       -> ~41 judgements/day
+    daily accepts ~1,794                       -> SUSTAINABLE SAMPLE = 2.3%
+
+`--audit-sample 0.05` is over-subscribed ~2.2x against the groq budget. That
+is the whole mechanism: the sample spends at 5% until the bucket is dry a
+third of the way into the day, then delivers nothing.
+
+Three options, priced:
+
+- **(a) Accept it.** Free. But then say so in the model card: the accept-rate
+  evidence describes rows generated before ~11:35Z, not the corpus.
+- **(b) Lower `--audit-sample` to ~0.02.** One flag in data-worker.yml, no
+  prompt sha, instantly reversible. The budget then spans the UTC day and the
+  sample becomes REPRESENTATIVE. It buys no extra evidence - still ~40
+  rows/day - it fixes the distribution. Recommended if anything is done.
+- **(c) Add a free judge family.** Nothing is available: bai is excluded by
+  family_separation (it generates every row), groq is the exhausted one,
+  cerebras already carries a slot, mistral is the reserved tiebreak. This
+  needs a NEW free provider, not a re-ordering - I checked the ordering
+  hypothesis and it is already optimal.
+
+Reordering the judge list does NOT help, which is worth stating because it
+looks like it should: gemma is second in `routing.judge` and already takes a
+slot on every judgement, so there is no second groq call to eliminate.
+
 #### Not acted on
 
 Judge routing is a quality decision and the free-fleet ruling is a hard
