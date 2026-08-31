@@ -175,9 +175,10 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 16 | Stop the card claiming a citation check that never ran | **DONE** (F34) |
 | 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
 | 18 | Decide the ceiling remedy | **DONE** - hand throttle shipped, then REPLACED same day by a measured guard (`be25afd`): `STREAMS` lists all three, `served_streams` drops curated_c2 within 150 effective of the ceiling and on any ceiling it cannot measure (F35) |
-| 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **CLOSED - obsolete.** The re-open was the hand throttle's expiry; the guard now decides per run, so there is no date to remember. Live: serving, 466 effective against a 2,050 ceiling (F35) |
-| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, not urgent** - ~27 h of queue left, and a `data-plan` dispatch would be evicted by the 12:17Z cron anyway. Worth ~1.7x the corpus per fleet-hour when it happens (F37) |
-| 21 | Verify the ceiling guard's first live run | **OPEN** - run `33375922778` starts ~12:35Z when `33363831595` ends. Expect `ceiling guard: serving every stream - 466 effective ... ceiling of 2050`, then curated_c2 claims resuming (F35) |
+| 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **CLOSED - obsolete.** The re-open was the hand throttle's expiry; the guard now decides per run, so there is no date to remember. Live: serving, 401 effective against a 2,050 ceiling, 1,499 of headroom (F38) |
+| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, not urgent** - ~27 h of queue left. Worth ~1.7x the corpus per fleet-hour when it happens (F37) |
+| 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - 401 effective ... ceiling of 2050`, then curated_c2 claims (F38, F39) |
+| 22 | Filter IL-TUR-contaminated seeds at PLAN time | **OPEN** - 9.4% of accepted generated rows are burned on seeds decontamination always deletes. No prompt sha changes, so it is cheap; helps only rows planned after it (F38) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
 
@@ -1505,6 +1506,95 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F38. THE TWO GENERATED RETENTION FIGURES WERE A GUESS AND A DEFAULT. BOTH ARE NOW READINGS, AND BOTH WERE OPTIMISTIC
+
+`MEASURED_RETENTION` sizes the whole corpus - an accepted task is not an
+assembled row, and holding the accepted COUNT as the numerator while the chain
+shrinks the denominator is what shipped grounded_synthesis at 27.7% against a
+30.1% target with every stream pool individually on target. Its seven
+file-based figures were readings. Its two GENERATED figures were not:
+
+- `synthesis: 0.857` was labelled in the source, in capitals, `A PLACEHOLDER,
+  NOT A READING` - kept rather than deleted only because deleting it fell back
+  to a HIGHER number on no evidence at all.
+- `curated_c2` had no entry, so it was silently taking `DEFAULT_RETENTION`
+  0.95 - a figure nobody ever measured for it.
+
+Both are now measured, off the first chain to ship 50+ generated rows:
+
+    stream        entered  shipped  retention   was
+    synthesis         447      378      0.846   0.857  (placeholder)
+    curated_c2        491      401      0.817   0.95   (default)
+    transition          5        3       n<50   absent (still absent)
+
+**Both readings came in BELOW the number they replaced**, which is the
+direction that matters: every generated sizing before today was optimistic,
+curated_c2's by 16%.
+
+#### The instrument was checked before it was believed
+
+The table's own comment predicted `--measure` "will reproduce these seven
+numbers off the next completed chain." It did - all seven, to three decimals
+(0.996 / 0.846 / 1.000 / 0.958 / 0.983 / 0.910 / 0.957), off a chain run on a
+store snapshot with pools shipped WHOLE rather than shaped. Seven known
+answers reproduced exactly is what qualifies the two unknown ones; without that
+check this is just a number from a different-looking run.
+
+#### The loss is one decontamination rule, not a spread
+
+Of synthesis's 69 drops and curated_c2's 90, **all but two are
+decontamination** - dedupe took 2 rows and the length cut took 0 - and the
+single largest reason is `case_id:iltur`:
+
+    curated_c2   case_id:iltur   58      synthesis   case_id:iltur   30
+    curated_c2   narrow:bbl      11      synthesis   narrow:bbl      15
+    curated_c2   short:bbl       10      synthesis   short:bbl       14
+
+These are generated rows whose SEED CASE is in the IL-TUR eval set. So:
+
+1. The figures move when the eval corpora move, not when the gates or the
+   templates do. Re-measure after a decontamination corpus changes, not after
+   a prompt edit.
+2. **88 of 938 accepted generated rows (9.4%) were burned on seeds the chain
+   was always going to delete.** That is fleet time spent generating rows that
+   cannot ship. A planner-side seed filter against the IL-TUR case-id set
+   would recover it, and it changes no prompt sha - but it only helps rows
+   planned AFTER it, since pending tasks are already stamped to their seeds.
+   Logged as task 22, not done tonight (see F37 on why nothing writes to the
+   store while a worker holds the baton).
+
+#### What it does to the one-way door
+
+The guard compares an EFFECTIVE count against an effective ceiling, and the
+ceiling is invariant to these two values - it is set by the pools, and it
+stayed at 2,050. Only the numerator moved:
+
+    effective generated-curated   466 -> 401   (491 accepted x 0.817, not x 0.95)
+    headroom to the guard's trip point       1,499 effective rows
+    the door in ACCEPTED terms    ~2,158 -> ~2,509 accepted curated rows
+
+So the door is **further away than F35 said**, by ~350 accepted rows. This is
+the guard being more accurate, not more permissive: the same code, reading a
+measured retention instead of a default nobody fitted. It is also the third
+correction in this file that ran in the safe direction only by luck, which is
+the argument for measuring rather than defaulting.
+
+### F38b. THE ONE-TEACHER CUT TAKES 84 ACCEPTED SYNTHESIS ROWS
+
+Measured on the same chain, and it belongs beside F35's arithmetic. The
+assembly chain arms `verify --require-generator --require-current-prompt`, and
+that cut demotes **531 accepted synthesis rows to 447** - 84 rows, 16%, every
+one of them from a RETIRED provider (`cerebras/gpt-oss-120b` and
+`lightning/lightning-ai/gpt-oss-120b`) under the 2026-08-28 sole-generator
+ruling. `curated_c2` is untouched at 491, so the ceiling guard is unaffected.
+
+The consequence: **wherever this file quotes accepted synthesis, the number
+that reaches the corpus is 16% lower.** F35's band table reads 531 on the
+synthesis axis; the assembling corpus sees 447. Combined with F38's retention
+that is 447 x 0.846 = 378 effective rows from 531 accepted - a 29% total
+haircut between "accepted" and "in the training set", and the single most
+common way this project has mis-sized itself.
 
 ### F37. F36's VARIANT EFFECT IS ONE GATE, AND THE GATE IS RIGHT
 
