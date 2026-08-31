@@ -11,6 +11,7 @@ from tuned.data.config import (
     DifficultyCfg,
     ModelRef,
     TransitionCfg,
+    DEFAULT_COOLDOWN_S,
     load_build_config,
 )
 from tuned.train.config import load_config
@@ -143,6 +144,30 @@ def test_base_fixture_is_valid(tmp_path):
     # the specific mutation, not a broken base doc.
     cfg = load_build_config(_write(tmp_path, _base_doc()), allow_unpinned=True)
     assert cfg.routing.judge_mode == "dual"
+
+
+def test_cooldown_defaults_to_the_historical_300_when_unset(tmp_path):
+    """Every config written before 2026-08-31 omits the key, and must keep the
+    behaviour it had: the Router's own constructor default."""
+    doc = _base_doc()
+    doc["routing"].pop("cooldown_s", None)
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.routing.cooldown_s == DEFAULT_COOLDOWN_S == 300.0
+
+
+def test_cooldown_is_read_from_the_config(tmp_path):
+    doc = _base_doc()
+    doc["routing"]["cooldown_s"] = 60
+    cfg = load_build_config(_write(tmp_path, doc), allow_unpinned=True)
+    assert cfg.routing.cooldown_s == 60.0
+
+
+def test_the_shipped_config_cools_for_a_minute(tmp_path):
+    """The live value, pinned. deepseek's limit is a request-counted per-minute
+    bucket (301 of 2,151 requests refused on 2026-08-29), so five minutes was
+    ~5x the real recovery - see the routing.cooldown_s comment."""
+    cfg = load_build_config(DATA_CONFIG, allow_unpinned=True)
+    assert cfg.routing.cooldown_s == 60.0
 
 
 def test_rule1_unknown_routing_ref_rejected(tmp_path):

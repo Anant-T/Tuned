@@ -1106,3 +1106,27 @@ routing:
   # false collapse refusal more likely. Set it forward, never back, if audit
   # mode is ever restarted against a new fleet.
   judge_mode_since: "2026-08-28T20:17:03.000000Z"
+
+  # HOW LONG A REF STAYS OUT AFTER ITS BREAKER TRIPS. 60, not the 300 that
+  # governed every provider until 2026-08-31, and the difference is measured
+  # rather than guessed: the bai block's rate limit is a REQUEST-COUNTED
+  # per-minute bucket, and budget_ledger recorded 301 429s in 2,151 requests on
+  # 2026-08-29 (14%; 126/1,171 the day before). A per-minute bucket has refilled
+  # after a minute, so five minutes was ~5x the real recovery and bought nothing
+  # but dead air at a 14% refusal rate.
+  #
+  # 300 WAS NEVER CHOSEN. It was providers.Router.__init__'s generic default,
+  # with no config key and all three make_router call sites bare - which is the
+  # whole reason this key exists. DEFAULT_COOLDOWN_S keeps 300 for anything that
+  # does not set it.
+  #
+  # The trip itself is NOT over-eager and breaker_threshold stays at 4:
+  # ChatClient.complete already absorbs six jittered retries honouring
+  # Retry-After under a 120 s sleep budget and a 300 s deadline before ONE
+  # failure is counted, so four consecutive of those is a real outage.
+  #
+  # This is a THROUGHPUT setting, not a safety one. What made a cooldown
+  # dangerous was generate.py parking rows that were never called; that is
+  # fixed at the disposition ladder, and shortening the wait alone would only
+  # have made the crater smaller.
+  cooldown_s: 60

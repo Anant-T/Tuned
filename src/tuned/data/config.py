@@ -173,6 +173,13 @@ class ProviderCfg:
     models: tuple[ModelCfg, ...]
 
 
+# What the fleet cooled for before the value was configurable, and still the
+# Router's own constructor default (providers.Router.__init__) so a Router
+# built directly is unaffected. It was never CHOSEN for any provider - it is a
+# generic breaker default that nothing overrode - which is why it is a config
+# key now: the right wait is a fact about the provider, not about the fleet.
+DEFAULT_COOLDOWN_S = 300.0
+
 @dataclass(frozen=True)
 class RoutingCfg:
     generator: tuple[str, ...]
@@ -192,6 +199,9 @@ class RoutingCfg:
     # when it is 56 pre-audit verdicts. Read by audit_readout.summarize's
     # `since` and by the collapse gate that acts on it.
     judge_mode_since: str | None
+    # Seconds a ref stays out after its breaker trips. Defaulted, so every
+    # existing config and fixture keeps the historical 300 s.
+    cooldown_s: float = DEFAULT_COOLDOWN_S
 
 
 @dataclass(frozen=True)
@@ -970,6 +980,7 @@ def load_build_config(path: str | Path, *, allow_unpinned: bool = False) -> Buil
         judge_mode=r["judge_mode"],
         judge_collapse_floor=r.get("judge_collapse_floor", DEFAULT_JUDGE_COLLAPSE_FLOOR),
         judge_mode_since=r.get("judge_mode_since", DEFAULT_JUDGE_MODE_SINCE),
+        cooldown_s=float(r.get("cooldown_s", DEFAULT_COOLDOWN_S)),
     )
 
     # build.train_config is repo-root-relative, same convention the tests
