@@ -1546,7 +1546,13 @@ buy 33 fixture edits made while nobody is awake to review them.
    `test_the_supervisor_default_sample_is_the_judges_own_constant` already
    applies to `DEFAULT_AUDIT_SAMPLE`).
 
-Step 1 is worth doing on its own merits even if the default never moves.
+Step 1 has a trap worth naming before anyone starts it: a fixture that builds
+its corpus FROM `cfg.assembly.targets()` and is then graded AGAINST those same
+targets is tautological - it passes whatever the lookup returns and can no
+longer catch a targets bug. The hardcoded 60 / 16 / 24 is at least a concrete
+second opinion. So step 1 is "derive the fixture, keep an independent assertion
+on the numbers", not a blind substitution, and it is NOT obviously worth doing
+on its own merits.
 
 ### F46. THE VARIANT EFFECT, MEASURED PER TASK: v1 64%, v4 28%
 
