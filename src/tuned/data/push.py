@@ -553,15 +553,28 @@ def render_card(
             count = items if items is not None else 0
             lines.append(f"- **{script}** - not screened ({why}); {count} eval item(s)")
     lines.append("")
-    lines.append("## The BNS Section 358 transition stream")
-    lines.append("")
-    lines.append(
-        "A dedicated stream teaches the IPC-to-BNS recodification directly: which offence "
-        "family governs depending on the offence date relative to the appointed day, and "
-        "which procedural code (BNSS vs CrPC, BSA vs Evidence Act) applies at each stage from "
-        "FIR through appeal. Answer keys are derived from statute text and the audited "
-        "IPC-to-BNS mapping table, never model-generated."
+    # SIZED, AND OMITTED AT ZERO. This section used to render unconditionally,
+    # which made a stream that ended with 5 accepted rows out of ~5,000 read
+    # like a headline feature of the corpus. A reader choosing this dataset
+    # BECAUSE of the transition is the reader most harmed by that, so the count
+    # is stated and the section disappears entirely when nothing shipped - the
+    # same rule the mix and licence tables already follow: say what is there,
+    # never what was intended.
+    n_transition = sum(
+        1 for r in rows if ((r or {}).get("_prov") or {}).get("task_type") == "transition"
     )
+    if n_transition:
+        lines.append("## The BNS Section 358 transition stream")
+        lines.append("")
+        lines.append(
+            f"{n_transition} of the {rows_total} rows come from a dedicated stream teaching "
+            "the IPC-to-BNS recodification directly: which offence family governs depending "
+            "on the offence date relative to the appointed day, and which procedural code "
+            "(BNSS vs CrPC, BSA vs Evidence Act) applies at each stage from FIR through "
+            "appeal. Answer keys for that stream are derived from statute text and the "
+            "audited IPC-to-BNS mapping table, never model-generated - though an answer key "
+            "constrains which sections an answer must cite, not which conclusion it reaches."
+        )
     # P1.7: the audit-mode disclosure the card owes its reader. Fixed prose,
     # not a measured section - like "Known risk" below, it states a fact
     # about the PIPELINE'S policy, not a number pulled from this run's stats
@@ -574,8 +587,9 @@ def render_card(
     lines.append("")
     lines.append(
         "This corpus is gate-qualified, not judge-calibrated. Under this pipeline's audit "
-        "judge mode, most rows ship on automated gate checks alone (format, citation "
-        "existence, length, license); only a hash-selected fraction of rows also receives a "
+        "judge mode, most rows ship on automated gate checks alone (format, length, "
+        "licence, temporal validity, and the citation checks described in the next section); "
+        "only a hash-selected fraction of rows also receives a "
         "dual-judge accept/reject verdict from two independent judge models, and that "
         "fraction is the only quality evidence for the rows that shipped on gates alone. The "
         "dual-judged sample's accept rate is DESCRIPTIVE - a measurement of that sample - not "
@@ -598,8 +612,8 @@ def render_card(
         "that owe a headed answer, only above a measured threshold, and never where the "
         "cut would leave the answer under its own length floor. The trace is untouched. "
         "The full generation as the teacher returned it remains in the build store, which "
-        "does not ship, so the trim cannot be undone from the published rows; each row "
-        "carries the number of characters cut from it."
+        "does not ship, so the trim cannot be undone from the published rows; each "
+        "generated row carries the number of characters cut from it."
     )
     lines.append("")
     lines.append(
@@ -607,12 +621,35 @@ def render_card(
         "so the gate and the assembler agree about what a row is. Rows are therefore "
         "admitted on the size of the text the corpus actually holds."
     )
+    lines.append("")
+    lines.append("## What the citation gate checks, and what it does not")
+    lines.append("")
+    lines.append(
+        "The citation gate has two halves and they are not equally strong. The SUSPECT half "
+        "reads citation-shaped strings in the reporter formats the index does not model and "
+        "refuses the ones that cannot be reconciled with the materials the generator was "
+        "shown; it needs no index and always runs. The EXISTENCE half asks a corpus index "
+        "whether a cited authority exists at all, and it runs only where a citation index is "
+        "present in the build. Where none is, the gate records the row as "
+        "`novel_skipped: no-index`, and this pipeline reads such a row as unverified rather "
+        "than passed - so this card does not count it as a check the row survived. Treat a "
+        "cited authority in this corpus as unverified unless you have checked it."
+    )
+    lines.append("")
+    lines.append(
+        "Neither half is a check that a citation is APT. The strongest thing the existence "
+        "half can say is that an authority is real, never that it supports the proposition "
+        "it was cited for, and no gate in this pipeline reads a citation for that."
+    )
+    lines.append("")
     lines.append("## Known risk: teacher legal error")
     lines.append("")
     lines.append(
         "Teacher-generated reasoning and answers can be legally wrong in a way none of the "
-        "automated gates catch (citation existence, temporal validity, format, length and "
-        "judge scores all pass a plausible-sounding wrong answer). The mitigation is human: "
+        "automated gates catch (temporal validity, format, length and judge scores all pass "
+        "a plausible-sounding wrong answer, and the citation checks above speak to whether an "
+        "authority is real, never to whether the reasoning around it is right). The mitigation "
+        "is human: "
         "an operator reads 50 random accepted examples before the corpus ships - the only "
         "legal-accuracy check in this pipeline - and this residual risk is accepted and "
         "disclosed here rather than assumed away."

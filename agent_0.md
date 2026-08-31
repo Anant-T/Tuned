@@ -63,6 +63,12 @@ decision - no breakage anywhere.**
   corpus) were refused on characters the corpus would never hold (F32).
 - The cron was **measured, not changed**: fires are late, never lost (F26).
 
+**The card claimed a citation check that has run on zero rows** - 1,875 of
+1,875 accepted rows carry `novel_skipped: no-index`, so the existence half has
+never run, and the card listed it among the gates a row ships on. Corrected
+tonight; the gate itself cannot be armed without a citation index, whose
+coverage is 4.7% (F34).
+
 **One legal error is in the corpus.** Accepted row `412b8d1c5430` puts an appeal
 under the BNSS where its own answer key says the CrPC continues to govern - it
 cites all four required sections, so a permanent gate passed it. `check_answer_key`
@@ -166,6 +172,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 11 | Stop shipping the answer's second deliberation | **DONE** `fb611f5` (F28) |
 | 12 | Build the 50-example review packet the card requires, and pre-screen it | **DONE** `4505840` - reproducible CLI, 4/50 flagged (the first 12/50 was a screen bug, F29) |
 | 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it. The 5 transition rows are already read: 1 is wrong (F30) |
+| 16 | Stop the card claiming a citation check that never ran | **DONE** (F34) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
 
@@ -1420,6 +1427,84 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F34. The dataset card claimed a citation check that has run on ZERO rows
+
+The card told its reader, twice, that rows ship having passed "citation
+existence". Measured on the live store:
+
+    accepted rows with a `citations` gate result   1,875
+      existence half SKIPPED (novel_skipped)       1,875   (100%, all "no-index")
+      existence half actually checked                  0
+
+Not "mostly skipped". **Never run, on any row that has ever shipped.**
+
+This is not an inference. `check_citations` returns
+`{"novel": None, "novel_skipped": "no-index", "suspect": [...]}` whenever
+`ctx.citation_index is None`, and passes on the suspect channel alone. And
+`gates.py`'s module docstring already made the reading rule mandatory, in
+capitals, before I found this: *"a stored gate_result carrying novel_skipped
+must be read as 'unverified', never as 'passed'."* The card was reading it as
+passed.
+
+It matters more here than the count suggests. Citation existence is the one
+claim a reader of an INDIAN-LAW corpus checks first, and F29 independently
+found 4 of 50 sampled rows citing an authority their source never names. A card
+that claims the check ran is worse than a card that stays silent, because it
+tells a reader not to look.
+
+**Fixed in the prose, not in the pipeline, and that is the right scope.** The
+truthful version now names both halves, states the condition on the strong one,
+and does not count a skipped half as a check survived:
+
+- the SUSPECT half - citation-shaped strings in reporter formats the index does
+  not model, diffed against the grounding so a cite carried IN is not counted
+  as an invention - needs no index and always runs. Verified against
+  `citations.suspect_citations` before writing it onto a public card;
+- the EXISTENCE half runs only where an index is present, and where it is not
+  the row is `novel_skipped: no-index` and reads as unverified;
+- and a limitation that survives even WITH an index: existence is not aptness.
+  The strongest thing the gate can say is that an authority is real, never that
+  it supports the proposition it was cited for. The "Known risk" section said
+  citation existence was among the gates a wrong answer sails through, which
+  implied the gate had run; it now says what is actually true.
+
+**Why not just arm the gate.** Building the index is not a prose fix and cannot
+be validated unattended: the 2026-08-31 audit put its coverage at 4.7% of
+citations, and arming an index that thin turns a permanent `citations` reject
+into the default outcome for correct citations. The card change is honest at
+any coverage; arming the gate needs a coverage measurement first.
+
+Card prose only - no `PUSH_VERSION` bump, following the P1.7 precedent in
+`push.py` (README text changes nothing in `build_manifest.json`'s shape).
+
+#### Two more claims audited in the same pass, both corrected
+
+Having found one, I read every sentence of the rendered card against the code
+rather than stopping at the finding:
+
+1. **The transition section rendered unconditionally.** "A dedicated stream
+   teaches the IPC-to-BNS recodification directly" is a headline feature claim,
+   and the stream ended with **5 accepted rows** (F22). At ~5,000 rows that is
+   0.1% - and the reader most harmed by the overstatement is exactly the one
+   choosing this dataset BECAUSE of the transition. The section is now counted
+   from the shipped rows (`_prov.task_type`, over train + eval, so the number
+   is exact rather than sampled) and **disappears entirely at zero**. It also
+   now says the thing F30 proves: an answer key constrains which sections an
+   answer must cite, not which conclusion it reaches.
+2. **"each row carries the number of characters cut from it"** was wrong about
+   four fifths of the corpus. `answer_preamble_dropped` is written in
+   `decontaminate.py:1196`, in the GENERATED-row branch only; curated and
+   replay rows have no such field and are never trimmed. Now "each generated
+   row".
+
+**Left alone, deliberately:** the card says "an operator reads 50 random
+accepted examples before the corpus ships". The pipeline does not enforce that,
+and Task 13 is still open - but `push.py` runs only at the end of an
+operator-dispatched `data-assemble`, so there IS a human at the ship, and F20
+already says not to dispatch it yet. Recorded rather than rewritten: turning it
+into an enforced attestation would change the ship path, and that is the
+operator's call, not one to take while they are asleep.
 
 ### F33. The allowlist existed and could not be reached, and Step 6 is now one dispatch
 

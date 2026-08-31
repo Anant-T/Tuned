@@ -1297,3 +1297,62 @@ class _PushCfg:
     repo_id = "x/y"
     private = True
     card_extra = None
+
+
+def test_render_card_does_not_claim_citations_were_checked_against_a_corpus():
+    """The card listed "citation existence" among the gates rows ship on.
+
+    Measured on the live store 2026-08-31: 1,875 of 1,875 accepted rows carry
+    `novel_skipped: no-index`, so the existence half has run on NONE of them.
+    gates.py's own docstring is unambiguous - "a stored gate_result carrying
+    novel_skipped must be read as 'unverified', never as 'passed'" - and a
+    legal corpus is judged on exactly this claim, so the card may not make it.
+    """
+    report, decon, rows, push_cfg, versions = _card_fixture()
+    card = render_card(report=report, decon=decon, rows=rows, push_cfg=push_cfg, versions=versions)
+    assert "citation existence, length, license" not in card, (
+        "the card still lists an existence check among the gates rows ship on"
+    )
+    assert "## What the citation gate checks" in card
+    # The two halves, named, with the condition on the strong one.
+    assert "novel_skipped" in card and "no-index" in card
+    assert "unverified rather than passed" in card
+    # And the limitation that survives even WITH an index: existence is not support.
+    assert "never that it supports the proposition" in card
+
+
+def test_render_card_omits_the_transition_section_when_no_such_row_shipped():
+    """The section is a headline feature claim, and it used to render
+    unconditionally.
+
+    `transition` planned 2,200 tasks and ended with 5 accepted rows against a
+    ~5,000-row corpus. A card that describes "a dedicated stream teaches the
+    IPC-to-BNS recodification" without saying how much of the corpus that is
+    misleads by prominence - a reader choosing this dataset BECAUSE of the
+    transition would get 0.1% of what the section promises.
+    """
+    report, decon, rows, push_cfg, versions = _card_fixture()
+    assert not any((r.get("_prov") or {}).get("task_type") == "transition" for r in rows)
+    card = render_card(report=report, decon=decon, rows=rows, push_cfg=push_cfg, versions=versions)
+    assert "transition stream" not in card
+    assert "358" not in card
+
+
+def test_render_card_sizes_the_transition_section_when_such_rows_shipped():
+    report, decon, rows, push_cfg, versions = _card_fixture()
+    rows = rows + [
+        row("q", "a", source="synthesis", license="CC-BY-4.0", task_type="transition")
+        for _ in range(7)
+    ]
+    card = render_card(report=report, decon=decon, rows=rows, push_cfg=push_cfg, versions=versions)
+    assert "## The BNS Section 358 transition stream" in card
+    # the size, stated - not left for the reader to assume
+    assert "7 of the" in card and "never model-generated" in card
+
+
+def test_render_card_scopes_the_trim_note_to_generated_rows():
+    """Curated and replay rows carry no answer_preamble_dropped and are never
+    trimmed, so "each row" was wrong about four fifths of the corpus."""
+    report, decon, rows, push_cfg, versions = _card_fixture()
+    card = render_card(report=report, decon=decon, rows=rows, push_cfg=push_cfg, versions=versions)
+    assert "each generated row carries the number of characters cut" in card
