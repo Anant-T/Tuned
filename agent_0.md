@@ -179,6 +179,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, SIZED at ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41). **Do NOT dispatch yet:** the claim is FIFO by rowid, so a wave planned now is worked LAST and the dispatch costs up to ~4 h of idle fleet. Trigger is queue depth (< ~1,000 pending synthesis), not the clock (F43). **Command rehearsed and corrected (F45): `--n` counts the LIVE arm-NULL queue, so it is `<live> + 780` - the stream total over-plans 2.3x** |
 | 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - 401 effective ... ceiling of 2050`, then curated_c2 claims (F38, F39) |
 | 22 | Filter IL-TUR-contaminated seeds at PLAN time | **CLOSED - wrong fix.** The drops are co-citation, not contamination: 0 of 88 match the eval item's own case. A seed filter would implement the over-firing and cost 9.6% of the pool for no integrity gain (F40) |
+| 26 | OPERATOR DECISION: retire the pending v2/v4 irac tasks and replan them on v1/v3 | **OPEN, sized at ~182 accepted rows (~37% of the shortfall) for zero extra fleet time.** Needs a cancel/park command that does not exist yet, plus a park state that frees queue capacity honestly. F37's "no safe window" objection is superseded - `--phase plan` shows the pattern (F46) |
 | 25 | OPERATOR DECISION: turn off the row-side case_id channel (`--no-case-id-from-text`) | **OPEN** - recovers 81 generated rows (~9%) with exact containment untouched; deferred because it is an eval-integrity call and the rows are recoverable retroactively, so waiting costs nothing (F40) |
 | 23 | Re-fit `synthesis` retention after the teacher purge lands, or teach `generated_counts` to skip rows the cut will take | **CLOSED - neither is needed.** The shipping chain runs `verify` immediately before `shape` over one DB and verify writes the demotion back, so production sizing already reads a post-demotion store. Only an ad-hoc `--headroom` run outside the chain sees the inflated count, and the guard reads the curated bucket, which has no teacher cut (F44) |
 | 24 | Citation-existence half | **CLOSED** - index exists, is on the baton, is armed live, costs 8 rows of 943, and all 8 were already dropped by the chain (F39) |
@@ -1509,6 +1510,52 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F46. THE VARIANT EFFECT, MEASURED PER TASK: v1 64%, v4 28%
+
+F36 and F37 measured the variant effect per GENERATION. Sizing a wave needs it
+per TASK, because a task may spend up to three attempts. Read off the whole
+synthesis irac population (arm IS NULL), forward-valid denominator - the same
+`accepted / (accepted + rejected + format_parked)` F41 settled on:
+
+    prompt_id                 acc   rej  park   yield/task   pending
+    gen_irac_analysis_v1      146    46    35      64.3%        350
+    gen_irac_analysis_v3      105    24    58      56.1%        322
+    gen_irac_analysis_v2       80    47    64      41.9%        361
+    gen_irac_analysis_v4       60    50   108      27.5%        355
+    ALL irac                  391   167   265      47.5%
+
+n = 187-227 per arm, and the ordering is F36's and F37's exactly - v1 > v3 > v2
+> v4 - now on a third independent instrument. **v1 is 2.3x v4 per task.**
+
+**This confirms F41's sizing rather than moving it.** F41 costed the top-up two
+ways: ~1,279 tasks at the pooled 38.6%, or ~780 on v1+v3. The v1/v3 mean here is
+~60.5%, and 780 x 0.605 = 472 accepted against the 494 the shortfall asks for.
+The two numbers were derived from different instruments and they agree.
+
+#### The unclaimed prize in the queue, sized - and NOT taken
+
+716 of the pending irac tasks are on the two worst templates (v2 361, v4 355).
+Worked as they stand they return `361 x 0.419 + 355 x 0.275 = ~249` accepted.
+The same 716 tasks on v1/v3 would return `~431`. **The swap is worth ~182
+accepted synthesis rows - about 37% of the whole shortfall - for the same fleet
+time**, and slightly less token spend, since the better templates retry less.
+
+It is not taken tonight, and the reason is not the one F37 gave. **F37 said
+there is "no safe window" because a worker holds the baton continuously. That is
+now wrong**: `--phase plan` established the pattern - pull, reconcile, wait out
+the leases, refuse if a host is still live, act, push - inside the `data-build`
+concurrency group. A park phase could be exactly as safe. The real reasons are:
+
+- **No such command exists.** `tuned.data.tasks` plans and re-opens; there is no
+  cancel/park path, so this is new code plus a new CI phase.
+- **It destroys queued work**, and it needs a state to destroy it INTO: a park
+  that is not in `TERMINALLY_DEAD` still occupies queue capacity against
+  `--plan-n`, and none of the three dead states honestly means "the operator
+  retired this template".
+- **It is an optimisation, not a blocker.** The top-up alone closes the
+  shortfall; this would close a third of it again, sooner. Worth doing awake,
+  not asleep.
 
 ### F45. `--plan-n` IS MEASURED AGAINST THE LIVE QUEUE, AND THE OBVIOUS READING OVER-PLANS BY 2.3x
 
