@@ -1637,8 +1637,28 @@ re-run with the real index before promotion) was implemented and is live.
 **And the 8 rows were free.** All eight had already been dropped by
 decontamination or dedupe - 0 of 8 appear in the assembled corpus. The
 existence half has, so far, rejected nothing the chain was not rejecting
-anyway. That is a reason to keep it armed, not to relax it: it is currently
-costing zero rows to hold a real guarantee.
+anyway.
+
+**But do not read those 8 as caught fabrications.** Every one of them failed on
+an SCC or AIR citation - `(1999) 3 SCC 231`, `AIR 1960 SC 980`, `(2013) 1 SCC
+641`, `AIR 1954 SC 569` - and the index is **INSC 37,995 + SCR 30,601 + 7,642
+other, with ZERO SCC and ZERO AIR**. So an SCC or AIR citation the model
+introduces beyond its grounding is flagged novel BY CONSTRUCTION, whether it is
+genuine or invented. The gate cannot tell those two apart in the two reporters
+the corpus actually cites most.
+
+The correct summary is narrower than "arming it is safe":
+
+- The prediction it would reject ~95% of genuine citations was wrong by two
+  orders of magnitude, and wrong for a specific reason worth keeping - it
+  reasoned from index COVERAGE and did not account for `novel_citations`
+  exempting anything the grounding already carries.
+- Arming it is nearly free (8 rows, all already dropped) and should stay
+  armed: it is a live tripwire on citations invented outside the materials.
+- It is NOT evidence of citation soundness, and its pass rate must never be
+  quoted as such - the same caution already recorded for the 99.2% `citations`
+  pass rate, for the same reason. Extending the index to SCC and AIR is what
+  would turn it into a real guarantee.
 
 ### F39b. THE RETENTION TABLE AND ITS CALLER USE DIFFERENT DENOMINATORS
 
