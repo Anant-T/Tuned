@@ -1510,6 +1510,51 @@ the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
 
+### F42. THE SHIPPING GATE IS RED ON THREE COUNTS AND THEY ARE ALL ONE CAUSE
+
+`stats` returns 1 on RED and the chain breaks there, so a RED corpus means
+`push.py` never runs and nothing reaches the hub. It has been carried as a
+standing risk ("mix gate likely RED at v1.0-MVP") without anyone reading the
+report. Run on the fully-armed corpus (6,592 rows, teacher cut + citation half
+armed, pools shipped WHOLE):
+
+    chain        PASS   custody complete
+    length       PASS   p50 2617 / p90 5655 / p99 7175, max 8096 of 8192
+    mix          FAIL   replay 64.9% (target 42), grounded_synthesis 5.7% (30),
+                        curated 29.4% (28) - off by +22.94pp and -24.38pp
+    trace        FAIL   63.3% carry reasoning traces, floor 80%
+    empty_think  FAIL   36.7% byte-exact empty think, window [18%, 20%]
+    dup          PASS   0.0%
+    markup       PASS   no '<|' in any row
+    license      PASS   Apache-2.0 5588, MIT 315, ODC-BY 273, CC-BY-4.0 252, CC0 161
+    cross_code   PASS   0 rows name BNS/BNSS/BSA with pre-transition provenance
+
+**The three failures are one fact wearing three hats.** The corpus is
+replay-dominated because the pools shipped whole, and `replay/nothink` is 1,200
+rows of the 1,200-row binding pool - so replay floods the mix (+22.94pp), those
+rows carry no trace (63.3% against an 80% floor), and they are byte-exact empty
+think (36.7% against a 20% ceiling). One cause, three gates. `assemble_argvs`
+says exactly this in its docstring; this is the reading that confirms it.
+
+**What matters is what is NOT red.** Every gate that is independent of corpus
+SIZING passes: custody, length, duplicates, markup, licence, cross-code. There
+is no second blocker hiding behind the expected one - which is the only thing
+this run could have told us that the docstring did not.
+
+So the shipping path is gated on exactly one thing: getting the corpus inside
+the band so `shape` runs. `shape` trims `replay/nothink` against
+`DEFAULT_EMPTY_TARGET = 0.19`, which is the midpoint of the empty_think
+window, and solves the mix simultaneously - the three gates resolve together or
+not at all. That makes F41's ~780-task top-up the whole of the remaining
+shipping work, and F38's retention re-fit load-bearing for it: `shape` aims at
+these targets THROUGH the retention table, so a table that was 16% optimistic
+on curated was aiming the shaper at the wrong point.
+
+**One known non-blocker, re-confirmed live.** `markup` PASSes while all 575
+aalap rows carry Llama-2 `<s> [INST] <<SYS>>` markup, because the gate only
+tests for the ChatML `<|` prefix. Already recorded; still true; still not a
+gate failure.
+
 ### F41. THE QUEUE AS PLANNED DOES NOT REACH THE BAND, AND THE TOP-UP IS ~780 TASKS
 
 The ceiling guard stops the corpus becoming UNASSEMBLABLE. It says nothing
