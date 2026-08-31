@@ -177,7 +177,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 18 | Decide the ceiling remedy | **DONE** - hand throttle shipped, then REPLACED same day by a measured guard (`be25afd`): `STREAMS` lists all three, `served_streams` drops curated_c2 within 150 effective of the ceiling and on any ceiling it cannot measure (F35) |
 | 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **CLOSED - obsolete.** The re-open was the hand throttle's expiry; the guard now decides per run, so there is no date to remember. Live: serving, 401 effective against a 2,050 ceiling, 1,499 of headroom (F38) |
 | 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, SIZED at ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41). **Do NOT dispatch yet:** the claim is FIFO by rowid, so a wave planned now is worked LAST and the dispatch costs up to ~4 h of idle fleet. Trigger is queue depth (< ~1,000 pending synthesis), not the clock (F43). **Command rehearsed and corrected (F45): `--n` counts the LIVE arm-NULL queue, so it is `<live> + 780` - the stream total over-plans 2.3x** |
-| 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - 401 effective ... ceiling of 2050`, then curated_c2 claims (F38, F39) |
+| 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - ~400 effective ... ceiling of 2050`, then curated_c2 claims - which DO resume despite every curated row sitting behind 3,162 synthesis rows by rowid, because claiming is per-stream (F38, F39, F43) |
 | 22 | Filter IL-TUR-contaminated seeds at PLAN time | **CLOSED - wrong fix.** The drops are co-citation, not contamination: 0 of 88 match the eval item's own case. A seed filter would implement the over-firing and cost 9.6% of the pool for no integrity gain (F40) |
 | 26 | OPERATOR DECISION: retire the pending v2/v4 irac tasks and replan them on v1/v3 | **OPEN, sized at ~182 accepted rows (~37% of the shortfall) for zero extra fleet time.** Needs a cancel/park command that does not exist yet, plus a park state that frees queue capacity honestly. F37's "no safe window" objection is superseded - `--phase plan` shows the pattern (F46) |
 | 25 | OPERATOR DECISION: turn off the row-side case_id channel (`--no-case-id-from-text`) | **OPEN** - recovers 81 generated rows (~9%) with exact containment untouched; deferred because it is an eval-integrity call and the rows are recoverable retroactively, so waiting costs nothing (F40) |
@@ -1710,8 +1710,22 @@ weighting and no shuffle - the queue is FIFO by rowid. `task_id` is a TEXT
 hash, so it does not alias rowid, and rowid is therefore plain insertion
 order. Two consequences:
 
-- Tasks planned tonight sit BEHIND all ~4,750 already pending. At ~2.36
-  generations each that is ~27 h of fleet work in front of them.
+- Tasks planned tonight sit BEHIND every pending task IN THEIR OWN STREAM -
+  3,162 of them for synthesis. **The queue is one FIFO per stream, not one
+  FIFO**: `generate.py:2228` runs `for stream in streams: claim_tasks(...,
+  stream=stream)`, giving each `--stream` a guaranteed `n_workers` slice per
+  pass before a top-up walks them in order for the remainder. So the 1,592
+  pending curated_c2 rows are NOT in front of a new synthesis task - but all
+  3,162 pending synthesis rows are, and the queue as a whole is ~27 h of
+  fleet work.
+
+  Measured, because the single-FIFO reading is tempting and wrong in the
+  other direction too: ordered by rowid, the first 3,162 pending rows are
+  synthesis and every curated_c2 row is behind them. Under one shared FIFO
+  curated_c2 would never be claimed at all until synthesis drained - which
+  would have made task 21 look like a guard failure when it is nothing of
+  the kind. Per-stream claiming is what makes "serving every stream" mean
+  what it says.
 - They also sit behind the RE-OPENED rows. A re-open is an UPDATE, not an
   insert, so a `gen_unroutable` row keeps its original low rowid and jumps
   ahead of anything planned later. `REOPEN_ON_EMPTY` therefore feeds the fleet
