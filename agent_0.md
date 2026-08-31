@@ -1587,6 +1587,58 @@ At that mix the fleet pays 5.10 generations per clean row. On v1+v3 only it
 would pay ~3.0 - **about 1.7x the corpus for the same fleet**, or ~128
 gate-passing rows/hour against today's ~75.
 
+#### The other three gates are right too - I checked all four
+
+A gate fix is FREE and a template fix is expensive: gate thresholds live in
+config and change no prompt sha, while editing a template re-stamps it and
+parks every pending task on it. So an over-firing gate would have been the
+cheapest win available. There is none. All four checked:
+
+- **`banned_meta` (100 failures)** - every one is the single phrase "the
+  excerpt". No template mentions the word (`grep` = 0 across all four irac
+  templates), so the model volunteers it: it refers to the material it was
+  handed as a document. At inference there is no excerpt, which is precisely
+  what the gate exists to stop. Correct.
+- **`prompt_echo` (94)** - 69 are echoed instruction spans, 29 a restated
+  opening. One echoed span is `"never write as though the matter had been
+  handed to you as a text"` - the model reciting the template's own
+  prohibition back into the answer. Correct, and a second instance of the F37
+  rule: stating a prohibition is not enforcing it.
+- **`length_band` (152)** - `think>think_max` 138, `total>total_max` 86,
+  `think<think_min` 8. **Not unsatisfiable**: prompt + think_min + answer_min
+  exceeds total_max on 0 of 428, and a think at the 4,500 cap fails to fit on
+  only 7%. prompt_est runs p50 1,527 / p90 3,229 / max 4,669 against 8,192, so
+  the budget is not being eaten by the prompt.
+- **`irac_placement`** - four separate checks above.
+
+#### think_max: measured, positive, and deliberately NOT taken
+
+Since trace length is not steerable by prompt, the only lever on the 138
+`think>think_max` failures is the cap. Raising it saturates, because
+`total<=8192` takes over:
+
+    think_max   passes length_band   as SOLE blocker -> clean rate
+       4500          276 / 428        (baseline)        19.6%
+       5000          300              +3                20.3%
+       5500          316              +6                21.0%
+       6000          328              +8                21.5%
+       6500          333              +9                21.7%
+       7000          333              (no further gain)
+
+So 4500 -> 6000 is worth **+9.5% relative throughput**. Not taken, for three
+reasons. It is the *second* lever, and the variant allocation above is worth
++70% for no quality cost at all - spending the quality budget on the smaller
+one first is backwards. `think_max` has already ratcheted 3,000 -> 4,000 ->
+4,500 chasing yield, and each raise buys volume with trace discipline. And
+longer traces cost tokens per epoch against a corpus already budgeted at
+~37-50M tokens per epoch on a quota-week.
+
+Recorded rather than done, so the next person to want throughput finds the
+number already measured and does not re-derive it: **the cap is worth ~+9.5%
+if it is ever the right thing to spend.** It changes no prompt sha, so it can
+be taken at any time - and `REOPEN_ON_EMPTY` re-opens `format_parked` rows, so
+previously parked generations would get a second chance under the wider band.
+
 #### What NOT to do about it tonight
 
 The stamped tasks cannot be re-pointed: `task_id_for` hashes the prompt_id, so
