@@ -901,6 +901,13 @@ synthesis. Three tests: a drained stream must not shrink the batch; a
 one-task stream must still get its task (no pre-emption); and with every
 stream full the top-up must find nothing to do. Suite **3,755 / 19 skipped**.
 
+**Falsifiable prediction for the next run** (starts ~07:25Z, when run #9's
+315 minutes are up and the 04:17Z cron's queued job takes the group): with
+`transition` empty, the first pass claims 12 synthesis + 0 transition + 12
+curated_c2 = 24, and the top-up brings it to the budget of 36 - allocated
+`synthesis` first, so **`claimed=36` with synthesis holding 24 of it.** If the
+log still says `claimed=24`, the fix did not reach the runner.
+
 **Not done, deliberately:** raising `--n-workers` past 12. 48 in flight is
 blessed by the comment's own lease arithmetic and would add a further ~9%, but
 it is a tuning decision on top of a bug fix, and the two should not ship in one
@@ -968,20 +975,38 @@ row against `v1`'s 3.3** - 4.7x. Over the pending pool:
 prize than every throughput lever in this file combined, and it is free -
 it costs one line in the Step 6 plan command.
 
-#### Why nothing shipped tonight
+#### The mechanism is CLEAR, and adding a variant is safe - verified
 
-- Retiring a variant is not possible without deleting its template file, and
-  the file must stay: 678 pending `v4` tasks are stamped with that
-  `prompt_id` and `generate.py:1701` checks the sha.
-- The safe move is ADDITIVE - land `v5`/`v6` in the proven speech/letter genre,
-  which dilutes `v4` from 25% to 17% of new tasks and touches no pending row.
-  But authoring prompts is generative work I cannot validate offline, and the
-  standing instruction is a 5-10 row test before anything lengthy.
-- Nothing is on the critical path: the pending queue holds ~2.4 days of work.
+Retiring a variant would mean deleting its template, and the file must stay:
+678 pending `v4` tasks are stamped with that `prompt_id` and `generate.py:1701`
+checks its sha. So the move is ADDITIVE. Three things checked before saying it
+is safe:
 
-**Ready for the operator, needs one decision:** author `gen_irac_analysis_v5`
-and `gen_summarization_v3` in the senior-advocate-aloud / letter genre, run a
-10-row A/B against `v4`/`v1`, and plan Step 6 on the winners.
+1. **`pick_variant` runs at PLAN time only** - the single call site is
+   `tasks.py:576`. `generate.py` reads `task["prompt_id"]` and loads that
+   template. **Adding a file cannot touch a pending row.**
+2. **Growing the pool DOES re-map future planning** - `pool[digest % len(pool)]`
+   goes 4 -> 5, so the `pick_variant` docstring's guarantee ("a wave replanned
+   tomorrow must reproduce today's assignment exactly") stops holding across
+   the change, and `commit_rows`' INSERT-OR-IGNORE crash-resume idempotence
+   does not span it. Bounded, not dangerous: `_existing_in_queue` makes
+   `--plan-n` a whole-stream target and `PER_SEED_CAP` is 4, so a replan at an
+   unchanged N still creates nothing.
+3. **Two tests force the change to be acknowledged**, by design - the sha table
+   at `tests/test_build_prompts.py:114` (the same tripwire F15 relies on) and
+   the exact-tuple assertion at `:843`. Adding `v5` is: the template, one sha
+   line, one tuple entry.
+
+So the blocker is NOT mechanism. It is that I cannot validate a new prompt's
+CONTENT without a live call, and the account-level rate bucket is held by CI.
+Nothing is on the critical path either: the pending queue holds ~2.4 days.
+
+**Ready for the operator, one decision, ~15 minutes:** author
+`gen_irac_analysis_v5` (senior-advocate-aloud, the `v3` genre) and
+`gen_summarization_v3` (letter, the `v2` genre), add the two test entries,
+run a 10-row A/B against `v4`/`v1` on a scratch DB with the worker paused,
+then plan Step 6 on the winners. Adding two prose-genre variants dilutes `v4`
+from 25% to 17% of new tasks even if they only perform averagely.
 
 
 ## 6. Constants interrogated
