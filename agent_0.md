@@ -7,7 +7,7 @@ working state once already.
 
 ---
 
-## 0. State of play (2026-08-31, ~03:40Z)
+## 0. State of play (2026-08-31, ~06:00Z)
 
 **The pipeline works end to end. What is left is throughput and one prompt
 decision - no breakage anywhere.**
@@ -41,6 +41,20 @@ decision - no breakage anywhere.**
 - delete a template file (678 pending tasks are stamped with `v4` - F24);
 - reopen the 2,063 `skip:slots` transition rows (they would re-die - F18);
 - widen `curated_c2` (it raises the bar it is already above - F16).
+
+**Shipped since 03:40Z** (both on `origin/main`, suite **3,781 / 19**):
+- `c61311a` **the variant allowlist** - `--variant` pins a wave to chosen
+  templates, binding new rows only, so Step 6 can stop buying the expensive
+  personas without deleting a template and parking the live queue (F27).
+- `fb611f5` **the answer's second deliberation is no longer shipped** - 490 of
+  733 IRAC-contract rows opened with 2,400-4,800 chars of first-person
+  reasoning before the first heading, which no gate can see (`answer_max` does
+  not exist). Trimmed at assembly for zero generations: median answer **801 ->
+  379 words**, rows over the templates' own 450-word spec **94% -> 33%** (F28).
+- **The 50-example review packet** the dataset card requires before shipping is
+  built and pre-screened; 12 of 50 rows cite an authority their source never
+  names (F29). The human read itself is still outstanding.
+- The cron was **measured, not changed**: fires are late, never lost (F26).
 
 **The one decision waiting:** two prompt personas are burning half the fleet.
 `gen_irac_analysis_v4` (examiner writing a model answer) spends **15.6
@@ -122,7 +136,11 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 5 | Root-cause the `transition` stream's 99% reject rate | **DONE** - 96% was the planner bug (`708d455`); the rest is a 95.7% `statutory_quotation` compliance gap (F18) |
 | 6 | Widen the queue, sized to measured yield | **SIZED, deliberately not dispatched** - synthesis-only, **~1,500-1,600 tasks** (re-sized on per-variant rates, F24); blocked on the variant decision, not on capacity |
 | 8 | Fleet claim budget: restore the designed 36 in flight and make it invariant to drained streams | **DONE** - 3 tests, suite 3,755/19 (F23) |
-| 9 | Author `gen_irac_analysis_v5` + `gen_summarization_v3` in the proven speech/letter genre; 10-row A/B; then plan Step 6 on the winners | **READY, needs the bucket free** (F24) |
+| 9 | Author `gen_irac_analysis_v5` + `gen_summarization_v3` in the proven speech/letter genre; 10-row A/B; then plan Step 6 on the winners | **READY, needs the bucket free** (F24). Superseded in part: `--variant` now lets Step 6 avoid the losing personas **without** authoring anything (F27) |
+| 10 | Variant allowlist so a wave can be planned on the templates that earned it | **DONE** `c61311a` (F27) |
+| 11 | Stop shipping the answer's second deliberation | **DONE** `fb611f5` (F28) |
+| 12 | Build the 50-example review packet the card requires, and pre-screen it | **DONE** - `data/build/out/review_packet.html`, 12/50 flagged (F29) |
+| 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
 
 **The one open blocker:** `curated_c2` is over-generated against synthesis and
@@ -1043,6 +1061,131 @@ clean" reading: the raw diagnostic rate is over ALL generations and measures
 the discard pile, not the corpus.
 
 
+### F26. The cron is late, not lossy - do NOT tune the schedule on jitter
+
+Two scheduled fires (00:17Z, 04:17Z) produced no run, which looks like GitHub
+dropping them. It is not. Measured intervals between consecutive worker starts
+over 38 hours: **9.62, 4.21, 8.51, 6.49, 4.76, 4.43 h - mean 6.34 h against a
+6 h period.** Nothing is being lost; fires arrive with heavy jitter and the
+long gaps are paid back by the short ones.
+
+**Confirmed live while this was being written:** the 04:17Z fire arrived at
+**05:42:37Z - 85 minutes late** - and entered the queue as `pending` behind the
+02:03Z dispatch, which is precisely the behaviour described above. It also
+carries sha `fb611f5`, so it is the first run to execute both of tonight's
+fixes, and the first place to check the F23 prediction of `claimed=36`.
+
+That matters because the obvious "fix" is wrong. A run lasts **5.45 h**, and
+the workflows share concurrency group `data-build` with
+`cancel-in-progress: false`, so exactly one runs and one waits. At `*/4` the
+mean interval (~4.2 h) is already below the run length, so the pending slot
+self-fills and the extra fires are discarded on arrival - the schedule would be
+tighter on paper and identical in practice. **No cron change made.** Tuning a
+6 h period against +/-3 h of jitter is fitting noise.
+
+### F27. A wave can now be planned on chosen templates (`c61311a`)
+
+F24 established that `gen_irac_analysis_v4` costs 15.6 generations per accepted
+row against `v1`'s 3.3, and Step 6 wants to stop buying the expensive personas.
+There was no way to express that:
+
+- `--arm` labels an A/B cell; it does **not** pin a template. `pick_variant`
+  still runs unconditionally over the whole pool.
+- Deleting the losing template files is **unsafe**: `task_id_for` does not hash
+  `prompt_sha`, so removing a variant re-maps the draw for every row already
+  pending and parks the queue as `stale_prompt` - which never re-opens, because
+  re-stamping the sha re-parks it instantly.
+
+So the mechanism has to bind **new rows only**. `prompt_registry.group_variants`
+validates an operator's allowlist against the registry at plan time (a typo
+fails before a single row is inserted, naming the legal ids), and
+`pick_variant(..., allow=...)` **narrows without reordering** - a surviving
+variant keeps its registry position, so the same (seed, sample) that drew `v1`
+out of the full pool still draws `v1`. `plan_rows`/`plan_wave`/`commit_rows`
+thread it through, the `wave_planned` event records it, and `--variant` is
+repeatable on the CLI. Naming some task types narrows **only those**; every
+other task type keeps the full paraphrase rotation.
+
+Ten tests, incl. the pin, the no-op equivalence `plan_rows(...) ==
+plan_rows(..., variants=None)`, and that an unknown id fails before any write.
+Suite **3,773 / 19**.
+
+### F28. FIXED: the shipped answer contained a SECOND deliberation (`fb611f5`)
+
+Every `irac_analysis` template asks for a **250-450 word** answer and says the
+reasoning "takes as long as it needs to take" - in the trace. The corpus did
+not obey. Of 733 accepted rows whose task type owes an IRAC answer, **490 open
+with 2,400-4,800 characters of first-person deliberation before the first IRAC
+heading**: 65% of all answer words sat in front of the answer.
+
+It is not a summary of the trace and not a lead-in. Against the `think` block
+it shares a median **57% of content words but only 5.4% of 5-word runs** - the
+model reasons a second time, in fresh wording, inside the field the student is
+trained to emit. No gate can see it: `check_length_band` has `total_max`,
+`think_max` and `answer_min` but **no `answer_max`** - answer length is bounded
+only from below - and `check_irac_placement` only requires the headings to be
+present in the answer and absent from the think, never that the answer *opens*
+with them.
+
+Distribution is bimodal, which is why a threshold is honest here: **234 rows at
+exactly 0 characters of preamble, 13 between 1 and 1,200, 486 above 1,201.**
+`PREAMBLE_MIN_CHARS = 1000` sits in the empty middle; no plausible value in the
+gap changes the outcome.
+
+Fixed at **assembly**, not at generation. `decontaminate.generated_rows` is the
+one seam where `think` + `answer` become the shipped turn, so trimming there
+costs **zero generations**; gating it would have re-run every offending row.
+`answer_without_preamble` cuts from the first IRAC heading, and only for
+`IRAC_ANSWER_TASK_TYPES` - a summary or a drafted notice is prose by genre, and
+a line of one that happens to begin "Issue" is not a contract to act on.
+`TRIMMED_MIN_CHARS = 480` is **not arbitrary**: `answer_min` is 120 tokens and
+`gates._est_tokens` is `len // 4`, so 480 characters is exactly the gate floor -
+the trim can never push a row under the bar it already cleared.
+
+Measured on the live store: **488 of 733 rows trimmed, median answer 801 -> 379
+words** (inside the templates' own spec), rows over 450 words **94% -> 33%**.
+Safety checks before shipping: **0%** of trimmed answers back-reference the cut
+text ("as noted above"); **3.3%** fall under 200 words but none under the gate
+floor; **15.9%** lose a section number that appeared *only* in the preamble -
+the residual risk, and the reason the packet now screens the trimmed text.
+Worth roughly **125 rescued generations** as a side effect: 1,591 rows blew
+`total_max`, and 250 of those had it as their only violation.
+
+The trace is untouched, the full generation stays in the build store, each row
+carries `answer_preamble_dropped`, and the dataset card discloses it under
+**Answer normalisation**. Suite **3,781 / 19**.
+
+### F29. The 50-example review packet exists, and 12 rows carry an authority the source never names
+
+The dataset card names a human read of 50 accepted examples as a ship
+prerequisite - "the only legal-accuracy check in this pipeline" - and it had
+never been scheduled. `data/build/out/review_packet.html` (gitignored, nothing
+uploaded) is a stratified draw with a **floor of 3 per cell**, so `transition`
+(5 accepted rows in total) and `statute_qa` survive a draw that a proportional
+sample would have washed out. Each card shows the answer **as it will ship**
+(post-trim), with the cut preamble moved into the trace rather than deleted, and
+collapsible source, trace and judge, plus a verdict control.
+
+A mechanical pre-screen orders the reading. Legal correctness needs a human, but
+two failure modes do not: an answer citing a **section** or a **reported
+citation** the source never mentions. **12 of 50 rows** carry one - `drafting`
+1/4, `irac_analysis` 5/34, `statute_qa` 1/4, `summarization` 2/5, `transition`
+3/3. Transition's 3/3 is **expected by construction** (mapping IPC to BNS means
+naming sections an IPC-era judgment cannot contain) and is flagged as "verify
+the mapping", which is the highest-value check in the packet.
+
+**Two screen bugs found and fixed before any of this was believed**, both of
+which had manufactured a wrong answer:
+1. One permissive pattern on both sides read "Section 29 contains" as section
+   `29CON`. Now strict on the answer (the suffix must be attached to the
+   number), permissive on the source (a near-miss there only *suppresses* a
+   flag, so permissiveness is the safe direction).
+2. Making the source pattern prefix-optional let every page number in a 40-page
+   judgment count as a section mention - the screen returned **0 findings by
+   construction**. A separate probe (0 sections extracted from 50 answers)
+   caught it. A clean "nothing found" is worthless until the instrument is shown
+   able to find something.
+
 ## 6. Constants interrogated
 
 | Constant | Verdict |
@@ -1052,6 +1195,9 @@ the discard pile, not the corpus.
 | `MAX_ATTEMPTS = 3` | Fine, but `claim_tasks` bumps `attempts` *at claim time, before routing*. So returning a cooling row to `pending` without refunding only lengthens the fuse from 1 claim to 3. **The refund is mandatory, not optional.** |
 | `routing.generator` = 1 ref | **Deliberate - do not widen.** `yaml:890-909` is an operator directive of 2026-08-28: the sole-generator flip is "AN ALLOCATION DECISION, NOT A YIELD DECISION" (cerebras metered, ~$4.63, directed to judging). Widening also breaks the single-teacher cut that `off_teacher`/`--require-generator` protects, and the gates (`think_max 4500`) are fitted on deepseek. |
 | `rpm: 8` (bai) | Chosen with evidence (`yaml:353`: a valid call came back 429 at 10). Next lever if trips stay frequent. |
+| cron `0 */4` (`data-worker.yml`) | **Measured, left alone.** Fires are late, not dropped: mean interval 6.34 h over 38 h on the old 6 h period. A run is 5.45 h and the concurrency group holds one running + one waiting, so at `*/4` the pending slot already self-fills. Changing it would be fitting +/-3 h of jitter. (F26) |
+| `PREAMBLE_MIN_CHARS = 1000` (`decontaminate.py:1214`) | **Chosen from a bimodal histogram**, not picked: 234 rows at exactly 0 preamble, 13 between 1 and 1,200, 486 above 1,201. Any value in the gap gives the same answer. (F28) |
+| `TRIMMED_MIN_CHARS = 480` (`decontaminate.py:1220`) | **Derived, not chosen.** `answer_min` is 120 tokens and `gates._est_tokens` is `len // 4`, so 480 chars *is* the gate floor - the trim cannot push a row under a bar it already cleared. If either moves, this must move with it. |
 | `DEFAULT_AUDIT_SAMPLE = 0.05` | Reasoned, not arbitrary (`judge.py:181-189`). **Open question:** is 5% enough evidence at ~35-40 judged rows/day? Out of scope tonight. |
 
 ## 7. Decision log
