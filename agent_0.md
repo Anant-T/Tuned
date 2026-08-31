@@ -176,7 +176,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
 | 18 | Decide the ceiling remedy | **DONE** - hand throttle shipped, then REPLACED same day by a measured guard (`be25afd`): `STREAMS` lists all three, `served_streams` drops curated_c2 within 150 effective of the ceiling and on any ceiling it cannot measure (F35) |
 | 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **CLOSED - obsolete.** The re-open was the hand throttle's expiry; the guard now decides per run, so there is no date to remember. Live: serving, 401 effective against a 2,050 ceiling, 1,499 of headroom (F38) |
-| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, not urgent** - ~27 h of queue left. Worth ~1.7x the corpus per fleet-hour when it happens (F37) |
+| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, now SIZED: ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Not just a throughput win - without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41) |
 | 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - 401 effective ... ceiling of 2050`, then curated_c2 claims (F38, F39) |
 | 22 | Filter IL-TUR-contaminated seeds at PLAN time | **CLOSED - wrong fix.** The drops are co-citation, not contamination: 0 of 88 match the eval item's own case. A seed filter would implement the over-firing and cost 9.6% of the pool for no integrity gain (F40) |
 | 25 | OPERATOR DECISION: turn off the row-side case_id channel (`--no-case-id-from-text`) | **OPEN** - recovers 81 generated rows (~9%) with exact containment untouched; deferred because it is an eval-integrity call and the rows are recoverable retroactively, so waiting costs nothing (F40) |
@@ -1509,6 +1509,85 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F41. THE QUEUE AS PLANNED DOES NOT REACH THE BAND, AND THE TOP-UP IS ~780 TASKS
+
+The ceiling guard stops the corpus becoming UNASSEMBLABLE. It says nothing
+about whether the corpus becomes ASSEMBLABLE, and those are different
+questions: below the band is recoverable (add synthesis), above the ceiling is
+not. Having fixed the second, here is the first, measured.
+
+**The band's floor rises with curated, and slower than 1:1.** Read off
+`synthesis_band` on the live pools at v1.0-MVP:
+
+    curated eff    synthesis band (effective)    midpoint ratio
+        398          600 ..  1050  (window 450)      2.07x
+        600          900 ..  1375  (window 475)      1.90x
+        800         1175 ..  1675  (window 500)      1.78x
+       1000         1475 ..  2000  (window 525)      1.74x
+       1242         1825 ..  2375  (window 550)      1.69x
+       2050         3000 ..  3200  (window 200)      1.51x
+
+The corpus needs roughly **1.5-2.1 effective synthesis rows per effective
+curated row**, and the window WIDENS as both grow - so the target is easier to
+hit later, not harder, right up until it collapses to 200 at the ceiling.
+
+**The queue lands at 1.13, not 1.7.** Projecting the pending queue at measured
+per-task yields:
+
+    synthesis   443 accepted + 3,162 pending x 38.6%  = 1,664 accepted = 1,407 eff
+    curated_c2  487 accepted + 1,592 pending x 64.8%  = 1,519 accepted = 1,241 eff
+                                                         ratio 1.13, band wants 1.69
+
+So at drain the corpus sits **418 effective rows BELOW the floor** - still
+outside, still on the low-synthesis side, exactly where F35 found it and for
+the same reason.
+
+**Watch the yield denominator - it is the same trap as F39b.** Synthesis's
+all-terminal yield is 24.8%, and using it oversizes the fix by 3x. 635 of its
+terminal tasks are not merit outcomes at all: `stale_prompt` 502 (template
+re-stamps), `off_teacher` 84 (the retired-provider purge), `input_ineligible`
+42. None of those recur for a NEW task. The forward-valid figure is bounded:
+
+    merit only      accepted/(accepted+rejected)              50.7%
+    + gate parks    accepted/(acc+rej+format_parked)          38.6%   <- use this
+    all terminal    accepted/everything                       24.8%   <- do NOT
+
+38.6% is the honest one: `format_parked` is a real gate failure, and while
+`REOPEN_ON_EMPTY` re-opens those rows they re-park unless a gate threshold
+moves.
+
+#### The fix, sized
+
+    shortfall            418 effective
+                       = 494 accepted synthesis
+                       = ~1,279 more synthesis tasks at the pooled 38.6%
+                       = ~780 tasks planned on v1+v3 only (F37: 3.11 vs 5.10
+                         generations per clean row, a 1.64x)
+
+**~780 tasks.** That is the whole gap, and F37's variant lever pays for a third
+of it by itself. This is what task 20 should plan, and the two findings
+compose: the wave that fixes the mix is the same wave that fixes the yield.
+
+#### And it settles the throttle argument with an independent number
+
+Corpus size at v1.0-MVP for each option, from `plan` on the live pools:
+
+    stop curated now (the hand throttle)   curated  398 + synth 1044 ->  3,326 rows
+    drain the queue + the top-up           curated 1242 + synth 1825 ->  6,063 rows
+    ...at the top of the band              curated 1242 + synth 2375 ->  7,421 rows
+    curated at the ceiling                 curated 2050 + synth 3100 -> 10,021 rows
+
+The throttle would have capped the corpus at **3,326 rows against 6,063** for
+the same fleet - a third confirmation, from a direction F35 did not use, that
+throttling curated was the wrong instrument. The right one was always to plan
+more synthesis, because synthesis is the side that can still be added.
+
+**The real ceiling is the pools, not the fleet.** Even at the irreversibility
+ceiling the corpus tops out near 10,021 rows, against a dataset spec of
+15-20k. The binding pool is `replay/nothink` at 1,200. So the last lever on
+corpus SIZE is not generation at all - it is rebuilding that pool larger,
+which is exactly the remedy `--headroom`'s refusal message names.
 
 ### F40. THE case_id CHANNEL IS DELETING 9.4% OF THE CORPUS FOR CO-CITATION, NOT CONTAMINATION
 
