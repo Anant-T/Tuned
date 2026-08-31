@@ -186,7 +186,17 @@ AUDIT_ACCEPT_DISPOSITION = "audit:gate-accept"
 # exactly like an unsampled row - what it must not do is end in judge_error,
 # which would make a row's survival depend on whether the hash picked it.
 AUDIT_UNJUDGED_DISPOSITION = "audit:gate-accept:unjudged"
-DEFAULT_AUDIT_SAMPLE = 0.05
+# 0.02, sized to the ceiling above rather than picked. Measured on run
+# 33363831595 (2026-08-31): generation decides ~1,800 rows a UTC day and the
+# dual fleet can serve ~36 of them, so 0.05 selected ~90 and ~54 shipped
+# `audit:gate-accept:unjudged` - fine for those rows, worthless as evidence.
+# Worse, the 36 that WERE judged all landed before groq's daily budget hit
+# zero: the last dual judgement in that run is 11:30 and every sampled row
+# after it went unjudged, so the surviving verdicts were the early part of a
+# FIFO queue rather than the uniform sample audit_sampled promises. Sampling
+# at the ceiling buys the same ~36 judgements spread over the whole day.
+# Raise it again if the ceiling rises - a test asserts the relationship.
+DEFAULT_AUDIT_SAMPLE = 0.02
 
 # Defined in generate.py and re-exported here: the startup preflight sizes
 # the judge's largest possible call with the SAME renderer this worker uses,

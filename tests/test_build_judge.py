@@ -2473,3 +2473,46 @@ def test_the_two_audit_accepts_are_told_apart_in_the_store(tmp_path, cfg, paths)
     assert judge_mod.AUDIT_UNJUDGED_DISPOSITION.startswith(
         judge_mod.AUDIT_ACCEPT_DISPOSITION
     )
+
+
+def test_the_default_audit_sample_fits_inside_the_daily_dual_judge_ceiling():
+    """Sampling more rows than the fleet can judge does not buy more evidence.
+
+    Both numbers below are measured off run 33363831595 (2026-08-31,
+    07:19-12:34Z), not assumed:
+
+    - The dual-judge ceiling is ~36 rows per UTC day. groq's budget is DAILY
+      and shared across runs - that run's first visible reading is already
+      `spent=117.4k left=83k`, inherited from the runs before it - and it ends
+      the day at `left=0k` on BOTH groq refs. 400k of groq at ~11k per dual
+      judgement is ~36.
+    - Generation decides ~1,800 rows a day (393 in that run, ~4.6 runs a day).
+
+    At 0.05 the hash selects ~90 and the fleet can serve ~36, so ~54 ship as
+    `audit:gate-accept:unjudged`. Those rows are fine - they ship on their
+    gates like any unsampled row - but they yield no evidence, and the 36 that
+    ARE judged all land before the budget dies. In that run the last dual
+    judgement is at 11:30 and every sampled row after it (11:40, 11:51, 12:15,
+    12:28) went unjudged, so the surviving verdicts are the early part of a
+    FIFO queue rather than the uniform sample audit_sampled promises.
+
+    Sizing the rate to the ceiling costs nothing and fixes that: the same ~36
+    judgements, spread across the whole day. This asserts the RELATIONSHIP, so
+    if the ceiling is ever raised - pairing each groq ref with cerebras
+    instead of with each other would roughly double it - the rate has to be
+    revisited deliberately rather than left behind.
+    """
+    from tuned.data.judge import DEFAULT_AUDIT_SAMPLE
+
+    rows_decided_per_utc_day = 1800
+    dual_judgements_per_utc_day = 36
+
+    sampled = DEFAULT_AUDIT_SAMPLE * rows_decided_per_utc_day
+    assert sampled <= dual_judgements_per_utc_day, (
+        "the hash selects more rows than the fleet can judge; the excess ships "
+        "unjudged and biases the surviving sample toward the early day"
+    )
+    assert sampled >= 0.75 * dual_judgements_per_utc_day, (
+        "the rate leaves most of the judge budget unspent, which is evidence "
+        "bought and not collected"
+    )
