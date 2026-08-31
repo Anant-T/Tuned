@@ -1553,6 +1553,41 @@ survivors of a pairing must differ, so every dual judgement burns at least
 one groq call, and groq's per-model ~200k/day is the ceiling on the whole
 audit instrument. For the last hour of a 5h15m run the instrument was dead.
 
+#### SHARPENED 2026-08-31 13:40Z: it is not a leak, it is most of the day
+
+The next run, `33381288057`, opened its FIRST batch with both groq models
+already at zero:
+
+    bai/deepseek-v4-flash         spent=29780.3k  left=-
+    cerebras/gemma-4-31b          spent=  235.6k  left=764k
+    groq/qwen/qwen3.6-27b         spent=  207.2k  left=0k
+    groq/openai/gpt-oss-20b       spent=  213.2k  left=0k
+    mistral/mistral-large-latest  spent=    0.0k  left=5000k
+
+The ledger carries ACROSS runs, because the bucket is a daily one (reset
+boundary assumed UTC midnight - not verified). So this entire 5h15m run has
+no second family and every hash-sampled row in it ships unjudged. Confirmed
+live: `audit-accept-unjudged` appears in its judge stream within the hour,
+against 09:36Z for the previous run.
+
+The day's shape, then:
+
+    00:00Z ---- both groq models funded ---- 09:38Z (gpt-oss) 11:35Z (qwen)
+      |<---- ~1.5 runs WITH dual judging ---->|<-- ~3.1 runs with NONE -->|
+
+**~12.4 of every 24 hours, and roughly 3 of every 4.6 runs, produce zero
+dual-judged rows.** The daily total (~15-40) still matches the config's own
+"~35-40 rows/UTC-day" estimate, so the VOLUME was known. What was not is the
+DISTRIBUTION, and that is what breaks the warrant:
+
+> "the sample's accept rate is the quality evidence for the whole batch"
+
+holds only if the sample is representative. A sha256 hash-sample is. A hash
+sample intersected with "was generated before ~11:35Z" is NOT - and because
+claiming is FIFO by rowid per stream (F43), what the fleet generates early in
+a UTC day is systematically different work from what it generates late.
+The evidence covers the front of the queue and nothing else.
+
 #### The idle 5,000k of mistral is NOT the fix - I checked before proposing it
 
 `mistral/mistral-large-latest` reports `spent=0.0k left=5000k` in every
@@ -1583,13 +1618,15 @@ the distance instead of being cancelled or evicted. Its readout:
     format_parked   451 ->   886    (+435)
     rejected      2,620 -> 2,635     (+15)
 
-    56 gen batches x 36 claimed = 2,016 generations
+    56 gen batches, 2,016 claimed, 2,007 gen-ok, 9 err (0.45%)
     deepseek tokens 14,150.2k -> 27,391.4k  = 13,241k spent
 
-**393 accepted from 2,016 generations is 19.5%.** F37 measured 19.6% clean
+**393 accepted from 2,007 generations is 19.6%.** F37 measured 19.6% clean
 on a different instrument (this run's own gate_result rows, before any of
-this log existed). Two independent readings agreeing to a tenth of a point
-is the strongest confirmation the yield model has had.
+this log existed). Two independent readings agreeing exactly
+is the strongest confirmation the yield model has had. (Count the batch
+lines with care: `_finish` tails gen.log into its own report, so the last 20
+appear TWICE in the archived log and a naive grep reads 76 batches, not 56.)
 
 #### CORRECTED: the 58-minute gap was the fence, not a runner queue
 
