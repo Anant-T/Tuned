@@ -999,11 +999,25 @@ and in `judge_mode: audit` a sampled row the fleet cannot serve ships as
 (`judge.py`, the MAX_JUDGE_ATTEMPTS branch). So groq running dry costs some
 audit evidence, never a stall. No action.
 
-**Throughput looks HIGHER than the 23.6 accepted rows/hour on record** -
-~8 gate-passing generations per batch across 16 batches inside roughly an hour.
-Do not plan off that: the log carries no timestamps, it is a checkpoint that
-may lag, and the figure needs the final run report to confirm. Flagged, not
-banked.
+**Throughput: I flagged it as looking HIGHER than the 23.6 accepted rows/hour
+on record. Sampling it properly says otherwise.** The log carries no
+timestamps, so one reading cannot give a rate - it only looks like one if you
+assume the checkpoint is current. Two readings can:
+
+    08:15Z   16 batches
+    09:11Z   18 batches      -> 2 batches / 56 min
+
+That is ~28 min per batch of 36, or roughly **17 gate-passing rows/hour** -
+consistent with the ~23.6 on record and certainly not above it. The earlier
+impression came from dividing 16 batches by the run's elapsed time as though
+the log were live; it is pushed on a cadence, so early in a run it reads
+current and later it lags, which manufactures exactly that illusion of a fast
+start. **One sample of a checkpointed log is not a rate.**
+
+Cumulative for the run at 09:11Z: **647 generations, 127 past the gates =
+19.6%.** That is the honest pooled figure for the CURRENT three-stream mix; it
+should rise once the throttle leaves only synthesis, and rise further on the
+F36 variants.
 
 
 ### F24. CORRECTION to F14 - `irac_placement` is not a compliance gap, it is GENRE
