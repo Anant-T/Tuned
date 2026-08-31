@@ -2438,3 +2438,82 @@ def test_a_cue_is_not_matched_inside_a_longer_word():
     assert not check_self_verification("Counsel is awaiting instructions.", ctx).passed
     assert check_self_verification("Wait: the date is wrong.", ctx).passed
     assert check_self_verification("I will re-examining that step.", ctx).passed
+
+
+# --- length_band measures the answer THAT WILL SHIP -------------------------
+#
+# decontaminate cuts a second deliberation from the head of an IRAC answer at
+# assembly, so from that change onward the gate and the assembler disagreed
+# about what a row IS: the gate weighed several thousand characters that the
+# corpus would never contain, and rejected rows that fit the training bucket
+# comfortably. Measured on the live store, 172 rows were refused for
+# total>total_max alone and fit once trimmed.
+
+
+def _preamble(n_chars: int) -> str:
+    # First-person deliberation, no IRAC heading anywhere in it.
+    unit = "I begin by considering whether the provision applies on these facts. "
+    return (unit * (n_chars // len(unit) + 1))[:n_chars]
+
+
+_IRAC_BODY = (
+    "**Issue**\nWhether the appellant is liable on these facts.\n\n"
+    "**Rule**\nThe provision requires intention and an overt act, and the "
+    "authorities are consistent that both must be established on the record "
+    "before a conviction may be sustained on this footing.\n\n"
+    "**Application**\nOn this record the ingredients are made out, because the "
+    "evidence establishes both limbs without contradiction from the defence. The "
+    "witnesses were consistent on the material particulars, the documents were "
+    "proved in the manner the statute requires, and no submission was advanced "
+    "that would displace the presumption arising on these facts.\n\n"
+    "**Conclusion**\nThe appeal is dismissed and the conviction is affirmed."
+)
+# Longer than TRIMMED_MIN_CHARS on purpose. A body under the answer floor is
+# refused a trim BY DESIGN, so a short fixture here would test that guard and
+# quietly stop testing the gate.
+assert len(_IRAC_BODY) > 480
+
+
+def test_length_band_measures_the_answer_after_the_preamble_is_cut():
+    answer = _preamble(20000) + "\n\n" + _IRAC_BODY
+    ctx = _ctx(task_type="irac_analysis")
+    results = {r.gate: r for r in run_all(_content("t" * 200, answer), 100, ctx)}
+    band = results["length_band"]
+    assert band.passed, band.detail
+    assert band.detail["answer_est"] == len(_IRAC_BODY) // 4
+
+
+def test_length_band_still_refuses_a_row_that_is_too_long_after_the_cut():
+    answer = _preamble(2000) + "\n\n" + _IRAC_BODY + ("\nfurther argument. " * 900)
+    ctx = _ctx(task_type="irac_analysis")
+    results = {r.gate: r for r in run_all(_content("t" * 200, answer), 100, ctx)}
+    assert "total>total_max" in results["length_band"].detail["violations"]
+
+
+def test_a_genre_without_an_irac_contract_is_measured_whole():
+    # summarization owes prose, not headings; nothing is cut, so nothing about
+    # how it is measured may change.
+    answer = _preamble(20000) + "\n\n" + _IRAC_BODY
+    ctx = _ctx(task_type="summarization")
+    results = {r.gate: r for r in run_all(_content("t" * 200, answer), 100, ctx)}
+    assert "total>total_max" in results["length_band"].detail["violations"]
+    assert results["length_band"].detail["answer_est"] == len(answer) // 4
+
+
+def test_the_trace_is_measured_whole_because_the_trim_never_touches_it():
+    answer = _preamble(4000) + "\n\n" + _IRAC_BODY
+    think = "t" * 4000
+    ctx = _ctx(task_type="irac_analysis")
+    results = {r.gate: r for r in run_all(_content(think, answer), 100, ctx)}
+    assert results["length_band"].detail["think_est"] == len(think) // 4
+    assert "think>think_max" in results["length_band"].detail["violations"]
+
+
+def test_the_answer_floor_cannot_be_newly_failed_by_the_cut():
+    # TRIMMED_MIN_CHARS is answer_min * 4 by construction, so a cut that would
+    # take the answer under the floor is refused and the answer measured whole.
+    # Live check: shortest trimmed answer is 215 est tokens against a 120 floor.
+    answer = _preamble(6000) + "\n\n**Issue**\nToo short to stand alone."
+    ctx = _ctx(task_type="irac_analysis")
+    results = {r.gate: r for r in run_all(_content("t" * 200, answer), 100, ctx)}
+    assert results["length_band"].detail["answer_est"] == len(answer) // 4

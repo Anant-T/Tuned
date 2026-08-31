@@ -601,6 +601,12 @@ def render_card(
         "does not ship, so the trim cannot be undone from the published rows; each row "
         "carries the number of characters cut from it."
     )
+    lines.append("")
+    lines.append(
+        "The length band is measured on the answer as it ships, not as it was returned, "
+        "so the gate and the assembler agree about what a row is. Rows are therefore "
+        "admitted on the size of the text the corpus actually holds."
+    )
     lines.append("## Known risk: teacher legal error")
     lines.append("")
     lines.append(

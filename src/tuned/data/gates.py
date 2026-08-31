@@ -1058,6 +1058,53 @@ def check_think_format(content: str, ctx: GateContext) -> GateResult:
     return GateResult("think_format", True, detail)
 
 
+# Every generator template sizes the answer in words - "roughly 250 to 450
+# words" - and puts the reasoning in the trace, where the think block already
+# holds it. The accepted corpus said otherwise on 2026-08-31: of 733 rows whose
+# task type owes an IRAC answer, 490 opened with 2,400-4,800 characters of
+# first-person deliberation before the first heading, and that preamble was 65%
+# of all answer words. It shares a median 57% of its content words with the
+# think block but repeats only 5% of its five-word runs - a second pass over the
+# same reasoning in fresh wording, not a copy. Nothing catches it: the length
+# band has an answer_min and no answer_max, and irac_placement asks that the
+# headings BE in the answer, not that the answer OPEN with them. Trained on
+# this, the student learns to close its think block and deliberate again.
+#
+# Trimmed rather than gated, because gating costs generations and this costs
+# none: the row is already paid for, the trace already carries the reasoning,
+# and the raw generation stays in the store either way.
+#
+# 1000 is not a round number picked for looking like one. The measured
+# distribution is bimodal - 234 rows begin AT the heading, 486 begin 1,200+
+# characters in, and 13 rows lie anywhere between - so this sits in an empty
+# gap, and moving it anywhere inside that gap changes nothing.
+PREAMBLE_MIN_CHARS = 1000
+
+# gates._est_tokens is len//4 and the band's answer_min is 120 tokens. A trim
+# that would push the answer under its own floor is not made: 3.3% of the
+# affected rows are short enough for that, and a stub is worse than a row that
+# deliberates twice - the band would refuse it downstream anyway.
+TRIMMED_MIN_CHARS = 480
+
+
+def answer_without_preamble(answer: str, task_type: str | None) -> tuple[str, int]:
+    """(answer, characters dropped) - the answer from its first IRAC heading.
+
+    Only the task types that owe an IRAC answer are touched. A summary or a
+    drafted notice is prose by genre, and a line of one that happens to open
+    with "Issue" is not a contract this may act on.
+    """
+    if task_type not in IRAC_ANSWER_TASK_TYPES:
+        return answer, 0
+    match = _IRAC_HEADING_RE.search(answer or "")
+    if match is None or match.start() < PREAMBLE_MIN_CHARS:
+        return answer, 0
+    trimmed = answer[match.start():]
+    if len(trimmed) < TRIMMED_MIN_CHARS:
+        return answer, 0
+    return trimmed, match.start()
+
+
 def check_length_band(
     prompt_est: int, think_est: int, answer_est: int, ctx: GateContext
 ) -> GateResult:
@@ -1894,7 +1941,15 @@ def run_all(content: str, prompt_est_tokens: int, ctx: GateContext) -> list[Gate
     think, answer = split_think(text, ctx.think_open, ctx.think_close)
     return [
         check_think_format(text, ctx),
-        check_length_band(prompt_est_tokens, _est_tokens(think), _est_tokens(answer), ctx),
+        # The answer as the corpus will hold it: decontaminate cuts the same
+        # preamble at assembly, so weighing the untrimmed text here refused
+        # rows over characters that would never reach the training bucket.
+        check_length_band(
+            prompt_est_tokens,
+            _est_tokens(think),
+            _est_tokens(answer_without_preamble(answer, ctx.task_type)[0]),
+            ctx,
+        ),
         check_citations(text, ctx),
         check_statutory_grounding(answer, ctx, think=think),
         check_temporal(text, ctx),

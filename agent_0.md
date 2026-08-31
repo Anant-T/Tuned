@@ -1338,6 +1338,55 @@ were generated (`think_max` 3000 -> 4500; F24's genre result). Re-measure the
 rate on a **10-row probe** after the genre variants land; replan only if it
 clears the synthesis streams' opportunity cost.
 
+### F32. The length band was weighing text the corpus would never hold (`gates.py`)
+
+F28 trimmed the answer's second deliberation **at assembly** - and in doing so
+left the gate and the assembler disagreeing about what a row *is*. From that
+commit until this one, `check_length_band` weighed several thousand characters
+of preamble that `decontaminate` would delete before the row ever reached the
+training bucket, and refused rows on their size.
+
+Measured on the live store: of 2,431 `length_band` failures, **250 name
+`total>total_max` as their ONLY violation**, and **110 of those sit inside the
+band once the answer is measured as it ships** (109 `irac_analysis`, 1
+`statute_qa`). Against 805 accepted rows that is a **13.7%** loss taken for a
+mis-measurement.
+
+**Correction to my own first pass:** I reported 172 before including
+`prompt_est` in the total. `total` is prompt + think + answer, and dropping the
+prompt inflated the count by 56%. The number is 110.
+
+The fix is to measure once, in one place. `answer_without_preamble` and its two
+constants **moved from `decontaminate.py` into `gates.py`**, beside the
+`_IRAC_HEADING_RE` they use - `decontaminate` already imported from `gates`, so
+the reverse import would have been a cycle - and `decontaminate` re-exports the
+name for callers that found it there first. `run_all` now passes
+`_est_tokens(answer_without_preamble(answer, ctx.task_type)[0])`.
+
+Why this is strictly more correct, not merely more permissive:
+- `total_max` guards the **8192 training bucket**, and the row that enters that
+  bucket is the trimmed one. Measuring the raw text was conservative by
+  accident, never by design.
+- `think_max` is untouched: the trim never touches the trace, and the 1,325
+  rows failing `total>total_max,think>think_max` together stay rejected - they
+  are genuinely too long.
+- `answer_min` now applies to the shipped answer, which is the stricter reading
+  and the right one: today a row can clear the floor on the strength of a
+  preamble that gets deleted. It **cannot newly fail**, because
+  `TRIMMED_MIN_CHARS` is `answer_min * 4` by construction. Verified on the
+  store: of 488 trimmed accepted rows the shortest is **215 est tokens against
+  a 120 floor**, and **0** would flip to failing.
+- A genre without an IRAC contract (`summarization`, `drafting`) is untrimmed
+  and so measured exactly as before.
+
+**This does not recover the 110.** They are `rejected`, and reopening
+regenerates rather than re-gates, so recovering them would cost the calls again;
+the value is that the same loss stops recurring. If a re-gate CLI is ever worth
+writing, those 110 rows are its first customer - the generations are still in
+the store.
+
+Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
 ## 6. Constants interrogated
 
 | Constant | Verdict |

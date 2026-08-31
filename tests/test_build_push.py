@@ -615,6 +615,9 @@ def test_render_card_discloses_that_answers_were_trimmed():
     report, decon, rows, push_cfg, versions = _card_fixture()
     card = render_card(report=report, decon=decon, rows=rows, push_cfg=push_cfg, versions=versions)
     assert "## Answer normalisation" in card
+    # The gate measures what ships too, or the card would be describing a
+    # corpus assembled under one rule and admitted under another.
+    assert "measured on the answer as it ships" in card
     assert "first IRAC heading" in card
     assert "think block" in card
 
