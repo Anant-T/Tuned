@@ -56,6 +56,28 @@ def test_the_fleet_is_one_generator_and_one_judge():
         assert argv[argv.index("--config") + 1] == "cfg.yaml"
 
 
+def test_dropping_a_stream_from_STREAMS_stops_the_fleet_claiming_it():
+    """STREAMS is the only brake on a stream that is over-generating.
+
+    `--stream` becomes store.claim_tasks(stream=...), so a stream missing
+    from this tuple is one the generator never claims - its planned tasks
+    simply stay pending, which is why editing the tuple is a reversible
+    throttle that touches neither the store nor the baton. The sibling test
+    above pins that every LISTED stream reaches both children; this pins the
+    converse, which is the half the brake actually rests on. Without it,
+    child_argvs could restate the stream list inline and disarm the throttle
+    while every other test stayed green.
+    """
+    from tuned.data.judge import DEFAULT_AUDIT_SAMPLE
+
+    argvs = actions_worker.child_argvs(
+        "cfg.yaml", n_workers=8, audit_sample=DEFAULT_AUDIT_SAMPLE
+    )
+    for argv in argvs:
+        passed = {argv[i + 1] for i, a in enumerate(argv) if a == "--stream"}
+        assert passed == set(actions_worker.STREAMS)
+
+
 def test_the_assembly_chain_runs_in_order_and_stats_gates_last():
     argvs = actions_worker.assemble_argvs("cfg.yaml")
     modules = [a[3] for a in argvs]
@@ -1206,6 +1228,45 @@ def test_off_teacher_is_unrecoverable_without_the_automatic_reopen():
     assert "off_teacher" in actions_worker.REOPEN_ON_EMPTY
 
 
+def _task_db(path, rows):
+    """(state, stream) rows in the shape run_worker reads."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE task (state TEXT, stream TEXT)")
+    conn.executemany("INSERT INTO task VALUES (?, ?)", rows)
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_pending_work_in_an_UNSERVED_stream_does_not_count_as_claimable(tmp_path):
+    """Throttling a stream must not also disable the empty-queue recovery.
+
+    Dropping a stream from STREAMS leaves its planned tasks pending forever -
+    that is the point, it is what makes the throttle reversible. But the
+    queue-empty guard reads a whole-store `SELECT state, COUNT(*)`, so those
+    permanently-pending rows would read as work the fleet is about to do.
+    Nothing would ever be re-opened and every run would sit its full ~5 h
+    claiming nothing, which is the exact stall the guard was added to end.
+    """
+    db = _task_db(tmp_path / "s.sqlite3", [("pending", "curated_c2")])
+    assert actions_worker._claimable_in(db, ("synthesis", "transition")) == 0
+    assert actions_worker._claimable_in(db, ("synthesis", "curated_c2")) == 1
+
+
+def test_the_reported_task_states_still_cover_every_stream(tmp_path):
+    """Claimability narrows to the served streams; VISIBILITY must not.
+
+    A throttled stream's backlog is the operator's cue to re-open it, so it
+    has to keep appearing in the job summary even though no run will touch
+    it."""
+    db = _task_db(
+        tmp_path / "s.sqlite3",
+        [("pending", "curated_c2"), ("accepted", "synthesis")],
+    )
+    assert actions_worker._task_counts(db) == {"pending": 1, "accepted": 1}
+
+
 def test_the_reopen_runs_only_when_there_is_nothing_left_to_claim():
     """Unconditionally, it is a churn loop against a pool gap that is usually
     still there - re-open, fail to route, park, re-open - six times a day. On
@@ -1214,7 +1275,7 @@ def test_the_reopen_runs_only_when_there_is_nothing_left_to_claim():
     import inspect
 
     src = inspect.getsource(actions_worker.run_worker)
-    guard = src.index("if counts is not None and not _claimable(counts):")
+    guard = src.index("if counts is not None and not servable:")
     reopen = src.index("REOPEN_ON_EMPTY", guard)
     spawn = src.index("subprocess.Popen")
     assert guard < reopen < spawn, "the re-open must sit inside the empty branch, before the children"

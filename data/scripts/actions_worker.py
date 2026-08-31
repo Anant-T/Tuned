@@ -48,7 +48,37 @@ from typing import Sequence
 from tuned.data.paths import DEFAULT_CONFIG
 from tuned.data.shape import SHAPED_PREFIX
 
-STREAMS = ("synthesis", "transition", "curated_c2")
+# The streams the fleet may CLAIM. `--stream` becomes claim_tasks(stream=...),
+# so a stream left out here is never served and its planned tasks simply stay
+# pending - no store write, no baton, and restoring the string resumes them.
+#
+# curated_c2 is OUT as of 2026-08-31, and not because it is unwanted: it is
+# running open-loop, far ahead of the stream it has to stay matched to.
+# `shape` refuses from both sides, so the feasible generated-curated count is
+# an INTERVAL set by how much grounded_synthesis exists, and the interval is
+# roughly half the synthesis count (`shape --headroom` prints today's):
+#
+#   accepted synthesis   accepted curated_c2 that admits it
+#              409                     0 ..   237
+#            1,550                   632 ..   948
+#            3,617 (full MVP)      1,818 .. 2,160
+#
+# Live: 391 accepted curated_c2 against 409 accepted synthesis - already past
+# the top of the window, which is why the chain refuses today - with 1,825
+# more curated_c2 tasks queued. Draining them lands ~2,149 accepted, feasible
+# ONLY if synthesis also reaches full MVP, and within 26 rows of the absolute
+# ceiling (~2,065) past which no synthesis count in any quantity assembles
+# this corpus at all.
+#
+# The asymmetry decides it rather than any forecast of throughput: stopping
+# now is reversible, and generated rows cannot be dropped, so overshooting is
+# not. Re-add the string once synthesis has actually earned the headroom.
+#
+# transition STAYS despite being drained. `budget = n_workers * len(streams)`
+# and the top-up walks this tuple in order, so a drained stream donates its
+# floor to synthesis - the bucket the corpus is short on. Dropping it too
+# would cut the fleet from 2*n_workers calls in flight to n_workers.
+STREAMS = ("synthesis", "transition")
 DB_RELPATH = Path("state") / "law_v1.sqlite3"
 GRACE_S = 90  # SIGTERM -> this long -> SIGKILL, wide enough for a final fsync
 
@@ -388,8 +418,31 @@ def _task_counts(state_db: Path) -> dict[str, int] | None:
         return None
 
 
-def _claimable(counts: dict[str, int]) -> int:
-    return sum(counts.get(state, 0) for state in CLAIMABLE_STATES)
+def _claimable_in(state_db: Path, streams: Sequence[str]) -> int | None:
+    """Claimable tasks the fleet will ACTUALLY serve, i.e. in these streams.
+
+    Separate from _task_counts because the two questions differ once a stream
+    is throttled out of STREAMS. _task_counts answers "what is in the store",
+    which the job summary wants whole - a throttled stream's backlog is the
+    cue to re-open it. This answers "is there anything left for this run to
+    do", and counting a stream nobody serves would leave the queue looking
+    busy forever: the re-open would never fire and every run would sit its
+    full duration claiming nothing.
+    """
+    if not state_db.is_file():
+        return None
+    placeholders = ",".join("?" * len(streams))
+    try:
+        with sqlite3.connect(f"file:{state_db.as_posix()}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM task WHERE stream IN "
+                f"({placeholders}) AND state IN "
+                f"({','.join('?' * len(CLAIMABLE_STATES))})",
+                (*streams, *CLAIMABLE_STATES),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else 0
 
 
 def _report(lines: Sequence[str]) -> None:
@@ -663,7 +716,7 @@ def _finish(
     counts = _task_counts(root / DB_RELPATH)
     if counts is not None:
         report.append("task states: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
-        if not _claimable(counts):
+        if not _claimable_in(root / DB_RELPATH, STREAMS):
             report.append(
                 "QUEUE EMPTY - nothing left to claim; re-plan with "
                 "`python -m tuned.data.tasks --config <cfg> --n <rows>`"
@@ -707,7 +760,10 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
     # try before declaring the queue dead, and it either finds work (in which
     # case the run proceeds normally) or it does not.
     counts = _task_counts(root / DB_RELPATH)
-    if counts is not None and not _claimable(counts):
+    # Claimability is asked of the SERVED streams; the printed counts stay
+    # whole so a throttled stream's backlog remains visible in the summary.
+    servable = _claimable_in(root / DB_RELPATH, STREAMS)
+    if counts is not None and not servable:
         print(f"no claimable work: {counts} - trying {', '.join(REOPEN_ON_EMPTY)}")
         subprocess.run(
             [sys.executable, "-m", "tuned.data.tasks", "--config", args.config,
@@ -715,7 +771,7 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
             check=False,
         )
         counts = _task_counts(root / DB_RELPATH) or counts
-        if not _claimable(counts):
+        if not _claimable_in(root / DB_RELPATH, STREAMS):
             _report([
                 "task states: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())),
                 "QUEUE EMPTY - nothing left to claim, and re-opening "
@@ -735,7 +791,7 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
             # this job - a red run here would train the operator to ignore red.
             _push(bundle, root, staging, "queue-empty checkpoint", attempts=3)
             return 0
-        print(f"re-open found work: {_claimable(counts)} claimable - continuing")
+        print(f"re-open found work: {_claimable_in(root / DB_RELPATH, STREAMS)} claimable - continuing")
 
     deadline = time.monotonic() + args.minutes * 60
     next_push = time.monotonic() + args.push_every
