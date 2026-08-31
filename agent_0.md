@@ -176,8 +176,8 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
 | 18 | Decide the ceiling remedy | **DONE** - hand throttle shipped, then REPLACED same day by a measured guard (`be25afd`): `STREAMS` lists all three, `served_streams` drops curated_c2 within 150 effective of the ceiling and on any ceiling it cannot measure (F35) |
 | 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **CLOSED - obsolete.** The re-open was the hand throttle's expiry; the guard now decides per run, so there is no date to remember. Live: serving, 401 effective against a 2,050 ceiling, 1,499 of headroom (F38) |
-| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, SIZED at ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41). **Do NOT dispatch yet:** the claim is FIFO by rowid, so a wave planned now is worked LAST and the dispatch costs up to ~4 h of idle fleet. Trigger is queue depth (< ~1,000 pending synthesis), not the clock (F43). **Command rehearsed and corrected (F45): `--n` counts the LIVE arm-NULL queue, so it is `<live> + 780` - the stream total over-plans 2.3x**. ETA now MEASURED, not guessed: the queue drains ~863 pending/run at ~374 min/cycle, so 4,072 pending is ~29 h and the whole queue is dry around 2026-09-01 18:00Z. The <~1,000-synthesis trigger arrives sooner - roughly two runs out, ~2026-09-01 00:00Z - but the per-stream split has to be read on the baton at dispatch time, not extrapolated (F50) |
-| 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - ~400 effective ... ceiling of 2050`, then curated_c2 claims - which DO resume despite every curated row sitting behind 3,162 synthesis rows by rowid, because claiming is per-stream (F38, F39, F43). Pre-registered on the swept working copy: `ceiling guard: serving every stream - 398 effective generated-curated rows against a ceiling of 2050` (the live figure will be a little higher; 2050 is a function of the static replay/curated_c1 pools and should match exactly). **The guard cannot bind on this queue** - draining every pending curated_c2 task lands ~1,241 effective against a throttle point of 1,900, so what is being verified is that it MEASURES and serves, not that it throttles. Log route CLOSED until the run completes: GitHub serves no log blob for an in_progress job (404) and the step summary renders only at step end, so the read lands when the run's log is archived. It went in_progress 12:38Z, but F50 measured a ~58 min runner-queue lag BEFORE the job clock starts, so expect the 315-minute window to run ~13:35Z-18:50Z and the log ~19:00Z, not the ~17:00Z a naive reading of `startedAt` gives (F49, F50). Robust either way now: the 12:17Z cron is stamped at `699af2c`, which carries `_run_log`, so if it ever displaces this run the replacement puts the same line on the baton within 15 minutes instead |
+| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, SIZED at ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41). **Do NOT dispatch yet:** the claim is FIFO by rowid, so a wave planned now is worked LAST and the dispatch costs up to ~4 h of idle fleet. Trigger is queue depth (< ~1,000 pending synthesis), not the clock (F43). **Command rehearsed and corrected (F45): `--n` counts the LIVE arm-NULL queue, so it is `<live> + 780` - the stream total over-plans 2.3x**. ETA now MEASURED, not guessed: the queue drains ~863 pending/run at ~315.6 min/cycle, so 4,072 pending is ~25 h and the whole queue is dry around 2026-09-01 14:00Z. The <~1,000-synthesis trigger arrives sooner - roughly two runs out, ~2026-09-01 00:00Z - but the per-stream split has to be read on the baton at dispatch time, not extrapolated (F50) |
+| 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - ~400 effective ... ceiling of 2050`, then curated_c2 claims - which DO resume despite every curated row sitting behind 3,162 synthesis rows by rowid, because claiming is per-stream (F38, F39, F43). Pre-registered on the swept working copy: `ceiling guard: serving every stream - 398 effective generated-curated rows against a ceiling of 2050` (the live figure will be a little higher; 2050 is a function of the static replay/curated_c1 pools and should match exactly). **The guard cannot bind on this queue** - draining every pending curated_c2 task lands ~1,241 effective against a throttle point of 1,900, so what is being verified is that it MEASURES and serves, not that it throttles. Log route CLOSED until the run completes: GitHub serves no log blob for an in_progress job (404) and the step summary renders only at step end, so the read lands when the run's log is archived. Its JOB started 12:34:43Z (there is no runner lag - the earlier 58 min was the fence, see F50's correction), so the 315-minute window runs to ~17:49Z and the archived log lands ~18:00Z (F49, F50). Robust either way now: the 12:17Z cron is stamped at `699af2c`, which carries `_run_log`, so if it ever displaces this run the replacement puts the same line on the baton within 15 minutes instead |
 | 22 | Filter IL-TUR-contaminated seeds at PLAN time | **CLOSED - wrong fix.** The drops are co-citation, not contamination: 0 of 88 match the eval item's own case. A seed filter would implement the over-firing and cost 9.6% of the pool for no integrity gain (F40) |
 | 27 | **OPERATOR ACTION, DEADLINE ~2026-09-02: squash the baton's git history** | **OPEN, hard stop.** 55.00 GB of a 100 GB ACCOUNT-WIDE free private quota is already used (baton 38.83 + 16.17 in ten checkpoint repos) and it grows 14.8 GB/day - every checkpoint is a fresh ~565 MB LFS blob; wall ~2026-09-03, and a squash needs up to 36 h to reflect. `super_squash_history` takes it back to ~1 GB, is irreversible, and must run when NO worker holds the baton - end-of-job after the final push, or cancel-squash-dispatch by hand. Recurs ~weekly (F48) |
 | 28 | Decide whether 15 dual-judged rows/run is enough quality evidence | **OPEN, OPERATOR DECISION** - the audit sample is sized right (5.09%) but delivers 15 judged rows and 0 rejections per run, with 25% of the sample shipping unjudged. Cause is family exhaustion, not budget: after groq's two models hit their daily cap there is only ONE free family left for a deepseek row and a dual judgement needs two. mistral's idle 5,000k is NOT the fix - it is the reserved tiebreak family (F51) |
@@ -1573,7 +1573,7 @@ quality evidence for the whole batch" currently rests on 15 rows per run, and
 the shortfall is not random - it is concentrated in the back half of every
 run, after groq runs dry.
 
-### F50. WHAT A COMPLETE RUN ACTUALLY PRODUCES, AND THE 58 MINUTES NOBODY COUNTED
+### F50. WHAT A COMPLETE RUN ACTUALLY PRODUCES (AND A 58-MINUTE GAP I FIRST MISREAD)
 
 Run `33363831595` (sha `0227bdd`, no ceiling guard) is the first run to go
 the distance instead of being cancelled or evicted. Its readout:
@@ -1591,34 +1591,54 @@ on a different instrument (this run's own gate_result rows, before any of
 this log existed). Two independent readings agreeing to a tenth of a point
 is the strongest confirmation the yield model has had.
 
-#### The job clock starts ~58 minutes after the run does
+#### CORRECTED: the 58-minute gap was the fence, not a runner queue
 
-    run created            2026-08-31T06:20:57Z
-    FIRST LOG LINE         2026-08-31T07:19:21Z     <- 58 min in the runner queue
-    last line              2026-08-31T12:34:31Z     = 07:19 + exactly --minutes 315
+The first reading of this was WRONG and is left here because the wrong
+version was committed. Run `33363831595` was created 06:20:57Z and its first
+log line is 07:19:21Z, which I attributed to ~58 minutes waiting for a hosted
+runner. It was not. The job timings say otherwise:
 
-`gh run list` reports `startedAt == createdAt`, so the API hides this
-entirely. The consequence is that a run occupies its slot for **~374 minutes
-from creation**, not the ~322-327 the data-worker.yml cadence comment
-assumes. That comment picks `*/4` over `*/3` on the grounds that "the queued
-run starts ~80 min before the next cron fires, so nothing is ever
-displaced" - a margin of ~80 min that a ~50 min overrun mostly consumes.
+    33349462956   job 02:03:25Z -> 07:18:57Z
+    33363831595   job 07:18:59Z  (2 s after its predecessor)  -> 12:34:34Z
+    33381288057   job 12:34:43Z  (9 s after its predecessor)
 
-Compounding it, GitHub delivers the schedule LATE: the `17 */4` slot before
-this one arrived as run `33361492672` created 05:42:37Z, ~85 minutes behind.
-The cadence reasoning is sound in shape and optimistic in its constants; the
-displacement it was designed to avoid is one late cron away, and the thing
-displaced would be an operator dispatch.
+**Job start follows fence release within seconds, every time.** The 58
+minutes was `concurrency: data-build` holding the run behind `33349462956`,
+which is the fence doing precisely its job. There is no hidden runner lag,
+and `gh run view --json jobs` exposes the real `startedAt` - it is only the
+RUN-level `startedAt` that lies by echoing `createdAt`.
 
-Not changed. `*/4` is still right - going denser makes displacement MORE
-likely, not less - and the fix if one is ever wanted is a longer
-`timeout-minutes` margin, not a different period.
+What this corrects downstream:
+
+- **The cycle is ~315.6 min, not ~374.** Two consecutive runs measured
+  315.5 and 315.6 minutes of job time with ~2-9 s of dead air between them.
+  The fleet chains back to back and the cadence comment's ~322-327 min
+  estimate is if anything pessimistic.
+- **Throughput is ~1,794 accepted rows/day, not ~1,500** (393 per 315.6 min).
+- The 4,072 pending tasks are ~4.7 runs = **~25 hours**, not ~29.
+
+#### Displacement is real, and it was observed - but I caused it
+
+`33361492672` is the `17 */4` cron delivered 05:42:37Z (~85 min late, which
+IS a real and separate finding). It never ran: it was cancelled 06:20:59Z,
+two seconds after my own `workflow_dispatch` created `33363831595`. A second
+pending trigger replaces the one already waiting, exactly as the workflow
+comment warns - only here the operator dispatch displaced the cron, not the
+other way round.
+
+With a 315.6 min run against a 240 min cron the pending slot is always
+occupied when the next cron fires, so a cron run is displaced roughly once
+per cycle. That is harmless when the displaced run is an identical cron, and
+it is why the machine stays saturated. `*/4` stays: denser makes displacement
+more likely, not less, and the only thing worth protecting is an operator
+dispatch - which should be issued when no cron is pending, not defended by
+changing the period.
 
 #### Throughput, and what it means for the queue
 
-At +393 accepted per run and ~374 min per cycle, the fleet banks **~1,500
+At +393 accepted per run and ~315.6 min per cycle, the fleet banks **~1,794
 accepted rows/day**. The 4,072 pending tasks are therefore ~4.7 runs, or
-about **29 hours**, of work - which is when the queue runs dry, not when the
+about **25 hours**, of work - which is when the queue runs dry, not when the
 corpus is done.
 
 ### F49. A 5h16m JOB PUBLISHES NOTHING UNTIL IT ENDS, INCLUDING THE GUARD'S OWN LINE
