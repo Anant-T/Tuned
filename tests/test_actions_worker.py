@@ -1387,7 +1387,10 @@ def test_the_cron_period_is_under_the_cycle_it_schedules():
     """
     workflow = _worker_workflow()
     crons = [entry["cron"] for entry in workflow[True]["schedule"]]
-    assert crons == ["17 */4 * * *"]
+    assert crons == ["17 */4 * * *", "47 */4 * * *"]
+    # Both fires sit inside the SAME four-hour window, so the period the rest
+    # of this test reasons about is still four hours - see the redundancy test
+    # below for why there are two of them.
     period_min = 4 * 60
 
     parsed = actions_worker.main_parser().parse_args(["--phase", "worker", "--hf-repo", "u/r"])
@@ -1872,3 +1875,34 @@ def test_a_storage_reading_that_fails_does_not_fail_the_run(tmp_path, monkeypatc
     written = (tmp_path / "build" / "logs" / actions_worker._run_scope()
                / "worker.log").read_text(encoding="utf-8")
     assert "storage: reading unavailable" in written
+
+
+def test_the_schedule_fires_twice_per_window_because_github_drops_fires(tmp_path):
+    """A dropped cron fire is a stalled unattended build, and they get dropped.
+
+    On 2026-08-31 the `17 */4` schedule was due at 00:17, 04:17, 08:17 and
+    12:17Z and produced exactly ONE run - the 04:17 fire, 85 minutes late. The
+    two clean misses cannot be blamed on the concurrency group: a fire that
+    lost the pending slot would still exist as a cancelled `schedule` run, and
+    there is none, while the runs that WERE pending at 08:17 and 12:17 both
+    survived to be replaced by an operator dispatch instead. GitHub documents
+    that scheduled runs may be delayed or dropped under load.
+
+    The fence makes a second fire free. `concurrency: data-build` with
+    `cancel-in-progress: false` holds one running plus one pending, so a
+    second trigger 30 minutes after the first either finds the slot already
+    taken - and replaces a pending run with an identical one - or delivers the
+    fire the first one lost. No extra compute, no change to the four-hour
+    cadence, one more chance per window.
+
+    Neither fire is at the top of the hour, which is the load peak GitHub
+    names as the reason fires slip in the first place.
+    """
+    workflow = _worker_workflow()
+    minutes = sorted(int(entry["cron"].split()[0]) for entry in workflow[True]["schedule"])
+    hours = {entry["cron"].split()[1] for entry in workflow[True]["schedule"]}
+
+    assert len(minutes) == 2, "one fire is one chance; the fence makes a second one free"
+    assert hours == {"*/4"}, "both fires belong to the same four-hour window"
+    assert minutes[1] - minutes[0] >= 30, "a retry in the same minute retries the same load"
+    assert all(m > 5 for m in minutes), "the top of the hour is the load peak that drops fires"
