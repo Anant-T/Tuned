@@ -1577,6 +1577,39 @@ one of the three axes** and silently redefine the quality bar. So the postage
 figure is real but it is not waste: 96% of the budget is the evidence the rubric
 requires in order to score at all.
 
+**THE MECHANISM, read off the completed run's final ledger (17:50Z):**
+
+    groq/qwen/qwen3.6-27b         spent=207.2k  left=0k
+    groq/openai/gpt-oss-20b       spent=213.2k  left=0k
+    cerebras/gemma-4-31b          spent=334.6k  left=665k
+    mistral/mistral-large-latest  spent=  0.0k  left=5000k
+
+The fleet did NOT run out of tokens - it ran out of FAMILIES. A dual judgement
+needs two distinct families; deepseek is excluded because it generated the row;
+so once both groq refs hit our `tpd`, the only family left is `gemma` and no
+pair can form. 665k and 5,000k sit unspent while rows ship unjudged. That is
+why re-sizing the sample cannot help: the constraint is combinatorial.
+
+**The obvious fix, and why it is not free.** `mistral/mistral-large-latest` is
+free, a distinct family, entirely unspent, and already trusted in the TIEBREAK
+seat - a higher-stakes role than a judge slot, since a tiebreak decides a
+contested row alone. The judge-seat fence above it is titled "MISTRAL-SMALL IS
+OUT OF THE JUDGE SEAT, AND THE FENCE IS ABOUT SMALL SPECIFICALLY" and is fitted
+on `mistral-small-latest`'s calibration (precision 0.237 against a 0.75 gate).
+It does not cover large. **But `judge_task` builds each slot's exclude set as
+`base_exclude | {o.family for o in outcomes}`, and the tiebreak inherits it - so
+a family that JUDGES a row cannot TIEBREAK it.** Mistral is, per its own block,
+"the ONLY live tiebreak candidate for EITHER generator family". Appending it to
+`routing.judge` therefore fires exactly when groq is dry, pairs gemma+mistral,
+and leaves that row with **no tiebreak family at all**. It converts "no
+judgement" into "judgement that cannot be resolved if the two slots disagree",
+on ~20% of judged rows. That is a real trade, not a free win.
+
+**And there is no headroom in the cap itself:** groq's `tpd: 200000` is their
+published per-model daily limit (recorded 2026-08-19), unlike mistral's `tpd`
+which its own comment marks as "FLOORS, NOT MEASUREMENTS". Groq returns no
+daily-token header to probe it against, so it cannot be raised on evidence.
+
 **What that leaves for task 28**, honestly narrowed rather than widened:
   * accept ~36 dual judgements/day as the evidence base, or
   * change the fleet topology - pair each groq ref with cerebras (784k budget
