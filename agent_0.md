@@ -176,6 +176,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
 | 18 | Decide the ceiling remedy | **DONE** - curated_c2 throttled off `STREAMS`; reversible, re-open at ~1,100 accepted synthesis, and BEFORE ~1,196 (F35) |
 | 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **OPEN - the throttle's expiry, check with `shape --headroom`** (F35) |
+| 20 | Plan the synthesis top-up on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN - do it WITH the curated re-open, not before; would displace the queued worker** (F36) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
 
@@ -1430,6 +1431,79 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F36. THE PROMPT VARIANT IS WORTH 3.6x THE FLEET'S TIME, AND IT REPLICATES ON DEEPSEEK
+
+`pick_variant` is `sha256(seed_id:sample_ix) % len(pool)`, so seeds are
+RANDOMLY assigned to prompt paraphrases and the rotation is a free randomised
+trial. Read on the live snapshot, deepseek generations only, terminal tasks:
+
+    prompt_id                 tasks   accepted   accept%   gens/accepted row
+    gen_irac_analysis_v1        127        111     87.4%        3.35
+    gen_irac_analysis_v3         93         65     69.9%        5.57
+    gen_irac_analysis_v2         81         53     65.4%        6.70
+    gen_irac_analysis_v4         94         44     46.8%       11.95
+    gen_summarization_v2         28         27     96.4%        2.26
+    gen_summarization_v1         22         16     72.7%        4.88
+
+**v1 buys 3.6x the rows per generation that v4 does.** Generations ARE the
+fleet's time, so this is the largest lever on the binding resource, and it is
+already paid for.
+
+#### The two confounds, both checked
+
+1. **Retired generator.** The pooled table mixes cerebras/gpt-oss (1,135 gens),
+   lightning (146) and mistral (115) with deepseek (1,800). The figures above
+   are deepseek ONLY - `EXISTS (... g.provider='bai')` - because the pooled
+   profile belongs to a generator that no longer runs.
+2. **Gate era.** A ranking is worthless if the arms ran under different
+   `think_max` settings. They did not - the arms are contemporaneous to the
+   SECOND:
+
+       gen_irac_analysis_v1   372 gens   2026-08-28T21:27:42 .. 08-31T05:03:41
+       gen_irac_analysis_v2   355        2026-08-28T21:27:56 .. 08-31T05:03:23
+       gen_irac_analysis_v3   362        2026-08-28T21:27:52 .. 08-31T05:04:04
+       gen_irac_analysis_v4   526        2026-08-28T21:28:04 .. 08-31T05:03:30
+
+   All four start within 22 seconds and end within 41. Same period, same
+   teacher, same thresholds, random assignment. This is a clean RCT.
+
+Note v4 spent the MOST generations (526) to produce the FEWEST accepted rows
+(44). It is not merely a worse template; it is actively the most expensive one.
+
+#### What can and cannot be done about it
+
+**The 3,453 pending synthesis tasks are already stamped.** `task_id_for` hashes
+`prompt_id`, so a task IS its variant, and `tuned.data.tasks` has no park or
+cancel - only `--reopen`, which un-parks. Deleting a bad template would park
+its pending tasks as `stale_prompt`, which is TERMINALLY_DEAD and irreversible.
+**So the queue runs as planned**; expected yield at the rates above is ~2,630
+accepted, against ~3,612 needed for MVP.
+
+**The lever is the NEXT wave, and the flag for it shipped this session (F33).**
+The top-up needed is ~600-700 accepted rows, and planned on the good variants
+that is a much smaller wave than it would otherwise be:
+
+    Actions -> data-plan -> variants:
+      gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2
+
+**v1+v3, not v1 alone** - deliberately. Pinning to the single best template
+maximises yield and minimises PROMPT DIVERSITY: every irac row would then come
+from one paraphrase, which is a training-data risk the accept rate does not
+price. v3 is a different persona at a good rate (senior advocate arguing aloud
+vs judge writing judgment), so v1+v3 keeps two genres and drops only the two
+bad ones. Cost is ~9pp of yield against v1 alone.
+
+**Do NOT dispatch it yet.** `data-plan` shares the `data-build` concurrency
+group, so dispatching now would displace the queued worker run, and the queue
+already holds 3,453 pending tasks - more than the frozen-curated band admits
+(F35). Plan the top-up when synthesis nears drained, at the same time as the
+curated_c2 re-open.
+
+**Cheap follow-up, safe to do any time:** ADD a second summarization variant in
+the proven genre. Adding a FILE does not change any existing template's sha, so
+no pending task is parked; EDITING one parks every pending task on it. That is
+the whole reason the rule is "add, never delete or edit".
 
 ### F35. curated_c2 IS RUNNING OPEN-LOOP AHEAD OF SYNTHESIS, INTO A ONE-WAY DOOR
 
