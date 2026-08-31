@@ -7,7 +7,7 @@ working state once already.
 
 ---
 
-## 0. State of play (2026-08-31, ~06:10Z)
+## 0. State of play (2026-08-31, ~06:25Z)
 
 **The pipeline works end to end. What is left is throughput and one prompt
 decision - no breakage anywhere.**
@@ -58,6 +58,9 @@ decision - no breakage anywhere.**
   plus `src/tuned/data/review.py` behind 15 tests, read-only against any store
   copy, deterministic in `--salt` so a re-render after the corpus grows returns
   the same 50 rows (F29).
+- `0227bdd` **the length band now weighs the answer that ships** - F28 had left
+  the gate and the assembler disagreeing, and 110 rows (13.7% of the accepted
+  corpus) were refused on characters the corpus would never hold (F32).
 - The cron was **measured, not changed**: fires are late, never lost (F26).
 
 **One legal error is in the corpus.** Accepted row `412b8d1c5430` puts an appeal
@@ -68,8 +71,12 @@ checks citations, not conclusions, and `families_by_kind` is never read (F30).
 transition generations). Not fixed unattended - `transition` is a finished
 stream, so the gate would guard ~0 future rows.
 
+**Next run is `33363831595`** (dispatched 06:20Z on `0227bdd`, pending behind
+the 02:03Z run which ends ~07:20Z). It is the first run carrying ALL of
+tonight's fixes.
+
 **What the next session should pick up**, in order: read the F23 prediction
-(`claimed=36`) off run `33361492672` once it starts - it is the first run on
+(`claimed=36`) off run `33363831595` once it starts - it is the first run on
 post-fix code; then the persona decision below; then Step 6, which `--variant`
 now unblocks. Do not dispatch `data-assemble` (F20).
 
@@ -1416,6 +1423,13 @@ Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
    spend silently. Noted, not changed.
 5. **Cheap subagents** for mechanical work (test writing, transition forensics,
    doc drafting); the main session keeps root-causing and verification.
+6. **Dispatched a worker on `0227bdd` at 06:20Z, replacing the queued
+   `fb611f5` fire.** The concurrency group holds one running plus one waiting,
+   so a dispatch REPLACES the waiting run rather than adding to it: the
+   scheduled run went `cancelled` at 06:20:59Z having never started, so nothing
+   was lost, and the next ~5.5h of generation gets F32's 13.7% instead of
+   waiting a further cycle for it. Confirmed the cancellation was the
+   concurrency swap and not a failure before recording this.
 
 ## 8. Open risks
 
