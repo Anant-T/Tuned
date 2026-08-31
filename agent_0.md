@@ -33,9 +33,14 @@ bounded cost `--db-every` names, and it landed near the low end of it.
 raw log automatically - no manual recovery step, and nothing needs repairing by
 hand. NOTE the next run will be the first to carry `--db-every 7200`.
 
-A local copy of the whole baton (state + raw + streams + corpus) was taken to
-`C:\Users\Anant\Desktop\baton-backup-2026-08-31` because the baton is the only
-copy and the squash it is waiting on is irreversible.
+A local copy of the baton is being taken to
+`C:\Users\Anant\Desktop\baton-backup-2026-08-31`, because the baton is the only
+copy and the squash it is waiting on is irreversible. The first attempt died on
+an `httpx.ReadTimeout` with 0.30 GB of `raw/gen` on disk and the 785 MB database
+still on the far side of it, so the retry raises `HF_HUB_DOWNLOAD_TIMEOUT` to
+120 s and fetches `state/` FIRST - it is the only part of the baton that cannot
+be rebuilt from the rest. Check the directory before trusting this paragraph:
+the copy is complete only if `state/law_v1.sqlite3` is there at ~785 MB.
 
 ---
 
