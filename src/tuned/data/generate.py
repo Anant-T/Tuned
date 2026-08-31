@@ -2217,6 +2217,12 @@ async def run_workers(
         # louder stream starving a quieter one), then spend whatever budget
         # the drained streams left behind on the streams that can still use
         # it. The ceiling never rises above the sized bound.
+        #
+        # The top-up walks `streams` IN ORDER, which is not incidental:
+        # actions_worker.STREAMS is (synthesis, transition, curated_c2), so the
+        # surplus a drained stream leaves behind lands on synthesis first - the
+        # one bucket the corpus is actually short on. Reordering STREAMS
+        # silently reallocates that surplus.
         budget = n_workers * len(streams)
         claimed: list = []
         for stream in streams:
