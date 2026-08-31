@@ -1356,12 +1356,30 @@ training bucket, and refused rows on their size.
 Measured on the live store: of 2,431 `length_band` failures, **250 name
 `total>total_max` as their ONLY violation**, and **110 of those sit inside the
 band once the answer is measured as it ships** (109 `irac_analysis`, 1
-`statute_qa`). Against 805 accepted rows that is a **13.7%** loss taken for a
-mis-measurement.
+`statute_qa`).
 
-**Correction to my own first pass:** I reported 172 before including
-`prompt_est` in the total. `total` is prompt + think + answer, and dropping the
-prompt inflated the count by 56%. The number is 110.
+**Two corrections to my own arithmetic, both downward. Neither number I first
+reached was right:**
+
+1. I said **172** before including `prompt_est`. `total` is prompt + think +
+   answer; dropping the prompt inflated it 56%. The length figure is **110**.
+2. I then called 110 "a 13.7% loss", which is **wrong** and the more misleading
+   error. Those 110 rows had their *length verdict* changed - most of them also
+   failed OTHER gates, so they were never one measurement away from the corpus.
+   The number that matters is rows for which `length_band` was the **sole**
+   blocker:
+
+| | rows |
+|---|---|
+| generations whose only failing gate is `length_band` | 221 |
+| ...that pass on today's caps alone (rejected under a superseded `think_max`) | 6 |
+| ...that pass on today's caps **and** the shipped-answer measure | **41** |
+| **attributable to this fix** | **35** (4.3% of the 805 accepted) |
+
+So the honest claim is **35 rows, ~4.3%**, not 110 or 13.7%. Still worth having
+for zero generations, and still a real inconsistency to close - but a third of
+what I first wrote, and the third time tonight that a plausible first number
+did not survive being re-derived.
 
 The fix is to measure once, in one place. `answer_without_preamble` and its two
 constants **moved from `decontaminate.py` into `gates.py`**, beside the
@@ -1386,11 +1404,19 @@ Why this is strictly more correct, not merely more permissive:
 - A genre without an IRAC contract (`summarization`, `drafting`) is untrimmed
   and so measured exactly as before.
 
-**This does not recover the 110.** They are `rejected`, and reopening
-regenerates rather than re-gates, so recovering them would cost the calls again;
-the value is that the same loss stops recurring. If a re-gate CLI is ever worth
-writing, those 110 rows are its first customer - the generations are still in
-the store.
+**This recovers nothing already rejected.** Those rows are `rejected`, and
+reopening regenerates rather than re-gates, so recovering them would pay for the
+calls a second time; the value here is forward-looking - the same loss stops
+recurring.
+
+**A re-gate would be worth 41 rows for zero API calls**, and that is now a
+measured number rather than a hunch: 41 generations sitting in the store pass
+every gate under today's configuration, 35 of them because of this fix and 6
+because `think_max` moved 3000 -> 4500 underneath them. At ~44 accepted rows/hr
+that is roughly an hour of generation, recoverable without touching the rate
+bucket. It needs a CLI that re-runs `run_all` over stored generations and
+promotes the passes - not written tonight, because it is a new write path into
+the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
 
