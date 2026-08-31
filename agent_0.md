@@ -176,7 +176,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
 | 18 | Decide the ceiling remedy | **DONE** - hand throttle shipped, then REPLACED same day by a measured guard (`be25afd`): `STREAMS` lists all three, `served_streams` drops curated_c2 within 150 effective of the ceiling and on any ceiling it cannot measure (F35) |
 | 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **CLOSED - obsolete.** The re-open was the hand throttle's expiry; the guard now decides per run, so there is no date to remember. Live: serving, 401 effective against a 2,050 ceiling, 1,499 of headroom (F38) |
-| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, SIZED at ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41). **Do NOT dispatch yet:** the claim is FIFO by rowid, so a wave planned now is worked LAST and the dispatch costs up to ~4 h of idle fleet. Trigger is queue depth (< ~1,000 pending synthesis), not the clock (F43) |
+| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, SIZED at ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41). **Do NOT dispatch yet:** the claim is FIFO by rowid, so a wave planned now is worked LAST and the dispatch costs up to ~4 h of idle fleet. Trigger is queue depth (< ~1,000 pending synthesis), not the clock (F43). **Command rehearsed and corrected (F45): `--n` counts the LIVE arm-NULL queue, so it is `<live> + 780` - the stream total over-plans 2.3x** |
 | 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - 401 effective ... ceiling of 2050`, then curated_c2 claims (F38, F39) |
 | 22 | Filter IL-TUR-contaminated seeds at PLAN time | **CLOSED - wrong fix.** The drops are co-citation, not contamination: 0 of 88 match the eval item's own case. A seed filter would implement the over-firing and cost 9.6% of the pool for no integrity gain (F40) |
 | 25 | OPERATOR DECISION: turn off the row-side case_id channel (`--no-case-id-from-text`) | **OPEN** - recovers 81 generated rows (~9%) with exact containment untouched; deferred because it is an eval-integrity call and the rows are recoverable retroactively, so waiting costs nothing (F40) |
@@ -1509,6 +1509,61 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F45. `--plan-n` IS MEASURED AGAINST THE LIVE QUEUE, AND THE OBVIOUS READING OVER-PLANS BY 2.3x
+
+The top-up is one dispatch, so it was worth rehearsing rather than typing. Run
+on a scratch copy of the swept working store, asking for the ~780-task wave the
+way the docs read - "`--n` is a target for the whole stream, not an increment",
+stream total 4,970, so `--n 5750`:
+
+    stream=synthesis target=5750 variants=gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2
+    planned 1805  collided 0
+      irac_analysis 1354   summarization 451
+
+**1,805 tasks, not 780.** The target is not measured against the stream. It is
+measured against `_existing_in_queue` (`tasks.py:284`), which counts rows that
+can still BECOME a dataset row - and it filters two ways at once:
+
+    synthesis, every arm                        4,970
+    synthesis, arm IS NULL                      4,570   (400 rows sit in an A/B arm)
+    minus TERMINALLY_DEAD                        -625   (rejected 364, stale_prompt 244,
+                                                         input_ineligible 17)
+    = the number --n is compared against        3,945
+    5750 - 3945                                 1,805   <- what it actually planned
+
+Both filters bite. `arm IS NULL` is deliberate (an armed wave is a separate
+queue), and TERMINALLY_DEAD is deliberate (a wave that lost rows must be able to
+replace them). Together they mean **the stream total is never the right input**,
+and here the naive reading over-plans by 2.3x.
+
+#### The command, with the number read at dispatch time
+
+    n = <live> + 780,  where <live> is, on the BATON, at the moment of dispatch:
+
+    SELECT COUNT(*) FROM task
+     WHERE stream = 'synthesis' AND arm IS NULL
+       AND state NOT IN ('rejected', 'stale_prompt', 'input_ineligible');
+
+    data-plan:  stream = synthesis
+                n      = <live + 780>
+                mix    = irac_analysis=0.75,summarization=0.25
+                variants = gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2
+
+Do NOT reuse 4,725 (3,945 + 780): that live count was read off a scratch copy
+and the queue moves every run.
+
+#### What the rehearsal confirmed working
+
+- **The allowlist binds exactly.** All 1,805 new rows drew from the three named
+  templates and nothing else - v1 691 / v3 663 / summarization_v2 451 - and the
+  irac split is the sha-modulo over a two-element pool, not a preference.
+- **The mix binds exactly.** 1,354 / 451 is 0.75 / 0.25 to the row.
+- **All new rows are `pending`, `sample_ix 0`** - fresh seeds, no re-draw of an
+  existing (seed, task_type) pair, so nothing collides (`collided 0`).
+- **The dispatch path carries it.** `data-plan.yml` exposes a `variants` input
+  and `actions_worker.py:1199-1206` splits it on commas into repeated
+  `--variant`, so the comma-separated string works from the browser form.
 
 ### F44. THE 19% SYNTHESIS OVERSTATEMENT NEVER REACHES THE SHIPPING PATH
 
