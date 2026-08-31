@@ -7,7 +7,7 @@ working state once already.
 
 ---
 
-## 0. State of play (2026-08-31, ~06:00Z)
+## 0. State of play (2026-08-31, ~06:10Z)
 
 **The pipeline works end to end. What is left is throughput and one prompt
 decision - no breakage anywhere.**
@@ -42,7 +42,7 @@ decision - no breakage anywhere.**
 - reopen the 2,063 `skip:slots` transition rows (they would re-die - F18);
 - widen `curated_c2` (it raises the bar it is already above - F16).
 
-**Shipped since 03:40Z** (both on `origin/main`, suite **3,781 / 19**):
+**Shipped since 03:40Z** (all on `origin/main`, suite **3,796 / 19**):
 - `c61311a` **the variant allowlist** - `--variant` pins a wave to chosen
   templates, binding new rows only, so Step 6 can stop buying the expensive
   personas without deleting a template and parking the live queue (F27).
@@ -54,6 +54,10 @@ decision - no breakage anywhere.**
 - **The 50-example review packet** the dataset card requires before shipping is
   built and pre-screened; 12 of 50 rows cite an authority their source never
   names (F29). The human read itself is still outstanding.
+- `4505840` **the review packet is reproducible** - `data/scripts/review_packet.py`
+  plus `src/tuned/data/review.py` behind 15 tests, read-only against any store
+  copy, deterministic in `--salt` so a re-render after the corpus grows returns
+  the same 50 rows (F29).
 - The cron was **measured, not changed**: fires are late, never lost (F26).
 
 **One legal error is in the corpus.** Accepted row `412b8d1c5430` puts an appeal
@@ -63,6 +67,11 @@ checks citations, not conclusions, and `families_by_kind` is never read (F30).
 1 row of 718; the blind spot behind it is systematic (19.9% of gate-passing
 transition generations). Not fixed unattended - `transition` is a finished
 stream, so the gate would guard ~0 future rows.
+
+**What the next session should pick up**, in order: read the F23 prediction
+(`claimed=36`) off run `33361492672` once it starts - it is the first run on
+post-fix code; then the persona decision below; then Step 6, which `--variant`
+now unblocks. Do not dispatch `data-assemble` (F20).
 
 **The one decision waiting:** two prompt personas are burning half the fleet.
 `gen_irac_analysis_v4` (examiner writing a model answer) spends **15.6
@@ -147,7 +156,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 9 | Author `gen_irac_analysis_v5` + `gen_summarization_v3` in the proven speech/letter genre; 10-row A/B; then plan Step 6 on the winners | **READY, needs the bucket free** (F24). Superseded in part: `--variant` now lets Step 6 avoid the losing personas **without** authoring anything (F27) |
 | 10 | Variant allowlist so a wave can be planned on the templates that earned it | **DONE** `c61311a` (F27) |
 | 11 | Stop shipping the answer's second deliberation | **DONE** `fb611f5` (F28) |
-| 12 | Build the 50-example review packet the card requires, and pre-screen it | **DONE** - `data/build/out/review_packet.html`, 12/50 flagged (F29) |
+| 12 | Build the 50-example review packet the card requires, and pre-screen it | **DONE** `4505840` - reproducible CLI, 4/50 flagged (the first 12/50 was a screen bug, F29) |
 | 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it. The 5 transition rows are already read: 1 is wrong (F30) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
