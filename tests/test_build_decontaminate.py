@@ -4942,3 +4942,122 @@ def test_the_guard_is_off_unless_a_number_is_given():
 
     index = EvalIndex(_eval_items(40, 60))
     assert index.total_grams > 0  # would have refused under any guessed cap
+
+
+# --------------------------------------------------------------------------
+# The answer's second deliberation.
+#
+# Every generator template states the answer's size in words - "roughly 250 to
+# 450 words" - and puts the reasoning in the trace, where the think block
+# already holds it. On 2026-08-31 the accepted corpus said otherwise: of 733
+# rows whose task type owes an IRAC answer, 490 (67%) open with 2,400-4,800
+# characters of first-person deliberation BEFORE the first heading, and that
+# preamble is 65% of all answer words. It shares a median 57% of its content
+# words with the think block while repeating only 5% of its five-word runs, so
+# it is a second pass over the same reasoning in fresh wording, not a copy.
+#
+# Nothing catches it: the length band has an answer_min and no answer_max, and
+# irac_placement asks only that the headings BE in the answer, not that the
+# answer open with them. Trained on this, the student learns to close its think
+# block and then deliberate again.
+#
+# The distribution is bimodal - 234 rows start at the heading, 486 start
+# 1,200+ characters in, and 13 rows lie anywhere between - so the threshold
+# sits in an empty gap rather than on a judgement call.
+# --------------------------------------------------------------------------
+
+IRAC_TAIL = (
+    "## Issue\nWhether a second appeal lay to the High Court when no substantial "
+    "question of law had been framed, and whether the reappreciation of evidence "
+    "that followed was open to it.\n\n"
+    "## Rule\nSection 100 of the Code of Civil Procedure permits a second appeal "
+    "only on a substantial question of law, which must be framed before the appeal is "
+    "heard on its merits. The provision withholds from the High Court the ordinary "
+    "appellate power to reweigh evidence, and concurrent findings of fact reached by "
+    "the courts below are binding unless they are perverse.\n\n"
+    "## Application\nNo substantial question of law was framed at any stage here. "
+    "The High Court proceeded directly to the evidence, preferred its own reading of "
+    "the attesting witness testimony to that of the first appellate court, and reversed "
+    "on that basis alone. Neither court below was held to have acted perversely, and no "
+    "such finding was recorded. What the High Court did was therefore the reweighing "
+    "that section 100 puts beyond it, and the absence of a framed question is not a "
+    "formal defect but the jurisdictional precondition itself.\n\n"
+    "## Conclusion\nThe second appeal was not maintainable and the judgment of the "
+    "High Court is set aside. The decree of the first appellate court stands restored, "
+    "and the parties are left to bear their own costs."
+)
+
+
+def test_a_second_deliberation_is_dropped_from_the_answer():
+    from tuned.data.decontaminate import answer_without_preamble
+
+    preamble = "I need to pin down what actually happened procedurally.\n" * 40 + "\n"
+    answer, dropped = answer_without_preamble(preamble + IRAC_TAIL, "irac_analysis")
+    assert answer == IRAC_TAIL
+    assert dropped == len(preamble)
+
+
+def test_a_short_lead_in_is_left_alone():
+    """One sentence introducing the analysis is not a second deliberation, and
+    the bimodal distribution puts nothing real in this range."""
+    from tuned.data.decontaminate import answer_without_preamble
+
+    lead = "On the question referred, my analysis follows.\n\n"
+    answer, dropped = answer_without_preamble(lead + IRAC_TAIL, "irac_analysis")
+    assert answer == lead + IRAC_TAIL
+    assert dropped == 0
+
+
+def test_an_answer_with_no_heading_is_left_alone():
+    from tuned.data.decontaminate import answer_without_preamble
+
+    prose = "The appeal fails. " * 300
+    assert answer_without_preamble(prose, "irac_analysis") == (prose, 0)
+
+
+def test_a_task_type_that_owes_no_irac_answer_is_left_alone():
+    """A summary or a drafted notice is prose by genre; the word "Issue" at the
+    head of one of its lines is not a contract this may act on."""
+    from tuned.data.decontaminate import answer_without_preamble
+
+    text = "Long deliberation.\n" * 100 + "\n" + IRAC_TAIL
+    assert answer_without_preamble(text, "summarization") == (text, 0)
+    assert answer_without_preamble(text, None) == (text, 0)
+
+
+def test_trimming_never_leaves_a_stub():
+    """3.3% of the affected rows would fall under the band's answer_min once
+    trimmed. Those keep their preamble: a row too short to ship is worse than
+    a row that deliberates twice, and the length band would refuse it anyway."""
+    from tuned.data.decontaminate import answer_without_preamble
+
+    stub = "## Issue\nWhether.\n\n## Conclusion\nNo."
+    text = "Deliberation at length.\n" * 100 + "\n" + stub
+    assert answer_without_preamble(text, "irac_analysis") == (text, 0)
+
+
+def test_generated_rows_ship_the_trimmed_answer_and_record_the_cut(tmp_path):
+    from tuned.data.decontaminate import generated_rows
+
+    store = open_store(tmp_path, n_seeds=1)
+    preamble = "Let me work through what actually happened here.\n" * 40 + "\n"
+    _accept_generation(store, seed_id="seed000", think="my reasoning",
+                       answer=preamble + IRAC_TAIL)
+    row = next(iter(generated_rows(store, state="accepted")))
+    store.close()
+
+    content = row["messages"][1]["content"]
+    assert content.endswith(IRAC_TAIL)
+    assert "Let me work through" not in content.split("</think>")[-1]
+    assert "my reasoning" in content.split("</think>")[0]
+    assert row["_prov"]["answer_preamble_dropped"] == len(preamble)
+
+
+def test_an_untrimmed_row_records_no_cut(tmp_path):
+    from tuned.data.decontaminate import generated_rows
+
+    store = open_store(tmp_path, n_seeds=1)
+    _accept_generation(store, seed_id="seed000", think="t", answer=IRAC_TAIL)
+    row = next(iter(generated_rows(store, state="accepted")))
+    store.close()
+    assert row["_prov"]["answer_preamble_dropped"] == 0

@@ -606,6 +606,19 @@ def test_render_card_discloses_gate_qualified_not_judge_calibrated():
     assert re.search(r"\d+(\.\d+)?%\s+accept", card) is None
 
 
+def test_render_card_discloses_that_answers_were_trimmed():
+    """The shipped answer is not always the bytes the teacher returned: an
+    answer that deliberated a second time before its first IRAC heading has
+    that preamble cut at assembly. A card that did not say so would describe
+    a corpus that does not exist, and the trim is not recoverable from the
+    published rows - only from the build store, which does not ship."""
+    report, decon, rows, push_cfg, versions = _card_fixture()
+    card = render_card(report=report, decon=decon, rows=rows, push_cfg=push_cfg, versions=versions)
+    assert "## Answer normalisation" in card
+    assert "first IRAC heading" in card
+    assert "think block" in card
+
+
 def test_render_card_refuses_without_a_decon_version():
     report, _decon, rows, push_cfg, versions = _card_fixture()
     with pytest.raises(CardDataMissing, match="decon_version"):

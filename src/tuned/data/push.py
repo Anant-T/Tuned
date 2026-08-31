@@ -586,6 +586,21 @@ def render_card(
         "calibration rules forbid outright."
     )
     lines.append("")
+    lines.append("")
+    lines.append("## Answer normalisation")
+    lines.append("")
+    lines.append(
+        "The assistant turn of a generated row is its reasoning trace inside the think "
+        "block, followed by its answer. Where a teacher deliberated a SECOND time in the "
+        "answer itself - restating in fresh wording the reasoning the think block already "
+        "held - before reaching the first IRAC heading, that preamble is cut at assembly "
+        "and the answer ships from its first heading. It is cut only for the task types "
+        "that owe a headed answer, only above a measured threshold, and never where the "
+        "cut would leave the answer under its own length floor. The trace is untouched. "
+        "The full generation as the teacher returned it remains in the build store, which "
+        "does not ship, so the trim cannot be undone from the published rows; each row "
+        "carries the number of characters cut from it."
+    )
     lines.append("## Known risk: teacher legal error")
     lines.append("")
     lines.append(
