@@ -611,6 +611,24 @@ under the present templates. Given F14/F18 (both live gates are generator
 non-compliance, not thresholds), the next wave is worth more after a template
 decision than before one. Fire it when the queue actually nears exhaustion.
 
+
+**Accept rates re-measured with explicit exclusions (2026-08-31 03:15Z).** The
+earlier 33.0% for synthesis was slightly optimistic; excluding `gen_unroutable`
+(a shredder artifact, not a merit outcome) and `skip:slots` (the planner bug -
+no answer was ever bought) the terminal rates are:
+
+    stream       accepted  rejected  parked  ineligible   accept
+    curated_c2        310        13     269           0    52.4%
+    synthesis         337       419     264          42    31.7%
+    transition          3        87      26           0     2.6%
+
+curated_c2 accepts at **1.65x** synthesis's rate, which is the whole reason the
+1.12:1 arrival ratio sits below the 1.47:1 the window needs. Note the shape of
+the difference too: curated_c2 barely gets *rejected* (13) and mostly *parks*
+(269), while synthesis carries 419 rejects - permanent gates and judge calls.
+At 31.7% the queue's endpoint is synth ~1,499 rather than 1,546, so the
+shortfall is **~+520 accepted synthesis**, not ~+470. Conclusions unchanged.
+
 ### F17. Live throughput, measured on run #9
 
     5 gen batches, claimed=36 each: gen-ok 35-36, err 0-1, cooling 0, unroutable 0
