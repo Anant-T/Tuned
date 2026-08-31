@@ -293,6 +293,62 @@ more grounded_synthesis rows, and that single number is the ship date. The
 only other lever is trimming replay, which shrinks the whole corpus
 proportionally; that is a product decision, recorded here rather than taken.
 
+### Step 6 sizing, from MEASURED yield (2026-08-31)
+
+Task-level terminal yield on the baton, counting only graded outcomes
+(`accepted + rejected + format_parked`; `stale_prompt` and `input_ineligible`
+are artefacts, not quality outcomes):
+
+| stream | graded terminal | accepted | yield |
+|---|---|---|---|
+| synthesis | 1,020 | 337 | **33.0%** |
+| curated_c2 | 592 | 310 | **52.4%** |
+
+Against the gaps in the corpus table above:
+
+- **grounded_synthesis** needs ~2,760 more accepted to reach 3,100. The 3,401
+  synthesis tasks now queued yield ~1,122, so the current queue closes less
+  than half the gap. Closing the rest needs roughly **5,000 further synthesis
+  tasks**. Seed headroom is ample (61,853 seeds x `PER_SEED_CAP` 4, ~5k used).
+- **curated_c2 needs nothing more.** 1,768 queued x 52.4% = ~926 accepted, so
+  curated lands near 2,936 against a 2,880 target and a 3,086 ceiling. Planning
+  more would push it OUT of band. Do not widen curated.
+- **transition stays where it is.** With `708d455` its wave can draw the 1,100
+  usable grid seeds, but the stream converts at 3/137 = 2.2% even on
+  well-formed seeds, so widening it now would buy permanent rejects. It is not
+  needed for MVP: synthesis has the headroom to carry grounded_synthesis alone.
+  Fix the quotation problem first (see below).
+
+**Route: `data-plan.yml` only.** It is the sole sanctioned path to the remote
+queue - the worker never plans, and `--phase seed-push` refuses once the remote
+owns the baton. `--plan-n` is a TARGET for the stream, not an increment, and it
+counts every non-terminally-dead task, so the number to pass is
+`current_counted + wanted`, not `wanted`.
+
+**Deliberately NOT dispatched tonight.** Two reasons, both about the fence:
+`data-plan` shares the `data-build` concurrency group, which holds one running
+plus one pending run, and a second pending trigger REPLACES the one already
+waiting - so a plan dispatched now would be silently displaced by the 05:17Z
+cron. And there is no urgency: 5,190 queued rows at ~300 gen/hour is well over
+a day of work. Dispatch it when the queue is closer to drained, sized on yield
+measured after the fix rather than before it.
+
+### The transition stream has a SECOND defect, unfixed
+
+Separate from the planner bug: of the 137 well-formed grid-seeded rows, 3 were
+accepted and 87 rejected, and `statutory_quotation` fires on 85 of those 87
+(97.7%). The prompt hands the teacher the build's "operative effect" prose for
+the savings clause and tells it explicitly not to present that as quoted
+section text; the model quotes it anyway. On this stream `temporal` and
+`answer_key` are PERMANENT gates, so a format slip that would merely
+`regenerate` on synthesis becomes an irreversible `reject` here - which is why
+the same gates that synthesis survives convert transition at 2%.
+
+Not fixed tonight, and deliberately so: it is a generator-behaviour problem,
+the stream is not on the MVP critical path, and prompt levers on this teacher
+have a recorded history of not working (the 2026-08-27 paired A/B on trace
+length). Fix it before any transition wave is widened, not after.
+
 ## 6. Constants interrogated
 
 | Constant | Verdict |
