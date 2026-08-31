@@ -1308,7 +1308,26 @@ def main_parser() -> argparse.ArgumentParser:
     # reconcile_raw replays generations and judgements from the raw log but
     # neither task state nor gate_result, so a crash returns up to this much
     # already-paid work to `pending` to be bought again.
-    parser.add_argument("--db-every", type=float, default=3600)
+    #
+    # RAISED 3600 -> 7200 on 2026-08-31, as the emergency lever it was always
+    # meant to be, and it should be PUT BACK once the baton is squashed. The
+    # trigger: with the raw log sharded hourly the DB became ~95% of the
+    # remaining growth, and the countdown read 32.2 GB of headroom against
+    # 18.8 GB/day - a wall at ~2026-09-02 11:18Z. `super_squash_history` is the
+    # real fix and reclaims far more, but the quota takes up to 36 h to reflect
+    # one, which put the operator's deadline at ~2026-08-31 23:18Z, in the
+    # middle of their night. Halving the DB cadence takes the burn to
+    # ~9.8 GB/day and the wall to ~2026-09-03 18:40Z, which buys the squash a
+    # waking day to happen in.
+    #
+    # WHAT IT COSTS, stated plainly because this number is a durability bound
+    # and not a tuning knob: a crash now returns up to TWO hours of paid
+    # generation to `pending` instead of one - roughly 140 generations at the
+    # observed ~72/hour. That is the trade, it is only paid on a crash (the
+    # end-of-job push always carries a database, and the last run exited
+    # `success`), and it is strictly cheaper than the wall it avoids, where
+    # every run loses its entire 5h15m because the Hub refuses the upload.
+    parser.add_argument("--db-every", type=float, default=7200)
     # 12 per stream x 3 streams = 36 calls in one gather. Admission runs at
     # the generator bucket's rate (~7.5 s/call at rpm 8), so the last call is
     # admitted at ~270 s and runs at most ~120 s: ~390 s against a 900 s

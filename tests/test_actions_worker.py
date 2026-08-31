@@ -1193,7 +1193,10 @@ def test_the_database_rides_a_slower_lane_and_the_final_push_always_carries_it()
 
     parsed = actions_worker.main_parser().parse_args(["--phase", "worker", "--hf-repo", "u/r"])
     assert parsed.push_every == 900
-    assert parsed.db_every == 3600
+    # 7200, not 3600, since 2026-08-31 - the documented emergency lever, pulled
+    # because the storage wall arrived before the operator could squash. The
+    # arithmetic and how to revert live on the argument itself.
+    assert parsed.db_every == 7200
     assert parsed.db_every > parsed.push_every, "a DB cadence at or under the append cadence buys nothing"
 
     src = inspect.getsource(actions_worker.run_worker)
