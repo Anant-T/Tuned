@@ -176,7 +176,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
 | 18 | Decide the ceiling remedy | **DONE** - hand throttle shipped, then REPLACED same day by a measured guard (`be25afd`): `STREAMS` lists all three, `served_streams` drops curated_c2 within 150 effective of the ceiling and on any ceiling it cannot measure (F35) |
 | 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **CLOSED - obsolete.** The re-open was the hand throttle's expiry; the guard now decides per run, so there is no date to remember. Live: serving, 466 effective against a 2,050 ceiling (F35) |
-| 20 | Plan the synthesis top-up on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN** - no longer coupled to a curated re-open. 3,162 synthesis tasks are still pending, so a top-up wave is not urgent; plan it when the queue thins (F36) |
+| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, not urgent** - ~27 h of queue left, and a `data-plan` dispatch would be evicted by the 12:17Z cron anyway. Worth ~1.7x the corpus per fleet-hour when it happens (F37) |
 | 21 | Verify the ceiling guard's first live run | **OPEN** - run `33375922778` starts ~12:35Z when `33363831595` ends. Expect `ceiling guard: serving every stream - 466 effective ... ceiling of 2050`, then curated_c2 claims resuming (F35) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
@@ -1505,6 +1505,110 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F37. F36's VARIANT EFFECT IS ONE GATE, AND THE GATE IS RIGHT
+
+F36 measured that the prompt variant is worth 3.6x the fleet's time and left
+the mechanism open. It is `irac_placement`, almost entirely. Measured on this
+run's 428 generations (2026-08-31 07:15Z onward), independent of F36's sample:
+
+    gate                  failed  seen   fail%     sole blocker on
+    irac_placement           247   428   57.7%     66 generations
+    length_band              152   428   35.5%     13
+    banned_meta              100   428   23.4%     20
+    prompt_echo               94   428   22.0%      9
+    statutory_grounding       49   428   11.4%      7
+    self_verification         31   428    7.2%      9
+    verbatim_overlap          14   428    3.3%      -
+
+`irac_placement` fails more than the next two gates combined and is the sole
+thing standing between 66 generations (15% of the run) and a clean row.
+
+#### It is not drift. I checked, because F24 was.
+
+F24's `irac_placement` blow-up WAS template/gate drift, so drift is the first
+hypothesis, not the last. It does not hold here, on four checks:
+
+1. **The failure mode is the trace, not the answer.** Of 247 failures, **225
+   are leak-only** - the ANSWER carries its headings correctly and the THINK
+   trace also runs under IRAC labels. Only 11 are a missing heading.
+2. **The regex cannot be firing on prose.** `_IRAC_HEADING_RE` is line-initial
+   and requires a terminator (`:`, `.`, emphasis, or end of line), so "the
+   issue is settled, this is the rule" - which the templates themselves
+   suggest writing - does not match.
+3. **The matched text is real.** Sampled four failures: `'    Issue: Whether
+   the issuing bank can refuse...'`, `'**Rule:**'`, `'Conclusion: Conviction
+   of Devender upheld...'`. These are full labelled IRAC run-throughs inside
+   `<think>`, not false positives.
+4. **The template already forbids it, explicitly and at length.** v4 says the
+   headings "belong to the model answer and never inside your reasoning, which
+   runs as continuous prose and never opens a line with one of those four
+   words", and spends a further three sentences pre-empting the exact habit.
+
+So the gate is doing precisely its job - this is the MSLR pathology, a model
+scripting its reasoning as a template it fills in afterwards - and the model
+ignores the prohibition anyway. That is the same result as the trace-length
+A/B and the genre finding: **an explicit format prohibition does not survive
+contact with the model's habit.** Do not spend another round on wording.
+
+#### Retries do not rescue it either
+
+    irac_placement pass        attempt 1  49.7%   attempt 2  37.9%   attempt 3  36.7%
+    ALL gates clean            attempt 1  21.5%   attempt 2  18.2%   attempt 3  18.3%
+
+The rate FALLS with attempt. That is survivorship, not decay - attempt 2 only
+ever re-rolls tasks that failed attempt 1, which are the harder seeds and the
+worse variants - but the practical reading stands: a retry is worth ~18%, not
+the 21.5% of a fresh task, and it costs a whole generation. Retrying is not
+the lever, and MAX_ATTEMPTS is not mis-set.
+
+#### The lever is allocation, and here is its price
+
+Same run, irac_analysis only. The assignment is `sha256(seed_id:sample_ix) %
+len(pool)`, so this is a randomised trial, not an observational split:
+
+    variant   clean  gens  clean%  gens/row  ktok/row
+    v1           27    73   37.0%      2.70      15.9
+    v3           27    95   28.4%      3.52      23.5
+    v2           20   138   14.5%      6.90      47.7
+    v4           10   122    8.2%     12.20      82.5
+    ALL          84   428   19.6%      5.10      33.9
+
+**v4 costs 4.5x v1 per clean row in generations and 5.2x in tokens.** The
+ordering replicates F36's (v1 > v3 > v2 > v4) on fresh data, which is what a
+real effect looks like.
+
+The pending queue does not know any of this - it was planned before the
+measurement and is split almost evenly:
+
+    pending irac_analysis:  v2 405   v1 402   v4 397   v3 360
+
+At that mix the fleet pays 5.10 generations per clean row. On v1+v3 only it
+would pay ~3.0 - **about 1.7x the corpus for the same fleet**, or ~128
+gate-passing rows/hour against today's ~75.
+
+#### What NOT to do about it tonight
+
+The stamped tasks cannot be re-pointed: `task_id_for` hashes the prompt_id, so
+a task IS its variant. The three tempting actions are all wrong right now:
+
+- **Editing a template** re-stamps its prompt_sha and parks every pending task
+  on it as `stale_prompt`, permanently (there is no re-stamp; re-opening
+  re-parks instantly).
+- **Parking the v2/v4 tasks** means writing task state to the store, and the
+  baton is held by a running worker continuously - run N+1 starts 2 seconds
+  after run N ends. There is no safe window, and a writer against `data/build`
+  during a run is the rule this session already broke once.
+- **Dispatching `data-plan` now** would evict itself. It shares the
+  `data-build` concurrency group, which holds one running plus one waiting run,
+  and the 4-hourly cron claims that waiting slot at 12:17Z - cancelling
+  whatever an operator queued behind it.
+
+And it is not urgent: 3,162 synthesis plus 1,592 curated_c2 tasks at ~2.36
+generations each is ~27 hours of fleet work. The recommendation is for the
+NEXT wave, whenever it is planned - `--plan-variant gen_irac_analysis_v1
+--plan-variant gen_irac_analysis_v3` (both, not v1 alone: prompt diversity is
+worth more than the 0.8 generations/row v1 saves over v3).
 
 ### F36. THE PROMPT VARIANT IS WORTH 3.6x THE FLEET'S TIME, AND IT REPLICATES ON DEEPSEEK
 
