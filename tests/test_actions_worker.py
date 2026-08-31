@@ -751,12 +751,16 @@ def test_the_report_separates_servable_work_from_a_throttled_backlog(tmp_path, c
         ("pending", None, "curated_c2"),
         ("pending", None, "curated_c2"),
     ])
+    # curated_c2 leaves the served list at RUNTIME now, when the ceiling guard
+    # drops it - so the report is told what this run served rather than reading
+    # the module constant, which no longer knows.
     actions_worker._finish(root, [_FakeProc()], ("gen",),
-                           gen_died_early=False, final_push_ok=True)
+                           gen_died_early=False, final_push_ok=True,
+                           streams=("synthesis", "transition"))
     out = capsys.readouterr().out
     assert "pending=3" in out, "the whole-store line must not shrink"
     assert "1 claimable in synthesis, transition" in out
-    assert "2 pending in streams this run does not serve" in out
+    assert "2 pending in streams this run did not serve" in out
 
 
 def test_the_backlog_report_covers_every_plannable_stream(tmp_path, capsys):
@@ -1614,3 +1618,118 @@ def test_the_plan_workflow_can_carry_an_allowlist(tmp_path):
     assert not inputs["variants"].get("default", "")
     run = plan["jobs"]["plan"]["steps"][-1]["run"]
     assert "--plan-variant" in run and "inputs.variants" in run
+
+
+# --------------------------------------------------------------------------
+# The curated_c2 ceiling guard
+#
+# curated_c2 was throttled out of STREAMS by hand on 2026-08-31 on the
+# reasoning that draining its ~1,825 queued tasks would land ~2,149 accepted
+# rows, within 26 of the one-way ceiling. That arithmetic multiplied PENDING
+# tasks by 1.0. curated_c2's measured terminal accept rate is ~65%, so the
+# drain actually lands ~1,190 accepted with ~450 effective rows of margin -
+# and the hand throttle cost ~4,800 rows of assembled corpus to prevent a
+# breach the queue could not cause. The policy below replaces the guess.
+
+
+def test_curated_c2_is_served_while_the_corpus_is_far_from_the_ceiling():
+    assert actions_worker.served_streams(
+        ("synthesis", "transition", "curated_c2"),
+        generated_curated=466, ceiling=2050,
+    ) == ("synthesis", "transition", "curated_c2")
+
+
+def test_curated_c2_is_dropped_once_the_corpus_is_inside_the_margin():
+    """Generated rows cannot be dropped, so the last safe moment to stop is
+    BEFORE the count that makes the corpus unassemblable, not at it."""
+    assert actions_worker.served_streams(
+        ("synthesis", "transition", "curated_c2"),
+        generated_curated=2050 - actions_worker.CEILING_MARGIN_EFFECTIVE + 1,
+        ceiling=2050,
+    ) == ("synthesis", "transition")
+
+
+def test_an_unmeasurable_ceiling_stops_curated_c2_rather_than_risking_it():
+    """Fail CLOSED. Not serving the stream costs assembly delay and is undone
+    by serving it again; serving it past the ceiling is permanent. The two
+    errors are not the same size, so the unknown case takes the recoverable
+    one."""
+    assert actions_worker.served_streams(
+        ("synthesis", "transition", "curated_c2"),
+        generated_curated=0, ceiling=None,
+    ) == ("synthesis", "transition")
+
+
+def test_the_guard_touches_no_stream_but_curated_c2():
+    """synthesis is the bucket the corpus is short of from BOTH sides; a
+    ceiling on curated must never be a reason to stop generating it."""
+    assert actions_worker.served_streams(
+        ("synthesis", "transition"), generated_curated=10**6, ceiling=None,
+    ) == ("synthesis", "transition")
+
+
+def test_the_ceiling_state_counts_ACCEPTED_curated_rows_not_PENDING_ones():
+    """THE regression test for the throttle that should not have happened.
+
+    A store with a large curated_c2 backlog and few accepted rows is FAR from
+    the ceiling: pending tasks are not corpus rows, and ~35% of them never
+    will be. Reading the backlog as though it were already accepted is what
+    made a stream with 450 effective rows of headroom look 26 rows away from
+    a one-way door.
+    """
+    class _Store:
+        def accepted_count(self, stream):
+            return {"curated_c2": 100}.get(stream, 0)
+
+    from tuned.data.config import load_build_config
+    cfg = load_build_config(actions_worker.DEFAULT_CONFIG)
+    generated_curated = actions_worker.measured_curated(_Store(), cfg.assembly)
+    assert generated_curated < 200, (
+        "100 accepted curated rows must not measure as thousands - the guard "
+        "would then throttle a stream that has all of its headroom left"
+    )
+
+
+def test_the_ceiling_guard_reaches_the_children_that_do_the_claiming():
+    """A guard the fleet never sees is not a guard.
+
+    `served_streams` deciding to drop curated_c2 means nothing unless the
+    decision becomes the children's `--stream` arguments - so child_argvs
+    takes the served list rather than reading the module constant, which by
+    design no longer knows what this run decided.
+    """
+    from tuned.data.judge import DEFAULT_AUDIT_SAMPLE
+
+    argvs = actions_worker.child_argvs(
+        "cfg.yaml", n_workers=8, audit_sample=DEFAULT_AUDIT_SAMPLE,
+        streams=("synthesis", "transition"),
+    )
+    for argv in argvs:
+        passed = {argv[i + 1] for i, a in enumerate(argv) if a == "--stream"}
+        assert passed == {"synthesis", "transition"}
+        assert "curated_c2" not in argv
+
+
+def test_an_absent_build_leaves_the_ceiling_unmeasurable_rather_than_crashing(tmp_path):
+    """The guard runs before the baton is unpacked on a cold checkout, and a
+    run that dies measuring its own safety margin is worse than one that
+    pauses a stream. Unmeasurable resolves to the recoverable error."""
+    generated_curated, ceiling = actions_worker.ceiling_state(
+        actions_worker.DEFAULT_CONFIG, tmp_path / "nothing-here"
+    )
+    assert ceiling is None
+    assert actions_worker.served_streams(
+        actions_worker.STREAMS,
+        generated_curated=generated_curated, ceiling=ceiling,
+    ) == ("synthesis", "transition")
+
+
+def test_the_ceiling_is_measured_for_the_profile_the_chain_assembles():
+    """A ceiling is a property of a PROFILE - the shares decide which pool
+    binds. Two copies of the profile name would let the guard clear a stream
+    against one target while the chain assembled another, and the corpus that
+    then failed to assemble would be permanently unassemblable."""
+    import inspect
+
+    sig = inspect.signature(actions_worker.assemble_argvs)
+    assert sig.parameters["profile"].default is actions_worker.PROFILE

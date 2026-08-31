@@ -53,56 +53,123 @@ from tuned.data.tasks import PLANNABLE_STREAMS
 # so a stream left out here is never served and its planned tasks simply stay
 # pending - no store write, no baton, and restoring the string resumes them.
 #
-# curated_c2 is OUT as of 2026-08-31, and not because it is unwanted: it is
-# running open-loop, far ahead of the stream it has to stay matched to.
-# `shape` refuses from both sides, so the feasible generated-curated count is
-# an INTERVAL set by how much grounded_synthesis exists, and the interval is
-# roughly half the synthesis count (`shape --headroom` prints today's):
-#
-#   accepted synthesis   accepted curated_c2 that admits it
-#              409                     0 ..   237
-#            1,550                   632 ..   948
-#            3,617 (full MVP)      1,818 .. 2,160
-#
-# Live: 391 accepted curated_c2 against 409 accepted synthesis - already past
-# the top of the window, which is why the chain refuses today - with 1,825
-# more curated_c2 tasks queued. Draining them lands ~2,149 accepted, feasible
-# ONLY if synthesis also reaches full MVP, and within 26 rows of the absolute
-# ceiling (~2,065) past which no synthesis count in any quantity assembles
-# this corpus at all.
-#
-# The asymmetry decides it rather than any forecast of throughput: stopping
-# now is reversible, and generated rows cannot be dropped, so overshooting is
-# not.
-#
-# THE THROTTLE EXPIRES. A frozen curated count caps synthesis from the other
-# side too - too few curated rows underfill the bucket just as surely. At 391
-# accepted curated the feasible accepted-synthesis range is 636..1,196, so the
-# chain starts assembling again at ~636 with no further curated rows, and the
-# string should go back around ~1,100. `shape --headroom` prints the live band.
-#
-# That deadline is SOFT, unlike the ceiling. Overshooting 1,196 puts the corpus
-# out of band on the LOW side, where curated underfills - and the remedy for
-# that is to generate more curated rows, i.e. exactly what re-opening does.
-# Only the high side is one-way. Leaving this throttle on too long costs
-# assembly delay, never damage.
+# ALL THREE ARE LISTED. curated_c2 was thrown out of this tuple by hand on
+# 2026-08-31 and put back the same day, and the round trip is the lesson: the
+# reason for throwing it out was that draining its ~1,825 queued tasks would
+# land ~2,149 accepted rows, 26 short of the ceiling past which the corpus can
+# never be assembled. That multiplied PENDING tasks by 1.0. curated_c2's
+# measured terminal accept rate is ~65% (491 accepted against 756 decided), so
+# the drain lands ~1,190 accepted with ~450 effective rows of margin. Freezing
+# the count instead caps the assembled corpus at 3,655 rows where draining it
+# reaches 8,430 - a hand throttle that cost ~4,800 rows to prevent a breach the
+# queue could not cause.
 #
 # transition STAYS despite being drained. `budget = n_workers * len(streams)`
 # and the top-up walks this tuple in order, so a drained stream donates its
-# floor to synthesis - the bucket the corpus is short on. Dropping it too
-# would cut the fleet from 2*n_workers calls in flight to n_workers.
-STREAMS = ("synthesis", "transition")
+# floor to synthesis - the bucket the corpus is short on. Dropping it would cut
+# the fleet from 2*n_workers calls in flight to n_workers.
+STREAMS = ("synthesis", "transition", "curated_c2")
 # Every stream that can hold a task, served or not - IMPORTED, not restated.
 # Only the run report uses it, to say how much of the queue this run was never
 # going to touch, and a hand-copied list would drift the moment a stream is
 # added: the report would then under-count the throttled backlog and say
 # nothing, which is the failure mode it exists to prevent.
 ALL_STREAMS = PLANNABLE_STREAMS
+
+# The one stream whose overproduction is IRREVERSIBLE. `shape` refuses from
+# both sides, and generated rows cannot be dropped - decontaminate reads every
+# accepted generation while the shaper only trims stream files - so above the
+# ceiling no synthesis count in any quantity assembles this corpus, ever.
+CEILING_GUARDED_STREAM = "curated_c2"
+# Effective rows of clearance to stop at. A run claims up to n_workers*batch
+# rows per pass and the store is read once per run, so the guard must cover a
+# whole run's production plus the reopen path (format_parked rows return to
+# pending when the queue drains). At ~75 gate-passing rows/hour over a 5h15m
+# job that is ~390 rows; 150 effective covers the curated share of it with the
+# margin on the recoverable side.
+CEILING_MARGIN_EFFECTIVE = 150
+# The profile the chain assembles, and therefore the profile whose ceiling is
+# the real one: the shares decide which pool binds, so a ceiling measured
+# against a different profile clears a stream on the wrong number.
+PROFILE = "v1.0-MVP"
+
+
+def measured_curated(store, assembly) -> float:
+    """Effective generated-curated rows in the store.
+
+    ACCEPTED rows, retention-corrected - not pending tasks. The distinction is
+    the whole point: a pending task is a row that may never exist, and reading
+    the backlog as though it were already banked is what produced a throttle
+    on a stream that had all of its headroom left.
+    """
+    from tuned.data.shape import CURATED_BUCKET, generated_counts
+
+    effective, _ = generated_counts(store, assembly)
+    return effective[CURATED_BUCKET]
+
+
+def ceiling_state(config: str, root: Path) -> tuple[float, int | None]:
+    """(effective generated-curated rows, the ceiling) for this build.
+
+    Returns a None ceiling for anything it cannot read - no store, no stream
+    files, a config that will not load, pools that admit no corpus at all.
+    The caller turns that into the recoverable error rather than guessing,
+    because every one of those cases is also what a cold checkout looks like
+    before the baton is unpacked.
+    """
+    try:
+        from tuned.data.config import load_build_config
+        from tuned.data.jsonl import read_jsonl
+        from tuned.data.shape import (classify, curated_ceiling, _pool_retention)
+        from tuned.data.store import Store
+
+        cfg = load_build_config(config)
+        streams_dir = root / "streams"
+        rows = [r for path in sorted(streams_dir.glob("*.jsonl"))
+                for r in read_jsonl(path)]
+        if not rows:
+            return 0.0, None
+        pools = classify(rows, cfg.assembly)
+        store = Store.open(root / DB_RELPATH)
+        try:
+            generated_curated = measured_curated(store, cfg.assembly)
+        finally:
+            store.close()
+        ceiling = curated_ceiling(
+            pools, targets=cfg.assembly.targets(PROFILE),
+            tolerance_pp=cfg.assembly.gates.mix_tolerance_pp,
+            retention=_pool_retention(pools),
+        )
+        return generated_curated, ceiling
+    except Exception as exc:  # noqa: BLE001 - see the docstring: any failure
+        print(f"  ceiling unmeasurable ({type(exc).__name__}: {exc})")
+        return 0.0, None
+
+
+def served_streams(streams: Sequence[str], *, generated_curated: float,
+                   ceiling: int | None,
+                   margin: int = CEILING_MARGIN_EFFECTIVE) -> tuple[str, ...]:
+    """`streams`, minus curated_c2 when the corpus is near the one-way door.
+
+    Fails CLOSED on an unmeasurable ceiling. The two errors are not the same
+    size: not serving the stream costs assembly delay and is undone by serving
+    it again next run, while serving it past the ceiling cannot be undone at
+    all. The unknown case therefore takes the recoverable error - which is the
+    same asymmetry that justified the hand throttle, applied where it belongs.
+    """
+    if CEILING_GUARDED_STREAM not in streams:
+        return tuple(streams)
+    if ceiling is not None and generated_curated < ceiling - margin:
+        return tuple(streams)
+    return tuple(s for s in streams if s != CEILING_GUARDED_STREAM)
+
+
 DB_RELPATH = Path("state") / "law_v1.sqlite3"
 GRACE_S = 90  # SIGTERM -> this long -> SIGKILL, wide enough for a final fsync
 
 
-def child_argvs(config: str, *, n_workers: int, audit_sample: float) -> list[list[str]]:
+def child_argvs(config: str, *, n_workers: int, audit_sample: float,
+                streams: Sequence[str] = STREAMS) -> list[list[str]]:
     """The two children: one generating process, one judging process.
 
     One of each is the store's intended safe topology - disjoint claim state
@@ -110,7 +177,7 @@ def child_argvs(config: str, *, n_workers: int, audit_sample: float) -> list[lis
     share one raw file (jsonl.append_ndjson is single-writer) and double-run
     the per-process rate bucket into real 429s.
     """
-    stream_args = [a for s in STREAMS for a in ("--stream", s)]
+    stream_args = [a for s in streams for a in ("--stream", s)]
     return [
         [sys.executable, "-u", "-m", "tuned.data.generate", "--config", config,
          *stream_args, "--n-workers", str(n_workers), "--forever"],
@@ -125,7 +192,7 @@ def assemble_argvs(
     citation_index: Path | None = None,
     streams: list[str] | None = None,
     out_dir: Path | None = None,
-    profile: str = "v1.0-MVP",
+    profile: str = PROFILE,
 ) -> list[list[str]]:
     """The assembly chain, in order. stats is last and gates push.py.
 
@@ -717,6 +784,7 @@ def _finish(
     *,
     gen_died_early: bool,
     final_push_ok: bool,
+    streams: Sequence[str] = STREAMS,
 ) -> int:
     """Say what happened, everywhere the operator might look, and exit
     accordingly.
@@ -740,15 +808,15 @@ def _finish(
         # what this run could ever have done, so where the two diverge, say
         # both. Silence when they agree: a second number restating the first
         # is noise in the one readout an operator reads.
-        served = _claimable_in(root / DB_RELPATH, STREAMS) or 0
+        served = _claimable_in(root / DB_RELPATH, streams) or 0
         everywhere = _claimable_in(root / DB_RELPATH, ALL_STREAMS) or 0
         if everywhere > served:
             report.append(
-                f"  of which {served} claimable in {', '.join(STREAMS)}; "
-                f"{everywhere - served} pending in streams this run does not "
-                f"serve (throttled - see STREAMS)"
+                f"  of which {served} claimable in {', '.join(streams)}; "
+                f"{everywhere - served} pending in streams this run did not "
+                f"serve (see STREAMS and the curated_c2 ceiling guard)"
             )
-        if not _claimable_in(root / DB_RELPATH, STREAMS):
+        if not _claimable_in(root / DB_RELPATH, streams):
             report.append(
                 "QUEUE EMPTY - nothing left to claim; re-plan with "
                 "`python -m tuned.data.tasks --config <cfg> --n <rows>`"
@@ -791,10 +859,28 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
     # fail to route, park, re-open - 6x a day. Here it is the last thing to
     # try before declaring the queue dead, and it either finds work (in which
     # case the run proceeds normally) or it does not.
+    # Which streams this run may serve is a MEASUREMENT, taken after the baton
+    # is restored and before anything is claimed. curated_c2 leaves the list
+    # when the corpus is within a run's production of the count past which it
+    # can never be assembled - see served_streams for why the unknown case
+    # also stops it.
+    generated_curated, ceiling = ceiling_state(args.config, root)
+    streams = served_streams(
+        STREAMS, generated_curated=generated_curated, ceiling=ceiling
+    )
+    if streams != tuple(STREAMS):
+        print(f"ceiling guard: serving {', '.join(streams)} - "
+              f"{', '.join(s for s in STREAMS if s not in streams)} held at "
+              f"{generated_curated:.0f} effective generated-curated rows "
+              f"against a ceiling of {ceiling}")
+    else:
+        print(f"ceiling guard: serving every stream - {generated_curated:.0f} "
+              f"effective generated-curated rows against a ceiling of {ceiling}")
+
     counts = _task_counts(root / DB_RELPATH)
     # Claimability is asked of the SERVED streams; the printed counts stay
     # whole so a throttled stream's backlog remains visible in the summary.
-    servable = _claimable_in(root / DB_RELPATH, STREAMS)
+    servable = _claimable_in(root / DB_RELPATH, streams)
     if counts is not None and not servable:
         print(f"no claimable work: {counts} - trying {', '.join(REOPEN_ON_EMPTY)}")
         subprocess.run(
@@ -803,7 +889,7 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
             check=False,
         )
         counts = _task_counts(root / DB_RELPATH) or counts
-        if not _claimable_in(root / DB_RELPATH, STREAMS):
+        if not _claimable_in(root / DB_RELPATH, streams):
             _report([
                 "task states: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())),
                 "QUEUE EMPTY - nothing left to claim, and re-opening "
@@ -823,14 +909,15 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
             # this job - a red run here would train the operator to ignore red.
             _push(bundle, root, staging, "queue-empty checkpoint", attempts=3)
             return 0
-        print(f"re-open found work: {_claimable_in(root / DB_RELPATH, STREAMS)} claimable - continuing")
+        print(f"re-open found work: {_claimable_in(root / DB_RELPATH, streams)} claimable - continuing")
 
     deadline = time.monotonic() + args.minutes * 60
     next_push = time.monotonic() + args.push_every
     next_db_push = time.monotonic() + args.db_every
     procs, pumps = [], []
     for name, argv in zip(("gen", "judge"), child_argvs(
-        args.config, n_workers=args.n_workers, audit_sample=args.audit_sample
+        args.config, n_workers=args.n_workers, audit_sample=args.audit_sample,
+        streams=streams,
     )):
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -925,6 +1012,7 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
     return _finish(
         root, procs, names,
         gen_died_early=gen_died_early, final_push_ok=final_push_ok,
+        streams=streams,
     )
 
 
