@@ -1702,10 +1702,18 @@ Two things follow, and the first is the useful one:
    the throttle is what fixes that** - it redirects the fleet's whole budget
    onto the one stream that closes the gap. At ~636 accepted synthesis the
    chain starts assembling again with not one further curated row.
-2. **Re-open curated_c2 before accepted synthesis reaches ~1,196**, not at the
-   1,300 first written here - that figure was past the edge, and acting on it
-   would have walked out of the band on the low side while congratulating
-   itself on the throttle. Around ~1,100 accepted synthesis is the cue.
+2. **Re-open curated_c2 as accepted synthesis approaches ~1,196**, not at the
+   1,300 first written here - that figure was past the edge. Around ~1,100 is
+   the cue.
+
+**But the deadline is SOFT, and the asymmetry is the opposite of the ceiling's
+- this matters for an unattended run.** Leaving the throttle on too long puts
+the corpus out of band on the LOW side, where the curated bucket underfills.
+That is entirely recoverable: the fix is to generate more curated rows, which
+is exactly what re-opening does. Only the HIGH side is one-way, because
+generated rows cannot be dropped. So missing ~1,196 costs assembly DELAY, never
+damage, and the throttle is safe to leave on overnight. Do not treat 1,196 as
+something worth taking a risk to hit.
 
 `shape --headroom` prints the live band, so the condition is checkable in one
 command and does not depend on this table staying fresh. The 391 rows already

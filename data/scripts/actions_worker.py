@@ -79,7 +79,13 @@ from tuned.data.tasks import PLANNABLE_STREAMS
 # side too - too few curated rows underfill the bucket just as surely. At 391
 # accepted curated the feasible accepted-synthesis range is 636..1,196, so the
 # chain starts assembling again at ~636 with no further curated rows, and the
-# string must go back BEFORE ~1,196. `shape --headroom` prints the live band.
+# string should go back around ~1,100. `shape --headroom` prints the live band.
+#
+# That deadline is SOFT, unlike the ceiling. Overshooting 1,196 puts the corpus
+# out of band on the LOW side, where curated underfills - and the remedy for
+# that is to generate more curated rows, i.e. exactly what re-opening does.
+# Only the high side is one-way. Leaving this throttle on too long costs
+# assembly delay, never damage.
 #
 # transition STAYS despite being drained. `budget = n_workers * len(streams)`
 # and the top-up walks this tuple in order, so a drained stream donates its
