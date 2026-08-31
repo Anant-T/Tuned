@@ -176,10 +176,11 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
 | 18 | Decide the ceiling remedy | **DONE** - hand throttle shipped, then REPLACED same day by a measured guard (`be25afd`): `STREAMS` lists all three, `served_streams` drops curated_c2 within 150 effective of the ceiling and on any ceiling it cannot measure (F35) |
 | 19 | Re-open curated_c2 when synthesis nears ~1,100 accepted | **CLOSED - obsolete.** The re-open was the hand throttle's expiry; the guard now decides per run, so there is no date to remember. Live: serving, 401 effective against a 2,050 ceiling, 1,499 of headroom (F38) |
-| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, SIZED at ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41). **Do NOT dispatch yet:** the claim is FIFO by rowid, so a wave planned now is worked LAST and the dispatch costs up to ~4 h of idle fleet. Trigger is queue depth (< ~1,000 pending synthesis), not the clock (F43). **Command rehearsed and corrected (F45): `--n` counts the LIVE arm-NULL queue, so it is `<live> + 780` - the stream total over-plans 2.3x** |
+| 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, SIZED at ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41). **Do NOT dispatch yet:** the claim is FIFO by rowid, so a wave planned now is worked LAST and the dispatch costs up to ~4 h of idle fleet. Trigger is queue depth (< ~1,000 pending synthesis), not the clock (F43). **Command rehearsed and corrected (F45): `--n` counts the LIVE arm-NULL queue, so it is `<live> + 780` - the stream total over-plans 2.3x**. ETA now MEASURED, not guessed: the queue drains ~863 pending/run at ~374 min/cycle, so 4,072 pending is ~29 h and the whole queue is dry around 2026-09-01 18:00Z. The <~1,000-synthesis trigger arrives sooner - roughly two runs out, ~2026-09-01 00:00Z - but the per-stream split has to be read on the baton at dispatch time, not extrapolated (F50) |
 | 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - ~400 effective ... ceiling of 2050`, then curated_c2 claims - which DO resume despite every curated row sitting behind 3,162 synthesis rows by rowid, because claiming is per-stream (F38, F39, F43). Pre-registered on the swept working copy: `ceiling guard: serving every stream - 398 effective generated-curated rows against a ceiling of 2050` (the live figure will be a little higher; 2050 is a function of the static replay/curated_c1 pools and should match exactly). **The guard cannot bind on this queue** - draining every pending curated_c2 task lands ~1,241 effective against a throttle point of 1,900, so what is being verified is that it MEASURES and serves, not that it throttles. Log route CLOSED until the run completes: GitHub serves no log blob for an in_progress job (404) and the step summary renders only at step end, so the read lands ~17:00Z, ~5h16m after the ~11:45Z start (F49). Robust either way now: the 12:17Z cron is stamped at `699af2c`, which carries `_run_log`, so if it ever displaces this run the replacement puts the same line on the baton within 15 minutes instead |
 | 22 | Filter IL-TUR-contaminated seeds at PLAN time | **CLOSED - wrong fix.** The drops are co-citation, not contamination: 0 of 88 match the eval item's own case. A seed filter would implement the over-firing and cost 9.6% of the pool for no integrity gain (F40) |
 | 27 | **OPERATOR ACTION, DEADLINE ~2026-09-02: squash the baton's git history** | **OPEN, hard stop.** 55.00 GB of a 100 GB ACCOUNT-WIDE free private quota is already used (baton 38.83 + 16.17 in ten checkpoint repos) and it grows 14.8 GB/day - every checkpoint is a fresh ~565 MB LFS blob; wall ~2026-09-03, and a squash needs up to 36 h to reflect. `super_squash_history` takes it back to ~1 GB, is irreversible, and must run when NO worker holds the baton - end-of-job after the final push, or cancel-squash-dispatch by hand. Recurs ~weekly (F48) |
+| 28 | Decide whether 15 dual-judged rows/run is enough quality evidence | **OPEN, OPERATOR DECISION** - the audit sample is sized right (5.09%) but delivers 15 judged rows and 0 rejections per run, with 25% of the sample shipping unjudged. Cause is family exhaustion, not budget: after groq's two models hit their daily cap there is only ONE free family left for a deepseek row and a dual judgement needs two. mistral's idle 5,000k is NOT the fix - it is the reserved tiebreak family (F51) |
 | 26 | OPERATOR DECISION: retire the pending v2/v4 irac tasks and replan them on v1/v3 | **OPEN, sized at ~182 accepted rows (~37% of the shortfall) for zero extra fleet time.** Needs a cancel/park command that does not exist yet, plus a park state that frees queue capacity honestly. F37's "no safe window" objection is superseded - `--phase plan` shows the pattern (F46) |
 | 25 | OPERATOR DECISION: turn off the row-side case_id channel (`--no-case-id-from-text`) | **OPEN** - recovers 81 generated rows (~9%) with exact containment untouched; deferred because it is an eval-integrity call and the rows are recoverable retroactively, so waiting costs nothing (F40) |
 | 23 | Re-fit `synthesis` retention after the teacher purge lands, or teach `generated_counts` to skip rows the cut will take | **CLOSED - neither is needed.** The shipping chain runs `verify` immediately before `shape` over one DB and verify writes the demotion back, so production sizing already reads a post-demotion store. Only an ad-hoc `--headroom` run outside the chain sees the inflated count, and the guard reads the curated bucket, which has no teacher cut (F44) |
@@ -1511,6 +1512,114 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F51. THE AUDIT SAMPLE DIES WHEN THE SECOND FAMILY DOES, NOT WHEN THE BUDGET DOES
+
+Run `33363831595` is the first COMPLETE run to read end to end. Its judge
+side accepted 393 rows and rejected none. The outcome tags split exactly:
+
+    audit-accept            373    gate-only, never sampled (by design)
+    accept                   15    actually dual-judged
+    audit-accept-unjudged     5    hash-SELECTED, and shipped without a judge
+
+So the sample rate is right - 20 of 393 is 5.09% against `--audit-sample
+0.05` - but the delivered evidence is **15 judged rows, 15 accepts, 0
+rejects**. A quarter of the sample leaked.
+
+`AUDIT_UNJUDGED_DISPOSITION`'s comment is explicit that this beats the
+alternative ("what it must not do is end in judge_error, which would make a
+row's survival depend on whether the hash picked it"), so the leak is a
+designed concession, not a bug. What was never measured is how big it gets.
+
+#### The cause is family exhaustion, and the correlation is exact
+
+    groq/openai/gpt-oss-20b  left=0k at 09:38:44Z   (spent 205.2k)
+    groq/qwen/qwen3.6-27b    left=0k at 11:35:29Z   (spent 200.6k)
+
+    unjudged at  09:36:22Z   <- gpt-oss on its last tokens
+                 11:40:36Z                    11:51:43Z    |  every one after qwen ran out
+                 12:15:25Z    |
+                 12:28:32Z   /
+
+Every generation is deepseek since the sole-generator ruling, so
+family_separation excludes deepseek from judging its own row. That leaves
+exactly three free families - qwen (groq), gpt-oss (groq), gemma (cerebras) -
+and a dual judgement needs TWO OF THEM. After 11:35Z only gemma remained, so
+the second slot could not be filled **at any budget**: cerebras still had
+784k of 1,000k unspent and spent only 99.8k all run.
+
+**The binding constraint is not tokens, it is distinct free families.** Both
+survivors of a pairing must differ, so every dual judgement burns at least
+one groq call, and groq's per-model ~200k/day is the ceiling on the whole
+audit instrument. For the last hour of a 5h15m run the instrument was dead.
+
+#### The idle 5,000k of mistral is NOT the fix - I checked before proposing it
+
+`mistral/mistral-large-latest` reports `spent=0.0k left=5000k` in every
+single batch line, which looks exactly like free judge capacity going to
+waste. It is not. The config gives it `roles: [tiebreak]` and `rpm: 2`, and
+says why at length: with the judges' families excluded, mistral is the ONE
+family left for a contested row, so promoting it to judge would let it be
+spent in slot A or B and then be excluded from the tiebreak seat it exists to
+fill. At rpm 2 it could serve ~630 calls in a 315-minute run - ample for
+tiebreaks, nowhere near 393 rows. The config refuted this before I did.
+
+#### Not acted on
+
+Judge routing is a quality decision and the free-fleet ruling is a hard
+constraint, so this is an operator call, not an agent one. Recorded because
+it changes what the evidence is WORTH: "the sample's accept rate is the
+quality evidence for the whole batch" currently rests on 15 rows per run, and
+the shortfall is not random - it is concentrated in the back half of every
+run, after groq runs dry.
+
+### F50. WHAT A COMPLETE RUN ACTUALLY PRODUCES, AND THE 58 MINUTES NOBODY COUNTED
+
+Run `33363831595` (sha `0227bdd`, no ceiling guard) is the first run to go
+the distance instead of being cancelled or evicted. Its readout:
+
+    accepted        946 -> 1,339    (+393)
+    pending       4,935 -> 4,072    (-863)
+    format_parked   451 ->   886    (+435)
+    rejected      2,620 -> 2,635     (+15)
+
+    56 gen batches x 36 claimed = 2,016 generations
+    deepseek tokens 14,150.2k -> 27,391.4k  = 13,241k spent
+
+**393 accepted from 2,016 generations is 19.5%.** F37 measured 19.6% clean
+on a different instrument (this run's own gate_result rows, before any of
+this log existed). Two independent readings agreeing to a tenth of a point
+is the strongest confirmation the yield model has had.
+
+#### The job clock starts ~58 minutes after the run does
+
+    run created            2026-08-31T06:20:57Z
+    FIRST LOG LINE         2026-08-31T07:19:21Z     <- 58 min in the runner queue
+    last line              2026-08-31T12:34:31Z     = 07:19 + exactly --minutes 315
+
+`gh run list` reports `startedAt == createdAt`, so the API hides this
+entirely. The consequence is that a run occupies its slot for **~374 minutes
+from creation**, not the ~322-327 the data-worker.yml cadence comment
+assumes. That comment picks `*/4` over `*/3` on the grounds that "the queued
+run starts ~80 min before the next cron fires, so nothing is ever
+displaced" - a margin of ~80 min that a ~50 min overrun mostly consumes.
+
+Compounding it, GitHub delivers the schedule LATE: the `17 */4` slot before
+this one arrived as run `33361492672` created 05:42:37Z, ~85 minutes behind.
+The cadence reasoning is sound in shape and optimistic in its constants; the
+displacement it was designed to avoid is one late cron away, and the thing
+displaced would be an operator dispatch.
+
+Not changed. `*/4` is still right - going denser makes displacement MORE
+likely, not less - and the fix if one is ever wanted is a longer
+`timeout-minutes` margin, not a different period.
+
+#### Throughput, and what it means for the queue
+
+At +393 accepted per run and ~374 min per cycle, the fleet banks **~1,500
+accepted rows/day**. The 4,072 pending tasks are therefore ~4.7 runs, or
+about **29 hours**, of work - which is when the queue runs dry, not when the
+corpus is done.
 
 ### F49. A 5h16m JOB PUBLISHES NOTHING UNTIL IT ENDS, INCLUDING THE GUARD'S OWN LINE
 
