@@ -723,6 +723,45 @@ Rebuilding the replay/curated pools larger (the F19 remedy) also writes into
 worker running, or it risks a BATON STOLEN.
 
 
+### F21. The profile decision, costed - and the two different "how many rows" numbers
+
+`agent_0`/memory both carry "which profile ships is an UNMADE DECISION". It can
+now be costed against the pools actually on hand, and the answer is lopsided:
+
+    profile      | targets (synth/cur/replay) | ceiling gen_synth | max corpus
+    v1.0-MVP     | 0.301 / 0.28  / 0.419      |             3,207 |     10,021
+    v1.1-full    | 0.600 / 0.16  / 0.240      |             6,289 |     10,147
+
+**Both profiles cap at the same ~10.1k corpus, and v1.1-full costs nearly twice
+the generated synthesis to reach it.** The binding pool just moves: replay/nothink
+under MVP, the curated pool under full. So v1.1-full's nominal 18,000-row target
+is not reachable with these pools either - it buys ~130 more rows for ~3,000
+more accepted synthesis rows, which at the measured rate is weeks of generator
+time. **On current pools v1.0-MVP dominates**; v1.1-full is only worth choosing
+for the higher teacher-generated PROPORTION (60% vs 30% of the corpus), and that
+argument should be made on training grounds, not on size.
+
+**Two numbers, and they are not the same target** - I had been quoting the first
+without naming it:
+
+- **~+470 accepted synthesis** brings the counts inside the feasible window, so
+  the chain STOPS REFUSING and a corpus ships. That corpus is ~6,700 rows.
+- **~+2,870 accepted synthesis** (337 -> 3,207) reaches the MVP ceiling and the
+  full ~10,021-row corpus.
+
+At the measured rate - ~90 tasks completed/hour, 63.8% of the queue synthesis,
+33.0% terminal accept - synthesis accrues at roughly **19 accepted rows/hour**,
+so the ceiling is **~6-7 days of continuous cron generation**, and the shippable
+window is ~1 day away.
+
+The queue cannot get there on its own: its 3,665 synthesis tasks yield ~1,209
+accepted, against the 2,870 needed. **Step 6 therefore needs ~5,000 more
+synthesis tasks, not the ~1,515 sized for the window alone** - a `data-plan`
+target of roughly `current_counted + 5,000`, synthesis only, `--mix` explicit.
+Still gated on the template decision in F14/F18, since planning locks the wave
+to today's prompt_ids.
+
+
 ## 6. Constants interrogated
 
 | Constant | Verdict |
