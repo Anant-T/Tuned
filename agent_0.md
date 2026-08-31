@@ -693,6 +693,36 @@ What it does mean, concretely:
 Suite green at the time of writing: **3,752 passed, 19 skipped**.
 
 
+### F20. Operational: do NOT dispatch `data-assemble` yet, and the one command that says when
+
+`shape` refuses at today's true composition, and `run_assemble` stops the chain
+on the first non-zero rc - so a `data-assemble` dispatch right now burns a runner
+and produces nothing. That refusal is the system working: it declines to ship a
+corpus whose mix it cannot hit, rather than shipping a replay-dominated one,
+which is exactly what the unshaped pre-08-29 runs did.
+
+**No new tooling is needed to know when it is ready** - `shape` already answers
+it, and its refusal states the shortfall in rows:
+
+    python -m tuned.data.shape --config data/configs/data_law_v1.yaml --profile v1.0-MVP
+
+- Prints a plan and writes `out/shaped_*.jsonl` -> the chain will run; dispatch
+  `data-assemble`.
+- `REFUSED: ... curated/trace would need -N rows` -> curated_c2 is above the
+  window for the synthesis on hand; **more synthesis** (not less curated).
+- `REFUSED: ... curated/trace needs N rows ... pool holds 300` -> the opposite
+  end; curated_c2 is below the window.
+- `REFUSED: ... replay/nothink needs N ... pool holds 1200` -> the F19 ceiling;
+  no amount of generation helps, the pools must be rebuilt larger.
+
+It reads the live store, so run it against a **read-only or scratch copy** while
+a worker holds the baton, never against `data/build` directly.
+
+Rebuilding the replay/curated pools larger (the F19 remedy) also writes into
+`streams/`, which the baton owns - so that work waits for a window with no
+worker running, or it risks a BATON STOLEN.
+
+
 ## 6. Constants interrogated
 
 | Constant | Verdict |
