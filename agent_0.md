@@ -541,14 +541,29 @@ curated_c2" call - widening it raises the bar it is already under.
 roughly **+500 accepted synthesis rows** (~1,500 planned tasks at the measured
 33% accept rate), `--mix` explicit because statute_qa silently under-fills.
 
-**Not dispatched tonight, deliberately.** `data-plan.yml` shares the `data-build`
-concurrency group, which is precisely what stops a planner from stealing the
-baton from a running worker. That group holds one running plus one pending run,
-and a new trigger REPLACES the one already waiting - with a 4h cron against runs
-of up to 5h16m, a dispatch made now is very likely to be discarded silently
-rather than run. The queue already holds ~35h of work and the shortfall only
-bites at exhaustion, so there is nothing to buy by firing it now and a real
-chance of confusion. Fire it when no worker is active.
+**Not dispatched tonight, deliberately - and the timing rule, corrected.**
+`data-plan.yml` shares the `data-build` concurrency group, which is exactly what
+stops a planner from stealing the baton from a running worker. My first reading
+was that a dispatch now would "very likely be discarded"; that is too strong and
+contradicts the cron's own rationale, which picks */4 over */3 precisely so that
+"nothing is ever displaced; ... the thing displaced could be an operator's
+data-assemble dispatch". The real rule is narrower:
+
+The group holds one running plus one pending, and a new trigger REPLACES the
+pending one, so **a dispatch runs only if it is the LAST trigger to arrive
+before the running job ends**. Cron is `17 */4` (00:17 / 04:17 / 08:17Z). Run #9
+was dispatched manually at 02:03Z, off-phase, and ends ~07:28Z. So the window in
+which a data-plan dispatch actually survives is **after 04:17Z and before
+07:28Z** - it replaces the 04:17 pending run and starts when #9 finishes. The
+cost is one skipped worker cycle (~49 min of generation before the 08:17 cron).
+
+It is still not worth firing tonight, for two reasons that outlast the timing:
+the queue is not ~35h of work but closer to **60h** - 5,749 tasks where the
+first batches show ~31 of 36 going to `regenerate`, so most tasks are claimed
+about three times - and planning a wave now LOCKS IN the current ~33% yield
+under the present templates. Given F14/F18 (both live gates are generator
+non-compliance, not thresholds), the next wave is worth more after a template
+decision than before one. Fire it when the queue actually nears exhaustion.
 
 ### F17. Live throughput, measured on run #9
 
