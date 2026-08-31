@@ -7,6 +7,38 @@ working state once already.
 
 ---
 
+## !! THE BUILD IS STOPPED ON PURPOSE (2026-08-31 19:24Z) !!
+
+**Read this before wondering why no runs are firing.** The operator asked for a
+strict pause, so:
+
+1. **`data-worker.yml` is DISABLED.** Cron fires AND `workflow_dispatch` are both
+   blocked - this is why nothing restarts on its own. Re-enable with:
+   `gh workflow enable data-worker.yml`
+2. **Run `33412727342` was CANCELLED at ~19:24Z**, 1.55 h into its 5.25 h budget.
+   It was healthy; it did not fail.
+
+**What survived, checked rather than assumed** (baton head `7d307f63`):
+
+    raw/gen/2026-08-31/gen-19.ndjson    8.4 MB   last push 19:21:54Z
+    state/law_v1.sqlite3              785.4 MB   last DB push 18:51:48Z
+
+So raw envelopes are safe to 19:21:54Z (~2 min of generation lost) and the DB is
+stale by ~33 min. Generations in that window ARE in the raw log and
+`reconcile_raw` replays them, but task state and `gate_result` are not, so those
+rows come back `pending` and some already-paid work is bought again. That is the
+bounded cost `--db-every` names, and it landed near the low end of it.
+
+**On resume:** re-enable the workflow and dispatch. The first run reconciles the
+raw log automatically - no manual recovery step, and nothing needs repairing by
+hand. NOTE the next run will be the first to carry `--db-every 7200`.
+
+A local copy of the whole baton (state + raw + streams + corpus) was taken to
+`C:\Users\Anant\Desktop\baton-backup-2026-08-31` because the baton is the only
+copy and the squash it is waiting on is irreversible.
+
+---
+
 ## 0. State of play (2026-08-31, ~06:25Z)
 
 **The pipeline works end to end. What is left is throughput and one prompt
