@@ -1628,6 +1628,23 @@ is the strongest confirmation the yield model has had. (Count the batch
 lines with care: `_finish` tails gen.log into its own report, so the last 20
 appear TWICE in the archived log and a naive grep reads 76 batches, not 56.)
 
+#### `err` in the batch line is NOT a failure rate
+
+It reads like one and it is not. `generate.py:491` increments `stats.errors`
+on `result.error is not None OR result.skipped is not None`, so a task that
+was SKIPPED without a call - `skip:slots` is the big one, it killed 2,063
+transition tasks - lands in the same counter as a provider failure. Only the
+other site (`generate.py:2267`, a raised exception) is attributable, and it
+persists to `store.log_event("worker_task_error", ...)` inside the 565 MB
+database, which is not on any cheap baton surface.
+
+Nor does the raw log help: 368 rows of `raw/gen` from the current run carry
+ZERO `error` fields, because only answered calls are written there.
+
+Practical effect: the previous run's 0.45% and a later run's 1.4% are not
+comparable as failure rates, and neither is worth chasing from outside the
+store. Read `worker_task_error` events if the question ever matters.
+
 #### CORRECTED: the 58-minute gap was the fence, not a runner queue
 
 The first reading of this was WRONG and is left here because the wrong
