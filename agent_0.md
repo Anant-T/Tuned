@@ -7,6 +7,45 @@ working state once already.
 
 ---
 
+## 0. State of play (2026-08-31, ~03:10Z)
+
+**The pipeline works end to end. The corpus is short on one bucket, and that is
+the only thing between here and a shipped dataset.**
+
+- **Build is running and healthy.** Run #9 (`33349462956`), 288 generations,
+  **1 error, zero cooling parks, zero unroutable**. The queue-shredder fix is
+  holding under real load. ~4.7 generations/min, ~19 accepted synthesis rows/hr.
+- **The assembly chain went GREEN for the first time** - `CHAIN RC=0`, all nine
+  gates passing at `v1.0-MVP`. The three historically-RED gates were never
+  miscalibrated; the old runs just never ran `shape` (F16).
+- **The one blocker is arithmetic, not breakage.** `curated_c2` is over-generated
+  against synthesis, so `shape` refuses. Feasible `curated_c2` is a two-sided
+  window (`gs/2.18 <= gc <= gs/1.47`); the queue delivers 1.12:1 against a
+  required 1.47:1 (F16, F19).
+- **Two targets, not one:** ~**+470** accepted synthesis makes the chain stop
+  refusing (~6,700-row corpus, ~1 day out); ~**+2,870** reaches the MVP ceiling
+  (~10,021 rows, ~6-7 days). The queue yields only ~1,209, so Step 6 needs
+  ~5,000 more synthesis tasks (F21).
+- **There is a hard ceiling at ~10,021 rows**, binding on the replay/nothink
+  pool, and `--replay-nothink-share` cannot lift it. Both profiles cap there,
+  but `v1.1-full` costs ~2x the synthesis to reach it - **on current pools MVP
+  dominates** (F19, F21).
+
+**Do not, without deciding first:**
+- dispatch `data-assemble` (it would fail at `shape` and burn a runner - F20);
+- edit any prompt template (parks the live queue as `stale_prompt`; ship a new
+  `prompt_id` instead - F15);
+- reopen the 2,063 `skip:slots` transition rows (they would re-die - F18);
+- widen `curated_c2` (it raises the bar it is already above - F16).
+
+**Awaiting a decision:** the templates. Both remaining gate losses -
+`irac_placement` 63.8% and transition's `statutory_quotation` 95.7% - are
+deepseek not honouring rules the templates already state plainly (F14, F18).
+Planning a big wave locks it to today's prompt_ids, which is why Step 6 is sized
+but not fired.
+
+---
+
 ## 1. Agent prompt (verbatim, so the role is re-assumable)
 
 > you are now agent_0 you have to reach the goal of getting everything done and
