@@ -1513,6 +1513,48 @@ the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
 
+### F54. THE CRON DELIVERED ONE FIRE IN FOUR TODAY - SHIPPED A SECOND FIRE
+
+The build's continuity rests entirely on the schedule: `GITHUB_TOKEN` cannot
+trigger a workflow, so there is no self-dispatch and a fire that never arrives
+is a stalled build nobody is watching.
+
+`17 */4 * * *` was due at 00:17, 04:17, 08:17 and 12:17Z on 2026-08-31 and
+produced **one** run - `33361492672`, the 04:17 fire, created 05:42:37Z, 85
+minutes late.
+
+**The two clean misses are not the concurrency fence, and that is checkable.**
+A fire that arrived and lost the pending slot would still EXIST, as a
+cancelled `schedule` run; `gh run list` back to 08-28 shows none. And the runs
+that held the pending slot at those moments both survived: `33367854354` was
+pending at 08:17 and lived until my 09:05 dispatch replaced it, `33381288057`
+was pending at 12:17 and went on to run. Neither was displaced by a cron run,
+because no cron run came. GitHub documents that scheduled runs may be delayed
+or dropped under load, which is what this looks like.
+
+**Caveat, stated rather than buried:** four fires is a small sample, and the
+older `*/6` schedule delivered 7 of its 8 expected fires on 08-29/08-30. The
+drop is new since `414c1dc` moved it to `*/4` at 2026-08-30T21:42Z. So the
+rate is uncertain; the mitigation does not depend on knowing it.
+
+**Shipped: a second fire at `47 */4`, 30 minutes after the first.** The fence
+makes it free. `cancel-in-progress: false` holds one running plus one pending,
+so the second trigger either finds the slot taken - and replaces a pending run
+with an identical one - or delivers the fire the first one lost. No extra
+compute, no change to the four-hour cadence, one more chance per window. The
+displacement risk the `*/4` comment reasons about is unchanged in kind: it is
+still an operator's `data-assemble` dispatch that could lose a pending slot,
+now in a second 30-minute window rather than a wider cadence. A stalled
+overnight build costs more than a dispatch an awake operator can re-fire.
+
+Neither fire sits at the top of the hour, which is the load peak GitHub names
+as the reason fires slip - asserted in the test, so a later edit cannot walk
+into it.
+
+**Also done, belt and braces:** `33406267642` dispatched by hand at 15:03Z on
+`4dff9d9`, so the run that picks up F53 does not depend on the 16:17Z fire
+landing. Two tests. Suite **3,836 / 19** (+1).
+
 ### F53. THE RAW LOG NOW SHARDS BY HOUR, WHICH BUYS ABOUT A DAY - SHIPPED
 
 F52 measured the burn and named the driver. This is the fix, and it needed no
