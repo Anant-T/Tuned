@@ -67,14 +67,20 @@ DEFAULT_EMPTY_TARGET = 0.19
 #
 # EVERY FIGURE BELOW IS A READING, and each carries the n it was read from.
 # `--measure` computes them off the chain's own artifacts (see
-# retention_report). The values here were read on 2026-08-30 from the
-# 2026-08-29 full-chain run in the build out/ dir - a chain that predates the
-# drop record's `source` field, so its drops were attributed through `form`,
-# which is exact for every file-based source (row_form falls back to `source`
-# for a row with no task identity) and is why the generated streams are absent
-# from the readings. `--measure` refuses that artifact rather than repeating
-# the attribution, and will reproduce these seven numbers off the next
-# completed chain.
+# retention_report). The seven file-based values were read on 2026-08-30 from
+# the 2026-08-29 full-chain run in the build out/ dir - a chain that predates
+# the drop record's `source` field, so its drops were attributed through
+# `form`, which is exact for every file-based source (row_form falls back to
+# `source` for a row with no task identity) and is why the generated streams
+# were absent from that reading. `--measure` refuses that artifact rather than
+# repeating the attribution.
+#
+# It said it would reproduce those seven numbers off the next completed chain,
+# and on 2026-08-31 it did - all seven to three decimals, off a chain run on a
+# store snapshot with pools shipped WHOLE (no shape step) rather than shaped.
+# That is what qualified the same run's two generated readings below: the
+# instrument was checked against seven known answers before it was believed on
+# two unknown ones.
 #
 # The previous table was a set of round numbers that did not reproduce -
 # PredEx sat at 0.900 against a measured 0.846, WildChat at 0.955 against
@@ -90,25 +96,33 @@ MEASURED_RETENTION = {
     "GSMS-B/Indian-Legal-QA-BNS-BNSS-BSA": 0.983,      # n=300    2026-08-30
     "allenai/WildChat-4.8M": 0.910,                    # n=300    2026-08-30
     "169Pi/indian_law": 0.957,                         # n=300    2026-08-30
-    # GENERATED rows are the ones this correction exists for, and they are the
-    # ones still UNMEASURED: an accepted task is not an assembled row, and
-    # sizing the corpus off the accepted COUNT holds the numerator while the
-    # chain shrinks the denominator - which is how the first shaped rehearsal
-    # shipped grounded_synthesis at 27.7% against a 30.1% target with every
-    # stream pool individually on target. Keyed by stream name because that is
-    # what a generated row carries as _prov.source.
+    # GENERATED rows are the ones this correction exists for: an accepted task
+    # is not an assembled row, and sizing the corpus off the accepted COUNT
+    # holds the numerator while the chain shrinks the denominator - which is
+    # how the first shaped rehearsal shipped grounded_synthesis at 27.7%
+    # against a 30.1% target with every stream pool individually on target.
+    # Keyed by stream name because that is what a generated row carries as
+    # _prov.source.
     #
-    # 0.857 IS A PLACEHOLDER, NOT A READING. The corpus held 15 generated rows
-    # when the table above was measured - far under RETENTION_MIN_N - so
-    # `--measure` reports the count and refuses to print a figure. It is kept
-    # rather than deleted because deleting it falls back to DEFAULT_RETENTION
-    # (0.95), which is a HIGHER retention on no evidence at all and would
-    # under-size the corpus in the one place the correction matters. Re-fit it
-    # from the first run that ships 50+ generated rows.
-    "synthesis": 0.857,
-    # `transition` and `curated_c2` are ABSENT deliberately. Neither has ever
-    # put a row through the chain, so any number here would be invented; the
-    # DEFAULT_RETENTION fallback is the honest answer until they have.
+    # Both were MEASURED on 2026-08-31, off the first chain to ship 50+
+    # generated rows. synthesis replaces a 0.857 placeholder that was kept
+    # (not deleted) precisely because deleting it fell back to a HIGHER
+    # DEFAULT_RETENTION on no evidence - and the reading came in BELOW the
+    # guess, so the guess was optimistic too. curated_c2 had no entry at all
+    # and was therefore taking 0.95: its real retention is 0.817, so every
+    # curated sizing before today was 16% optimistic.
+    #
+    # The loss is not spread across the chain. Of synthesis's 69 drops and
+    # curated_c2's 90, ALL but two are decontamination and the largest single
+    # reason is `case_id:iltur` (30 and 58) - generated rows whose seed case
+    # is in the IL-TUR eval set. Dedupe took 2 rows and the length cut took 0.
+    # So these figures move when the eval corpora move, not when the gates or
+    # the templates do; re-measure after a decontamination corpus changes.
+    "synthesis": 0.846,     # n=447  2026-08-31  (was a 0.857 placeholder)
+    "curated_c2": 0.817,    # n=491  2026-08-31  (was taking the 0.95 default)
+    # `transition` is ABSENT deliberately: it has put 5 rows through the chain,
+    # far under RETENTION_MIN_N, so any number here would be invented and the
+    # DEFAULT_RETENTION fallback is the honest answer until it has more.
 }
 DEFAULT_RETENTION = 0.95
 

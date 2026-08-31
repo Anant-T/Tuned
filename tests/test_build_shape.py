@@ -288,10 +288,10 @@ def test_generated_counts_discount_the_rows_the_chain_will_drop(tmp_path):
     assert accepted == {SYNTHESIS_BUCKET: 100, CURATED_BUCKET: 100}
     assert raw == {SYNTHESIS_BUCKET: 100, CURATED_BUCKET: 100}
     assert effective[SYNTHESIS_BUCKET] == round(100 * MEASURED_RETENTION["synthesis"])
-    # curated_c2 has never put a row through the chain, so it carries no
-    # measured entry and takes the default rather than an invented figure.
-    assert "curated_c2" not in MEASURED_RETENTION
-    assert effective[CURATED_BUCKET] == round(100 * DEFAULT_RETENTION)
+    assert effective[CURATED_BUCKET] == round(100 * MEASURED_RETENTION["curated_c2"])
+    # Both streams now carry a reading, and both readings are below the
+    # default - so the discount is larger than the fallback ever applied.
+    assert effective[CURATED_BUCKET] < round(100 * DEFAULT_RETENTION)
     assert effective[SYNTHESIS_BUCKET] < accepted[SYNTHESIS_BUCKET]
 
 
@@ -452,21 +452,40 @@ def test_measure_shapes_nothing_and_writes_nothing(tmp_path, capsys):
 
 
 def test_the_table_holds_no_number_that_was_never_measured():
-    """transition and curated_c2 have never put a row through the chain. A
-    value here would be invented, and DEFAULT_RETENTION is the honest answer
-    until they have - this is the fence against someone filling them in."""
+    """A stream that has not put RETENTION_MIN_N rows through the chain stays
+    ABSENT rather than being filled in: a value there would be invented, and
+    DEFAULT_RETENTION is the honest answer until it has. `transition` has
+    shipped 3 rows of 5 and is still on the wrong side of that floor."""
     from tuned.data.shape import MEASURED_RETENTION
 
     assert "transition" not in MEASURED_RETENTION
-    assert "curated_c2" not in MEASURED_RETENTION
     # The reading that made the point: the old table said 0.900.
     assert MEASURED_RETENTION["L-NLProc/PredEx_Instruction-Tuning_Pred-Exp"] == 0.846
     assert MEASURED_RETENTION["allenai/WildChat-4.8M"] == 0.910
-    # synthesis is KEPT below the floor on purpose: deleting it falls back to
-    # DEFAULT_RETENTION, which is a higher retention on no evidence at all.
-    from tuned.data.shape import DEFAULT_RETENTION
 
+
+def test_both_generated_streams_that_cleared_the_floor_carry_a_reading():
+    """synthesis and curated_c2 were re-fit on 2026-08-31 off the first chain
+    to ship 50+ generated rows (447 and 491). Both land BELOW the 0.95
+    default, so the default was optimistic in exactly the place the correction
+    exists for - and curated_c2, which had no entry at all, was the more
+    optimistic of the two by 14%."""
+    from tuned.data.shape import DEFAULT_RETENTION, MEASURED_RETENTION
+
+    assert MEASURED_RETENTION["synthesis"] == 0.846
+    assert MEASURED_RETENTION["curated_c2"] == 0.817
     assert MEASURED_RETENTION["synthesis"] < DEFAULT_RETENTION
+    assert MEASURED_RETENTION["curated_c2"] < DEFAULT_RETENTION
+
+
+def test_the_synthesis_reading_replaced_a_placeholder_that_flattered_it():
+    """0.857 was never a reading - it was a guess kept in the table because
+    deleting it fell back to a HIGHER number on no evidence. The measurement
+    it was standing in for came in below it, which is the direction that
+    matters: the guess was the optimistic one too."""
+    from tuned.data.shape import MEASURED_RETENTION
+
+    assert MEASURED_RETENTION["synthesis"] < 0.857
 
 
 # --------------------------------------------------------------------------
