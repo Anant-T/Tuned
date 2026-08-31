@@ -1598,6 +1598,21 @@ would stretch that to about twenty.
 
 Two tests, both written first and watched fail. Suite **3,832 / 19** (+2).
 
+**And the wall now counts itself down.** Both times this quota has been hit it
+was measured by hand, in whatever session happened to be looking, and the
+second measurement came out 2.8x the first. `_log_storage_headroom` reads it
+once per run, after the baton is restored, and puts `storage: N GB of 100
+used, M GB headroom` on the baton through `_run_log`. logs/ is scoped per run
+and never restored, so consecutive runs leave readings ~5.3 h apart and the
+slope between two of them is the rate - level and countdown from the same
+instrument, with no agent required. Totals only, never repo ids: this goes to
+stdout, this repo's Actions logs are PUBLIC, and the account being summed is
+mostly private repositories. Best-effort on the `_run_log` rule - the Hub
+being unreachable for a metadata call says nothing about whether the job can
+generate rows, and a test asserts a failed reading still ends the run green.
+
+Three more tests, written first and watched fail. Suite **3,835 / 19** (+5).
+
 ### F52. THE STORAGE BURN IS 41.5 GB/DAY, AND THE RAW LOG IS MOST OF IT
 
 F48 put the burn at 14.8 GB/day and the wall at ~2026-09-03. Both were
