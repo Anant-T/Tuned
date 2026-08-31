@@ -75,6 +75,7 @@ from tuned.data.providers import (
     CHARS_PER_TOKEN_LATIN,
     CONTEXT_SAFETY_MARGIN,
     DEFAULT_JUDGE_REPLY_TOKENS,
+    TRANSIENT_SKIPS,
     ProviderError,
     classify_route_failure,
     context_estimate,
@@ -125,6 +126,12 @@ INPUT_INELIGIBLE_DISPOSITION = "input-ineligible:section_text"
 # and which tasks.reopen_tasks zeroes, because a row parked at the cap by a
 # fleet-wide failure has spent none of its budget on the answer.
 MAX_ATTEMPTS = 3
+
+# Longest the loop will sit out a cooling generator pool in one go. The wait
+# is read from the breaker, not guessed, so this only caps a pathological
+# cooldown: the worker wakes, finds the pool still out, and waits again. Kept
+# well under DEFAULT_LEASE_S so a sleeping worker never outlives its claims.
+MAX_COOLDOWN_WAIT_S = 120.0
 
 # Prompt ids for the judge's two calls. They live in this module, beside the
 # judge sizing that the startup preflight needs, because judge.py imports
@@ -679,9 +686,17 @@ def budget_ok_for(store, cfg, *, quota=None):
 
 
 def make_router(store, cfg, **kwargs):
-    """Router wired to the store's daily ledger (contract 7)."""
+    """Router wired to the store's daily ledger (contract 7).
+
+    The breaker cooldown comes from the config rather than the Router's own
+    default, so the three call sites (here, judge.py, difficulty.py) do not
+    each have to remember to pass it - they are all bare, which is how a
+    generic 300 s default ended up governing a provider whose rate limit
+    refills in a minute. setdefault, so an explicit kwarg still wins.
+    """
     from tuned.data.providers import Router
 
+    kwargs.setdefault("cooldown_s", cfg.routing.cooldown_s)
     return Router(cfg, budget_ok=budget_ok_for(store, cfg), **kwargs)
 
 
@@ -1978,6 +1993,8 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
     task_id = task["task_id"]
     attempts = int(task.get("attempts") or 0)
     exhausted = attempts >= MAX_ATTEMPTS
+    # Set by the one branch below whose claim called nobody.
+    refund = False
 
     if result.stale_prompt is not None:
         # Checked before `result.ok`, and before the attempt accounting below,
@@ -2002,6 +2019,31 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
             state, disposition = REJECTED_STATE, f"skip:{result.skipped}"
         elif result.unroutable:
             state, disposition = GEN_UNROUTABLE_STATE, "unroutable:generator"
+        elif (
+            result.no_eligible_model
+            and result.route_skips
+            and set(result.route_skips) <= TRANSIENT_SKIPS
+        ):
+            # NOTHING WAS CALLED AND THE REASON LIFTS ON ITS OWN. Checked
+            # BEFORE the `exhausted` branches, because the attempt cap is not
+            # the question here: cooling and over-budget say something about
+            # the MOMENT, and a row must not be parked for the fleet being
+            # briefly out. It is what turned one breaker cooldown into 5,180
+            # parked tasks on 2026-08-29 - with a single-ref generator pool,
+            # cooling empties it, so every claim in the window came back here
+            # having spent its budget in milliseconds without a single call.
+            #
+            # `result.route_skips` must be non-empty: an empty set is a
+            # VACUOUS subset of anything and would re-queue every unrouted row
+            # forever, including ones whose reason nobody recorded.
+            #
+            # The claim is refunded (below) rather than merely re-queued.
+            # claim_tasks bumps `attempts` before routing, so without that the
+            # fuse is three batches instead of one and the row still dies of a
+            # fact about the fleet. A provider that is genuinely down still
+            # parks on schedule: the calls it DOES answer between cooldowns
+            # count as provider_fault attempts in the usual way.
+            state, disposition, refund = PENDING_STATE, None, True
         elif exhausted and result.no_eligible_model:
             # Nothing was ever called, so nothing about this row was judged
             # and it must not be counted as a reject. Park it where re-opening
@@ -2056,7 +2098,10 @@ def apply_gate_disposition(store, task: Mapping, result: GenResult, *, worker_id
         named = ",".join(_non_diagnostic_gates(result.failed_gates))
         state, disposition = REJECTED_STATE, "reject:" + named
 
-    if not set_state_fenced(store, task_id, state, disposition, worker_id=worker_id):
+    if not set_state_fenced(
+        store, task_id, state, disposition,
+        worker_id=worker_id, refund_attempt=refund,
+    ):
         result.state = None
         return "lost-lease"
     result.state = state
@@ -2164,6 +2209,9 @@ async def run_workers(
         for stream in streams:
             claimed.extend(store.claim_tasks(worker_id, n_workers, stream=stream))
         stats.claimed = len(claimed)
+        # Rows that came back having called nobody because the whole pool was
+        # transiently out. Counted to decide the backoff below.
+        cooled = 0
         if claimed:
             # return_exceptions: one task that raises something nobody
             # anticipated must not take the other n-1 paid calls in this
@@ -2197,6 +2245,12 @@ async def run_workers(
                     store, task, result, worker_id=worker_id
                 ) != "lost-lease"
                 stats.absorb(result, landed=landed)
+                if (
+                    result.no_eligible_model
+                    and result.route_skips
+                    and set(result.route_skips) <= TRANSIENT_SKIPS
+                ):
+                    cooled += 1
         batches += 1
         totals.claimed += stats.claimed
         totals.gen_ok += stats.gen_ok
@@ -2216,6 +2270,21 @@ async def run_workers(
         if stats.claimed or not idle_announced:
             print(format_batch_line(batches, stats, budget_lines(store, cfg, day=day)))
         idle_announced = stats.claimed == 0
+        # THE WHOLE BATCH CAME BACK COOLING. Every row went back to `pending`
+        # unspent, so re-claiming at once re-runs the same wall at CPU speed
+        # for as long as the breaker holds - which is the shredder again, minus
+        # the parking. Ask the Router how long the pool is actually out for
+        # instead of guessing, so this stays correct when the cooldown moves.
+        if cooled and cooled == stats.claimed:
+            # A transient skip the breaker does not own has no clock to read:
+            # over-budget lifts at the UTC day boundary, not on a timer. Fall
+            # back to the ordinary idle poll there rather than spinning.
+            wait = (
+                min(router.cooldown_remaining("generator"), MAX_COOLDOWN_WAIT_S)
+                or idle_sleep_s
+            )
+            print(f"  generator pool transiently empty - waiting {wait:.0f}s")
+            await sleeper(wait)
         if stats.claimed == 0:
             if not forever:
                 break

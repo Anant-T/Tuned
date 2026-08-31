@@ -187,6 +187,7 @@ class FakeRouter:
         self.script = {role: list(items) for role, items in (script or {}).items()}
         self.missing_keys = set(missing_keys or ())
         self.cooling = set(cooling or ())
+        self.cooldown_s = 300.0
         self.over_budget = set(over_budget or ())
         self.calls: list[dict] = []
         self.closed = False
@@ -219,6 +220,12 @@ class FakeRouter:
 
     def pick(self, role, *, est_tokens=0, exclude_families=frozenset(), skipped=None):
         return self._eligible(role, exclude_families, skipped)
+
+    def cooldown_remaining(self, role: str) -> float:
+        """Router.cooldown_remaining's surface. A fixed wall, since this double
+        models cooling as a set membership rather than a clock."""
+        refs = {f"{r.provider}/{r.model}" for r in self.cfg.routing_refs(role)}
+        return self.cooldown_s if refs and refs <= self.cooling else 0.0
 
     def _next(self, role: str):
         items = self.script.get(role)

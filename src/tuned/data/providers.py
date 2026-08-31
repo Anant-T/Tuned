@@ -1844,6 +1844,28 @@ class Router:
     def is_cooling(self, ref: ModelRef) -> bool:
         return self._clock() < self._breaker(ref).cooling_until
 
+    def cooldown_remaining(self, role: str) -> float:
+        """Seconds until the SOONEST ref for `role` leaves its breaker cooldown.
+
+        0.0 when any ref is usable right now, and 0.0 for a role with no refs
+        at all - "the pool is empty" is the caller's own question and not one a
+        cooldown clock can answer.
+
+        Exists because the Router deliberately does not wait out its own
+        cooldowns (see the class docstring): it hands the decision up to the
+        caller, and a caller that must not spin needs to know how long the wall
+        lasts. Reading it rather than guessing is what keeps the worker's
+        backoff correct when the cooldown is re-tuned.
+        """
+        now = self._clock()
+        remaining = []
+        for ref in self.cfg.routing_refs(role):
+            until = self._breaker(ref).cooling_until
+            if until <= now:
+                return 0.0
+            remaining.append(until - now)
+        return min(remaining) if remaining else 0.0
+
     def report_success(self, ref: ModelRef) -> None:
         self._breaker(ref).consecutive_failures = 0
 

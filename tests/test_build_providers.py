@@ -1358,6 +1358,29 @@ def test_complete_aborts_the_whole_call_on_a_payload_4xx(cfg, keys):
     assert not router.is_cooling(GROQ_JUDGE)
 
 
+def test_cooldown_remaining_reports_the_soonest_ref(cfg, keys):
+    """The Router deliberately does not wait out its own cooldowns, so a caller
+    that must not spin has to be able to READ how long the wall lasts. Zero
+    while anything is usable, because that is when there is nothing to wait
+    for - not when the pool happens to be empty for some other reason."""
+    clock = FakeClock()
+    router = _router(cfg, clock=clock, breaker_threshold=1, cooldown_s=60.0)
+    assert router.cooldown_remaining("judge") == 0.0
+
+    refs = cfg.routing_refs("judge")
+    router.report_failure(refs[0])
+    # One ref out of several still leaves the pool usable NOW.
+    assert router.cooldown_remaining("judge") == 0.0
+
+    for ref in refs:
+        router.report_failure(ref)
+    assert router.cooldown_remaining("judge") == 60.0
+    clock.advance(25)
+    assert router.cooldown_remaining("judge") == pytest.approx(35.0)
+    clock.advance(40)
+    assert router.cooldown_remaining("judge") == 0.0
+
+
 def test_no_eligible_model_is_retryable_only_when_the_reason_is_transient(cfg, keys, monkeypatch):
     """"Everything is cooling" lifts on its own; "no key set" does not."""
     # Transient: over budget today.

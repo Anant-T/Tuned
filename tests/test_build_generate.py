@@ -117,6 +117,14 @@ def only_task(store):
     return dict(store.conn.execute("SELECT * FROM task LIMIT 1").fetchone())
 
 
+def _noop_sleeper():
+    """A sleeper that never actually waits, for the backoff paths."""
+    async def _sleep(seconds):
+        return None
+
+    return _sleep
+
+
 # --------------------------------------------------------------------------
 # Prompt assembly and the grounding contract.
 # --------------------------------------------------------------------------
@@ -1902,8 +1910,144 @@ def test_a_transient_pool_skip_still_re_queues(tmp_path, cfg, paths):
             generate_once(store, cfg, router, only_task(store), paths=paths)
         )
         assert result.unroutable is False
-        run(store, cfg, router, paths)
+        # sleeper: the worker now backs off for the breaker's remaining
+        # cooldown rather than re-claiming into the same wall, so a test that
+        # lets the real clock run would sit out MAX_COOLDOWN_WAIT_S.
+        run(store, cfg, router, paths, sleeper=_noop_sleeper())
         assert only_task(store)["state"] == "pending"
+
+
+def test_make_router_takes_its_cooldown_from_the_config(tmp_path, cfg):
+    """All three make_router call sites are bare - generate, judge, difficulty -
+    which is exactly how a generic 300 s constructor default came to govern a
+    provider whose rate limit refills in a minute. The value travels with the
+    config now, so none of them has to remember."""
+    from tuned.data.generate import make_router
+
+    with make_store(tmp_path) as store:
+        assert make_router(store, cfg).cooldown_s == cfg.routing.cooldown_s
+        # An explicit kwarg still wins, for the probes that want their own.
+        assert make_router(store, cfg, cooldown_s=5.0).cooldown_s == 5.0
+
+
+def test_a_cooling_pool_never_exhausts_the_row(tmp_path, cfg, paths):
+    """THE QUEUE SHREDDER, 2026-08-29: one breaker cooldown parked 5,180 tasks
+    inside two hours.
+
+    `test_a_transient_pool_skip_still_re_queues` covers only the half of this
+    that already worked - the row re-queues WHILE ATTEMPTS REMAIN, through the
+    ladder's final `else`. At the cap it fell through to the park instead, and
+    because nothing is CALLED while the pool cools, all three attempts burn in
+    milliseconds. `claim_tasks` bumps `attempts` before routing, so returning
+    the row to `pending` without refunding the claim only lengthens the fuse
+    from one batch to three - which is why this runs past MAX_ATTEMPTS and
+    asserts the counter, not just the state."""
+    with make_store(tmp_path) as store:
+        router = FakeRouter(
+            cfg,
+            cooling={"bai/deepseek-v4-flash", "cerebras/gpt-oss-120b"},
+            over_budget={"lightning/lightning-ai/gpt-oss-120b"},
+        )
+        for _ in range(MAX_ATTEMPTS + 2):
+            run(store, cfg, router, paths, sleeper=_noop_sleeper())
+        task = only_task(store)
+        assert task["state"] == "pending"
+        # Nothing was called, so nothing was spent. Same principle
+        # tasks.FREE_PARK_PREFIXES applies on re-open, applied here instead at
+        # the moment the claim comes back empty-handed.
+        assert task["attempts"] == 0
+
+
+def _dispose_at_the_cap(store, **result_kwargs):
+    """Drive the ladder at attempts == MAX_ATTEMPTS with a made-up skip set.
+
+    routing.generator has held ONE ref since the 2026-08-28 sole-generator
+    allocation directive, and one ref can only ever report ONE reason - so a
+    mixed skip set is unreachable through the router today and reachable again
+    the moment a second ref is ever added. The classification has to be right
+    either way, so it is tested where it lives."""
+    task = store.claim_tasks("gen-1", 1)[0]
+    result = GenResult(
+        task_id=task["task_id"], attempt=MAX_ATTEMPTS, ok=False, **result_kwargs
+    )
+    landed = apply_gate_disposition(
+        store, {**task, "attempts": MAX_ATTEMPTS}, result, worker_id="gen-1"
+    )
+    return landed, only_task(store)
+
+
+def test_a_partly_transient_skip_set_still_parks(tmp_path, cfg, paths):
+    """Only an ALL-transient skip set may re-queue. `missing-key` does not lift
+    on its own, so a set holding one keeps the old parking behaviour and the
+    operator still sees the structural reason in the disposition."""
+    with make_store(tmp_path) as store:
+        landed, task = _dispose_at_the_cap(
+            store, no_eligible_model=True, route_skips=("cooling", "missing-key")
+        )
+        assert landed == GEN_UNROUTABLE_STATE
+        assert task["disposition"] == "exhausted:unroutable:cooling,missing-key"
+
+
+def test_an_all_transient_skip_set_re_queues_even_at_the_cap(tmp_path, cfg, paths):
+    """The cap is not the question: what decides it is whether the reasons lift
+    on their own. At MAX_ATTEMPTS with nothing but `cooling`, the row goes back
+    to the queue and gets its wasted claim back."""
+    with make_store(tmp_path) as store:
+        landed, task = _dispose_at_the_cap(
+            store, no_eligible_model=True, route_skips=("cooling",)
+        )
+        assert landed == "pending"
+        assert task["disposition"] is None
+        # claim_tasks bumped it to 1 for a claim that called nothing.
+        assert task["attempts"] == 0
+
+
+def test_an_empty_skip_set_is_never_read_as_transient(tmp_path, cfg, paths):
+    """`set() <= TRANSIENT_SKIPS` is VACUOUSLY TRUE, so a subset test with no
+    non-empty guard would re-queue every unrouted row forever - including the
+    ones whose reason nobody recorded. Belt and braces: `no_eligible_model` is
+    set here too, which is the inconsistent state the guard exists for."""
+    with make_store(tmp_path) as store:
+        landed, task = _dispose_at_the_cap(
+            store, no_eligible_model=True, route_skips=(), provider_fault=True
+        )
+        assert landed == GEN_UNROUTABLE_STATE
+        assert task["disposition"] == "exhausted:unroutable:"
+
+
+def test_a_wholly_cooling_batch_waits_instead_of_spinning(tmp_path, cfg, paths):
+    """Re-queueing without backing off turns the shredder into a hot loop: the
+    row returns to `pending` and is re-claimed immediately, for as long as the
+    cooldown lasts. The worker asks the Router how long the pool is out for and
+    sleeps that long instead."""
+    slept: list[float] = []
+
+    async def recording_sleeper(seconds):
+        slept.append(seconds)
+
+    with make_store(tmp_path) as store:
+        router = FakeRouter(
+            cfg,
+            cooling={"bai/deepseek-v4-flash", "cerebras/gpt-oss-120b"},
+            over_budget={"lightning/lightning-ai/gpt-oss-120b"},
+        )
+        run(store, cfg, router, paths, sleeper=recording_sleeper)
+        assert slept, "a wholly-cooling batch must back off, not re-claim at once"
+        assert slept[0] > 0
+
+
+def test_a_batch_that_generated_does_not_wait(tmp_path, cfg, paths):
+    """The backoff is keyed to the whole batch being transiently skipped, not to
+    any single row: an ordinary batch must never pay it."""
+    slept: list[float] = []
+
+    async def recording_sleeper(seconds):
+        slept.append(seconds)
+
+    with make_store(tmp_path) as store:
+        router = FakeRouter(cfg)
+        run(store, cfg, router, paths, sleeper=recording_sleeper)
+        assert slept == []
 
 
 # --------------------------------------------------------------------------

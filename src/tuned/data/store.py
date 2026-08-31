@@ -238,7 +238,7 @@ def utcnow() -> str:
 
 
 def set_state_fenced(store, task_id: str, state: str, disposition: str | None,
-                     *, worker_id) -> bool:
+                     *, worker_id, refund_attempt: bool = False) -> bool:
     """Lease-fenced state write; a lost lease is logged, never silent.
 
     Both workers move tasks this way, and they used to do it with two copies
@@ -252,7 +252,10 @@ def set_state_fenced(store, task_id: str, state: str, disposition: str | None,
     able to SEE that happening, which an unchecked return value hides - hence
     the event, and hence the bool rather than None.
     """
-    moved = store.set_task_state(task_id, state, disposition, expect_worker=worker_id)
+    moved = store.set_task_state(
+        task_id, state, disposition,
+        expect_worker=worker_id, refund_attempt=refund_attempt,
+    )
     if not moved:
         store.log_event(
             "lost_lease",
@@ -1017,6 +1020,7 @@ class Store:
         *,
         expect_worker: str | None = None,
         reset_attempts: bool = False,
+        refund_attempt: bool = False,
     ) -> bool:
         """Move a task to `state`, releasing its lease unless it stays 'generating'.
 
@@ -1029,6 +1033,15 @@ class Store:
         exhausted means the first ordinary failure after the operator fixes
         the cause is terminal. Default False, so every other caller is
         byte-for-byte unaffected.
+
+        `refund_attempt` gives back ONE claim instead of zeroing the counter,
+        for the claim that came back without calling anybody: the whole
+        generator pool was cooling or over budget, so the row learned nothing
+        about itself and must not be charged. It is deliberately not
+        `reset_attempts`: a row may already have spent real attempts on real
+        replies, and handing those back too is the blanket-reset mistake
+        tasks.FREE_PARK_DISPOSITIONS was written to avoid. Floored at zero, and
+        ignored when `reset_attempts` is also passed.
 
         `expect_worker` is a lease fence. A worker that stalled past its lease
         (GC pause, hung socket) has already had its task legitimately reclaimed
@@ -1047,6 +1060,8 @@ class Store:
         params: list = [state, disposition, utcnow()]
         if reset_attempts:
             assignments += ", attempts = 0"
+        elif refund_attempt:
+            assignments += ", attempts = MAX(0, attempts - 1)"
         if state != "generating":
             assignments += ", claimed_by = NULL, claimed_at = NULL"
         where = "task_id = ?"
