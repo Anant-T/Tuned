@@ -1548,6 +1548,27 @@ end-of-job push always carries a database and the last run exited `success`.
 Against the wall it avoids - where every run loses its entire 5h15m because the
 Hub refuses the upload - it is strictly the cheaper risk.
 
+**CONFIRMED BY A SECOND, INDEPENDENT INSTRUMENT (18:56Z).** A storage sampler
+running every 900 s across the changeover, slopes fitted either side of a
+17:55Z cut:
+
+    before 17:55Z (12 pts)   47.6 GB/day
+    after  17:55Z ( 5 pts)   19.6 GB/day     (predicted 18.8 - agreement within 4%)
+
+The per-sample detail is better evidence than the slope: **18:11Z and 18:26Z are
+flat to three decimals**, because those pushes carried only the hourly shards
+(2.7 and 2.4 MB) and cost essentially nothing, and the +0.805 GB at 18:56Z is
+the new run's first DB snapshot. F53 is visible in the raw readings, not just in
+the fit. The 47.6 GB/day "before" also exceeds the 41.5 timed at 13:24-14:24Z,
+which is F52's acceleration prediction confirmed: the append-only log grows
+through the UTC day, so the rate climbs until the date rolls it over.
+
+Wall, recomputed on the measured slope rather than the modelled one: 31.37 GB at
+18:56Z, the current run finishing at 19.6 GB/day, then ~10.2 GB/day from ~23:07Z.
+
+    without the lever   ->  2026-09-02 09:20Z
+    with --db-every 7200 -> 2026-09-03 16:53Z
+
 **PUT IT BACK TO 3600 ONCE THE BATON IS SQUASHED.** This is a borrowed margin,
 not a new default, and the comment on the argument says so at the call site.
 The permanent fix is still F57: the `seed` table is 93% of the database and the
