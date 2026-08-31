@@ -139,6 +139,12 @@ MEASURED_RETENTION = {
     # generation since 2026-08-28 is deepseek, so store-accepted converges on
     # entered and 0.846 becomes right. Until then, subtract 84 accepted (~71
     # effective) from any synthesis sizing by hand.
+    #
+    # Reproduced on a SECOND chain run the same day, over the fully-armed
+    # population (after verify's citation half demoted 8 rows): 0.844 at n=443
+    # and 0.819 at n=487. Within 0.002 of the figures below, so the verify
+    # cuts do not move the ratio - only the count they are multiplied by, which
+    # is the whole of the caveat above.
     "synthesis": 0.846,     # n=447 ENTERED  2026-08-31  (was a 0.857 placeholder)
     "curated_c2": 0.817,    # n=491 ENTERED  2026-08-31  (was taking the 0.95 default)
     # `transition` is ABSENT deliberately: it has put 5 rows through the chain,
