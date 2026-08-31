@@ -1569,6 +1569,22 @@ Wall, recomputed on the measured slope rather than the modelled one: 31.37 GB at
     without the lever   ->  2026-09-02 09:20Z
     with --db-every 7200 -> 2026-09-03 16:53Z
 
+**THE DAY BOUNDARY WAS CHECKED BEFORE IT ARRIVED, because F53 depends on it.**
+If `day` were pinned at run start the shards would keep landing under
+`2026-08-31` and grow across days - the burn problem returning by the back door.
+It is not: `actions_worker.py` never passes a `day`, so `None` flows down through
+the generate loop (`generate.py:2185`) to `raw_gen_path`, and `utcday()` /
+`utchour()` are evaluated fresh on every envelope. At 00:00Z the path becomes
+`raw/gen/2026-09-01/gen-00.ndjson` and the old day's shards freeze for good.
+
+Known harmless quirk, recorded rather than fixed: `utcday()` and `utchour()` read
+the clock separately, so an append inside the microsecond window across midnight
+could name one shard `gen-00` under the previous day (or `gen-23` under the new
+one). No row is lost and nothing needs repairing - `default_raw_paths` globs
+`raw/<kind>/*/*.ndjson`, so a misfiled shard is still swept, and the next append
+corrects itself. Not worth touching a shared time util in a running system for a
+microsecond window with no data consequence.
+
 **PUT IT BACK TO 3600 ONCE THE BATON IS SQUASHED.** This is a borrowed margin,
 not a new default, and the comment on the argument says so at the call site.
 The permanent fix is still F57: the `seed` table is 93% of the database and the
