@@ -67,13 +67,13 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 |---|---|---|
 | 0 | `agent_0.md` at repo root | **DONE** 2026-08-31 |
 | - | Cancel run #8 (pre-guard code, claiming nothing) | **DONE** - cancel accepted 01:38Z |
-| 1 | Stop the shredder: wire `TRANSIENT_SKIPS` into `generate.py` + refund attempt + back off | TODO |
-| 1b | Make `cooldown_s`/`breaker_threshold` configurable; set `routing.cooldown_s: 60` | TODO |
-| 2 | Live 5-10 row test on a scratch DB copy; then force a breaker trip | TODO |
-| 3 | Push, dispatch `data-worker`, watch the armed reopen recover ~5,190 rows | TODO |
-| 4 | Measure the breaker trip rate; report (do not act) | TODO |
-| 5 | Root-cause the `transition` stream's 99% reject rate (subagent) | TODO |
-| 6 | Widen the queue, sized to measured yield | TODO |
+| 1 | Stop the shredder: wire `TRANSIENT_SKIPS` into `generate.py` + refund attempt + back off | **DONE** `3a71494` |
+| 1b | Make `cooldown_s`/`breaker_threshold` configurable; set `routing.cooldown_s: 60` | **DONE** `bc244e1` |
+| 2 | Live 5-10 row test on a scratch DB copy; then force a breaker trip | **DONE** - both halves green |
+| 3 | Push, dispatch `data-worker`, watch the armed reopen recover ~5,190 rows | **IN FLIGHT** - run #9 `33349462956` |
+| 4 | Measure the breaker trip rate; report (do not act) | BLOCKED on run #9 |
+| 5 | Root-cause the `transition` stream's 99% reject rate | **DONE** - planner bug, fixed `708d455` |
+| 6 | Widen the queue, sized to measured yield | BLOCKED on run #9 |
 
 Full plan: `~/.claude/plans/mossy-sauteeing-riddle.md` (not in the repo).
 
@@ -149,6 +149,81 @@ still-broken generator.** Step 1 must land first.
    It *is* `action="append"` (`tasks.py:793-802`). The multi-state call is well formed.
 5. **"The auto-reopen ran and failed silently under `check=False`."** It never
    ran at all - the guard postdates every run. There is no second bug.
+
+### Step 2: the fix is proven on real rows and a real breaker (2026-08-31)
+
+Both halves ran against a **scratch copy** of the baton DB
+(`scratchpad/livetest/`), never `data/build`, with run #8 already cancelled so
+exactly one generating host existed.
+
+*Merit half* - 5 reopened synthesis rows, live on deepseek:
+
+```
+batch 1: claimed=5 gen-ok=5 gated-out=4 err=0 tokens=34169 [regenerate=4]
+```
+
+1 row to `judging`, 4 `regenerate` (gated on merit), **zero `gen_unroutable`**.
+
+*Breaker half* - the REAL Router, tripped with 4 real `report_failure` calls,
+then 5 batches x 5 claims through a wholly-cooling pool:
+
+```
+after trip: cooldown_remaining=60.0s          <- config change live, was 300
+batch 1..5: claimed=5 gen-ok=0 err=5
+  generator pool transiently empty - waiting 60s   (x5)
+gen_unroutable: 0
+pending attempts: {0: 5185, 1: 4}
+```
+
+25 claims through a dead pool destroyed **nothing**; pre-fix that is ~8 rows.
+The 4 rows at `attempts=1` are exactly the ones genuinely gated out in the
+merit half. The re-open also confirmed the free-park refund: all 5,190 came
+back at `attempts=0`.
+
+### Step 5: the transition stream was never a gate problem (2026-08-31)
+
+`transition`: 2,150 rejected / 26 format_parked / 21 gen_unroutable / **3
+accepted**. But **2,063 of the 2,150 rejects are `skip:slots`** - refused by
+`build_slots` *before any teacher call*. Partitioned by seed source, the split
+is exact:
+
+```
+s3://indian-supreme-court-judgments     skip:slots 1415 / 1415
+L-NLProc/PredEx_...                     skip:slots  367 /  367
+L-NLProc/TathyaNyaya-...                skip:slots  281 /  281
+tuned/law-v1-transition-grid            skip:slots    0 /  137
+```
+
+Root cause in `tasks.py:_candidate_seeds`: the seed-stream clause
+`COALESCE(json_extract(meta_json,'$.stream'), ?) = ?` is **one-directional**.
+It keeps a transition seed out of a synthesis wave, but a seed declaring
+nothing satisfies `COALESCE(NULL,'transition')='transition'` and flows *into*
+the transition wave - where the slots it does not carry cannot render.
+Verified in the schema: grid seeds carry all four text slots plus both dates;
+the generic seeds carry none of them.
+
+Why the grid did not simply fill the wave: there are **1,100 usable grid seeds**
+(1,250 minus 150 `held_out`) and only 137 were ever used - and those 137 are
+*exactly* the alphabetically-first 137 (`first137_match=True`). A wave takes a
+seed_id-ordered prefix of the never-used pool, so only the grid seeds inside
+that prefix are reached. Capacity was never the constraint.
+
+Fixed in `708d455` with `tasks.CLOSED_WORLD_STREAMS = {"transition"}`: a
+closed-world stream requires the declaration, an open-world one only requires
+that it does not name someone else. One existing test asserted the opposite -
+`test_a_seed_that_declares_no_stream_is_offered_to_every_wave` - but its stated
+reason ("would empty every wave in the build") is about the open-world streams
+and still holds for them; including transition in its loop was
+over-generalisation that production disproved. Narrowed, not deleted.
+
+Cost accounting: `skip:slots` is refused before the call, so **no tokens were
+burned**. What was lost is 2,063 wave slots and a per-seed cap on 2,063 seeds
+(transition skips spend the cap; only `statute_qa` is exempt in that subquery).
+
+**Consequence for Step 6:** transition can now draw at most 1,100 seeds x
+`PER_SEED_CAP` 4 = 4,400 tasks, minus the 137 spent. A 2,200-row wave therefore
+fills, but at ~2 samples per scenario - lower diversity than the plan assumed.
+Size the transition mix against 1,100 distinct scenarios, not 2,200.
 
 ## 6. Constants interrogated
 
