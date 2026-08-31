@@ -179,7 +179,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, SIZED at ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41). **Do NOT dispatch yet:** the claim is FIFO by rowid, so a wave planned now is worked LAST and the dispatch costs up to ~4 h of idle fleet. Trigger is queue depth (< ~1,000 pending synthesis), not the clock (F43). **Command rehearsed and corrected (F45): `--n` counts the LIVE arm-NULL queue, so it is `<live> + 780` - the stream total over-plans 2.3x** |
 | 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - ~400 effective ... ceiling of 2050`, then curated_c2 claims - which DO resume despite every curated row sitting behind 3,162 synthesis rows by rowid, because claiming is per-stream (F38, F39, F43). Pre-registered on the swept working copy: `ceiling guard: serving every stream - 398 effective generated-curated rows against a ceiling of 2050` (the live figure will be a little higher; 2050 is a function of the static replay/curated_c1 pools and should match exactly). **The guard cannot bind on this queue** - draining every pending curated_c2 task lands ~1,241 effective against a throttle point of 1,900, so what is being verified is that it MEASURES and serves, not that it throttles |
 | 22 | Filter IL-TUR-contaminated seeds at PLAN time | **CLOSED - wrong fix.** The drops are co-citation, not contamination: 0 of 88 match the eval item's own case. A seed filter would implement the over-firing and cost 9.6% of the pool for no integrity gain (F40) |
-| 27 | **OPERATOR ACTION, DEADLINE ~2026-09-02: squash the baton's git history** | **OPEN, hard stop.** The baton repo is 38.83 GB of a 100 GB free-account private quota and grows 14.8 GB/day (every checkpoint is a fresh ~565 MB LFS blob); wall ~2026-09-04, and a squash needs up to 36 h to reflect. `super_squash_history` takes it back to ~1 GB, is irreversible, and must run when NO worker holds the baton - end-of-job after the final push, or cancel-squash-dispatch by hand. Recurs ~weekly (F48) |
+| 27 | **OPERATOR ACTION, DEADLINE ~2026-09-02: squash the baton's git history** | **OPEN, hard stop.** 55.00 GB of a 100 GB ACCOUNT-WIDE free private quota is already used (baton 38.83 + 16.17 in ten checkpoint repos) and it grows 14.8 GB/day - every checkpoint is a fresh ~565 MB LFS blob; wall ~2026-09-03, and a squash needs up to 36 h to reflect. `super_squash_history` takes it back to ~1 GB, is irreversible, and must run when NO worker holds the baton - end-of-job after the final push, or cancel-squash-dispatch by hand. Recurs ~weekly (F48) |
 | 26 | OPERATOR DECISION: retire the pending v2/v4 irac tasks and replan them on v1/v3 | **OPEN, sized at ~182 accepted rows (~37% of the shortfall) for zero extra fleet time.** Needs a cancel/park command that does not exist yet, plus a park state that frees queue capacity honestly. F37's "no safe window" objection is superseded - `--phase plan` shows the pattern (F46) |
 | 25 | OPERATOR DECISION: turn off the row-side case_id channel (`--no-case-id-from-text`) | **OPEN** - recovers 81 generated rows (~9%) with exact containment untouched; deferred because it is an eval-integrity call and the rows are recoverable retroactively, so waiting costs nothing (F40) |
 | 23 | Re-fit `synthesis` retention after the teacher purge lands, or teach `generated_counts` to skip rows the cut will take | **CLOSED - neither is needed.** The shipping chain runs `verify` immediately before `shape` over one DB and verify writes the demotion back, so production sizing already reads a post-demotion store. Only an ad-hoc `--headroom` run outside the chain sees the inflated count, and the guard reads the curated bucket, which has no teacher cut (F44) |
@@ -1512,7 +1512,7 @@ the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
 
-### F48. THE BATON RUNS OUT OF DISK ON ~2026-09-04, AND THE FIX NEEDS 36 HOURS' NOTICE
+### F48. PRIVATE STORAGE RUNS OUT ON ~2026-09-03, AND THE FIX NEEDS 36 HOURS' NOTICE
 
 The baton is a PRIVATE Hugging Face dataset repo on a FREE account, and every
 checkpoint uploads the ~565 MB VACUUMed database as a brand-new LFS blob. Git
@@ -1521,9 +1521,24 @@ keeps every one of them. Measured just now, against the live repo:
     tantan01/tuned-law-state   used_storage   38.83 GB   (82 commits)
     first commit  2026-08-28 20:25Z   last  2026-08-31 11:20Z   span 2.62 days
     growth                             14.8 GB/day
-    free-account PRIVATE quota            100 GB   (HF storage-limits doc)
-    headroom                            61.2 GB  =  4.1 days
-    wall                            ~2026-09-04
+
+**The quota is ACCOUNT-WIDE, not per-repo,** and ten private model repos hold
+the rest of it - so the headroom is smaller than the baton alone suggests:
+
+    baton (dataset)                                       38.83 GB
+    tuned-law-v1-qwen8b-ckpt-ddp        (the live lane)    9.32 GB
+    tuned-law-v1-qwen-ckpt-manual                          1.56 GB
+    tuned-law-v1-qwen8b-ckpt-ddp-rslora32                  1.59 GB
+    tuned-law-v1-qwen-ckpt-ddp                             1.30 GB
+    tuned-law-v1-qwen8b-ckpt-ddp-alpha64                   1.07 GB
+    tuned-law-v1-qwen-ckpt                                 0.79 GB
+    tuned-law-v1-qwen8b-ckpt-ddp-rslora                    0.54 GB
+    three more at 0.00 GB                                  0.00 GB
+    ------------------------------------------------------------
+    TOTAL PRIVATE                                         55.00 GB
+    free-account PRIVATE quota                           100    GB   (HF doc)
+    headroom                                              45    GB  =  3.0 days
+    wall                                             ~2026-09-03
 
 The account is `isPro: false, canPay: false`, so there is no overage to spill
 into: past the quota the Hub refuses uploads. Every push then fails, the worker
@@ -1564,6 +1579,16 @@ hand means cancelling the queued run first, squashing, then dispatching.
 source of truth for the whole build, it is four days out rather than four hours,
 and the choice between "automate it in the supervisor" and "run it by hand
 between dispatches" is exactly the kind of call that should be made awake.
+
+**A second lever, operator-only: 6.85 GB sits in retired experiment repos.**
+`-ddp-rslora` (0.54), `-ddp-rslora32` (1.59) and `-ddp-alpha64` (1.07) are the
+three adapter-scale A/B arms whose questions memory records as CLOSED and whose
+code was retired in `15c3eb9` / `2b3ac29` / `c3c3651`; `qwen-ckpt-manual` (1.56),
+`qwen-ckpt-ddp` (1.30) and `qwen-ckpt` (0.79) predate the 2026-08-08 strip to the
+Qwen3-8B DDP lane. Deleting them buys ~0.46 days - useful margin around a squash,
+not a substitute for one, and it is irreversible, so it is the operator's call
+and no part of it was done here. `tuned-law-v1-qwen8b-ckpt-ddp` (9.32 GB) is the
+LIVE lane and must not be touched.
 
 **The cheap partial mitigation, if the wall ever gets close:** raise
 `--db-every`. The database is nearly all of the growth, and the cost of a
@@ -2936,9 +2961,10 @@ new work.
 
 ## 8. Open risks
 
-- **THE BATON RUNS OUT OF DISK ~2026-09-04.** 38.83 GB used of a 100 GB free-account
-  private quota, +14.8 GB/day, and past it the Hub refuses uploads - every run then
-  loses its whole 5h15m of generation. Squash by ~09-02 (36 h to reflect). (F48)
+- **PRIVATE STORAGE RUNS OUT ~2026-09-03.** 55.00 GB of a 100 GB ACCOUNT-WIDE free
+  quota (baton 38.83 + 16.17 in checkpoint repos), +14.8 GB/day, and past it the Hub
+  refuses uploads - every run then loses its whole 5h15m of generation. Squash the
+  baton by ~09-01 (36 h to reflect). (F48)
 - **The breaker will trip again** - 14% of calls refused on 08-29. Steps 1/1b
   make that a bounded pause, not a massacre, but throughput is the next
   constraint. Measure in Step 4; the lever after that is `rpm`, not a second ref.
