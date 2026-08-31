@@ -1698,6 +1698,33 @@ Neither fire sits at the top of the hour, which is the load peak GitHub names
 as the reason fires slip - asserted in the test, so a later edit cannot walk
 into it.
 
+**CORRECTION, 16:11:34Z the same day: the missing fires are LATE, not dropped.**
+Run `33412727342` arrived as a `schedule` event at 16:11:34Z on `2a6f5f0`. It
+cannot be an early 16:17 fire - GitHub delays scheduled runs and never advances
+them - and it cannot be a `47 */4` fire, because that cron only reached `main`
+at 15:07:56Z. It is therefore **the 12:17 fire, delivered 3 h 54 m late**, and
+the delivery series for the day is 85 min late, then 3 h 54 m late.
+
+So "one fire in four" was a reading taken while fires were still in flight, and
+the claim above that the two misses were "clean" is wrong for at least one of
+them. What survives is the part the mitigation rests on: **on a four-hour
+cadence, a fire delivered ~4 h late has been overtaken by its own successor, so
+it buys no cycle that the next fire would not have** - operationally
+indistinguishable from a drop, which is a stalled unattended build.
+
+The second fire stays, and its justification is unchanged in force but changed
+in kind: it is not "a retry for a fire that vanished", it is **a second chance
+to start a cycle on time**. It cannot make lateness worse - the group admits one
+pending run no matter how many triggers arrive - and it costs no compute.
+
+It also arrived exactly where it was wanted. `33412727342` carries `2a6f5f0`,
+which is every change made tonight (F53's hourly shards, the storage countdown,
+`worker.log`, `--add`, the 0.02 audit sample), and it displaced the pending
+`33406267642` at `4dff9d9`, which carried only the first two. The by-hand
+re-dispatch planned for ~17:30Z is therefore **not needed** - and that is the
+fence behaving exactly as documented, a late fire replacing a pending run with
+a strictly better one.
+
 **Also done, belt and braces:** `33406267642` dispatched by hand at 15:03Z on
 `4dff9d9`, so the run that picks up F53 does not depend on the 16:17Z fire
 landing. Two tests. Suite **3,836 / 19** (+1).

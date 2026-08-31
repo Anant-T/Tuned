@@ -31,15 +31,18 @@ on:
     # trade for an unattended job whose failure mode is losing the work since
     # its last checkpoint.
     #
-    # TWO fires per window, not one, because GitHub drops them. On 2026-08-31
-    # this schedule was due at 00:17, 04:17, 08:17 and 12:17Z and produced
-    # exactly one run - the 04:17 fire, 85 minutes late. The two clean misses
-    # are not the fence: a fire that lost the pending slot would still exist
-    # as a cancelled `schedule` run, and there is none, while the runs pending
-    # at 08:17 and 12:17 both survived. A dropped fire on an unattended build
-    # is a stalled build, and the fence makes the retry free - a second
-    # trigger 30 min later either finds the slot taken and replaces a pending
-    # run with an identical one, or delivers the fire the first one lost.
+    # TWO fires per window, not one, because GitHub delivers them HOURS late
+    # here. On 2026-08-31 this schedule was due at 00:17, 04:17, 08:17 and
+    # 12:17Z; by 16:00Z it had produced one run, the 04:17 fire 85 minutes
+    # late. The 12:17 fire then arrived at 16:11:34Z - 3 h 54 m late, and
+    # provably not an early 16:17 fire, since GitHub delays fires but never
+    # advances them. On a four-hour cadence a fire that late has already been
+    # overtaken by the next one, so the practical effect is the same as a drop:
+    # a window in which an unattended build is stalled and nobody is watching.
+    # The fence makes the retry free - a second trigger 30 min later either
+    # finds the slot taken and replaces a pending run with an identical one, or
+    # delivers the fire the first one lost. It cannot make lateness worse: the
+    # concurrency group admits one pending run whatever arrives.
     # Neither is at the top of the hour, which is the load peak GitHub names.
     - cron: "17 */4 * * *"
     - cron: "47 */4 * * *"
