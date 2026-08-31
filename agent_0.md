@@ -1535,6 +1535,30 @@ so the queue as planned lands it near **1,550** - where the admissible
 curated_c2 is 632..948. The projected pair is (2,149 curated, 1,550 synthesis)
 and it is outside the region on both axes at once.
 
+#### Verified end to end, not just computed
+
+The band above is arithmetic over `shape.plan`; this is `plan` itself, run
+against the LIVE baton snapshot rather than the local `data/build` copy (which
+holds a stale 17 synthesis / 0 curated and will happily "succeed" on a 50-row
+corpus - check which store a number came from before believing it):
+
+    accepted    {grounded_synthesis: 414, curated: 391}
+    effective   {grounded_synthesis: 355, curated: 371}
+    REFUSED: no corpus size between 1106 and 1179 rows works. At the largest,
+      curated/trace would need -128 rows - the generated rows already in that
+      bucket overfill it. Either generate more grounded_synthesis (every row
+      buys ~3.3 corpus rows), rebuild the short stream larger, or move the
+      no-think budget with --replay-nothink-share.
+
+Three things this settles: the refusal is REAL and current, it is on the
+OVERFILL side exactly as the band predicts, and `plan`'s own first suggested
+remedy is "generate more grounded_synthesis" - which is what the throttle
+redirects the entire fleet to do.
+
+414, not 409: `grounded_synthesis` is synthesis (409) PLUS transition (5). The
+band table's left column is that sum. Transition is drained, so all further
+growth is synthesis.
+
 #### The design agrees, and says the same number
 
 The config is internally consistent and was never sized for this. Taking the
