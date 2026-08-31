@@ -479,6 +479,89 @@ only safe shape for any future template fix, and it is why the four existing
 versions exist.
 
 
+### F16. THE CHAIN IS GREEN - and the corpus is short on synthesis, not broken
+
+**First end-to-end assembly run in the repo's history. `CHAIN RC=0`, verdict
+GREEN at profile v1.0-MVP**, all nine gates passing on 716 rows:
+
+    chain PASS | length PASS p50 3532 / p99 7039, max 8088 (limit 8192)
+    mix   PASS | curated 28.1% (28%), grounded_synthesis 28.9% (30%), replay 43.0% (42%)
+    trace PASS 80.0% (>=80%) | empty_think PASS 20.0% (>=18, <=20)
+    dup PASS 0.0% | markup PASS | license PASS | cross_code PASS 0
+
+This retires the standing risk "three gates are red / `build_manifest.json` has
+never existed". The three gates were never miscalibrated - **the pre-2026-08-29
+runs simply never ran `shape`**, and shipping pools sized for the FINISHED
+corpus into a half-generated one guarantees a replay-dominated mix.
+`assemble_argvs` inserts shape only when `streams` is passed, and CI does pass
+it (read off the bundle's own `streams/` dir), so CI is on the fixed path.
+`build_manifest.json` is written by `push.py`, which runs only after stats goes
+green - so it has never existed because the chain never got that far, not
+because anything is missing.
+
+Two local-only gaps, neither a CI defect, both checked rather than assumed:
+- decontaminate needs the eval parquets (bbl/iltur/aibe) under `corpus/hf/`.
+  `stage_bundle` deliberately keeps them off the baton ("ONE file, never the
+  corpus dir - 1.9 GB"), and `run_assemble` re-fetches them on the runner from
+  `EVAL_SETS` before the chain. Only my scratch tree lacked them.
+- "semantic layer did NOT run (semhash-not-installed)" is my local env; semhash
+  is in the `[build]` extra that `data-assemble.yml` installs.
+
+**The one real blocker: `curated_c2` is over-generated relative to synthesis.**
+At the true composition shape REFUSES - *"curated/trace would need -136 rows -
+the generated rows already in that bucket overfill it"*. Generated rows cannot
+be dropped (shape trims stream files; decontaminate reads every accepted
+generation), so a smaller corpus raises the synthesis share instead of lowering
+it. I got the GREEN above only by simulating curated_c2 down to 120 in the
+scratch DB. Measured requirement, by asking `shape.plan` directly:
+
+    gen_curated |  min gen_synth | ratio | corpus
+            309 |            455 |  1.47 |   1512
+            800 |           1170 |  1.46 |   3887
+           1377 |           2015 |  1.46 |   6694
+           2000 |           2925 |  1.46 |   9718
+
+**The required ratio is a structural 1.46:1**, flat across the whole range - it
+is set by the profile targets and the curated_c1 no-think pool, not by volume.
+
+**And the queue does not deliver it.** The reopened pool run #9 is eating is
+63.8% synthesis / 35.4% curated_c2 (3,665 / 2,037), but the two streams accept
+at different rates - synthesis 33.0%, curated_c2 52.4% - so accepted rows arrive
+at only **1.12:1**:
+
+    at queue exhaustion:  synthesis 337 + 3665x0.330 = 1546
+                          curated_c2 310 + 2037x0.524 = 1377   (1.12)
+    shape needs 2015 synthesis at that curated count -> SHORT BY 469
+
+So draining the current queue does not make the corpus shippable. This is the
+measurement Step 6 was waiting for, and it confirms the earlier "do not widen
+curated_c2" call - widening it raises the bar it is already under.
+
+**Step 6, now sized:** the next `data-plan` dispatch is **synthesis-only**, for
+roughly **+500 accepted synthesis rows** (~1,500 planned tasks at the measured
+33% accept rate), `--mix` explicit because statute_qa silently under-fills.
+
+**Not dispatched tonight, deliberately.** `data-plan.yml` shares the `data-build`
+concurrency group, which is precisely what stops a planner from stealing the
+baton from a running worker. That group holds one running plus one pending run,
+and a new trigger REPLACES the one already waiting - with a 4h cron against runs
+of up to 5h16m, a dispatch made now is very likely to be discarded silently
+rather than run. The queue already holds ~35h of work and the shortfall only
+bites at exhaustion, so there is nothing to buy by firing it now and a real
+chance of confusion. Fire it when no worker is active.
+
+### F17. Live throughput, measured on run #9
+
+    5 gen batches, claimed=36 each: gen-ok 35-36, err 0-1, cooling 0, unroutable 0
+    gated-out 32-34 of 36 -> ~3 rows reach judging per batch
+    judge: audit mode, claimed=3 decided=3 accepted=3 [audit-accept=3]
+
+180 generations in 38 min = **4.72 generations/min**, ~**23.6 accepted rows/hour**
+across all streams. The shredder fix is holding under real load: zero cooling
+parks in 180 generations. Gates remain the ceiling (~8% of generations survive),
+exactly as the 2026-08-28 finding said - not routing, not judging.
+
+
 ## 6. Constants interrogated
 
 | Constant | Verdict |
