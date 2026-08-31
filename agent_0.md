@@ -1271,6 +1271,45 @@ and still state the opposite of the right answer. Eleven of the twelve gates
 score form. This is the concrete instance that argues the human read is not
 ceremony.
 
+### F31. "Has an answer key" is exactly "can run", and no other stream has ground truth
+
+Chasing F30 outward: **only `transition` seeds carry an answer key** - 1,250 of
+61,853 seeds, all on one 22-field schema. Every other task type has **zero**
+(irac_analysis, summarization, statute_qa, drafting, across both synthesis and
+curated_c2). So there is no second free legal-accuracy gate hiding anywhere in
+this pipeline; F30's fix opportunity is transition-only, which is what
+`check_answer_key`'s docstring already implies ("the stream exists precisely
+because the old/new-code answer is decidable in advance").
+
+The two properties turn out to be the same property. `transition.py:render_cell`
+writes `answer_key_json` **and** the four slots `build_slots` requires
+(`scenario`, `old_section_text`, `new_section_text`, `savings_text`), which for
+transition have **no fallbacks**. So a seed either is a purpose-built cell -
+keyed and renderable - or it is an ordinary case chunk: unkeyed, and a
+guaranteed `SlotError`. Measured, the correlation is exact: of 2,200 transition
+tasks, the **2,063 unkeyed ones are precisely the 2,063 `skip:slots`**, and all
+137 keyed ones actually ran (114 rejected, 17 format_parked, 5 accepted, 1
+unroutable).
+
+That is the same defect `708d455` already fixed and whose message already
+records ~1,100 grid seeds left unplanned - this only supplies the mechanism and
+the exact equivalence, which is worth having because **"does the seed have an
+answer key" is a one-column test for "could this task ever have run"**, and it
+is far cheaper than re-deriving slot renderability.
+
+Still-useful operational fact: **1,113 of the 1,250 cells have never been
+used**, and the planner now restricts transition to declared seeds, so a replan
+would have 8x the material that produced the 5 accepted rows.
+
+**Recommendation: do not replan transition yet.** Conversion among tasks that
+could actually run is 5/137 = **3.6%**, and F22's judgment stands - at that rate
+it is the worst possible claim on an account-level rate bucket, and the corpus
+is short on *synthesis*, not transition. The rejects are dominated by
+`length_band` and `irac_placement`, both of which have moved since these rows
+were generated (`think_max` 3000 -> 4500; F24's genre result). Re-measure the
+rate on a **10-row probe** after the genre variants land; replan only if it
+clears the synthesis streams' opportunity cost.
+
 ## 6. Constants interrogated
 
 | Constant | Verdict |
