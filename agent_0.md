@@ -179,6 +179,8 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, not urgent** - ~27 h of queue left. Worth ~1.7x the corpus per fleet-hour when it happens (F37) |
 | 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - 401 effective ... ceiling of 2050`, then curated_c2 claims (F38, F39) |
 | 22 | Filter IL-TUR-contaminated seeds at PLAN time | **OPEN** - 9.4% of accepted generated rows are burned on seeds decontamination always deletes. No prompt sha changes, so it is cheap; helps only rows planned after it (F38) |
+| 23 | Re-fit `synthesis` retention after the teacher purge lands, or teach `generated_counts` to skip rows the cut will take | **OPEN** - 0.846 is a chain retention against a pre-verify store count; the two converge once the 84 legacy rows are demoted (F39b) |
+| 24 | Citation-existence half | **CLOSED** - index exists, is on the baton, is armed live, costs 8 rows of 943, and all 8 were already dropped by the chain (F39) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
 
@@ -1506,6 +1508,71 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F39. THE CITATION-EXISTENCE HALF COSTS 0.85%, AND IT HAS BEEN ARMED ALL ALONG
+
+Standing risk, carried for days as "no citation index - verify existence-half
+UNVERIFIED". Every clause of it is wrong, and the last one is wrong in the
+expensive direction.
+
+    the index exists            76,238 citations, 1.25 MB, built 2026-08-29
+    it is ON THE BATON          corpus/citation_index.txt, 1 of 26 files
+    the live chain arms it      actions_worker reads root/corpus/citation_index.txt
+                                and passes it to verify; the "no index in the
+                                bundle" branch has never been taken
+    arming it costs             8 rows of 943 - 0.85%
+
+Measured by re-gating the full accepted population with the real index:
+`regated 943, clean 847, demoted 8, unverified 0`. Four synthesis and four
+curated_c2, all `accepted -> rejected`.
+
+**Why the 4.7%-coverage worry never materialised.** The index covers 4.7% of
+the citations that appear, and the reasonable fear was that arming a gate
+which fails on ANY novel citation would delete most of the corpus.
+`novel_citations(text, source, index)` takes the GROUNDING as well as the
+index, so a citation the materials already carry is not novel whatever the
+index knows. The model overwhelmingly cites what it was handed. What the gate
+catches is the narrow thing it is for: a citation introduced from the model's
+own memory that also exists nowhere in the corpus.
+
+So `citation_index=None` in `generate.py` is not a gap - it is the pilot mode
+the docstring describes, and the "MANDATORY FOLLOW-UP" it records (verify must
+re-run with the real index before promotion) was implemented and is live.
+
+**And the 8 rows were free.** All eight had already been dropped by
+decontamination or dedupe - 0 of 8 appear in the assembled corpus. The
+existence half has, so far, rejected nothing the chain was not rejecting
+anyway. That is a reason to keep it armed, not to relax it: it is currently
+costing zero rows to hold a real guarantee.
+
+### F39b. THE RETENTION TABLE AND ITS CALLER USE DIFFERENT DENOMINATORS
+
+Caught while checking F38's own numbers, and it partly undercuts them.
+
+`--measure` reports a CHAIN retention: shipped over rows ENTERING
+decontaminate. `generated_counts` multiplies that figure by
+`store.accepted_count(stream)` - the count BEFORE verify runs. Those are the
+same population only where verify demotes nothing.
+
+    curated_c2   491 accepted -> 491 entered -> 401 shipped   0.817 is CORRECT
+    synthesis    531 accepted -> 447 entered -> 378 shipped   0.846 OVERSTATES by 19%
+
+The gap is exactly F38b's one-teacher cut. `531 x 0.846 = 449` against 378
+that actually ship, and the difference is the 84 retired-provider rows that
+never reach the chain.
+
+It is a ONE-OFF, which is why the fix is a note rather than a number: those 84
+are demoted for good by the first assembly run that arms the cut, and every
+generation since 2026-08-28 is deepseek, so store-accepted converges on
+entered and 0.846 becomes right. **Until that run lands, subtract 84 accepted
+(~71 effective) from any synthesis sizing by hand.** Recorded in the table
+itself so the next reader meets it at the number, not in this file.
+
+Worth stating plainly: this is the same class of error as the throttle's, and
+the third time on this project that two different denominators were quietly
+multiplied together. The seven file-based sources are immune - they are not in
+the store, so entered is what the loader shipped - which is precisely why it
+took a generated-stream reading to expose it.
 
 ### F38. THE TWO GENERATED RETENTION FIGURES WERE A GUESS AND A DEFAULT. BOTH ARE NOW READINGS, AND BOTH WERE OPTIMISTIC
 

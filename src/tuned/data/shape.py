@@ -118,8 +118,26 @@ MEASURED_RETENTION = {
     # is in the IL-TUR eval set. Dedupe took 2 rows and the length cut took 0.
     # So these figures move when the eval corpora move, not when the gates or
     # the templates do; re-measure after a decontamination corpus changes.
-    "synthesis": 0.846,     # n=447  2026-08-31  (was a 0.857 placeholder)
-    "curated_c2": 0.817,    # n=491  2026-08-31  (was taking the 0.95 default)
+    #
+    # READ THE DENOMINATORS. These are CHAIN retentions - shipped over rows
+    # ENTERING decontaminate - while generated_counts multiplies them by
+    # store.accepted_count(), which is the count BEFORE verify runs. The two
+    # agree only where verify demotes nothing.
+    #
+    # curated_c2: they agree. It has no teacher cut, and the 4 rows its
+    # citation-existence half rejects are inside the 491, so 0.817 is both the
+    # chain retention and the store-accepted-to-shipped factor.
+    #
+    # synthesis: they do NOT agree today, and by 19%. 531 rows are accepted in
+    # the store; the one-teacher cut demotes 84 of them (retired cerebras and
+    # lightning gpt-oss-120b) and only 447 enter the chain. 531 x 0.846 = 449
+    # against 378 that actually ship. The gap is a ONE-OFF: those 84 rows are
+    # demoted for good by the first assembly run that arms the cut, and every
+    # generation since 2026-08-28 is deepseek, so store-accepted converges on
+    # entered and 0.846 becomes right. Until then, subtract 84 accepted (~71
+    # effective) from any synthesis sizing by hand.
+    "synthesis": 0.846,     # n=447 ENTERED  2026-08-31  (was a 0.857 placeholder)
+    "curated_c2": 0.817,    # n=491 ENTERED  2026-08-31  (was taking the 0.95 default)
     # `transition` is ABSENT deliberately: it has put 5 rows through the chain,
     # far under RETENTION_MIN_N, so any number here would be invented and the
     # DEFAULT_RETENTION fallback is the honest answer until it has more.
