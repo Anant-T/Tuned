@@ -523,6 +523,149 @@ def generated_counts(store, assembly, *, correct=True) -> tuple[dict, dict]:
     return {k: round(v) for k, v in effective.items()}, accepted
 
 
+def synthesis_band(pools, gc, *, targets, empty_target=DEFAULT_EMPTY_TARGET,
+                   replay_nothink_share=None, retention=None, tolerance_pp=2.0,
+                   step=25) -> tuple[int, int] | None:
+    """The generated-synthesis counts that work at this generated-curated count.
+
+    Refusal comes from BOTH sides - too few and the curated bucket overfills
+    its share, too many and the corpus outgrows the shortest pool - so the
+    answer is an interval, and how wide it is matters as much as where it is.
+    A narrow one means the next wave has to land on a target it can miss.
+    """
+    feasible = []
+    probe = max(step, gc // 100)
+    for gs in range(probe, 3 * gc + 2000, probe):
+        try:
+            plan(pools, targets=targets, generated_synthesis=gs, generated_curated=gc,
+                 empty_target=empty_target, replay_nothink_share=replay_nothink_share,
+                 retention=retention, tolerance_pp=tolerance_pp)
+            feasible.append(gs)
+        except ShapeError:
+            continue
+    return (feasible[0], feasible[-1]) if feasible else None
+
+
+def curated_ceiling(pools, *, targets, empty_target=DEFAULT_EMPTY_TARGET,
+                    replay_nothink_share=None, retention=None, tolerance_pp=2.0,
+                    max_curated=20000, step=25) -> int | None:
+    """Largest generated-curated count for which SOME synthesis count works.
+
+    THIS IS AN IRREVERSIBILITY BOUNDARY, not a tuning hint. `plan` refuses
+    from both sides: too few generated synthesis rows and the curated bucket
+    OVERFILLS its share, too many and the corpus outgrows the shortest stream
+    pool. Between those the feasible synthesis window narrows as the generated
+    curated count rises, and above this value it closes completely - no
+    generation, of any stream, in any quantity, reopens it.
+
+    And it cannot be walked back. The shaper trims STREAM files; decontaminate
+    reads every accepted generation out of the store, so a generated row is in
+    the corpus by existing. A build that crosses this line has produced a
+    corpus that can never be assembled at this profile, and the only remedies
+    left are rebuilding the short pool larger or changing the profile.
+
+    Feasibility in the generated-curated count is treated as monotone - true
+    for the squeeze described above - so this binary-searches it. The inner
+    synthesis sweep is COARSE, and deliberately: it can understate the ceiling
+    where the surviving window is narrower than one probe. Understating is the
+    safe direction for a headroom report - it warns early rather than late -
+    and it is the reason the sweep is not refined.
+    """
+    def works(gc: int) -> bool:
+        # The feasible window sits a little above gc and scales with it; the
+        # observed ratios run ~1.4x to ~2.7x, so this brackets it with room.
+        # The probe scales too, which keeps this ~300 evaluations whatever the
+        # magnitude - a fixed step is O(gc) per probe and turns the search into
+        # tens of thousands of plans for no extra precision where it matters.
+        probe = max(step, gc // 100)
+        for gs in range(probe, 3 * gc + 2000, probe):
+            try:
+                plan(pools, targets=targets, generated_synthesis=gs,
+                     generated_curated=gc, empty_target=empty_target,
+                     replay_nothink_share=replay_nothink_share,
+                     retention=retention, tolerance_pp=tolerance_pp)
+                return True
+            except ShapeError:
+                continue
+        return False
+
+    if not works(step):
+        return None
+    # GALLOP, then bisect. Probing max_curated first would be the obvious
+    # bracket and it is the expensive one: a probe costs O(gc) plans, so the
+    # single largest probe dominates everything else the search does. Doubling
+    # up from the bottom reaches the bracket in log2 probes that are each
+    # cheaper than the one before it.
+    lo = step
+    hi = 2 * step
+    while hi < max_curated and works(hi):
+        lo, hi = hi, 2 * hi
+    if hi >= max_curated:
+        return max_curated if works(max_curated) else _bisect_ceiling(works, lo, max_curated, step)
+    return _bisect_ceiling(works, lo, hi, step)
+
+
+def _bisect_ceiling(works, lo: int, hi: int, step: int) -> int:
+    """Largest feasible value in [lo, hi), given works(lo) and not works(hi)."""
+    while lo + step < hi:
+        mid = (lo + hi) // 2
+        if works(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _print_headroom(pools, *, targets, profile, gen_synth, gen_curated, accepted,
+                    empty_target, replay_nothink_share, tolerance_pp, retention) -> None:
+    """How much generated-curated room is left before the corpus is stuck.
+
+    Written because the number that matters is not in any report: `shape`
+    says yes or no about TODAY's counts, and the queue keeps generating. The
+    question an operator actually has - "how many more curated rows may this
+    build produce before it can never be assembled" - had no command.
+    """
+    kw = dict(targets=targets, empty_target=empty_target,
+              replay_nothink_share=replay_nothink_share,
+              retention=retention, tolerance_pp=tolerance_pp)
+    ceiling = curated_ceiling(pools, **kw)
+    print(f"generated-curated headroom - profile {profile}")
+    print(f"  pools                 {({f'{k[0]}/{"trace" if k[1] else "nothink"}': len(v) for k, v in sorted(pools.items())})}")
+    raw_curated = accepted.get(CURATED_BUCKET, 0)
+    print(f"  now                   {gen_curated} effective ({raw_curated} accepted), "
+          f"synthesis {gen_synth} effective")
+    if ceiling is None:
+        print("  ceiling               NONE - these pools admit no corpus at this "
+              "profile at any generated count. This is a POOL problem, not a "
+              "generation one: rebuild the short stream or change the profile.")
+        return
+    print(f"  ceiling               {ceiling} effective generated-curated rows")
+    left = ceiling - gen_curated
+    # Effective counts are retention-corrected, so convert back before quoting
+    # a number anyone can act on - the operator throttles ACCEPTED rows.
+    factor = (gen_curated / raw_curated) if raw_curated else 1.0
+    room = int(left / factor) if factor else left
+    if left <= 0:
+        print("  headroom              NONE - ALREADY PAST IT. No synthesis count "
+              "assembles this corpus at this profile, and generated rows cannot "
+              "be dropped.")
+    else:
+        print(f"  headroom              {left} effective (~{room} more accepted "
+              f"curated rows)")
+    band = synthesis_band(pools, gen_curated, **kw)
+    print(f"  synthesis needed now  {f'{band[0]}..{band[1]} effective' if band else 'NONE - this curated count is already unshapeable'}")
+    at_ceiling = synthesis_band(pools, ceiling, **kw)
+    if at_ceiling:
+        print(f"  ...and at the ceiling {at_ceiling[0]}..{at_ceiling[1]} effective "
+              f"(window {at_ceiling[1] - at_ceiling[0]})")
+    print()
+    print("  Generated rows cannot be dropped: the shaper trims stream files, "
+          "decontaminate reads every accepted generation. Past the ceiling the "
+          "corpus is unassemblable at this profile PERMANENTLY. The remedy that "
+          "keeps the work is rebuilding the binding pool larger, not generating "
+          "less - see the REFUSED message, which names it.")
+
+
 def main(argv=None) -> int:
     import argparse
 
@@ -548,6 +691,10 @@ def main(argv=None) -> int:
     p.add_argument("--no-retention-correction", action="store_true",
                    help="request exactly the target counts, ignoring the measured "
                         "per-source losses in decontaminate/dedupe/assemble")
+    p.add_argument("--headroom", action="store_true",
+                   help="print how many more GENERATED CURATED rows the corpus can "
+                        "still absorb before it becomes unassemblable at this "
+                        "profile, and exit; reads the store, writes nothing")
     p.add_argument("--measure", action="store_true",
                    help="print measured per-source retention off the last completed "
                         "chain in out/ and exit; shapes nothing and writes nothing")
@@ -589,6 +736,17 @@ def main(argv=None) -> int:
     all_rows = [r for rows in stream_rows.values() for r in rows]
     try:
         pools = classify(all_rows, cfg.assembly)
+        if args.headroom:
+            _print_headroom(
+                pools, targets=targets, profile=args.profile,
+                gen_synth=gen_synth, gen_curated=gen_curated, accepted=accepted,
+                empty_target=args.empty_target,
+                replay_nothink_share=args.replay_nothink_share,
+                tolerance_pp=cfg.assembly.gates.mix_tolerance_pp,
+                retention=({} if args.no_retention_correction
+                           else _pool_retention(pools)),
+            )
+            return 0
         plan_ = plan(
             pools, targets=targets,
             generated_synthesis=gen_synth, generated_curated=gen_curated,

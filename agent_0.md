@@ -173,6 +173,8 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 12 | Build the 50-example review packet the card requires, and pre-screen it | **DONE** `4505840` - reproducible CLI, 4/50 flagged (the first 12/50 was a screen bug, F29) |
 | 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it. The 5 transition rows are already read: 1 is wrong (F30) |
 | 16 | Stop the card claiming a citation check that never ran | **DONE** (F34) |
+| 17 | Measure the generated-curated ceiling; ship `shape --headroom` | **DONE** (F35) |
+| 18 | Decide the ceiling remedy: rebuild `replay/nothink`, or throttle `curated_c2` | **OPEN - OPERATOR DECISION, days not hours** (F35) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
 
@@ -1427,6 +1429,111 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F35. THE CORPUS IS ~11 ACCEPTED ROWS FROM BEING PERMANENTLY UNASSEMBLABLE
+
+This is the most important thing in this file. It is not a throughput problem
+and it is not reversible.
+
+**`shape` refuses from BOTH sides.** Too few generated synthesis rows and the
+curated bucket overfills its share of the mix; too many and the corpus outgrows
+the shortest stream pool. Between them is a window, and the window NARROWS as
+the generated-curated count rises - until it closes:
+
+    effective gen_curated   feasible gen_synthesis   corpus   window
+              371                 550 ..  1025        1,827    475
+            1,200               1,800 ..  2,300       5,980    500
+            1,600               2,350 ..  2,900       7,807    550
+            2,000               3,000 ..  3,200       9,801    200
+            2,050               3,000 ..  3,200       9,801    200
+            2,100                    INFEASIBLE          -       -
+
+**Ceiling: ~2,050-2,065 effective generated-curated rows.** Past it no synthesis
+count, in any quantity, assembles this corpus at `v1.0-MVP`. And it cannot be
+undone: `shape` trims STREAM files, while `decontaminate` reads every accepted
+generation out of the store, so **a generated row is in the corpus by
+existing.**
+
+#### Where the build is heading, unattended
+
+    headroom now                        ~1,769 more ACCEPTED curated rows
+    pending curated_c2 tasks             1,825, accepting at 96.3% -> ~1,758
+    margin                               ~11 rows
+    plus format_parked curated              116, which REOPEN_ON_EMPTY re-opens
+                                            automatically when the queue drains
+
+So the projected landing is **2,157 effective against a 2,050-2,065 ceiling** -
+over it - and the thing that pushes it over is a recovery path the worker runs
+BY ITSELF (`REOPEN_ON_EMPTY = ("gen_unroutable", "format_parked", "off_teacher")`).
+Nothing warns; `shape` is not run by the worker, only by `data-assemble`.
+The failure would first be visible as a `REFUSED` on a dispatch days later,
+by which time the rows that caused it are unremovable.
+
+Timeline: the queue holds ~2.4 days, and curated_c2 is at 391 accepted against a
+~2,160 budget, so **this is days away, not hours.** No emergency tonight.
+
+#### What binds it, measured
+
+    pools: curated/nothink 1400   curated/trace 300
+           replay/nothink  1200   replay/trace 3120
+
+At gc=2,066 the refusals name the two walls exactly:
+
+    gs=2,600  "curated/trace would need -286 rows - the generated rows
+               already in that bucket overfill it"
+    gs=3,100  "replay/nothink needs 1233 rows (to keep 1200 after losses)
+               but the pool holds 1200"
+
+**`replay/nothink` at 1,200 rows is the binding constraint** - it caps the
+corpus at ~10,021 (F19's ceiling, now explained rather than just observed),
+and the corpus size is what caps how many generated curated rows fit inside
+the curated share.
+
+**`--replay-nothink-share` does NOT rescue it.** The refusal message suggests
+that lever, so I tested it at 0.0 / 0.1 / 0.2 / 0.3 / 0.4 / 0.5 / 0.6 / 0.7:
+INFEASIBLE at every value. It moves the no-think budget between streams; it
+cannot conjure rows into a pool that holds 1,200.
+
+#### Three ways out, costed
+
+1. **Rebuild `replay/nothink` larger.** The only remedy that keeps every
+   generated row. It raises the corpus ceiling and therefore the curated one -
+   pinned by a test (`test_curated_ceiling_rises_when_the_binding_pool_is_larger`).
+   Cost: `streams/` is baton-owned, so it needs a window with no worker running.
+   **This is the recommended fix.**
+2. **Throttle `curated_c2` before it crosses.** There is NO park/stop CLI -
+   `--reopen` only un-parks - so the brake that exists today is
+   `STREAMS = ("synthesis", "transition", "curated_c2")` at
+   `actions_worker.py:51`. Dropping the third entry is a one-line repo edit the
+   cron picks up on its next run, with no store write and no baton. Cheap and
+   reversible, but it caps the corpus at whatever curated has by then.
+3. **Change the profile.** Not costed; `v1.1-full` needs ~2x the synthesis
+   (F21) and does not obviously widen this window.
+
+#### The instrument, so this number is never a stale doc again
+
+    python -m tuned.data.shape --config <cfg> --profile v1.0-MVP --headroom
+
+New (`--headroom`), read-only, writes nothing. Prints the ceiling, today's
+count, the headroom in ACCEPTED rows (converted back through the retention
+factor, because accepted rows are what an operator throttles), the synthesis
+band needed now, and the band at the ceiling with its width. `curated_ceiling`
+and `synthesis_band` are public and tested, including the case where the pools
+admit no corpus at all - which is a POOL problem and the opposite instruction
+to "generate less".
+
+The search galloping-then-bisects and its inner sweep is deliberately coarse,
+so it can UNDERSTATE the ceiling by up to one probe. That is the safe direction
+for a warning and it is why the report says 2,050 where a fine scan says 2,065.
+
+#### What this corrects
+
+The state of play said the shortfall was "~850 synthesis rows" and F16 put it
+at 469. Both measured the RATIO (1.46:1) and neither measured the CEILING, so
+both described a corpus that gets better as it grows. It does not: past
+gen_curated ~2,050 it stops existing. The real requirement is a MATCHED PAIR -
+and at full drain the pair is (2,157 curated, ~1,810 synthesis), which is
+outside the feasible region on both axes at once.
 
 ### F34. The dataset card claimed a citation check that has run on ZERO rows
 

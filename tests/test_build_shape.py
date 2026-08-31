@@ -20,6 +20,7 @@ from tuned.data.shape import (
     SYNTHESIS_BUCKET,
     ShapeError,
     classify,
+    curated_ceiling,
     is_trace,
     plan,
     select,
@@ -466,3 +467,99 @@ def test_the_table_holds_no_number_that_was_never_measured():
     from tuned.data.shape import DEFAULT_RETENTION
 
     assert MEASURED_RETENTION["synthesis"] < DEFAULT_RETENTION
+
+
+# --------------------------------------------------------------------------
+# curated_ceiling: the point past which no amount of synthesis rescues the
+# corpus. Generated rows CANNOT be dropped, so crossing it is irreversible.
+# --------------------------------------------------------------------------
+
+def _any_synthesis_works(pools, gc, *, targets, share=None):
+    for gs in range(25, 6 * gc + 2000, 25):
+        try:
+            plan(pools, targets=targets, generated_synthesis=gs, generated_curated=gc,
+                 replay_nothink_share=share, tolerance_pp=2.0)
+            return True
+        except ShapeError:
+            pass
+    return False
+
+
+def test_curated_ceiling_is_where_no_synthesis_count_can_rescue_the_corpus():
+    """The failure this exists to make visible: past the ceiling the corpus is
+    unassemblable FOREVER, because shape trims stream files and decontaminate
+    reads every accepted generation - so a curated row, once generated, cannot
+    be taken back out.
+
+    The short replay/nothink pool is what caps the corpus, and the corpus size
+    is what caps how many generated curated rows fit inside the curated share.
+    """
+    pools = {
+        (REPLAY_BUCKET, True): rows(REPLAY_TRACE, 8000, reasoning=True),
+        (REPLAY_BUCKET, False): rows(REPLAY_NOTHINK, 200, reasoning=False),
+        (CURATED_BUCKET, False): rows(CURATED_NOTHINK, 4000, reasoning=False),
+        (CURATED_BUCKET, True): rows(CURATED_TRACE, 4000, reasoning=True),
+    }
+    ceiling = curated_ceiling(pools, targets=MVP, max_curated=4000)
+    assert ceiling is not None and ceiling > 0
+    # what it returns is really feasible ...
+    assert _any_synthesis_works(pools, ceiling, targets=MVP)
+    # ... and past it nothing is, which is the whole point. Probed well clear
+    # of the boundary rather than one step past it: the sweep inside
+    # curated_ceiling is deliberately coarse and errs LOW, so a value just
+    # above what it returns may still be feasible - that is the documented
+    # direction of the error, not a defect this test should encode.
+    assert not _any_synthesis_works(pools, 2 * ceiling, targets=MVP)
+
+
+def test_curated_ceiling_is_none_when_the_pools_admit_no_corpus_at_all():
+    """A None here is the difference between "stop generating curated" and
+    "these pools cannot build this profile" - opposite instructions."""
+    starved = {
+        (REPLAY_BUCKET, True): rows(REPLAY_TRACE, 5, reasoning=True),
+        (REPLAY_BUCKET, False): rows(REPLAY_NOTHINK, 1, reasoning=False),
+        (CURATED_BUCKET, False): rows(CURATED_NOTHINK, 1, reasoning=False),
+        (CURATED_BUCKET, True): rows(CURATED_TRACE, 1, reasoning=True),
+    }
+    assert curated_ceiling(starved, targets=MVP) is None
+
+
+def test_curated_ceiling_rises_when_the_binding_pool_is_larger():
+    """It is the SHORT pool that sets the ceiling, so the remedy that keeps the
+    generated work is rebuilding that pool rather than throttling generation."""
+    def pools_with(nothink):
+        return {
+            (REPLAY_BUCKET, True): rows(REPLAY_TRACE, 6000, reasoning=True),
+            (REPLAY_BUCKET, False): rows(REPLAY_NOTHINK, nothink, reasoning=False),
+            (CURATED_BUCKET, False): rows(CURATED_NOTHINK, 6000, reasoning=False),
+            (CURATED_BUCKET, True): rows(CURATED_TRACE, 6000, reasoning=True),
+        }
+    # Small numbers on purpose: the claim is directional, and the search costs
+    # O(ceiling) plans, so proving it at 20k pools buys nothing but minutes.
+    small = curated_ceiling(pools_with(200), targets=MVP, max_curated=3000)
+    large = curated_ceiling(pools_with(600), targets=MVP, max_curated=3000)
+    assert large > small
+
+
+def test_headroom_reports_the_ceiling_and_shapes_nothing(tmp_path, capsys):
+    """The number an operator actually needs and had no command for.
+
+    `shape` answers yes/no about TODAY's counts while the queue keeps
+    generating, so "how many more curated rows may this build produce before
+    it can never be assembled" was unanswerable without writing a script.
+    """
+    config = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    _write_streams(paths)
+    store = open_store(tmp_path, n_seeds=1, db_path=paths.state_db)
+    _accept(store, "synthesis", 90)
+    _accept(store, "curated_c2", 10)
+    store.close()
+
+    assert shape_main(["--config", config, "--profile", "v1.0-MVP", "--headroom"]) == 0
+    out = capsys.readouterr().out
+    assert "generated-curated headroom" in out
+    assert "ceiling" in out and "headroom" in out
+    # and it is a REPORT: nothing shaped, nothing written
+    assert not (paths.out_dir / MANIFEST_FILENAME).exists()
+    assert not list(paths.out_dir.glob("shaped_*.jsonl"))
