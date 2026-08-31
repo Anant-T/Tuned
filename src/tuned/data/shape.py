@@ -140,6 +140,16 @@ MEASURED_RETENTION = {
     # entered and 0.846 becomes right. Until then, subtract 84 accepted (~71
     # effective) from any synthesis sizing by hand.
     #
+    # THAT HAND-CORRECTION IS FOR AD-HOC RUNS ONLY. `assemble_argvs` puts
+    # `verify --require-generator` immediately before `shape` in the one chain
+    # that ships, as sequential subprocesses over the same state DB, so the
+    # production sizing already reads a post-demotion store and needs no
+    # correction at all. The gap can mislead exactly one thing: a
+    # `shape --headroom` (or `plan`) run taken outside the chain against a
+    # store no assembly has swept yet - which is how it was found. It also
+    # cannot grow: `off_teacher` is a retired-provider set, closed since the
+    # 2026-08-28 sole-generator ruling.
+    #
     # Reproduced on a SECOND chain run the same day, over the fully-armed
     # population (after verify's citation half demoted 8 rows): 0.844 at n=443
     # and 0.819 at n=487. Within 0.002 of the figures below, so the verify

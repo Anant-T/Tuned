@@ -180,7 +180,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - 401 effective ... ceiling of 2050`, then curated_c2 claims (F38, F39) |
 | 22 | Filter IL-TUR-contaminated seeds at PLAN time | **CLOSED - wrong fix.** The drops are co-citation, not contamination: 0 of 88 match the eval item's own case. A seed filter would implement the over-firing and cost 9.6% of the pool for no integrity gain (F40) |
 | 25 | OPERATOR DECISION: turn off the row-side case_id channel (`--no-case-id-from-text`) | **OPEN** - recovers 81 generated rows (~9%) with exact containment untouched; deferred because it is an eval-integrity call and the rows are recoverable retroactively, so waiting costs nothing (F40) |
-| 23 | Re-fit `synthesis` retention after the teacher purge lands, or teach `generated_counts` to skip rows the cut will take | **OPEN** - 0.846 is a chain retention against a pre-verify store count; the two converge once the 84 legacy rows are demoted (F39b) |
+| 23 | Re-fit `synthesis` retention after the teacher purge lands, or teach `generated_counts` to skip rows the cut will take | **CLOSED - neither is needed.** The shipping chain runs `verify` immediately before `shape` over one DB and verify writes the demotion back, so production sizing already reads a post-demotion store. Only an ad-hoc `--headroom` run outside the chain sees the inflated count, and the guard reads the curated bucket, which has no teacher cut (F44) |
 | 24 | Citation-existence half | **CLOSED** - index exists, is on the baton, is armed live, costs 8 rows of 943, and all 8 were already dropped by the chain (F39) |
 | 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
@@ -1509,6 +1509,49 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F44. THE 19% SYNTHESIS OVERSTATEMENT NEVER REACHES THE SHIPPING PATH
+
+F39b found `generated_counts` multiplying a PRE-verify `accepted_count()` by a
+retention measured on rows that had already passed verify, and task 23 proposed
+either re-fitting after the teacher purge or teaching the counter to skip the
+rows the cut will take. Measured before building either: **neither is needed.**
+
+**The chain already orders it correctly.** `assemble_argvs` builds
+`verify --require-generator --require-current-prompt --state accepted` ->
+`shape` -> `decontaminate` -> `dedupe` -> `split` -> `assemble` -> `stats`, run
+as sequential subprocesses over one state DB. `verify` writes the demotion back
+(`verify.py:377`, `store.set_task_state(task_id, off_teacher, ...)`) - it is not
+a stream filter - so by the time `shape` calls `accepted_count()` the 84 rows
+are already out of `accepted`. Production sizing reads a post-demotion store and
+needs no correction.
+
+**The exposure is one command, outside the chain.** Only an ad-hoc
+`shape --headroom` / `plan` against a store no assembly has swept sees the
+inflated figure. That is exactly how it was found tonight, and it is why the
+number in F41 is right: F41 sized off the working copy AFTER a local chain run
+(accepted synthesis 443, `off_teacher` 84), not off the raw baton.
+
+**And it cannot reach the ceiling guard.** `ceiling_state` takes
+`effective[CURATED_BUCKET]` only, and the curated bucket has no teacher cut -
+`off_teacher` is 84 rows, all synthesis. The irreversible side of the band is
+untouched by this.
+
+**Live confirmation, 07:24Z baton snapshot vs the swept working copy:**
+
+    baton (no assembly has ever swept it)   accepted synthesis 409   off_teacher   0
+    working copy, after a local chain run   accepted synthesis 443   off_teacher  84
+
+So `off_teacher` is still 0 on the live store, and will stay 0 until the first
+assemble dispatch - at which point it becomes 84 permanently and the two
+denominators converge. The set is closed: every generation since the 2026-08-28
+sole-generator ruling is deepseek, which is in the pool.
+
+**Not built, deliberately.** A `generated_counts` that re-derives verify's
+teacher predicate would duplicate `latest_generations` + `teacher_of` in a
+second place, to track a fixed 84-row quantity that the shipping path already
+handles and that self-clears on the next assemble. That duplication is the F24
+drift failure mode, offered as a fix. Recorded in the retention comment instead.
 
 ### F43. THE TOP-UP CAN WAIT: THE CLAIM IS FIFO, SO A WAVE PLANNED NOW IS WORKED LAST
 
