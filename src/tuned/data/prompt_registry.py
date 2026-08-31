@@ -98,6 +98,7 @@ import string
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Sequence
 
 SYSTEM_MARK = "<!-- system -->"
 USER_MARK = "<!-- user -->"
@@ -290,7 +291,38 @@ def variants(task_type: str) -> tuple[str, ...]:
         ) from None
 
 
-def pick_variant(task_type: str, seed_id: str, sample_ix: int) -> str:
+def group_variants(prompt_ids: Sequence[str]) -> dict[str, tuple[str, ...]]:
+    """An operator's allowlist, grouped by the task type each id generates and
+    put back into registry (version-number) order.
+
+    Every id is checked against the registry HERE, at plan time, so a typo
+    fails before a single row is inserted. The alternative - filtering a pool
+    by an unrecognised string - would silently shrink the pool or empty it,
+    and a wave planned that way cannot be told from one planned correctly.
+    """
+    pool_of: dict[str, str] = {}
+    for task_type, ids in _variants_by_task().items():
+        for prompt_id in ids:
+            pool_of[prompt_id] = task_type
+    grouped: dict[str, set[str]] = {}
+    for prompt_id in prompt_ids:
+        try:
+            task_type = pool_of[prompt_id]
+        except KeyError:
+            raise KeyError(
+                f"{prompt_id!r} is not a generator template; generators are: "
+                f"{', '.join(sorted(pool_of))}"
+            ) from None
+        grouped.setdefault(task_type, set()).add(prompt_id)
+    return {
+        task_type: tuple(pid for pid in variants(task_type) if pid in chosen)
+        for task_type, chosen in sorted(grouped.items())
+    }
+
+
+def pick_variant(
+    task_type: str, seed_id: str, sample_ix: int, *, allow: Sequence[str] | None = None
+) -> str:
     """Which paraphrase this (seed, sample) draws. Deterministic and stable
     across processes - a plain hash() would not be, PYTHONHASHSEED randomizes
     str hashing per run, and a wave replanned tomorrow must reproduce today's
@@ -300,5 +332,16 @@ def pick_variant(task_type: str, seed_id: str, sample_ix: int) -> str:
     spread stays even for any variant count.
     """
     pool = variants(task_type)
+    if allow is not None:
+        # Narrowed, never reordered: the surviving variants keep their registry
+        # positions relative to each other, so the same (seed, sample) that drew
+        # v1 out of the full pool still draws v1 whenever v1 is allowed.
+        chosen = set(allow)
+        pool = tuple(prompt_id for prompt_id in pool if prompt_id in chosen)
+        if not pool:
+            raise ValueError(
+                f"allowlist {sorted(chosen)} names no {task_type!r} template; "
+                f"its variants are: {', '.join(variants(task_type))}"
+            )
     digest = hashlib.sha256(f"{seed_id}:{sample_ix}".encode("utf-8")).hexdigest()
     return pool[int(digest, 16) % len(pool)]

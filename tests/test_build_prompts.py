@@ -981,3 +981,72 @@ def test_tiebreak_template_carries_a_low_score_anchor():
     )
 
 
+
+
+# --------------------------------------------------------------------------
+# The variant allowlist.
+#
+# Spreading a wave evenly over every paraphrase is the right default and is
+# also a free randomised trial. The 2026-08-31 read of that trial found
+# gen_irac_analysis_v4 costing 15.6 generations per accepted row against v1's
+# 3.3 - a persona difference, not a compliance one. Acting on that evidence
+# needs a way to plan the NEXT wave on the variants that won without deleting
+# the ones that lost: deleting a template renumbers nothing but does re-map
+# every pending row's pick_variant answer, and task_id_for does not hash
+# prompt_sha, so the queue would park itself as stale_prompt.
+# --------------------------------------------------------------------------
+
+def test_an_allowlist_narrows_the_draw_to_the_named_templates():
+    allow = ("gen_irac_analysis_v1", "gen_irac_analysis_v3")
+    drawn = {
+        reg.pick_variant("irac_analysis", f"seed{i:05d}", 0, allow=allow)
+        for i in range(200)
+    }
+    assert drawn == set(allow)
+
+
+def test_the_allowlist_keeps_the_draw_deterministic():
+    allow = ("gen_irac_analysis_v1", "gen_irac_analysis_v3")
+    for i in range(50):
+        picked = reg.pick_variant("irac_analysis", f"seed{i}", 0, allow=allow)
+        assert picked == reg.pick_variant("irac_analysis", f"seed{i}", 0, allow=allow)
+
+
+def test_a_single_variant_allowlist_pins_every_draw():
+    picks = {
+        reg.pick_variant("summarization", f"seed{i}", i % 3, allow=("gen_summarization_v2",))
+        for i in range(100)
+    }
+    assert picks == {"gen_summarization_v2"}
+
+
+def test_an_allowlist_naming_nothing_in_the_pool_raises():
+    with pytest.raises(ValueError) as exc:
+        reg.pick_variant("irac_analysis", "seed-a", 0, allow=("gen_summarization_v1",))
+    assert "irac_analysis" in str(exc.value)
+
+
+def test_group_variants_groups_by_task_type_in_registry_order():
+    grouped = reg.group_variants(
+        ["gen_irac_analysis_v3", "gen_summarization_v2", "gen_irac_analysis_v1"]
+    )
+    assert grouped == {
+        "irac_analysis": ("gen_irac_analysis_v1", "gen_irac_analysis_v3"),
+        "summarization": ("gen_summarization_v2",),
+    }
+
+
+def test_group_variants_rejects_a_template_that_is_not_a_generator():
+    with pytest.raises(KeyError) as exc:
+        reg.group_variants(["gen_irac_analysis_v1", "judge_pointwise_v1"])
+    assert "judge_pointwise_v1" in str(exc.value)
+
+
+def test_group_variants_rejects_an_unknown_template():
+    with pytest.raises(KeyError) as exc:
+        reg.group_variants(["gen_irac_analysis_v9"])
+    assert "gen_irac_analysis_v9" in str(exc.value)
+
+
+def test_group_variants_of_nothing_is_empty():
+    assert reg.group_variants([]) == {}

@@ -1152,3 +1152,125 @@ def test_the_sql_statute_hint_never_hides_a_seed_the_real_predicate_accepts(
             assert truth and maybe  # the case that must survive both
     finally:
         store.close()
+
+
+# --------------------------------------------------------------------------
+# --variant: planning a wave on chosen templates.
+#
+# The default spread over every paraphrase is a randomised trial, and the
+# 2026-08-31 read of it separated the personas that pay from the ones that do
+# not (gen_irac_analysis_v4: 15.6 generations per accepted row, against 3.3
+# for v1). Acting on that means planning the next wave on the winners. It must
+# not mean DELETING the losers - task_id_for does not hash prompt_sha, so
+# changing the pool re-maps every pending row's draw and parks the queue as
+# stale_prompt. Hence an allowlist that binds new rows only.
+# --------------------------------------------------------------------------
+
+def test_a_variant_allowlist_pins_the_templates_a_wave_draws(store, cfg):
+    rows = plan_rows(store, cfg, "synthesis", 12, variants=["gen_irac_analysis_v1"])
+    irac = [r for r in rows if r["task_type"] == "irac_analysis"]
+    assert irac, "the synthesis mix must plan some irac_analysis to test this"
+    assert {r["prompt_id"] for r in irac} == {"gen_irac_analysis_v1"}
+    for row in rows:
+        assert row["prompt_sha"] == prompt_registry.load(row["prompt_id"]).sha
+        assert row["task_id"] == task_id_for(
+            row["seed_id"], row["task_type"], row["prompt_id"], row["sample_ix"]
+        )
+
+
+def test_the_allowlist_binds_only_the_task_types_it_names(store, cfg):
+    """Restricting irac must not pin summarization to whatever it happens to
+    list first - an operator narrows one task type at a time."""
+    rows = plan_rows(store, cfg, "synthesis", 12, variants=["gen_irac_analysis_v1"])
+    others = [r for r in rows if r["task_type"] != "irac_analysis"]
+    assert others
+    for row in others:
+        assert row["prompt_id"] == prompt_registry.pick_variant(
+            row["task_type"], row["seed_id"], row["sample_ix"]
+        )
+
+
+def test_no_allowlist_plans_exactly_what_it_planned_before(store, cfg):
+    assert plan_rows(store, cfg, "synthesis", 9) == plan_rows(
+        store, cfg, "synthesis", 9, variants=None
+    )
+
+
+def test_an_unknown_variant_fails_before_anything_is_written(store, cfg):
+    with pytest.raises(KeyError):
+        plan_rows(store, cfg, "synthesis", 4, variants=["gen_irac_analysis_v9"])
+    assert store.task_counts() == {}
+
+
+def test_the_wave_event_records_which_templates_were_allowed(store, cfg):
+    """A wave planned on a subset is not reproducible from the target alone;
+    the allowlist has to survive in the ledger next to it."""
+    plan_wave(store, cfg, "synthesis", 6, variants=["gen_irac_analysis_v1"])
+    detail = json.loads(store.events("wave_planned")[0]["detail_json"])
+    assert detail["variants"] == ["gen_irac_analysis_v1"]
+
+
+def test_an_unrestricted_wave_records_no_allowlist(store, cfg):
+    plan_wave(store, cfg, "synthesis", 6)
+    detail = json.loads(store.events("wave_planned")[0]["detail_json"])
+    assert detail["variants"] is None
+
+
+def test_cli_plans_a_wave_on_the_named_variants(tmp_path, cfg, capsys):
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=12, db_path=paths.state_db):
+        pass
+    assert tasks_main([
+        "--config", config_path, "--stream", "synthesis", "--n", "8",
+        "--variant", "gen_irac_analysis_v1", "--variant", "gen_irac_analysis_v2",
+    ]) == 0
+    with open_store(tmp_path, n_seeds=0, db_path=paths.state_db) as store:
+        drawn = {
+            r[0] for r in store.conn.execute(
+                "SELECT prompt_id FROM task WHERE task_type = 'irac_analysis'"
+            ).fetchall()
+        }
+    assert drawn and drawn <= {"gen_irac_analysis_v1", "gen_irac_analysis_v2"}
+
+
+def test_cli_rejects_an_unknown_variant_by_name(tmp_path, cfg, capsys):
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=12, db_path=paths.state_db):
+        pass
+    with pytest.raises(SystemExit):
+        tasks_main([
+            "--config", config_path, "--stream", "synthesis", "--n", "8",
+            "--variant", "gen_irac_analysis_v9",
+        ])
+    err = capsys.readouterr().err
+    # Not merely "argparse refused something": the refusal has to name the id
+    # and say what it should have been, or this test would pass just as well
+    # against a build that has no --variant flag at all.
+    assert "gen_irac_analysis_v9" in err and "not a generator template" in err
+
+
+def test_cli_echoes_the_allowlist_it_planned_on(tmp_path, cfg, capsys):
+    """The wave summary is what a CI log preserves; a run planned on two of
+    four personas must not read identically to one planned on all four."""
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=12, db_path=paths.state_db):
+        pass
+    assert tasks_main([
+        "--config", config_path, "--stream", "synthesis", "--n", "8",
+        "--variant", "gen_irac_analysis_v1",
+    ]) == 0
+    assert "variants=gen_irac_analysis_v1" in capsys.readouterr().out
+
+
+def test_cli_says_nothing_about_variants_when_it_used_them_all(tmp_path, cfg, capsys):
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=12, db_path=paths.state_db):
+        pass
+    assert tasks_main([
+        "--config", config_path, "--stream", "synthesis", "--n", "8",
+    ]) == 0
+    assert "variants=" not in capsys.readouterr().out

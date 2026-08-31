@@ -504,11 +504,21 @@ def plan_rows(
     task_type_mix: Mapping[str, float] | None = None,
     arm: str | None = None,
     sources: Sequence[str] | None = None,
+    variants: Sequence[str] | None = None,
 ) -> list[dict]:
     """The rows plan_wave would insert - pure enough to test and to preview.
 
     Reads the store, writes nothing. `cfg` supplies max_seq_length, from
     which seed_token_budget derives the longest seed worth planning against.
+
+    `variants` is an allowlist of generator template ids. The default (None)
+    spreads each (seed, sample) over every paraphrase of its task type, which
+    is both the right default and a free randomised trial of the templates.
+    Passing ids narrows the draw for THE TASK TYPES THEY NAME and leaves every
+    other type on its full pool, so an operator can act on that trial one task
+    type at a time. It binds new rows only: rows already in the queue keep the
+    prompt_id they were stamped with, because task_id_for does not hash the
+    template and re-deriving their draw would park them as stale_prompt.
     """
     planned_already = _existing_in_queue(store, stream, arm)
     wanted = max(0, n - planned_already)
@@ -520,6 +530,10 @@ def plan_rows(
         # Fail here, before anything is inserted, rather than at render time
         # when a worker has already claimed the row and is about to spend.
         prompt_registry.variants(task_type)
+    # Same reason, one line later: a mistyped allowlist is caught before the
+    # first row exists rather than by an operator noticing a wave that drew
+    # the wrong personas.
+    allowed = prompt_registry.group_variants(variants) if variants else {}
     quota = allocate(mix, wanted)
 
     candidates = _candidate_seeds(
@@ -573,7 +587,9 @@ def plan_rows(
             used[seed_id] += 1
             sample_ix = pair_counts.get((seed_id, task_type), 0)
             pair_counts[(seed_id, task_type)] = sample_ix + 1
-            prompt_id = prompt_registry.pick_variant(task_type, seed_id, sample_ix)
+            prompt_id = prompt_registry.pick_variant(
+                task_type, seed_id, sample_ix, allow=allowed.get(task_type)
+            )
             rows.append(
                 {
                     "task_id": task_id_for(seed_id, task_type, prompt_id, sample_ix),
@@ -589,7 +605,15 @@ def plan_rows(
     return rows
 
 
-def commit_rows(store, rows: Sequence[dict], *, stream: str, arm: str | None, target: int) -> int:
+def commit_rows(
+    store,
+    rows: Sequence[dict],
+    *,
+    stream: str,
+    arm: str | None,
+    target: int,
+    variants: Sequence[str] | None = None,
+) -> int:
     """Insert the planned rows and record what happened. Returns rows created.
 
     A count below len(rows) means task_ids collided with rows already in the
@@ -606,6 +630,10 @@ def commit_rows(store, rows: Sequence[dict], *, stream: str, arm: str | None, ta
             "rows": len(rows),
             "created": created,
             "collided": len(rows) - created,
+            # A wave planned on a subset of the templates cannot be told from
+            # a full-pool one by looking at the rows, and "which personas did
+            # that batch run" is exactly the question the next yield read asks.
+            "variants": list(variants) if variants else None,
         },
     )
     return created
@@ -620,6 +648,7 @@ def plan_wave(
     task_type_mix: Mapping[str, float] | None = None,
     arm: str | None = None,
     sources: Sequence[str] | None = None,
+    variants: Sequence[str] | None = None,
 ) -> int:
     """Top the (stream, arm) queue up to `n` tasks; returns rows NEWLY created.
 
@@ -627,9 +656,12 @@ def plan_wave(
     is a target rather than an increment.
     """
     rows = plan_rows(
-        store, cfg, stream, n, task_type_mix=task_type_mix, arm=arm, sources=sources
+        store, cfg, stream, n, task_type_mix=task_type_mix, arm=arm,
+        sources=sources, variants=variants,
     )
-    return commit_rows(store, rows, stream=stream, arm=arm, target=n)
+    return commit_rows(
+        store, rows, stream=stream, arm=arm, target=n, variants=variants
+    )
 
 
 def reopen_tasks(
@@ -822,6 +854,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--mix", default=None, help="task_type=weight,... (overrides the default)")
     parser.add_argument("--source", action="append", default=None, help="restrict to a source_id")
     parser.add_argument(
+        "--variant",
+        action="append",
+        default=None,
+        metavar="PROMPT_ID",
+        help=(
+            "plan only on these generator templates (repeatable, e.g. "
+            "gen_irac_analysis_v1). The default draws from every paraphrase "
+            "of each task type; naming some narrows ONLY the task types named"
+        ),
+    )
+    parser.add_argument(
         "--reopen",
         action="append",
         default=None,
@@ -915,14 +958,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.n is None:
                 return 0
         mix = parse_mix(args.mix) if args.mix else None
+        if args.variant:
+            try:
+                prompt_registry.group_variants(args.variant)
+            except KeyError as exc:
+                # A typo'd --variant is an operator error, not a crash: exit
+                # the way every other bad argument does, naming the id and the
+                # pool. Checked HERE and not around plan_rows, so that a
+                # KeyError raised for any other reason still surfaces as the
+                # traceback it is rather than as a usage message.
+                parser.error(str(exc.args[0] if exc.args else exc))
         rows = plan_rows(
-            store, cfg, stream, args.n, task_type_mix=mix, arm=args.arm, sources=args.source
+            store, cfg, stream, args.n, task_type_mix=mix, arm=args.arm,
+            sources=args.source, variants=args.variant,
         )
-        created = commit_rows(store, rows, stream=stream, arm=args.arm, target=args.n)
+        created = commit_rows(
+            store, rows, stream=stream, arm=args.arm, target=args.n,
+            variants=args.variant,
+        )
         by_type: dict[str, int] = {}
         for row in rows:
             by_type[row["task_type"]] = by_type.get(row["task_type"], 0) + 1
-        print(f"stream={stream} arm={args.arm or '-'} target={args.n}")
+        allowlist = f" variants={','.join(args.variant)}" if args.variant else ""
+        print(f"stream={stream} arm={args.arm or '-'} target={args.n}{allowlist}")
         if not rows:
             # "skipped N" reads as "N tasks were dropped"; the truth is that
             # the queue is already at (or past) the target, or every eligible
