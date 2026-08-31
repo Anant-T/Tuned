@@ -850,6 +850,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # that names one is asking for a filter it will not get.
     parser.add_argument("--stream", default=None, help=f"planning stream (default {DEFAULT_STREAM})")
     parser.add_argument("--n", type=int, default=None, help="target task count for the queue")
+    parser.add_argument(
+        "--add", type=int, default=None,
+        help="plan this many MORE than the queue already holds (resolved at run time)",
+    )
     parser.add_argument("--arm", default=None, help="A/B label, e.g. unscripted|scripted")
     parser.add_argument("--mix", default=None, help="task_type=weight,... (overrides the default)")
     parser.add_argument("--source", action="append", default=None, help="restrict to a source_id")
@@ -885,8 +889,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
-    if args.n is None and not args.reopen:
-        parser.error("nothing to do: pass --n (plan a wave) or --reopen STATE")
+    if args.n is not None and args.add is not None:
+        # Two answers to one question. --n says "make the queue this big",
+        # --add says "make it this much bigger"; letting either win silently
+        # is how a wave lands at a size nobody chose.
+        parser.error("--n and --add are two ways to size the same wave; pass one")
+    if args.n is None and args.add is None and not args.reopen:
+        parser.error("nothing to do: pass --n or --add (plan a wave) or --reopen STATE")
     if args.reopen and args.stream is not None and args.n is None:
         # --stream is honoured by the PLANNER and ignored by the re-open, so
         # it is meaningful in this command exactly when this command also
@@ -910,6 +919,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     paths = build_paths(cfg.build.workdir).ensure()
     store = Store.open(paths.state_db)
     try:
+        if args.add is not None:
+            # --n is a TARGET measured against the live queue, and the live
+            # queue drains the whole time. A wave sized by hand reads that
+            # count out of one run's log and is dispatched at the NEXT run
+            # boundary - hours later, hundreds of rows lighter - so the wave
+            # lands that much bigger than intended. Over-planning is not the
+            # mirror image of under-planning: generated rows cannot be
+            # dropped from the corpus afterwards, so the error is one-way.
+            #
+            # Resolved BEFORE the re-open, and the order is immaterial rather
+            # than convenient: _existing_in_queue already counts the
+            # recoverable parking states as live, so moving rows out of them
+            # does not change the number.
+            args.n = _existing_in_queue(store, stream, args.arm) + args.add
         if args.reopen:
             states = (
                 sorted(REOPEN_STATES) if "all" in args.reopen else list(dict.fromkeys(args.reopen))

@@ -1274,3 +1274,64 @@ def test_cli_says_nothing_about_variants_when_it_used_them_all(tmp_path, cfg, ca
         "--config", config_path, "--stream", "synthesis", "--n", "8",
     ]) == 0
     assert "variants=" not in capsys.readouterr().out
+
+
+def test_cli_adds_to_the_queue_it_finds_rather_than_to_the_one_it_was_told_about(
+    tmp_path, cfg, capsys
+):
+    """`--n` is a TARGET, and the queue it is compared against keeps draining.
+
+    Every wave so far has been sized by hand: read the live count out of a
+    finished run's log, add the increment, pass the sum as `--n`. The reading
+    and the dispatch are hours apart - the planner runs at a run boundary, and
+    the boundary before it is where the count came from - so the queue has
+    drained by hundreds of rows in between and the wave lands that much bigger
+    than intended. Over-planning is not symmetric with under-planning here:
+    generated rows cannot be dropped from the corpus afterwards.
+
+    `--add` moves the arithmetic inside the job, where it is done against the
+    queue that is actually there.
+    """
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=12, db_path=paths.state_db):
+        pass
+
+    assert tasks_main(["--config", config_path, "--stream", "synthesis", "--n", "5"]) == 0
+    capsys.readouterr()
+
+    assert tasks_main(["--config", config_path, "--stream", "synthesis", "--add", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "target=8" in out, "--add 3 onto a queue of 5 is a target of 8"
+    assert "planned 3  collided 0" in out
+
+
+def test_cli_refuses_add_and_n_together_because_they_are_two_answers(
+    tmp_path, cfg, capsys
+):
+    """One says "make it this big", the other says "make it this much bigger".
+    Silently letting one win is how a wave lands at the wrong size.
+
+    The message is asserted, not just the exit: argparse already exits on an
+    unknown flag, so a bare `raises(SystemExit)` here would pass before the
+    flag exists and prove nothing.
+    """
+    config_path = temp_config(tmp_path)
+    paths_for(tmp_path)
+    with pytest.raises(SystemExit):
+        tasks_main(["--config", config_path, "--stream", "synthesis", "--n", "5", "--add", "3"])
+    err = capsys.readouterr().err
+    assert "--add" in err and "--n" in err
+    assert "unrecognized" not in err
+
+
+def test_cli_counts_add_as_something_to_do(tmp_path, cfg, capsys):
+    """The usage guard refuses a command that would plan nothing and re-open
+    nothing. `--add` plans, so it has to satisfy that guard - otherwise the
+    only way to use the new flag is to pass the old one alongside it."""
+    config_path = temp_config(tmp_path)
+    paths = paths_for(tmp_path)
+    with open_store(tmp_path, n_seeds=12, db_path=paths.state_db):
+        pass
+    assert tasks_main(["--config", config_path, "--stream", "synthesis", "--add", "2"]) == 0
+    assert "planned 2" in capsys.readouterr().out
