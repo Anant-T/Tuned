@@ -56,6 +56,14 @@ decision - no breakage anywhere.**
   names (F29). The human read itself is still outstanding.
 - The cron was **measured, not changed**: fires are late, never lost (F26).
 
+**One legal error is in the corpus.** Accepted row `412b8d1c5430` puts an appeal
+under the BNSS where its own answer key says the CrPC continues to govern - it
+cites all four required sections, so a permanent gate passed it. `check_answer_key`
+checks citations, not conclusions, and `families_by_kind` is never read (F30).
+1 row of 718; the blind spot behind it is systematic (19.9% of gate-passing
+transition generations). Not fixed unattended - `transition` is a finished
+stream, so the gate would guard ~0 future rows.
+
 **The one decision waiting:** two prompt personas are burning half the fleet.
 `gen_irac_analysis_v4` (examiner writing a model answer) spends **15.6
 generations per accepted row** against `v1`'s 3.3; `gen_summarization_v1` (law
@@ -140,7 +148,8 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 10 | Variant allowlist so a wave can be planned on the templates that earned it | **DONE** `c61311a` (F27) |
 | 11 | Stop shipping the answer's second deliberation | **DONE** `fb611f5` (F28) |
 | 12 | Build the 50-example review packet the card requires, and pre-screen it | **DONE** - `data/build/out/review_packet.html`, 12/50 flagged (F29) |
-| 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it |
+| 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it. The 5 transition rows are already read: 1 is wrong (F30) |
+| 14 | Enforce `families_by_kind` per limb in `check_answer_key` | **OPEN, deliberately not done unattended** - only worth it if `transition` is replanned (F30) |
 | 7 | Prove the assembly chain end to end | **DONE** - `CHAIN RC=0`, stats **GREEN** at v1.0-MVP (F16) |
 
 **The one open blocker:** `curated_c2` is over-generated against synthesis and
@@ -1155,6 +1164,22 @@ The trace is untouched, the full generation stays in the build store, each row
 carries `answer_preamble_dropped`, and the dataset card discloses it under
 **Answer normalisation**. Suite **3,781 / 19**.
 
+**Verified through the real assembly chain**, same store, only the code
+changed - so this is a controlled before/after, not an estimate:
+
+| | before | after |
+|---|---|---|
+| `CHAIN RC` | 0 | **0** (all nine gates still PASS) |
+| length p50 | 3,532 tok | **3,224 tok** (-8.7%) |
+| length p90 | 5,542 tok | **5,311 tok** |
+| length p99 / max | 7,039 / 8,088 | **unchanged** |
+| rows | 716 | **718** |
+
+p99 and max not moving is the right shape: the longest rows are long because
+of their *source*, which the trim does not touch. The +2 rows are the rescue
+effect arriving in the corpus. At the ~10,021-row ceiling a 308-token median
+saving is roughly **3M tokens an epoch** that were a duplicated deliberation.
+
 ### F29. The 50-example review packet exists, and 12 rows carry an authority the source never names
 
 The dataset card names a human read of 50 accepted examples as a ship
@@ -1170,9 +1195,13 @@ A mechanical pre-screen orders the reading. Legal correctness needs a human, but
 two failure modes do not: an answer citing a **section** or a **reported
 citation** the source never mentions. **12 of 50 rows** carry one - `drafting`
 1/4, `irac_analysis` 5/34, `statute_qa` 1/4, `summarization` 2/5, `transition`
-3/3. Transition's 3/3 is **expected by construction** (mapping IPC to BNS means
-naming sections an IPC-era judgment cannot contain) and is flagged as "verify
-the mapping", which is the highest-value check in the packet.
+3/3. Transition's 3/3 is **expected by construction**, though not for the reason I
+first wrote: the task is not offence-mapping (IPC 302 -> BNS 103) but
+**which-enactment-governs**, and it turns on the three repeal-and-savings
+provisions (BNS 358, BNSS 531, BSA 170) plus s.6 of the General Clauses Act.
+Those are cited from law, never from the source judgment, so they can never be
+"sourced". The packet flags them as "verify the limbs", and F30 is what came of
+actually doing that.
 
 **Two screen bugs found and fixed before any of this was believed**, both of
 which had manufactured a wrong answer:
@@ -1185,6 +1214,62 @@ which had manufactured a wrong answer:
    construction**. A separate probe (0 sections extracted from 50 answers)
    caught it. A clean "nothing found" is worthless until the instrument is shown
    able to find something.
+
+### F30. An accepted row states the OPPOSITE conclusion to its own answer key
+
+Working the review packet turned up the thing the packet exists to find, and it
+was findable **mechanically**, because the transition seeds carry ground truth
+in `seed.answer_key_json`.
+
+Accepted row `412b8d1c5430` (`gen_transition_v1`, offence 2021-12-27, appointed
+day 2024-07-01) concludes:
+
+> 2. The conduct of this appeal is governed by the Bharatiya Nagarik Suraksha
+> Sanhita, 2023.
+
+Its own key says `families_by_kind.procedural = "old"` and
+`procedural_rule.effect = "the Code of Criminal Procedure, 1973 continues to
+govern this proceeding"`. The answer's reasoning is wrong on the facts too: it
+argues the appeal, **filed 25 March 2023**, "was not pending immediately before
+the commencement" - but commencement is 1 July 2024, so it plainly was, and
+BNSS s.531(2)(a) saves it to the CrPC. The other four accepted transition rows
+are correct on all three limbs (read individually, not sampled).
+
+**Why every gate passed it.** `check_answer_key` is PERMANENT and it ran - but
+it checks *citations, not conclusions*: expected sections present, forbidden
+absent, savings mentioned, both families named. This answer cites IPC 468,
+BNSS 531, BSA 170 and BNS 358 exactly as required, so it passes. The docstring
+is explicit that `governing_family` is "recorded, not enforced", with a sound
+reason: a single global family would contradict `must_name_both_families`.
+
+**But `families_by_kind` is never read at all** - not enforced, not even in the
+gate's `detail`. That field does not have the problem the docstring describes:
+it is *per limb*, and a transition conclusion states exactly those three limbs.
+It is the one field that encodes the answer, and nothing consults it.
+
+Scale, measured across every generation that PASSED `answer_key` and whose key
+says `procedural = "old"`: **29 of 146 (19.9%)** put the procedural limb under
+the new code in their conclusion region. Most died on other gates
+(`rejected`/`format_parked`), so the corpus damage is **1 row of 718** - but the
+blind spot is systematic, not a one-off. One caveat on my own instrument: row
+`9fbcc98d9a4b` counts in the 29 because its heading is `Conclusion -` rather
+than `**Conclusion**`, so the fallback window caught Application text; its
+actual conclusion declines to decide two limbs (under-answering, not inversion).
+
+**Not fixed tonight, deliberately.** `transition` is a finished stream (2,200 of
+2,200 terminal, 5 accepted), so a new permanent gate would apply to ~0 future
+rows unless the stream is replanned - and a correctness gate on a permanent
+path is not a thing to write unattended at 06:00 and merge without an operator
+reading it. Recorded with the evidence instead. **If transition is ever
+replanned, enforce `families_by_kind` per limb first**; that is the cheapest
+real legal-accuracy gate available anywhere in this pipeline, because the ground
+truth is already sitting in the seed.
+
+**The general lesson, which is the point of the packet:** a row can be
+well-formed, cite every required authority, satisfy twelve gates and a judge,
+and still state the opposite of the right answer. Eleven of the twelve gates
+score form. This is the concrete instance that argues the human read is not
+ceremony.
 
 ## 6. Constants interrogated
 
