@@ -120,6 +120,27 @@ CURATED_C2_MIX = {"summarization": 0.60, "irac_analysis": 0.40}
 # transition rows are the whole point of their own stream: one task type.
 TRANSITION_MIX = {"transition": 1.0}
 
+# Streams whose task type is built from the seed's META rather than its TEXT,
+# so a seed that declares no stream cannot serve them.
+#
+# _candidate_seeds excludes a seed that declares a DIFFERENT stream, and that
+# is right for every wave. The permissive half - "declares nothing stays
+# eligible for any wave" - is right only where the task is built out of the
+# seed's text, which is every open-world stream here. For transition,
+# build_slots needs scenario/old_section_text/new_section_text/savings_text
+# and offence_date/proceeding_started, all written by transition.py alone; a
+# generic corpus chunk has none of them, so silence is not neutrality but a
+# guarantee that the row will skip.
+#
+# Measured on the 2026-08-28T20:07 wave: of 2,200 transition tasks, 2,063 were
+# planned against s3://indian-supreme-court-judgments, PredEx and TathyaNyaya
+# seeds and every one died `skip:slots` before a teacher was called, while
+# 1,100 usable grid seeds sat unplanned - the wave takes a seed_id-ordered
+# prefix of the never-used pool, and only the 137 grid seeds inside that
+# prefix were reached. Keyed on the stream, not on transition.py's source id,
+# which _candidate_seeds deliberately does not know.
+CLOSED_WORLD_STREAMS = frozenset({"transition"})
+
 STREAM_MIX: dict[str, dict[str, float]] = {
     "synthesis": SYNTHESIS_MIX,
     "curated_c2": CURATED_C2_MIX,
@@ -399,11 +420,21 @@ def _candidate_seeds(
         "THEN json_extract(s.meta_json, '$.oversize') END, 0) = 0",
         "COALESCE(CASE WHEN json_valid(s.meta_json) "
         "THEN json_extract(s.meta_json, '$.held_out') END, 0) = 0",
-        "COALESCE(CASE WHEN json_valid(s.meta_json) "
-        "THEN json_extract(s.meta_json, '$.stream') END, ?) = ?",
+        # Closed-world streams require the declaration; open-world ones only
+        # require that it does not name someone else. See CLOSED_WORLD_STREAMS.
+        (
+            "CASE WHEN json_valid(s.meta_json) "
+            "THEN json_extract(s.meta_json, '$.stream') END = ?"
+            if stream in CLOSED_WORLD_STREAMS
+            else "COALESCE(CASE WHEN json_valid(s.meta_json) "
+            "THEN json_extract(s.meta_json, '$.stream') END, ?) = ?"
+        ),
         "COALESCE(s.token_count, 0) <= ?",
     ]
-    params: list = [PER_SEED_CAP, stream, stream, max_seed_tokens]
+    params: list = [PER_SEED_CAP, stream]
+    if stream not in CLOSED_WORLD_STREAMS:
+        params.append(stream)
+    params.append(max_seed_tokens)
     if sources:
         clauses.append(f"s.source_id IN ({', '.join('?' * len(sources))})")
         params.extend(sources)

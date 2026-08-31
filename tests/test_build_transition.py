@@ -1547,10 +1547,21 @@ def test_a_transition_seed_is_never_drawn_into_another_stream(store, cfg, mappin
     assert {row["task_type"] for row in own} == {T.TASK_TYPE}
 
 
-def test_a_seed_that_declares_no_stream_is_offered_to_every_wave(store, cfg):
+def test_a_seed_that_declares_no_stream_is_offered_to_every_open_wave(store, cfg):
     """The clause must be inert for every other builder: transition.py is the
     only writer of meta_json.stream, and a planner that treated a missing
-    declaration as a refusal would empty every wave in the build."""
+    declaration as a refusal would empty every wave in the build.
+
+    "Every wave" INCLUDED transition until 2026-08-31, and production settled
+    that: the 2026-08-28T20:07 wave planned 2,063 of its 2,200 rows against
+    stream-less corpus seeds and every one died `skip:slots` before a teacher
+    was called. The reasoning above is about not emptying the OPEN-world
+    waves, whose task is built from the seed's text, and it still holds for
+    them - which is what this test now pins. transition builds its task from
+    the seed's META, so silence there is not neutrality; see
+    tasks.CLOSED_WORLD_STREAMS and
+    test_a_closed_world_stream_refuses_a_seed_that_declares_nothing.
+    """
     store.upsert_source("fixture/source", "CC0")
     store.upsert_seeds(
         [
@@ -1562,9 +1573,11 @@ def test_a_seed_that_declares_no_stream_is_offered_to_every_wave(store, cfg):
             }
         ]
     )
-    for stream in ("synthesis", "curated_c2", T.STREAM):
+    for stream in ("synthesis", "curated_c2"):
         planned = {row["seed_id"] for row in tasks.plan_rows(store, cfg, stream, 2)}
         assert "streamless00001" in planned, stream
+    # ...and the closed-world wave is the one place it is refused.
+    assert tasks.plan_rows(store, cfg, T.STREAM, 2) == []
 
 
 def test_a_seed_with_no_held_out_key_is_still_plannable(store, cfg):

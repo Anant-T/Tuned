@@ -326,6 +326,23 @@ def seed_rows(n: int, *, text: str = SEED_TEXT, meta=None, case_type="criminal")
     ]
 
 
+def add_transition_seeds(store, n: int = 4) -> list[str]:
+    """Seeds a `transition` wave can actually be planned against.
+
+    The generic `seed_rows` fixture declares no stream, which is what every
+    open-world stream looks like - and since 2026-08-31 that is no longer
+    enough for transition (tasks.CLOSED_WORLD_STREAMS). Real transition seeds
+    always declare it: `transition.py` is the only writer of the grid and
+    stamps `meta_json.stream` on all 1,250 rows, so a fixture without it was
+    modelling a seed the builder cannot produce.
+    """
+    rows = seed_rows(n, meta={"stream": "transition"})
+    for i, row in enumerate(rows):
+        row["seed_id"] = f"trseed{i:03d}"
+    store.upsert_seeds(rows)
+    return [row["seed_id"] for row in rows]
+
+
 def open_store(tmp_path, *, n_seeds: int = 4, db_path=None, **seed_kwargs) -> Store:
     """A seeded store. `db_path` puts it where a CLI under test will look
     (build_paths(workdir).state_db) instead of beside tmp_path."""

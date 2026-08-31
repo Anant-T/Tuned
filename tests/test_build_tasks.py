@@ -6,6 +6,7 @@ from pipeline_fakes import (
     SEED_TEXT,
     SOURCE_ID,
     STATUTE_SECTION_TEXT,
+    add_transition_seeds,
     build_cfg,
     open_store,
     paths_for,
@@ -321,6 +322,7 @@ def test_unknown_task_type_fails_before_anything_is_written(store, cfg):
 
 
 def test_transition_stream_plans_transition_tasks(store, cfg):
+    add_transition_seeds(store, 3)
     plan_wave(store, cfg, "transition", 3)
     types = {r[0] for r in store.conn.execute("SELECT DISTINCT task_type FROM task").fetchall()}
     assert types == {"transition"}
@@ -520,6 +522,49 @@ def test_a_seed_that_declares_a_stream_is_only_planned_into_that_stream(tmp_path
             )
         }
         assert "trans1" in own
+
+
+def test_a_closed_world_stream_refuses_a_seed_that_declares_nothing(tmp_path, cfg):
+    """THE TRANSITION MASSACRE, 2026-08-28: 2,063 of one 2,200-row wave died
+    as `skip:slots` before a single teacher call.
+
+    The exclusion above is ONE-DIRECTIONAL. `COALESCE(meta.stream, ?) = ?`
+    keeps a transition seed out of a synthesis wave, but a seed that declares
+    nothing satisfies it in EVERY wave - including transition's, whose
+    build_slots needs scenario/old_section_text/new_section_text/savings_text
+    and both dates. A generic corpus chunk carries none of them, so the row
+    can only ever skip.
+
+    "Declares nothing stays eligible for any wave" is the right contract for
+    an open-world stream, where the task type is built out of the seed's TEXT.
+    It is the wrong one for a stream whose task type is built out of the
+    seed's META, because there the absence of a declaration is not neutrality
+    - it is a guarantee the slots cannot render. Hence the stream, not the
+    source id: `tuned/law-v1-transition-grid` stays transition.py's business.
+    """
+    import json as _json
+
+    with open_store(tmp_path, n_seeds=0) as store:
+        store.upsert_seeds([
+            {"seed_id": "trans1", "source_id": SOURCE_ID, "text": "t", "token_count": 900,
+             "case_type": "criminal", "code_era": "ipc",
+             "meta_json": _json.dumps({"stream": "transition", "question": "which code?"})},
+            {"seed_id": "plain1", "source_id": SOURCE_ID, "text": "t", "token_count": 900,
+             "case_type": "bail", "code_era": "bns"},
+        ])
+        # More rows than the one eligible seed can carry, so an unfixed planner
+        # HAS to reach for plain1 to fill the wave.
+        plan_wave(store, cfg, "transition", 6, task_type_mix={"transition": 1.0})
+        planned = {
+            r[0] for r in store.conn.execute(
+                "SELECT DISTINCT seed_id FROM task WHERE stream = 'transition'"
+            )
+        }
+        assert "trans1" in planned
+        assert "plain1" not in planned, (
+            "a stream-less seed cannot render transition slots; planning it "
+            "burns a wave slot and its per-seed cap on a guaranteed skip"
+        )
 
 
 def test_a_seed_whose_meta_is_not_json_is_still_planned_against(tmp_path, cfg):
@@ -831,6 +876,9 @@ def test_reopen_and_plan_a_named_stream_in_one_command(tmp_path, cfg, capsys):
     with open_store(tmp_path, n_seeds=6, db_path=paths.state_db) as store:
         plan_wave(store, cfg, "synthesis", 2)
         store.conn.execute("UPDATE task SET state = 'judge_unroutable'")
+        # ...and something the transition half of the command can be planned
+        # against, since a closed-world stream draws only declared seeds.
+        add_transition_seeds(store, 3)
 
     argv = ["--config", config_path, "--reopen", "judge_unroutable", "--n", "3",
             "--stream", "transition"]
@@ -856,6 +904,7 @@ def test_an_unfiltered_reopen_does_not_report_a_filter_it_did_not_have(tmp_path,
     paths = paths_for(tmp_path)
     with open_store(tmp_path, n_seeds=6, db_path=paths.state_db) as store:
         plan_wave(store, cfg, "synthesis", 2)
+        add_transition_seeds(store, 1)
         plan_wave(store, cfg, "transition", 1)
         store.conn.execute("UPDATE task SET state = 'judge_unroutable'")
 
@@ -883,6 +932,7 @@ def test_reopen_cli_names_the_streams_it_touched(tmp_path, cfg, capsys):
     paths = paths_for(tmp_path)
     with open_store(tmp_path, n_seeds=6, db_path=paths.state_db) as store:
         plan_wave(store, cfg, "synthesis", 2)
+        add_transition_seeds(store, 1)
         plan_wave(store, cfg, "transition", 1)
         store.conn.execute("UPDATE task SET state = 'gen_unroutable'")
 

@@ -98,6 +98,15 @@ def paths(tmp_path):
 
 def make_store(tmp_path, *, n_seeds=1, n_tasks=1, mix=None, meta=None, stream="synthesis",
                text=SEED_TEXT):
+    # transition is a CLOSED-WORLD stream (tasks.CLOSED_WORLD_STREAMS): its
+    # wave draws only seeds that DECLARE it, because its slots come from the
+    # seed's meta rather than its text. Declared here rather than in each
+    # caller's `meta` so that a test which deliberately withholds a slot -
+    # `meta=None`, or TRANSITION_META minus one date - still gets a task to
+    # assert build_slots refuses. transition.py stamps the same key on all
+    # 1,250 real grid seeds.
+    if stream == "transition":
+        meta = {**(meta or {}), "stream": "transition"}
     store = open_store(tmp_path, n_seeds=n_seeds, meta=meta, text=text)
     plan_wave(
         store, build_cfg(), stream, n_tasks,

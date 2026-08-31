@@ -1271,7 +1271,11 @@ def test_a_transient_tiebreak_failure_still_re_queues(tmp_path, cfg, paths):
 # --------------------------------------------------------------------------
 
 def test_the_judge_sees_the_scenario_on_the_transition_stream(tmp_path, cfg, paths):
-    store = open_store(tmp_path, n_seeds=1, meta=TRANSITION_META)
+    # transition is closed-world (tasks.CLOSED_WORLD_STREAMS): the wave draws
+    # only seeds that declare it, exactly as transition.py stamps them.
+    store = open_store(
+        tmp_path, n_seeds=1, meta={**TRANSITION_META, "stream": "transition"}
+    )
     plan_wave(store, cfg, "transition", 1, task_type_mix={"transition": 1.0})
     with store:
         asyncio.run(
