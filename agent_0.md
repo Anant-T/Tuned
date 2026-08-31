@@ -968,6 +968,43 @@ blessed by the comment's own lease arithmetic and would add a further ~9%, but
 it is a tuning decision on top of a bug fix, and the two should not ship in one
 commit.
 
+#### CONFIRMED 2026-08-31T08:20Z, on run 33363831595
+
+Read off `logs/33363831595/gen.log` on the baton - the in-progress job's log is
+404 from both `gh run view --log` and the jobs API, but the worker checkpoints
+`logs/` to the HF state repo every 15 min, which is a read-only path that works
+while the run is live. Worth remembering: that is how to watch a run without
+waiting ~5 h for it to finish.
+
+    batch 1..16: claimed=36 gen-ok=36 err=0 lost-lease=0
+
+**`claimed=36` on all 16 batches.** The prediction's failure mode was
+`claimed=24`, so the fix reached the runner and the budget is now invariant to
+how many streams have work. `err=0` and `lost-lease=0` throughout: no breaker
+trips, no expired leases.
+
+Two things the log says that F23 did not ask about:
+
+**Gates are the whole cost.** `gated-out` runs 22-34 of every 36, with
+`regenerate=` almost equal to it and `reject=` at 0-1. So ~78% of generations
+are regenerated, which is the same fact F36 measures per variant - and it is
+why the variant choice is worth 3.6x rather than a few points.
+
+**The judge budget is fine, checked rather than assumed.**
+`groq/qwen/qwen3.6-27b left=72k` and falling ~10k per 16 batches, so it
+exhausts in ~7 h. That is a non-event twice over: the judge pool continues
+`cerebras/gemma-4-31b` (left=873k) then `bai/deepseek-v4-flash` (uncapped),
+and in `judge_mode: audit` a sampled row the fleet cannot serve ships as
+`audit:gate-accept:unjudged` at the attempt cap instead of parking
+(`judge.py`, the MAX_JUDGE_ATTEMPTS branch). So groq running dry costs some
+audit evidence, never a stall. No action.
+
+**Throughput looks HIGHER than the 23.6 accepted rows/hour on record** -
+~8 gate-passing generations per batch across 16 batches inside roughly an hour.
+Do not plan off that: the log carries no timestamps, it is a checkpoint that
+may lag, and the figure needs the final run report to confirm. Flagged, not
+banked.
+
 
 ### F24. CORRECTION to F14 - `irac_placement` is not a compliance gap, it is GENRE
 
