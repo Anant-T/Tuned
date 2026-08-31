@@ -1458,3 +1458,57 @@ def test_the_plan_workflow_serializes_against_the_worker(tmp_path):
     assert set(plan[True]) == {"workflow_dispatch"}
     inputs = plan[True]["workflow_dispatch"]["inputs"]
     assert all(inputs[k]["required"] for k in ("stream", "n", "mix"))
+
+
+def test_plan_pins_the_wave_to_chosen_variants(tmp_path, monkeypatch):
+    """The allowlist has to survive the ONE operator path to the queue.
+
+    `--variant` landed on tuned.data.tasks, which runs on a laptop that must
+    not touch the baton. This phase is the only way a wave reaches the remote,
+    so an allowlist it cannot carry is an allowlist that cannot be used.
+    Repeatable AND comma-separated, because workflow_dispatch has no list
+    input type: the operator types one string.
+    """
+    cfg_path, calls, pushed = _plan_env(tmp_path, monkeypatch)
+    rc = actions_worker.main(
+        ["--phase", "plan", "--hf-repo", "u/r", "--config", str(cfg_path),
+         "--plan-n", "1600", "--plan-mix", "irac_analysis=0.55,summarization=0.45",
+         "--plan-variant", "gen_irac_analysis_v1, gen_irac_analysis_v2",
+         "--plan-variant", "gen_summarization_v2"]
+    )
+    assert rc == 0
+    planner = next(c for c in calls if "tuned.data.tasks" in c)
+    named = [planner[i + 1] for i, a in enumerate(planner) if a == "--variant"]
+    assert named == ["gen_irac_analysis_v1", "gen_irac_analysis_v2", "gen_summarization_v2"]
+
+
+def test_plan_treats_a_blank_variant_input_as_the_full_pool(tmp_path, monkeypatch):
+    """Load-bearing, and the same shape as the empty-skip-set guard in
+    generate.py: a workflow input left blank arrives as "", and forwarding it
+    would hand the planner an allowlist naming nothing."""
+    cfg_path, calls, pushed = _plan_env(tmp_path, monkeypatch)
+    rc = actions_worker.main(
+        ["--phase", "plan", "--hf-repo", "u/r", "--config", str(cfg_path),
+         "--plan-n", "1600", "--plan-mix", "irac_analysis=1.0",
+         "--plan-variant", "  ,  "]
+    )
+    assert rc == 0
+    planner = next(c for c in calls if "tuned.data.tasks" in c)
+    assert "--variant" not in planner, "a blank input must plan on every template"
+
+
+def test_the_plan_workflow_can_carry_an_allowlist(tmp_path):
+    """Read off the workflow, because the CLI flag existing is not the same as
+    the operator being able to reach it."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    plan = yaml.safe_load((root / "data-plan.yml").read_text(encoding="utf-8"))
+    inputs = plan[True]["workflow_dispatch"]["inputs"]
+    assert "variants" in inputs, "no operator path to the variant allowlist"
+    # Optional: the default wave draws from every paraphrase, and that stays
+    # the default here too.
+    assert not inputs["variants"].get("required", False)
+    assert not inputs["variants"].get("default", "")
+    run = plan["jobs"]["plan"]["steps"][-1]["run"]
+    assert "--plan-variant" in run and "inputs.variants" in run

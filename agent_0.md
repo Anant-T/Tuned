@@ -158,10 +158,11 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 3 | Push, dispatch `data-worker`, watch the armed reopen recover ~5,190 rows | **DONE** - run #9 generating |
 | 4 | Measure the breaker trip rate; report (do not act) | **DONE** - 0 trips in 180 gens; 4.72 gen/min, ~23.6 accepted/hr (F17) |
 | 5 | Root-cause the `transition` stream's 99% reject rate | **DONE** - 96% was the planner bug (`708d455`); the rest is a 95.7% `statutory_quotation` compliance gap (F18) |
-| 6 | Widen the queue, sized to measured yield | **SIZED, deliberately not dispatched** - synthesis-only, **~1,500-1,600 tasks** (re-sized on per-variant rates, F24); blocked on the variant decision, not on capacity |
+| 6 | Widen the queue, sized to measured yield | **READY TO FIRE, deliberately not dispatched** - command and allowlist decided (F33) - synthesis-only, **~1,500-1,600 tasks** (re-sized on per-variant rates, F24); blocked on the variant decision, not on capacity |
 | 8 | Fleet claim budget: restore the designed 36 in flight and make it invariant to drained streams | **DONE** - 3 tests, suite 3,755/19 (F23) |
-| 9 | Author `gen_irac_analysis_v5` + `gen_summarization_v3` in the proven speech/letter genre; 10-row A/B; then plan Step 6 on the winners | **READY, needs the bucket free** (F24). Superseded in part: `--variant` now lets Step 6 avoid the losing personas **without** authoring anything (F27) |
-| 10 | Variant allowlist so a wave can be planned on the templates that earned it | **DONE** `c61311a` (F27) |
+| 9 | Author `gen_irac_analysis_v5` + `gen_summarization_v3` in the proven speech/letter genre; 10-row A/B; then plan Step 6 on the winners | **DROPPED tonight, and it is not a loss** - the A/B needs a free rate bucket, and the fleet never has one (F33). `--variant` takes the same prize by pinning the personas that already won |
+| 10 | Variant allowlist so a wave can be planned on the templates that earned it | **DONE** `c61311a` (F27); reachable from the operator path only since F33 |
+| 15 | Carry the allowlist through `--phase plan` and `data-plan.yml` | **DONE** - 3 tests (F33) |
 | 11 | Stop shipping the answer's second deliberation | **DONE** `fb611f5` (F28) |
 | 12 | Build the 50-example review packet the card requires, and pre-screen it | **DONE** `4505840` - reproducible CLI, 4/50 flagged (the first 12/50 was a screen bug, F29) |
 | 13 | The legal read of those 50 examples | **OPEN - human task.** The packet only prepares it. The 5 transition rows are already read: 1 is wrong (F30) |
@@ -1419,6 +1420,91 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F33. The allowlist existed and could not be reached, and Step 6 is now one dispatch
+
+`c61311a` put `--variant` on `python -m tuned.data.tasks`. That module runs on
+the operator's laptop, which **must not touch the baton** - `--phase seed-push`
+refuses once the remote owns it, and the only sanctioned path from an operator
+to the remote queue is `data-plan.yml -> actions_worker.py --phase plan`.
+
+`run_plan` built the planner argv by hand:
+
+    argv = [... "--stream", ..., "--n", ..., "--mix", args.plan_mix]
+
+No variant. So the feature that F24 called "a bigger prize than every
+throughput lever in this file combined, and it is free - it costs one line in
+the Step 6 plan command" **had no line to be written on.** Shipped tonight:
+`--plan-variant` (repeatable AND comma-separated, because `workflow_dispatch`
+has no list input type) plus a `variants` input on the workflow.
+
+Two details are load-bearing rather than cosmetic:
+
+- **Blank means every template, not no template.** An operator leaving the box
+  empty sends `""`; forwarding that would hand the planner an allowlist naming
+  nothing. Same shape as the empty-skip-set guard Step 1 needed in
+  `generate.py`, and pinned by its own test.
+- **The ids are split here and validated there.** `tuned.data.tasks` checks
+  each against the registry and exits with a usage error on a typo, so a
+  mistyped persona fails before a row exists rather than quietly shrinking the
+  pool. Splitting in `run_plan` keeps that check where it already is.
+
+#### The persona decision, taken
+
+Read straight off F24's randomised trial - no new evidence needed, and none
+obtainable, since the A/B that Task 9 wanted requires a rate bucket the fleet
+holds around the clock:
+
+| task type | allow | why | reject |
+|---|---|---|---|
+| `irac_analysis` | `v1`, `v3` | 3.3 and 4.2 gens/accepted-row; judge-writing-judgment and advocate-speaking-aloud | `v2` (7.2), `v4` (**15.6**, and top of `banned_meta` and `prompt_echo`) |
+| `summarization` | `v2` | 4% `irac_placement` failure | `v1` (27% - **the identical instruction sentence**, z = 5.7) |
+
+`statute_qa` and `drafting` stay out of the mix: the first has zero eligible
+seeds and the second is parked, and the shipped `SYNTHESIS_MIX` sends a quarter
+of the wave to `statute_qa` silently. That is why `--plan-mix` has no default.
+
+#### The command
+
+Dispatch `data-plan` with:
+
+    stream    synthesis
+    n         <live synthesis tasks now> + 1600
+    mix       irac_analysis=0.55,summarization=0.45
+    variants  gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2
+
+**`n` is a TARGET, not an increment,** and it is measured against LIVE tasks -
+everything except `rejected` / `stale_prompt` / `input_ineligible`. At the
+06:00Z snapshot synthesis held **4,003 live** (3,453 pending, 409 accepted,
+124 `format_parked`, 12 generating, 5 `judge_skipped`), so the target was
+**5,603**. That number decays: accepted rows keep counting, rejected ones stop,
+so live falls at roughly the rejection rate and a target fixed today inserts
+MORE the later it is fired. Erring high is safe here - the corpus is short on
+synthesis in particular, and more synthesis moves the `shape` ratio the right
+way. Re-read the count first if it is easy; do not block on it.
+
+**Why 1,600.** F24 measured the speech/letter variants at 2,221 tasks ->
+1,401 accepted rows, i.e. **0.63 accepted rows per task**. The gap to the MVP's
+~3,207 accepted synthesis is ~850, which is 1,347 tasks; 1,600 carries ~19%
+margin for the rate moving under a narrowed pool.
+
+#### Why it was NOT dispatched tonight
+
+Not caution - arithmetic. The `data-build` group holds one running run and one
+waiting run, and a new pending trigger **replaces** the waiting one. So a
+`data-plan` dispatch now would cancel the queued worker, run ~20 min against a
+565 MB baton round trip, and leave the machine idle until the 08:17Z cron:
+**~55 min of lost generation, about 40 accepted rows.**
+
+Against that, it buys nothing for about 2.4 days, because that is what the
+pending queue already holds. There is no free window either - runs are ~5h16m
+against a 4h cron, so the fleet is saturated by design. The right moment is
+when the queue is actually running down, and the whole cost of finding that
+moment is one `gh run list`.
+
+**The deadline is real but distant:** if nobody fires it, the queue drains
+around 2026-09-02 and the worker starts re-opening parked rows instead of doing
+new work.
 
 ## 6. Constants interrogated
 

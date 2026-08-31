@@ -27,6 +27,17 @@ on:
         required: true
         default: "irac_analysis=0.55,summarization=0.45"
         type: string
+      variants:
+        # Blank = every paraphrase, which is the right default: pick_variant
+        # spreads (seed, sample) over the whole pool and that spread is the
+        # free randomised trial the rates are read from. Narrow it only to
+        # stop buying a persona the trial has already priced - deleting the
+        # template instead would re-map the draw for every pending row and
+        # park the live queue as stale_prompt.
+        description: "Optional prompt_id allowlist, comma-separated (blank = every template)"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: data-build
@@ -62,3 +73,4 @@ jobs:
           --plan-stream "${{ inputs.stream }}"
           --plan-n "${{ inputs.n }}"
           --plan-mix "${{ inputs.mix }}"
+          --plan-variant "${{ inputs.variants }}"

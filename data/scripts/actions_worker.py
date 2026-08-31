@@ -1014,7 +1014,22 @@ def run_plan(args, root: Path, bundle: Bundle) -> int:
         "--n", str(args.plan_n),
         "--mix", args.plan_mix,
     ]
-    print(f"== plan {args.plan_stream} -> target {args.plan_n} ({args.plan_mix}) ==")
+    # The allowlist reaches the queue only through here. workflow_dispatch has
+    # no list input type, so the operator types one string; a BLANK one has to
+    # mean "every template" rather than "no template", which is why the empty
+    # parts are dropped instead of forwarded. Splitting happens here and the
+    # ids go on one at a time, because tuned.data.tasks validates each against
+    # the registry - a typo should still fail before a row exists.
+    variants = [
+        pid.strip()
+        for chunk in (args.plan_variant or [])
+        for pid in chunk.split(",")
+        if pid.strip()
+    ]
+    for pid in variants:
+        argv += ["--variant", pid]
+    pinned = f" on {','.join(variants)}" if variants else ""
+    print(f"== plan {args.plan_stream} -> target {args.plan_n} ({args.plan_mix}){pinned} ==")
     rc = subprocess.run(argv).returncode
     if rc != 0:
         print(f"planner exited rc={rc} - baton NOT pushed, the remote queue is unchanged")
@@ -1022,7 +1037,7 @@ def run_plan(args, root: Path, bundle: Bundle) -> int:
 
     _push(
         bundle, root, root.parent / "bundle_out",
-        f"plan: {args.plan_stream} target {args.plan_n}",
+        f"plan: {args.plan_stream} target {args.plan_n}{pinned}",
     )
     return 0
 
@@ -1075,6 +1090,17 @@ def main_parser() -> argparse.ArgumentParser:
     # seed in the store (0 carry a section_text distinct from the seed body), and
     # 0.00 to drafting, which is parked. A wave planned on the default mix
     # silently under-fills by a quarter and says nothing.
+    parser.add_argument(
+        "--plan-variant",
+        action="append",
+        default=None,
+        metavar="PROMPT_ID",
+        help=(
+            "--phase plan: plan only on these generator templates (repeatable "
+            "and/or comma-separated). Default draws every paraphrase of each "
+            "task type; naming some narrows ONLY the task types named"
+        ),
+    )
     parser.add_argument(
         "--plan-mix",
         help="--phase plan: task_type=weight,... REQUIRED - the default mix under-fills",
