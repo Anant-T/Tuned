@@ -179,7 +179,7 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 20 | Plan the next wave on `gen_irac_analysis_v1,gen_irac_analysis_v3,gen_summarization_v2` | **OPEN, SIZED at ~780 synthesis tasks on v1+v3** (~1,279 at the pooled yield). Without it the drained queue lands 418 effective rows BELOW the band and the corpus cannot be assembled at all (F37, F41). **Do NOT dispatch yet:** the claim is FIFO by rowid, so a wave planned now is worked LAST and the dispatch costs up to ~4 h of idle fleet. Trigger is queue depth (< ~1,000 pending synthesis), not the clock (F43). **Command rehearsed and corrected (F45): `--n` counts the LIVE arm-NULL queue, so it is `<live> + 780` - the stream total over-plans 2.3x**. ETA now MEASURED, not guessed: the queue drains ~863 pending/run at ~315.6 min/cycle, so 4,072 pending is ~25 h and the whole queue is dry around 2026-09-01 14:00Z. The <~1,000-synthesis trigger arrives sooner - roughly two runs out, ~2026-09-01 00:00Z - but the per-stream split has to be read on the baton at dispatch time, not extrapolated (F50) |
 | 21 | Verify the ceiling guard's first live run | **OPEN** - `33375922778` was EVICTED, not verified: it was stamped at `dc2182d`, which predates the guard and carries the REJECTED hand throttle. Watch the replacement instead; expect `ceiling guard: serving every stream - ~400 effective ... ceiling of 2050`, then curated_c2 claims - which DO resume despite every curated row sitting behind 3,162 synthesis rows by rowid, because claiming is per-stream (F38, F39, F43). Pre-registered on the swept working copy: `ceiling guard: serving every stream - 398 effective generated-curated rows against a ceiling of 2050` (the live figure will be a little higher; 2050 is a function of the static replay/curated_c1 pools and should match exactly). **The guard cannot bind on this queue** - draining every pending curated_c2 task lands ~1,241 effective against a throttle point of 1,900, so what is being verified is that it MEASURES and serves, not that it throttles. Log route CLOSED until the run completes: GitHub serves no log blob for an in_progress job (404) and the step summary renders only at step end, so the read lands when the run's log is archived. Its JOB started 12:34:43Z (there is no runner lag - the earlier 58 min was the fence, see F50's correction), so the 315-minute window runs to ~17:49Z and the archived log lands ~18:00Z (F49, F50. DEAD END, do not re-attempt: the baton cannot answer this early. curated_c2 shares synthesis's `gen_*` templates (`CURATED_C2_MIX` is summarization+irac_analysis, there is no curated prompt file) and the raw gen record has no stream or task_id field, so `prompt_id` cannot tell the two streams apart - a tail read of raw/gen showing 87 synthesis-shaped prompts proves nothing either way). Robust either way now: the 12:17Z cron is stamped at `699af2c`, which carries `_run_log`, so if it ever displaces this run the replacement puts the same line on the baton within 15 minutes instead |
 | 22 | Filter IL-TUR-contaminated seeds at PLAN time | **CLOSED - wrong fix.** The drops are co-citation, not contamination: 0 of 88 match the eval item's own case. A seed filter would implement the over-firing and cost 9.6% of the pool for no integrity gain (F40) |
-| 27 | **OPERATOR ACTION, DEADLINE ~2026-09-02: squash the baton's git history** | **OPEN, hard stop.** 55.00 GB of a 100 GB ACCOUNT-WIDE free private quota is already used (baton 38.83 + 16.17 in ten checkpoint repos) and it grows 14.8 GB/day - every checkpoint is a fresh ~565 MB LFS blob; wall ~2026-09-03, and a squash needs up to 36 h to reflect. `super_squash_history` takes it back to ~1 GB, is irreversible, and must run when NO worker holds the baton - end-of-job after the final push, or cancel-squash-dispatch by hand. Recurs ~weekly (F48). **EXACT FIGURES 2026-08-31 13:25Z** from HF `usedStorage` (not derived): baton 42.07 GB, seven checkpoint repos 16.16 GB, **total 58.23 GB of 100** - ~3.2 GB above what F48 recorded this morning, so the 14.8 GB/day on file is probably LOW and the wall probably EARLIER than 09-03. Rate now being measured over a timed interval rather than derived. **A squash is not the only lever**: six of the seven checkpoint repos are retired lanes holding 6.84 GB - `-rslora` 0.54 + `-rslora32` 1.59 + `-alpha64` 1.06 (arms retired in 15c3eb9 / 2b3ac29 / c3c3651, both questions recorded FULLY CLOSED) and `qwen-ckpt` 0.78 + `-ckpt-ddp` 1.30 + `-ckpt-manual` 1.57 (pre-8B lanes, superseded when the repo was stripped to Qwen3-8B DDP on 2026-08-08). Only `qwen8b-ckpt-ddp` (8.68 GiB) is live. That is ~half a squash's worth of headroom for a delete that needs no quiet window - but it is irreversible and may be the only copy of those weights, so it is an OPERATOR call, listed not recommended. **RATE NOW TIMED, AND IT IS 2.8x THE FIGURE ON FILE: 58.24 GB at 13:24:19Z -> 59.97 GB at 14:24:23Z = +1.73 GB in 1.00 h = 41.5 GB/day.** Headroom 40.0 GB, so the wall is **~2026-09-01 14:20Z, about 24 h out** - and a squash needs up to 36 h to reflect, so IT IS ALREADY LATE. Mechanism: the DB is NOT the main cost. `raw/gen/<day>/gen.ndjson` is append-only and ~250 MB by mid-day, and the 900 s cadence re-uploads it WHOLE as a fresh LFS blob 4x/hour = ~1.0 GB/h against the hourly DB's 0.565 GB/h. It grows all day, so the rate ACCELERATES until the UTC date rolls the file over (F52) |
+| 27 | **OPERATOR ACTION, DEADLINE ~2026-09-02: squash the baton's git history** | **OPEN, hard stop.** 55.00 GB of a 100 GB ACCOUNT-WIDE free private quota is already used (baton 38.83 + 16.17 in ten checkpoint repos) and it grows 14.8 GB/day - every checkpoint is a fresh ~565 MB LFS blob; wall ~2026-09-03, and a squash needs up to 36 h to reflect. `super_squash_history` takes it back to ~1 GB, is irreversible, and must run when NO worker holds the baton - end-of-job after the final push, or cancel-squash-dispatch by hand. Recurs ~weekly (F48). **EXACT FIGURES 2026-08-31 13:25Z** from HF `usedStorage` (not derived): baton 42.07 GB, seven checkpoint repos 16.16 GB, **total 58.23 GB of 100** - ~3.2 GB above what F48 recorded this morning, so the 14.8 GB/day on file is probably LOW and the wall probably EARLIER than 09-03. Rate now being measured over a timed interval rather than derived. **A squash is not the only lever**: six of the seven checkpoint repos are retired lanes holding 6.84 GB - `-rslora` 0.54 + `-rslora32` 1.59 + `-alpha64` 1.06 (arms retired in 15c3eb9 / 2b3ac29 / c3c3651, both questions recorded FULLY CLOSED) and `qwen-ckpt` 0.78 + `-ckpt-ddp` 1.30 + `-ckpt-manual` 1.57 (pre-8B lanes, superseded when the repo was stripped to Qwen3-8B DDP on 2026-08-08). Only `qwen8b-ckpt-ddp` (8.68 GiB) is live. That is ~half a squash's worth of headroom for a delete that needs no quiet window - but it is irreversible and may be the only copy of those weights, so it is an OPERATOR call, listed not recommended. **RATE NOW TIMED, AND IT IS 2.8x THE FIGURE ON FILE: 58.24 GB at 13:24:19Z -> 59.97 GB at 14:24:23Z = +1.73 GB in 1.00 h = 41.5 GB/day.** Headroom 40.0 GB, so the wall is **~2026-09-01 14:20Z, about 24 h out** - and a squash needs up to 36 h to reflect, so IT IS ALREADY LATE. Mechanism: the DB is NOT the main cost. `raw/gen/<day>/gen.ndjson` is append-only and ~250 MB by mid-day, and the 900 s cadence re-uploads it WHOLE as a fresh LFS blob 4x/hour = ~1.0 GB/h against the hourly DB's 0.565 GB/h. It grows all day, so the rate ACCELERATES until the UTC date rolls the file over (F52) **MITIGATED, NOT SOLVED, 2026-08-31 14:55Z (F53):** the raw log now shards by hour (`gen-<hour>.ndjson`), which the Hub skips once frozen - burn ~42.7 -> ~19.5 GB/day, wall **~09-01 12:00Z -> ~2026-09-02 10:00Z**. Verified by model closure first: the remote's working tree is 1.336 GB and only TWO files change between pushes (DB 749.2 MB x1/h + raw 257.6 MB x4/h = 1.78 GB/h vs 41.5 GB/day timed), so those two files are the whole burn. The squash is still required and still needs its 36 h, but it is no longer due inside the operator's night. Takes effect on the run starting ~17:50Z; run `33381288057` is stamped `c84fb1f` and burns at the old rate until ~17:49Z. After this the DB is ~95% of the remainder - compressing the snapshot (~4x, ~5 GB/day) and `--db-every` 3600->7200 are both priced in F53 and both deliberately NOT taken. |
 | 28 | Decide whether 15 dual-judged rows/run is enough quality evidence | **OPEN, OPERATOR DECISION** - the audit sample is sized right (5.09%) but delivers 15 judged rows and 0 rejections per run, with 25% of the sample shipping unjudged. Cause is family exhaustion, not budget: after groq's two models hit their daily cap there is only ONE free family left for a deepseek row and a dual judgement needs two. mistral's idle 5,000k is NOT the fix - it is the reserved tiebreak family (F51) |
 | 26 | OPERATOR DECISION: retire the pending v2/v4 irac tasks and replan them on v1/v3 | **OPEN, sized at ~182 accepted rows (~37% of the shortfall) for zero extra fleet time.** Needs a cancel/park command that does not exist yet, plus a park state that frees queue capacity honestly. F37's "no safe window" objection is superseded - `--phase plan` shows the pattern (F46) |
 | 25 | OPERATOR DECISION: turn off the row-side case_id channel (`--no-case-id-from-text`) | **OPEN** - recovers 81 generated rows (~9%) with exact containment untouched; deferred because it is an eval-integrity call and the rows are recoverable retroactively, so waiting costs nothing (F40) |
@@ -1512,6 +1512,73 @@ promotes the passes - not written tonight, because it is a new write path into
 the store and the operator should see it before it runs.
 
 Five tests, one per claim above. Suite **3,801 / 19**; card discloses it.
+
+### F53. THE RAW LOG NOW SHARDS BY HOUR, WHICH BUYS ABOUT A DAY - SHIPPED
+
+F52 measured the burn and named the driver. This is the fix, and it needed no
+operator, no destructive step and no durability trade.
+
+**The model, now closed against the measurement.** F52 reasoned from cadence;
+this reads the remote's working tree, so the two can be reconciled file by file:
+
+    state/law_v1.sqlite3                749.2 MB   x1/h  = 0.749 GB/h
+    raw/gen/2026-08-31/gen.ndjson       257.6 MB   x4/h  = 1.030 GB/h
+    every other file (unchanged bytes)                     ~0
+    ------------------------------------------------------------
+                                                   1.78 GB/h = 42.7 GB/day
+
+against 41.5 GB/day timed. The model is closed: those two files ARE the burn.
+Note the DB is 749 MB, not the 565 MB on file - it has grown - and that the
+other 26 files cost nothing, because the Hub already holds those bytes and
+skips them. **That is the whole lever**: an unchanged file is free, so the
+problem is not what the bundle contains but that one big file changes every
+time.
+
+**The change.** `raw_gen_path` now returns `raw/gen/<day>/gen-<hour>.ndjson`.
+One re-upload is capped at an hour of generation (~18 MB at the measured 17.6
+MB/h), and every earlier shard freezes and is skipped. Raw drops from ~1.03
+GB/h to ~0.035 GB/h - a factor of ~30 - with the same data, the same 900 s
+cadence, and the same durability rule: the raw write is still the first thing
+that happens to an answer somebody paid for.
+
+**Why it is safe, stated as an invariant rather than a hope.** The shard sits
+at the SAME DEPTH as the file it replaces. `reconcile.default_raw_paths` globs
+`raw/<kind>/*/*.ndjson` - exactly one directory level - so both layouts are
+swept by the same pattern, and every recovered row is pointed at the file it
+actually occupies rather than at a name computed later. Logs written before
+today keep resolving unchanged. That invariant is asserted by a test, not
+assumed, because getting it wrong would silently strand crash recovery, which
+is the one thing the raw log exists for.
+
+**Effect, and it is honest about what it does not do.** ~42.7 -> ~19.5 GB/day.
+That does not remove the wall, it moves it: with 33 GB of headroom expected at
+17:50Z, ~09-01 12:00Z becomes **~2026-09-02 10:00Z**. A squash still has to
+happen and still needs its 36 h, but the deadline is no longer inside the
+operator's night.
+
+**Timing.** Run `33381288057` is stamped `c84fb1f`, which predates this, so it
+burns at the old rate until it ends ~17:49Z. The cron is `17 */4 * * *`, so the
+16:17Z fire queues behind it and starts ~17:50Z with the fix. Verification is a
+rate re-measure after that, not an inspection of the diff.
+
+**What is deliberately NOT done, priced so it need not be re-derived.** After
+this, the DB is ~95% of what is left. Two levers exist and neither was taken:
+
+- **Compress the snapshot.** A VACUUMed SQLite of mostly text compresses ~4x,
+  so 749 -> ~190 MB and the burn goes to ~5 GB/day. Zero cadence or content
+  change. NOT taken tonight: it changes how the crown jewel is restored, and a
+  bug there loses the entire build. The raw shard was safe because its
+  invariant was a glob depth that could be asserted in one line; this one is
+  not. It wants a live verification window, not an unattended night.
+- **`--db-every` 3600 -> 7200.** Halves the DB term, one reversible flag. NOT
+  taken: it doubles the window in which a crash loses task state and
+  gate_result, and `stage_bundle`'s own docstring records that skipping the DB
+  was refuted three times because rows whose answers were already bought come
+  back as `pending` and get paid for twice. It is the emergency lever if the
+  wall closes again before a squash lands - reversible, so it can be pulled and
+  put back.
+
+Two tests, both written first and watched fail. Suite **3,832 / 19** (+2).
 
 ### F52. THE STORAGE BURN IS 41.5 GB/DAY, AND THE RAW LOG IS MOST OF IT
 
