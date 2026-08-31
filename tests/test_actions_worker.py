@@ -1733,3 +1733,58 @@ def test_the_ceiling_is_measured_for_the_profile_the_chain_assembles():
 
     sig = inspect.signature(actions_worker.assemble_argvs)
     assert sig.parameters["profile"].default is actions_worker.PROFILE
+
+
+def test_the_ceiling_guards_decision_is_left_where_the_baton_will_carry_it(
+    tmp_path, monkeypatch
+):
+    """The guard's line has to outlive the run that printed it.
+
+    GitHub publishes a job's log only when the job ENDS, and there is no log
+    blob to fetch before that - so a 5h16m worker hides its single most
+    consequential decision (which streams it is allowed to serve) for 5h16m.
+    The job summary is no better: it renders when the STEP finishes, and the
+    worker is one step. logs/ is staged onto the baton on every checkpoint,
+    so the same line written there is readable within one checkpoint instead.
+    """
+    rc, _ = _run_worker(tmp_path, monkeypatch, [_FakeProc(), _FakeProc()])
+    assert rc == 0
+    written = (tmp_path / "build" / "logs" / actions_worker._run_scope()
+               / "worker.log").read_text(encoding="utf-8")
+    assert "ceiling guard:" in written
+
+
+def test_the_reopen_decision_is_left_on_the_baton_too(tmp_path, monkeypatch):
+    """Same blind spot as the ceiling guard, same fix.
+
+    "no claimable work ... trying gen_unroutable" is the line that says a run
+    found the queue dead and reached for the recovery - and it is printed in
+    the first minute of a job whose log GitHub will not publish for another
+    five hours. It belongs where a checkpoint can carry it.
+    """
+    root = tmp_path / "build"
+    _tiny_db(root / actions_worker.DB_RELPATH, "x").close()
+    conn = sqlite3.connect(root / actions_worker.DB_RELPATH)
+    conn.execute("CREATE TABLE task (state TEXT)")
+    conn.executemany("INSERT INTO task VALUES (?)", [("rejected",), ("stale_prompt",)])
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(actions_worker, "pull_and_restore", lambda b, r: None)
+    monkeypatch.setattr(actions_worker, "stage_bundle", lambda r, s, db=True: s)
+    monkeypatch.setattr(actions_worker.subprocess, "run",
+                        lambda argv, **kw: type("R", (), {"returncode": 0})())
+    monkeypatch.setattr(actions_worker.subprocess, "Popen",
+                        lambda *a, **k: pytest.fail("a child was spawned on an empty queue"))
+
+    class _Bundle:
+        repo_id = "u/r"
+
+        def push(self, staging, message):
+            return None
+
+    args = actions_worker.main_parser().parse_args(["--phase", "worker", "--hf-repo", "u/r"])
+    assert actions_worker.run_worker(args, root, _Bundle()) == 0
+    written = (root / "logs" / actions_worker._run_scope()
+               / "worker.log").read_text(encoding="utf-8")
+    assert "no claimable work:" in written

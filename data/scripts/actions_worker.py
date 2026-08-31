@@ -550,6 +550,30 @@ def _report(lines: Sequence[str]) -> None:
             print(f"step summary unavailable ({exc})")
 
 
+def _run_log(root: Path, line: str) -> None:
+    """Print it, and leave a copy where the next checkpoint will carry it.
+
+    GitHub publishes a job's log only when the job ENDS - there is no blob to
+    fetch before that, the API 404s - and a step summary renders when the
+    STEP ends, which for a single-step 5h16m worker is the same moment. A
+    decision taken in the run's first minute is therefore invisible for five
+    hours, which is how long it took to confirm the ceiling guard's first
+    live run. stage_bundle copies logs/ on every push INCLUDING the DB-less
+    ones, so a line written there rides the fast --push-every cadence and is
+    readable off the baton ~15 minutes in.
+
+    Best-effort: a run must not die because it could not narrate itself.
+    """
+    print(line)
+    path = root / "logs" / _run_scope() / "worker.log"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError as exc:
+        print(f"run log unavailable ({exc})")
+
+
 # Parked states worth one automatic re-open when the queue has run dry, and
 # the only three. None is a decision about an answer:
 # gen_unroutable is a wave that could not route at all (no key, every model
@@ -869,20 +893,22 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
         STREAMS, generated_curated=generated_curated, ceiling=ceiling
     )
     if streams != tuple(STREAMS):
-        print(f"ceiling guard: serving {', '.join(streams)} - "
-              f"{', '.join(s for s in STREAMS if s not in streams)} held at "
-              f"{generated_curated:.0f} effective generated-curated rows "
-              f"against a ceiling of {ceiling}")
+        _run_log(root, f"ceiling guard: serving {', '.join(streams)} - "
+                 f"{', '.join(s for s in STREAMS if s not in streams)} held at "
+                 f"{generated_curated:.0f} effective generated-curated rows "
+                 f"against a ceiling of {ceiling}")
     else:
-        print(f"ceiling guard: serving every stream - {generated_curated:.0f} "
-              f"effective generated-curated rows against a ceiling of {ceiling}")
+        _run_log(root, f"ceiling guard: serving every stream - "
+                 f"{generated_curated:.0f} effective generated-curated rows "
+                 f"against a ceiling of {ceiling}")
 
     counts = _task_counts(root / DB_RELPATH)
     # Claimability is asked of the SERVED streams; the printed counts stay
     # whole so a throttled stream's backlog remains visible in the summary.
     servable = _claimable_in(root / DB_RELPATH, streams)
     if counts is not None and not servable:
-        print(f"no claimable work: {counts} - trying {', '.join(REOPEN_ON_EMPTY)}")
+        _run_log(root, f"no claimable work: {counts} - "
+                 f"trying {', '.join(REOPEN_ON_EMPTY)}")
         subprocess.run(
             [sys.executable, "-m", "tuned.data.tasks", "--config", args.config,
              *[a for state in REOPEN_ON_EMPTY for a in ("--reopen", state)]],
@@ -909,7 +935,8 @@ def run_worker(args, root: Path, bundle: Bundle) -> int:
             # this job - a red run here would train the operator to ignore red.
             _push(bundle, root, staging, "queue-empty checkpoint", attempts=3)
             return 0
-        print(f"re-open found work: {_claimable_in(root / DB_RELPATH, streams)} claimable - continuing")
+        _run_log(root, f"re-open found work: "
+                 f"{_claimable_in(root / DB_RELPATH, streams)} claimable - continuing")
 
     deadline = time.monotonic() + args.minutes * 60
     next_push = time.monotonic() + args.push_every
