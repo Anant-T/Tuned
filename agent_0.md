@@ -70,10 +70,10 @@ Autocompact was raised **200k -> 260k** on 2026-08-31.
 | 1 | Stop the shredder: wire `TRANSIENT_SKIPS` into `generate.py` + refund attempt + back off | **DONE** `3a71494` |
 | 1b | Make `cooldown_s`/`breaker_threshold` configurable; set `routing.cooldown_s: 60` | **DONE** `bc244e1` |
 | 2 | Live 5-10 row test on a scratch DB copy; then force a breaker trip | **DONE** - both halves green |
-| 3 | Push, dispatch `data-worker`, watch the armed reopen recover ~5,190 rows | **IN FLIGHT** - run #9 `33349462956` |
-| 4 | Measure the breaker trip rate; report (do not act) | BLOCKED on run #9 |
+| 3 | Push, dispatch `data-worker`, watch the armed reopen recover ~5,190 rows | **DONE** - run #9 generating |
+| 4 | Measure the breaker trip rate; report (do not act) | IN PROGRESS - 0 trips so far |
 | 5 | Root-cause the `transition` stream's 99% reject rate | **DONE** - planner bug, fixed `708d455` |
-| 6 | Widen the queue, sized to measured yield | BLOCKED on run #9 |
+| 6 | Widen the queue, sized to measured yield | TODO - arithmetic below |
 
 Full plan: `~/.claude/plans/mossy-sauteeing-riddle.md` (not in the repo).
 
@@ -224,6 +224,74 @@ burned**. What was lost is 2,063 wave slots and a per-seed cap on 2,063 seeds
 `PER_SEED_CAP` 4 = 4,400 tasks, minus the 137 spent. A 2,200-row wave therefore
 fills, but at ~2 samples per scenario - lower diversity than the plan assumed.
 Size the transition mix against 1,100 distinct scenarios, not 2,200.
+
+### Step 3: THE BUILD IS UNSTALLED (2026-08-31T02:19Z)
+
+Run #9 `33349462956`, dispatched on `main` at 02:03Z after run #8 was cancelled.
+GitHub will not serve logs for an in-progress run, but **the worker pushes its
+own logs to the baton**, which is the better instrument anyway:
+
+```
+logs/33349462956/gen.log
+  batch 1: claimed=36 gen-ok=36 gated-out=33 err=0 tokens=290411 [regenerate=31 reject=2]
+  batch 2: claimed=36 gen-ok=36 gated-out=34 err=0 tokens=253579 [regenerate=30 reject=4]
+logs/33349462956/judge.log
+  judge_mode=audit audit_sample=0.05
+  judge batch 73:  claimed=3 decided=3 accepted=3 [audit-accept=3]
+  judge batch 138: claimed=2 decided=2 accepted=2 [audit-accept=2]
+```
+
+The baton held **zero claimable rows** before this run (run #7 measured
+`pending=0`, and run #8 claimed nothing and changed nothing), so `claimed=36`
+is itself the proof that the armed re-open fired. Also on the baton:
+`raw/gen/2026-08-31/gen.ndjson` (5.78 MB), and a commit titled
+**`periodic checkpoint (raw+streams)` at 02:18:49Z - the first one in the
+repo's entire history**, because every previous run generated nothing for the
+raw+streams cadence to upload.
+
+`loaded 0 key(s) from .env` appears again and is again correct: the file is
+absent in CI by design and the 5 secrets arrive as env vars (refuted
+hypothesis 1).
+
+### Step 4 (preliminary): the breaker is not the constraint - the gates are
+
+Zero `err`, zero breaker trips, zero cooldowns across 72 generations. The 14
+minutes from worker start to first push produced 2 batches of 36, so roughly
+**5 gen/min, ~300/hour**.
+
+What IS striking is `gated-out` 33 and 34 of 36 - a ~92% first-attempt gate
+failure. Those are `regenerate` (retryable, and the row keeps its place), not
+rejects; only 2 and 4 were rejects. But with `MAX_ATTEMPTS = 3` a row that
+never passes lands in `format_parked`, and the baton already holds 559 of
+those. Gate pass rate, not routing and not judging, is now the ceiling -
+consistent with the 2026-08-28 finding that judge accept was 82.9%.
+Measure over a full run before acting; do not tune gates on two batches.
+
+### The corpus arithmetic - what "ready" actually requires
+
+`stats` MEASURES the emitted mix; nothing downsamples to hit it. So the
+profile's three shares pin three absolute counts, and replay's 4,320 rows are
+what pin the total:
+
+```
+v1.0-MVP  grounded_synthesis 0.3010  curated 0.2796  replay 0.4194  (+/-2pp)
+x 10,300 =            3,100          2,880          4,320
+```
+
+Those are exactly the design counts - replay was built to 4,320 to put the
+total at 10,300. With replay fixed, the total must land in [9,832, 10,816],
+which sets the real floors:
+
+| bucket | accepted now | floor to pass the gate | gap |
+|---|---|---|---|
+| grounded_synthesis (synthesis 337 + transition 3) | **340** | 2,763 | **~2,423** |
+| curated (curated_c2 310 + curated_c1 1,700) | ~2,010 | 2,552 | ~542 |
+| replay | 4,320 | - | 0 |
+
+So the gate is reachable, not structurally impossible - but it needs ~2,400
+more grounded_synthesis rows, and that single number is the ship date. The
+only other lever is trimming replay, which shrinks the whole corpus
+proportionally; that is a product decision, recorded here rather than taken.
 
 ## 6. Constants interrogated
 
