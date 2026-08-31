@@ -349,58 +349,55 @@ the stream is not on the MVP critical path, and prompt levers on this teacher
 have a recorded history of not working (the 2026-08-27 paired A/B on trace
 length). Fix it before any transition wave is widened, not after.
 
-### P0 SHIPPING BLOCKER: the trace/empty-think budget cannot be met as built
+### RETRACTED: the "trace budget" blocker was already solved by `shape.py`
 
-**Found 2026-08-31, not previously recorded anywhere** - `prev_rep.md` never
-mentions empty_think, and no gate has ever run on an assembled corpus
-(`build_manifest.json` has never existed). This is independent of the queue
-work and is NOT fixed by generating more rows.
+I recorded a P0 blocker here claiming the trace and empty-think gates were RED
+by construction. **That was wrong, and the correction matters more than the
+finding.** The measurement was right; the conclusion was not.
 
-Measured directly from the two built streams on the baton:
+What I measured and still stands:
 
 | stream | rows | `_prov.reasoning` true | false (empty-think) |
 |---|---|---|---|
-| `streams/replay.jsonl` | 4,320 | 3,120 | **1,200** |
-| `streams/curated_c1.jsonl` | 1,700 | 300 | **1,400** |
+| `streams/replay.jsonl` | 4,320 | 3,120 | 1,200 |
+| `streams/curated_c1.jsonl` | 1,700 | 300 | 1,400 |
 
-`stats.trace_count` is literally `bool(row_prov(row).get("reasoning"))`
-(`stats.py:206`), so those are the numbers the gate will see. Synthesis and
-`curated_c2` rows are teacher traces and add only to the reasoning side, so at
-the v1.0-MVP design total the corpus is fixed at:
+What I missed: `src/tuned/data/shape.py` exists for exactly this, and its
+docstring states the problem in the same terms before solving it - *"the pools
+between them hold 2,452 no-think rows. Both cannot fit... Feeding the target
+mix with the pools' own composition lands empty-think at 34.3%, still red"*,
+and *"TRACE: the exact complement of empty-think... the same measurement, not a
+second problem."*
 
-```
-reasoning   3,120 + 300 + 1,180 (C2) + 3,100 (synth)  = 7,700  = 74.76%
-empty-think 1,200 + 1,400                             = 2,600  = 25.24%
-                                                total  10,300
-gates:  trace_floor 0.80        -> 74.76% is BELOW  -> RED
-        empty_think 0.18-0.20   -> 25.24% is ABOVE  -> RED
-```
+The builders produce **deliberately oversized fixed pools**. `shape` runs first
+in the assembly chain (`actions_worker.assemble_argvs`:
+`verify -> shape --profile -> decontaminate -> dedupe -> split -> assemble ->
+stats`) and trims them to a subset that hits both the mix and the empty-think
+window. It writes new `shaped_*.jsonl` files and never touches the pools, so a
+later run with more generated rows re-derives a bigger corpus from the same
+inputs.
 
-The band wants **1,854-2,060** empty-think rows and the build has **2,600** -
-an excess of ~540-746. Raising the total does not fix it: the two shares are
-complements, and reaching 13,000 (where 2,600 would be 20.0%) needs replay
-0.4194 x 13,000 = 5,452 rows against the 4,320 that exist, so the mix gate
-fails instead. The two profiles bracket the problem rather than solving it -
-25.24% at MVP's 10,300, 14.44% at v1.1-full's 18,000.
+**The consequence is the opposite of what I wrote.** The corpus is sized off
+the scarce resource: `N = generated_synthesis / 0.301`, because
+grounded_synthesis can only come from the teacher. So the gates can be green at
+essentially any size, and generation volume buys corpus SIZE rather than
+greenness. At today's 340 accepted grounded_synthesis that is ~1,130 rows; the
+10,300 in the config is the finished target, not a threshold to clear before
+anything can ship.
 
-**Levers, none taken tonight:**
+**The real open decision is `--replay-nothink-share`**, and it is a genuine
+one: the no-think budget can be filled from replay's chat slices
+(smoltalk_nothink / wildchat_prof / legal_qa_empty) or from curated_c1's raw
+legal rows (PredEx / aalap). The default preserves the design's intent -
+no-think trained on chit-chat, not on legal prediction - and yields ~2.05
+corpus rows per generated row; sourcing it from raw legal rows instead yields
+~2.88 but is, in shape.py's own words, "a TRAINING-DATA DESIGN CHANGE and
+deliberately not the default." That is an operator call about what the model
+learns, not a gate to be cleared, and it is left unmade.
 
-1. Shift the curated bucket's composition. The bucket is pinned at 2,880 but
-   its split is not: today it is C1 1,700 (mostly empty-think) + C2 1,180
-   (teacher rewrites, all reasoning). At C1 1,000 + C2 1,880 the empty-think
-   total is ~2,024 - **in band**. This costs ~650 more accepted `curated_c2`
-   rows and REVERSES the "do not widen curated" note above, so treat that note
-   as conditional on this decision.
-2. Rebuild replay with fewer empty slices (`smoltalk_nothink` 600,
-   `legal_qa_empty` 300, `wildchat_prof` 300 against OpenThoughts' 3,120).
-3. Accept a smaller corpus, which the mix gate then constrains separately.
-
-**Deliberately not acted on.** Rebuilding a built stream unattended is
-hard to reverse, the choice between levers 1 and 2 changes what the model is
-trained on, and none of it blocks tonight: grounded_synthesis is ~2,760 short
-on every branch, so generation must run regardless. Assembly is days away.
-This needs an operator decision, and it is the reason a green `stats` cannot be
-promised by volume alone.
+Lesson for this file: `prev_rep.md` not mentioning empty_think meant nobody had
+written a REPORT about it, not that nobody had solved it. Read the module that
+owns a concern before declaring the concern unowned.
 
 ## 6. Constants interrogated
 
@@ -436,8 +433,9 @@ promised by volume alone.
   constraint. Measure in Step 4; the lever after that is `rpm`, not a second ref.
 - **Corpus is the long pole.** ~337 accepted synthesis vs ~3,617 for MVP.
   Tonight makes the pipeline *run*; it cannot finish the corpus.
-- **The trace/empty-think budget is RED by construction** - see the P0 blocker
-  above. Volume does not fix it; a composition decision does.
+- **`--replay-nothink-share` is an unmade operator decision** - it sets whether
+  the no-think budget comes from chit-chat or from raw legal rows, and with it
+  whether a generated row buys ~2.05 or ~2.88 corpus rows. Not a gate.
 - **`stats` returns 1 on RED and breaks the chain**, so a RED corpus means
   `push.py` never runs and nothing reaches the hub. `build_manifest.json` has
   never existed. Shipping is gated on `mix`/`trace`/`empty_think`, all downstream
