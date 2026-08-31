@@ -999,25 +999,47 @@ and in `judge_mode: audit` a sampled row the fleet cannot serve ships as
 (`judge.py`, the MAX_JUDGE_ATTEMPTS branch). So groq running dry costs some
 audit evidence, never a stall. No action.
 
-**Throughput: I flagged it as looking HIGHER than the 23.6 accepted rows/hour
-on record. Sampling it properly says otherwise.** The log carries no
-timestamps, so one reading cannot give a rate - it only looks like one if you
-assume the checkpoint is current. Two readings can:
+**Throughput, measured: ~75 gate-passing rows/hour. Two wrong answers came
+first, and how they were wrong is the finding.**
 
-    08:15Z   16 batches
-    09:11Z   18 batches      -> 2 batches / 56 min
+`gen.log` carries no timestamps, so I read the batch counter and paired it
+with the wall-clock time *I fetched it*. That gave 16 batches at "08:15Z" and
+18 at "09:11Z" - 2 batches in 56 minutes - and I wrote down ~17 rows/hour and
+called my own earlier "looks faster than 23.6/hour" impression refuted. Both
+numbers were junk, in opposite directions, for the same reason: **my fetch
+time is not the log's time.**
 
-That is ~28 min per batch of 36, or roughly **17 gate-passing rows/hour** -
-consistent with the ~23.6 on record and certainly not above it. The earlier
-impression came from dividing 16 batches by the run's elapsed time as though
-the log were live; it is pushed on a cadence, so early in a run it reads
-current and later it lags, which manufactures exactly that illusion of a fast
-start. **One sample of a checkpointed log is not a rate.**
+The log's real time is recoverable and exact. The baton is a git repo, so
+every checkpoint push is a commit with a timestamp, and the pushes land on a
+clean 15:00 cadence. Reading `gen.log` at each revision gives the whole
+series rather than two smeared points:
 
-Cumulative for the run at 09:11Z: **647 generations, 127 past the gates =
-19.6%.** That is the honest pooled figure for the CURRENT three-stream mix; it
-should rise once the throttle leaves only synthesis, and rise further on the
-F36 variants.
+    07:34:24Z   batch  2      08:34:37Z   batch 13
+    07:49:26Z   batch  5      08:49:39Z   batch 16
+    08:04:28Z   batch  8      09:04:41Z   batch 18
+    08:19:35Z   batch 11
+
+16 batches in 90.3 min = **5.64 min/batch**, steady (2-3 per checkpoint, no
+drift). At claimed=36 that is **383 generations/hour**, and at the measured
+19.7% gate-pass over the same window (113/575) that is **~75 gate-passing
+rows/hour** - three times the 23.6 on record, so the original impression was
+right and my "correction" was the worse of the two errors.
+
+The denominators were also wrong, both ways. The run *triggered* at 06:20:57Z
+but its job *started* 07:18:59Z - two seconds after the previous job ended at
+07:18:57Z. That gap is the whole story of the cadence: the `data-build`
+concurrency group hands off back to back, and the 4 h cron against a 5h15m32s
+job means one is always waiting. Setup costs ~4 min (job start 07:18:59,
+batch 1 begins ~07:23), so a run is ~5h12m of generating, ~390 gate-passing
+rows, and the fleet runs **continuously at ~1,800 rows/day**.
+
+Rule, since I got this wrong twice: **read the rate from the baton's commit
+timestamps, never from when I happened to fetch.**
+
+Cumulative for the run at 09:04:41Z: **647 generations, 127 past the gates =
+19.6%**, 4.39M tokens, 6,782 tokens/generation. That is the pooled figure for
+the CURRENT three-stream mix; it should move once the throttle leaves
+synthesis + transition, and again on the F36 variants.
 
 
 ### F24. CORRECTION to F14 - `irac_placement` is not a compliance gap, it is GENRE
