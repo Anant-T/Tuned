@@ -3036,3 +3036,71 @@ def test_one_batch_runs_every_stream_concurrently(tmp_path, cfg, paths):
         assert store.task_counts().get("pending", 0) == 0
         # ...and ran together: a per-stream gather could never exceed 3.
         assert router.peak > 3
+
+
+# --------------------------------------------------------------------------
+# THE CLAIM BUDGET IS THE FLEET'S, NOT THE STREAM'S.
+#
+# In-flight concurrency was sized once, against the rate bucket and the lease:
+# n_workers PER STREAM over the configured streams. But the claim loop asked
+# each stream for n_workers and took whatever it got, so in-flight silently
+# became n_workers x (streams that still HAVE work). On 2026-08-31 the
+# transition stream reached its terminal state - 2,200 of 2,200 tasks spent -
+# and the fleet dropped from 36 calls in flight to 24 with nothing wrong and
+# nothing logged. Against a bucket that starts full at rpm 8 that is a ~17%
+# throughput loss, and it doubles when a second stream ends.
+#
+# The per-stream ask is a FAIRNESS floor, not a ceiling: no stream may be
+# starved by a louder one. Once every stream has had its floor, an unspent
+# budget belongs to whoever can use it.
+# --------------------------------------------------------------------------
+
+def test_a_drained_stream_does_not_shrink_the_batch(tmp_path, cfg, paths):
+    """The whole point of F22: `curated_c2` is declared but empty, and the
+    batch must still run the fleet's full n_workers * len(streams)."""
+    with make_store(tmp_path, n_seeds=8, n_tasks=6) as store:
+        # curated_c2 is declared to the worker but has no tasks at all.
+        run(
+            store, cfg, FakeRouter(cfg), paths,
+            streams=["synthesis", "curated_c2"], n_workers=3, max_batches=1,
+        )
+        counts = store.task_counts()
+        # Budget is 3 x 2 = 6. Before the fix this claimed 3 and left 3.
+        assert counts.get("pending", 0) == 0, counts
+        assert counts.get("judging", 0) == 6, counts
+
+
+def test_the_top_up_never_starves_the_quieter_stream(tmp_path, cfg, paths):
+    """A stream with only one task still gets that task claimed in the same
+    batch - the top-up spends what is LEFT, it does not pre-empt the floor."""
+    with make_store(tmp_path, n_seeds=12, n_tasks=10) as store:
+        plan_wave(store, cfg, "curated_c2", 1, task_type_mix={"summarization": 1.0})
+        run(
+            store, cfg, FakeRouter(cfg), paths,
+            streams=["synthesis", "curated_c2"], n_workers=3, max_batches=1,
+        )
+        rows = store.conn.execute(
+            "SELECT stream, COUNT(*) FROM task WHERE state='judging' GROUP BY 1"
+        ).fetchall()
+        landed = {r[0]: r[1] for r in rows}
+        # The quiet stream's single task ran...
+        assert landed.get("curated_c2") == 1, landed
+        # ...and synthesis took the 5 slots curated_c2 could not fill (3+1 -> 6).
+        assert landed.get("synthesis") == 5, landed
+
+
+def test_the_floor_is_still_a_floor_when_both_streams_are_full(tmp_path, cfg, paths):
+    """With work everywhere the top-up must find nothing to do: each stream
+    gets exactly n_workers, which is the anti-starvation property the
+    per-stream claim existed for in the first place."""
+    with make_store(tmp_path, n_seeds=20, n_tasks=10) as store:
+        plan_wave(store, cfg, "curated_c2", 10, task_type_mix={"summarization": 1.0})
+        run(
+            store, cfg, FakeRouter(cfg), paths,
+            streams=["synthesis", "curated_c2"], n_workers=3, max_batches=1,
+        )
+        rows = store.conn.execute(
+            "SELECT stream, COUNT(*) FROM task WHERE state='judging' GROUP BY 1"
+        ).fetchall()
+        landed = {r[0]: r[1] for r in rows}
+        assert landed == {"synthesis": 3, "curated_c2": 3}, landed

@@ -2205,9 +2205,28 @@ async def run_workers(
         # (~7.5 s/call at rpm 8), so 3 streams x 16 = 48 in flight admits its
         # last call at ~360 s and that call runs at most ~120 s - ~480 s
         # against a 900 s lease.
+        #
+        # THAT BOUND IS THE FLEET'S BUDGET, NOT A PER-STREAM QUOTA. Asking each
+        # stream for n_workers and keeping only what it gives back makes
+        # in-flight n_workers * (streams that still HAVE work), so a stream
+        # reaching its terminal state quietly shrinks the batch. On
+        # 2026-08-31 `transition` spent the last of its 2,200 tasks and the
+        # fleet fell from 36 calls in flight to 24 - a ~17% throughput loss
+        # against an unchanged bucket, with nothing wrong and nothing logged.
+        # So: claim the per-stream floor first (that floor is what stops a
+        # louder stream starving a quieter one), then spend whatever budget
+        # the drained streams left behind on the streams that can still use
+        # it. The ceiling never rises above the sized bound.
+        budget = n_workers * len(streams)
         claimed: list = []
         for stream in streams:
             claimed.extend(store.claim_tasks(worker_id, n_workers, stream=stream))
+        for stream in streams:
+            if len(claimed) >= budget:
+                break
+            claimed.extend(
+                store.claim_tasks(worker_id, budget - len(claimed), stream=stream)
+            )
         stats.claimed = len(claimed)
         # Rows that came back having called nobody because the whole pool was
         # transiently out. Counted to decide the backoff below.
