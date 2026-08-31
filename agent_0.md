@@ -1193,9 +1193,15 @@ collapsible source, trace and judge, plus a verdict control.
 
 A mechanical pre-screen orders the reading. Legal correctness needs a human, but
 two failure modes do not: an answer citing a **section** or a **reported
-citation** the source never mentions. **12 of 50 rows** carry one - `drafting`
-1/4, `irac_analysis` 5/34, `statute_qa` 1/4, `summarization` 2/5, `transition`
-3/3. Transition's 3/3 is **expected by construction**, though not for the reason I
+citation** the source never mentions. **4 of those 50 rows** carry one, three of
+them `transition`.
+
+**CORRECTION.** This was first reported as **12 of 50**, and 12 was wrong. Eight
+were false positives from a THIRD instance of the same bug: with `re.I`, the
+source-side pattern read "Section 482 of the Code" as section `482OF`, so the
+bare `482` never entered the source set and the answer's clean citation looked
+unsourced. Re-run on the identical 50 rows, old screen 12, new screen 4, and the
+4 are a strict subset of the 12. Transition's 3/3 is **expected by construction**, though not for the reason I
 first wrote: the task is not offence-mapping (IPC 302 -> BNS 103) but
 **which-enactment-governs**, and it turns on the three repeal-and-savings
 provisions (BNS 358, BNSS 531, BSA 170) plus s.6 of the General Clauses Act.
@@ -1203,8 +1209,11 @@ Those are cited from law, never from the source judgment, so they can never be
 "sourced". The packet flags them as "verify the limbs", and F30 is what came of
 actually doing that.
 
-**Two screen bugs found and fixed before any of this was believed**, both of
-which had manufactured a wrong answer:
+**Three screen bugs, each of which produced a confidently wrong number.** The
+lesson is not that regexes are hard; it is that this screen produced a clean,
+plausible, quotable figure on all three occasions, and nothing but re-deriving
+it caught the error. It is now in `src/tuned/data/review.py` behind 15 tests,
+and each bug below is pinned by one:
 1. One permissive pattern on both sides read "Section 29 contains" as section
    `29CON`. Now strict on the answer (the suffix must be attached to the
    number), permissive on the source (a near-miss there only *suppresses* a
@@ -1214,6 +1223,16 @@ which had manufactured a wrong answer:
    construction**. A separate probe (0 sections extracted from 50 answers)
    caught it. A clean "nothing found" is worthless until the instrument is shown
    able to find something.
+3. Case-insensitivity on the SUFFIX turned "Section 482 of" into `482OF`, which
+   inflated the finding count 3x. Fixed by scoping the flag - the prefix is
+   case-insensitive, the suffix is not - and by crediting the bare number in the
+   source set alongside the suffixed form, so "Section 420 IPC" still answers a
+   bare `420`.
+
+**Now reproducible.** `data/scripts/review_packet.py --state S --out P` rebuilds
+it from any store copy, read-only. The draw is deterministic in `--salt`, so
+re-rendering after the corpus grows returns the SAME 50 rows and stays
+comparable to the last read instead of silently becoming a fresh sample.
 
 ### F30. An accepted row states the OPPOSITE conclusion to its own answer key
 
