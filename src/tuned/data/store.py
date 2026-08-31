@@ -269,6 +269,11 @@ def utcday(day: str | None = None) -> str:
     return day if day is not None else datetime.now(UTC).strftime("%Y-%m-%d")
 
 
+def utchour(hour: str | None = None) -> str:
+    """`hour` if given, else the current UTC hour as HH (the raw-log shard key)."""
+    return hour if hour is not None else datetime.now(UTC).strftime("%H")
+
+
 def _lease_cutoff(lease_s: int) -> str:
     """Timestamp `lease_s` seconds ago - claims older than this are stale."""
     return (datetime.now(UTC) - timedelta(seconds=lease_s)).strftime(_TS_FMT)

@@ -3104,3 +3104,45 @@ def test_the_floor_is_still_a_floor_when_both_streams_are_full(tmp_path, cfg, pa
         ).fetchall()
         landed = {r[0]: r[1] for r in rows}
         assert landed == {"synthesis": 3, "curated_c2": 3}, landed
+
+
+def test_the_raw_gen_log_is_sharded_by_hour_so_a_push_reuploads_only_the_hour(tmp_path):
+    """One day-long append-only file is what makes the baton grow ~20 GB/day.
+
+    The remote is an LFS-backed git repo and every checkpoint re-uploads any
+    file whose bytes changed, WHOLE. `raw/gen/<day>/gen.ndjson` reached 258 MB
+    by mid-afternoon and was re-sent four times an hour, which measured at
+    ~1.0 GB/h against the hourly database snapshot's 0.75 GB/h. Naming the
+    shard for the hour caps a single re-upload at one hour of generation
+    (~18 MB) and freezes every earlier shard, which the Hub then skips.
+    """
+    paths = paths_for(tmp_path)
+    at_13 = generate_module.raw_gen_path(paths, "2026-08-31", "13")
+    at_14 = generate_module.raw_gen_path(paths, "2026-08-31", "14")
+
+    assert at_13 != at_14, "an hour boundary must start a new file"
+    from pathlib import Path
+
+    assert Path(at_13).parent == Path(at_14).parent == paths.raw_gen_dir("2026-08-31")
+
+
+def test_an_hourly_shard_is_still_found_by_the_reconcile_sweep(tmp_path):
+    """The load-bearing invariant of the rename, asserted rather than assumed.
+
+    `default_raw_paths` globs `raw/<kind>/*/*.ndjson` - exactly one directory
+    level - and every recovered row is pointed at the file it actually sits
+    in, so the shard has to keep sitting at that depth. Put an hour-named
+    shard where the writer now writes and require the sweep to find it; a
+    layout that nests deeper would silently strand crash recovery, which is
+    the one thing the raw log exists for.
+    """
+    from pathlib import Path
+
+    from tuned.data.jsonl import append_ndjson
+    from tuned.data.reconcile import default_raw_paths
+
+    paths = paths_for(tmp_path)
+    shard = Path(generate_module.raw_gen_path(paths, "2026-08-31", "14"))
+    append_ndjson(shard, {"kind": "generation", "task_id": "t0", "attempt": 1})
+
+    assert shard in default_raw_paths(paths.root)

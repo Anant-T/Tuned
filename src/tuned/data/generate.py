@@ -83,7 +83,7 @@ from tuned.data.providers import (
     undersized_families,
     unkeyed_roles,
 )
-from tuned.data.store import set_state_fenced, utcday, utcnow
+from tuned.data.store import set_state_fenced, utcday, utchour, utcnow
 from tuned.data.paths import DEFAULT_CONFIG
 
 # Task states this module owns. 'judging' is the hand-off to judge.py.
@@ -1587,9 +1587,28 @@ def next_attempt(store, task: Mapping) -> int:
 # The paid step.
 # --------------------------------------------------------------------------
 
-def raw_gen_path(paths, day: str | None = None) -> str:
-    day = utcday(day)
-    return str(paths.raw_gen_dir(day) / "gen.ndjson")
+def raw_gen_path(paths, day: str | None = None, hour: str | None = None) -> str:
+    """Where this envelope goes: one shard per UTC hour, under the day.
+
+    One file per day is the obvious layout and it is what makes the remote
+    grow. The baton is an LFS-backed git repo; a checkpoint re-uploads any
+    file whose bytes changed AS A WHOLE FILE, and the worker checkpoints
+    every 900 s. A day log at 258 MB by mid-afternoon therefore cost ~1.0
+    GB/h of permanent history - measured, and more than the hourly 749 MB
+    database snapshot beside it - rising all day as the file grew.
+
+    An hour-named shard caps one re-upload at an hour of generation (~18 MB)
+    and, more to the point, FREEZES every earlier shard: unchanged bytes are
+    already on the Hub, so they are skipped rather than re-sent. Same data,
+    same durability, ~30x less history.
+
+    The shard stays at the SAME DEPTH as the file it replaces, which is the
+    invariant the rest of the system rests on: reconcile.default_raw_paths
+    globs `raw/<kind>/*/*.ndjson`, so both layouts are swept, and every
+    recovered row is pointed at the file it actually occupies - so logs
+    written before this change keep resolving exactly as they did.
+    """
+    return str(paths.raw_gen_dir(utcday(day)) / f"gen-{utchour(hour)}.ndjson")
 
 
 def _gen_envelope(task: Mapping, attempt: int, ref: ModelRef, model_family, response,
