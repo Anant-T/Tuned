@@ -33,14 +33,25 @@ bounded cost `--db-every` names, and it landed near the low end of it.
 raw log automatically - no manual recovery step, and nothing needs repairing by
 hand. NOTE the next run will be the first to carry `--db-every 7200`.
 
-A local copy of the baton is being taken to
-`C:\Users\Anant\Desktop\baton-backup-2026-08-31`, because the baton is the only
-copy and the squash it is waiting on is irreversible. The first attempt died on
-an `httpx.ReadTimeout` with 0.30 GB of `raw/gen` on disk and the 785 MB database
-still on the far side of it, so the retry raises `HF_HUB_DOWNLOAD_TIMEOUT` to
-120 s and fetches `state/` FIRST - it is the only part of the baton that cannot
-be rebuilt from the rest. Check the directory before trusting this paragraph:
-the copy is complete only if `state/law_v1.sqlite3` is there at ~785 MB.
+**A verified local copy of the baton** is at
+`C:\Users\Anant\Desktop\baton-backup-2026-08-31` - 19 files, 1.47 GB, all four
+subtrees, taken because the baton is the only copy and the squash it is waiting
+on is irreversible. Not merely downloaded: `PRAGMA quick_check` on the copied
+`state/law_v1.sqlite3` (785,358,848 bytes) returns `ok`, 14 tables, and its
+newest generation is `18:51:03Z` - which is the 18:51:48Z DB push, so the copy
+carries everything the baton itself carries.
+
+    task 9,530 / generation 10,459 / gate_result 123,604 / judgement 400
+    pending 3,074, rejected 2,652, accepted 1,885, format_parked 1,313,
+    stale_prompt 502, input_ineligible 42, generating 36, gen_unroutable 15,
+    judge_error 6, judge_skipped 5
+
+The first attempt at this backup died on an `httpx.ReadTimeout` with only
+`raw/gen` on disk and the 785 MB database still on the far side of it, and it
+reported success loudly enough to be believed. If it has to be taken again:
+raise `HF_HUB_DOWNLOAD_TIMEOUT` past its 10 s default, fetch `state/` FIRST
+since it is the only part nothing else can rebuild, and integrity-check the
+result rather than trusting the exit code.
 
 ---
 
